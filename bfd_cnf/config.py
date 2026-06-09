@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 # os.environ["XLA_FLAGS"] = "--xla_dump_to=/tmp/xla_dump --xla_dump_hlo_as_text"
 
 import jax
@@ -42,9 +42,11 @@ prior_flow_layers = 10
 
 import math as _math
 
-# log_scale = 0.5 * log det(Σ_X); for a circular PSF with σ_xy = 400: 2*log(400)
+# log_scale = 0.5 * log det(C_X) for the *centroid* noise covariance C_X = σ_xy² · I.
+# The template catalogue's centroid noise is the FITS header SIG_XY = 391.4, so the
+# physical centroid scale is 2*log(391.4) ≈ 11.94 (≈ the σ_xy = 400 used here).
 prior_sigmax_log_scale_mean: float = 2.0 * _math.log(400.0)  # ≈ 11.98
-prior_sigmax_log_scale_std: float = 1.0  # covers ~e^±1.5 variation in σ_xy
+prior_sigmax_log_scale_std: float = 1.0  # normalises the (11, 13) range to ~±1σ
 
 q_nn_width = 64
 q_nn_depth = 4
@@ -57,23 +59,55 @@ batch_size = 1024
 num_samples = 4
 
 # ---------------------------------------------------------------------------
+# Selection / flux threshold
+# ---------------------------------------------------------------------------
+# Minimum M_f for the target selection function (raw moment units).
+# Must match the selection applied to the target catalogue AND the fluxMin
+# passed to bfd.TemplateTable.  The data.py quality cut uses the same value.
+target_flux_min: float = 1500.0
+
+# ---------------------------------------------------------------------------
 # Σ_X conditioning / training parameters
 # ---------------------------------------------------------------------------
 # Number of Σ_X conditions sampled per gradient step; losses are averaged.
 n_sx_train: int = 8
-# Range of 0.5 * log det(Σ_X) for the uniform prior over PSF noise scale.
-log_scale_range: tuple[float, float] = (11.0, 13.0)
+# Range of log_scale = 0.5*log det(C_X) (centroid noise) sampled uniformly each step.
+# Spans the physical centroid/template scale (SIG_XY ⇒ ≈11.94, the corner-plot
+# reference) up through the grid TARGETS' per-object C_X scales (median ≈13.27,
+# p1-p99 ≈12.75-14.24 derived from each target covariance at inference) so the prior is
+# trained in-range for both the marginal corner plot AND the PQR shear integration.
+# Normalisation (prior_sigmax_log_scale_mean/std=11.98/1.0) is kept so log_scale_n=0 at
+# the corner reference and continuation does not disturb the calibrated marginal.
+# (Was (11,13): missed the target bulk → 88% out-of-range at inference.  Was (12,17):
+# too broad — weak L(X|C_X) weighting → shift-contaminated marginal.)
+log_scale_range: tuple[float, float] = (11.0, 15.0)
 # Maximum PSF ellipticity magnitude |e| for Σ_X conditioning.
+# Must be >= the maximum |e| seen in target PSF covariances at inference.
 e_max: float = 0.2
 
 # ---------------------------------------------------------------------------
 # File path constants
 # ---------------------------------------------------------------------------
+# Repo-root-relative artifact directories.  ``config.py`` lives in the
+# ``bfd_cnf/`` package, so the repo root is the parent of the package dir.
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_PKG_DIR)
+FLOWS_DIR = os.path.join(_REPO_ROOT, "flows")
+PLOTS_DIR = os.path.join(_REPO_ROOT, "plots")
+DATA_DIR = os.path.join(_REPO_ROOT, "data")
+
+# External input data (not in the repo).
 FITS_PATH = "/home/vwetzell/Documents/BFD_cNF/tmpl_t04_joined.fits"
-PRIOR_FLOW_PATH = "/home/vwetzell/gitrepos/bfd_cnf/prior_flow_xy.eqx"
-Q_FLOW_PATH = "/home/vwetzell/gitrepos/bfd_cnf/q_flow_xy.eqx"
+# Deep-field summary template library: one row per galaxy (1.37M), with no
+# sub-pixel-shifted copies.  Used as the observed-template source for diagnostic
+# corner plots so the shifted replicas in tmpl_t04_joined don't inflate density.
+SUMMARY_FITS_PATH = "/home/vwetzell/Documents/BFD_cNF/summary_templates_new.fits"
 GRID_P_PATH = "/home/vwetzell/Documents/BFD_cNF/merged_masked_bfd_grid_p.npy"
 GRID_M_PATH = "/home/vwetzell/Documents/BFD_cNF/merged_masked_bfd_grid_m.npy"
+
+# Saved flow weights live in the repo's flows/ directory.
+PRIOR_FLOW_PATH = os.path.join(FLOWS_DIR, "prior_flow_xy.eqx")
+Q_FLOW_PATH = os.path.join(FLOWS_DIR, "q_flow_xy.eqx")
 
 # ---------------------------------------------------------------------------
 # Fixed matrices

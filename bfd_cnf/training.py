@@ -12,49 +12,55 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import equinox as eqx
+import numpy as np
 import optax
-from flowjax.train.loops import fit_to_key_based_loss
+from tqdm import tqdm
 
 from .config import (
-    batch_size,
-    num_samples,
-    prior_flow_layers,
-    prior_early_nn_width,
-    prior_early_nn_depth,
-    prior_last_nn_width,
-    prior_last_nn_depth,
-    prior_sigmax_nn_width,
-    prior_sigmax_nn_depth,
-    prior_sigmax_log_scale_mean,
-    prior_sigmax_log_scale_std,
-    q_flow_layers,
-    q_nn_width,
-    q_nn_depth,
-    min_scale,
-    max_scale,
     PRIOR_FLOW_PATH,
     Q_FLOW_PATH,
-    g_scale,
-    r_idx,
+    batch_size,
     c_idx,
-    r_off,
     c_off,
-    n_sx_train as _n_sx_train,
-    log_scale_range as _log_scale_range,
+    g_scale,
+    max_scale,
+    min_scale,
+    num_samples,
+    prior_early_nn_depth,
+    prior_early_nn_width,
+    prior_flow_layers,
+    prior_last_nn_depth,
+    prior_last_nn_width,
+    prior_sigmax_log_scale_mean,
+    prior_sigmax_log_scale_std,
+    prior_sigmax_nn_depth,
+    prior_sigmax_nn_width,
+    q_flow_layers,
+    q_nn_depth,
+    q_nn_width,
+    r_idx,
+    r_off,
+)
+from .config import (
     e_max as _e_max,
 )
-from .models.flows import (
-    build_flows,
-    make_elbo_loss,
-    batch_cholesky_of_sym,
-    cov2corr,
+from .config import (
+    log_scale_range as _log_scale_range,
+)
+from .config import (
+    n_sx_train as _n_sx_train,
 )
 from .data import transform_dataset_to_standard
+from .models.flows import (
+    batch_cholesky_of_sym,
+    build_flows,
+    cov2corr,
+    make_elbo_loss,
+)
 
 # ---------------------------------------------------------------------------
 # Standardisation statistics helper
@@ -65,6 +71,7 @@ def compute_std_stats(
     raw2standard: Any,
     moments_jnp: jax.Array,
     cov_jnp: jax.Array,
+    chunk_size: int = 50_000,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Compute normalisation statistics for the Cholesky conditioning features.
 
@@ -74,6 +81,9 @@ def compute_std_stats(
     coefficients.  These statistics are used to whiten the conditioning
     features passed to the flow networks.
 
+    Processed in chunks to avoid materialising the full (N, 4, 4, 4, 4)
+    Hessian intermediate on the GPU at once.
+
     Parameters
     ----------
     raw2standard : RawMomentStandardize
@@ -82,6 +92,8 @@ def compute_std_stats(
         Raw template moments.
     cov_jnp : jax.Array, shape (N, 4, 4)
         Per-object raw-moment covariance matrices.
+    chunk_size : int, optional
+        Number of rows processed per GPU call.  Default is 50 000.
 
     Returns
     -------
@@ -94,15 +106,22 @@ def compute_std_stats(
     std_off : jax.Array, shape (6,)
         Standard deviation of the off-diagonal correlation elements.
     """
-    y_std_all, Sigma_std_all = transform_dataset_to_standard(
-        raw2standard, moments_jnp, cov_jnp
-    )
+    n = moments_jnp.shape[0]
+    log_diag_chunks, off_chunks = [], []
 
-    L_all = batch_cholesky_of_sym(Sigma_std_all)
-    diag_all = jnp.diagonal(L_all, axis1=-2, axis2=-1)
-    log_diag_all = jnp.log(diag_all + 1e-12)
-    corr_all = cov2corr(Sigma_std_all)
-    off_all = corr_all[..., r_off, c_off]
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        _, Sigma_chunk = transform_dataset_to_standard(
+            raw2standard, moments_jnp[start:end], cov_jnp[start:end]
+        )
+        L_chunk = batch_cholesky_of_sym(Sigma_chunk)
+        diag_chunk = jnp.diagonal(L_chunk, axis1=-2, axis2=-1)
+        log_diag_chunks.append(jnp.log(diag_chunk + 1e-12))
+        corr_chunk = cov2corr(Sigma_chunk)
+        off_chunks.append(corr_chunk[..., r_off, c_off])
+
+    log_diag_all = jnp.concatenate(log_diag_chunks, axis=0)
+    off_all = jnp.concatenate(off_chunks, axis=0)
 
     mean_log_diag = jnp.mean(log_diag_all, axis=0)
     std_log_diag = jnp.std(log_diag_all, axis=0)
@@ -120,7 +139,7 @@ def compute_std_stats(
 def train_model(
     key: jax.Array,
     moments_jnp: jax.Array,
-    odd_moments_jnp: jax.Array,
+    centroid_moments_jnp: jax.Array,
     cov_jnp: jax.Array,
     dm_dg_jnp: jax.Array,
     d2m_dg2_jnp: jax.Array,
@@ -143,7 +162,7 @@ def train_model(
         JAX PRNG key.
     moments_jnp : jax.Array, shape (N, 4)
         Raw template moments.
-    odd_moments_jnp : jax.Array, shape (N, 2)
+    centroid_moments_jnp : jax.Array, shape (N, 2)
         First-order Fourier moments (centroid moments) for each template.
         Passed as ``data_X`` to ``make_elbo_loss`` and used to compute the
         centroid likelihood weight ``log N(X_G; 0, C_X)`` during training.
@@ -184,7 +203,9 @@ def train_model(
     losses : list of float
         Training loss values recorded by ``fit_to_key_based_loss``.
     """
-    jax.config.update("jax_debug_nans", True)
+    # NOTE: jax_debug_nans is intentionally NOT forced on here — it makes every step
+    # ~10-50x slower, which is prohibitive for a 20k-step run.  The debugging entry
+    # point ``train_from_scratch.py`` enables it explicitly when localising a NaN.
 
     mean_log_diag, std_log_diag, mean_off, std_off = compute_std_stats(
         raw2standard, moments_jnp, cov_jnp
@@ -214,18 +235,15 @@ def train_model(
     weights_np = np.array(weights)
     weights_np = weights_np / weights_np.sum()
 
-    loss = make_elbo_loss(
-        data_y=moments_jnp,
-        data_Sigma=cov_jnp,
-        data_dg=dm_dg_jnp,
-        data_d2g=d2m_dg2_jnp,
-        data_X=odd_moments_jnp,
+    elbo = make_elbo_loss(
+        N=moments_jnp.shape[0],
         batch_size=batch_size,
         num_samples=num_samples,
         weights=jnp.asarray(weights_np),
         log_scale_range=log_scale_range,
         e_max=e_max,
         n_sx_train=n_sx_train,
+        use_sx=(log_scale_range is not None),
         raw2standard=raw2standard,
         mean_log_diag=mean_log_diag,
         std_log_diag=std_log_diag,
@@ -239,14 +257,37 @@ def train_model(
     )
 
     model_tuple = (prior_flow, q_flow)
-    key, sub = jr.split(key)
-    model_tuple, losses = fit_to_key_based_loss(
-        sub,
-        model_tuple,
-        loss_fn=loss,
-        steps=steps,
-        optimizer=optimizer,
-    )
+    opt_state = optimizer.init(eqx.filter(model_tuple, eqx.is_inexact_array))
+
+    @eqx.filter_jit
+    def train_step(
+        model, data_y, data_Sigma, data_dg, data_d2g, data_X, opt_state, key
+    ):
+        loss_val, grads = eqx.filter_value_and_grad(
+            lambda m: elbo(m, data_y, data_Sigma, data_dg, data_d2g, data_X, key)
+        )(model)
+        updates, new_opt_state = optimizer.update(
+            grads, opt_state, eqx.filter(model, eqx.is_inexact_array)
+        )
+        return eqx.apply_updates(model, updates), new_opt_state, loss_val
+
+    losses = []
+    pbar = tqdm(range(steps))
+    for _ in pbar:
+        key, subkey = jr.split(key)
+        model_tuple, opt_state, loss_val = train_step(
+            model_tuple,
+            moments_jnp,
+            cov_jnp,
+            dm_dg_jnp,
+            d2m_dg2_jnp,
+            centroid_moments_jnp,
+            opt_state,
+            subkey,
+        )
+        loss_f = float(loss_val)
+        losses.append(loss_f)
+        pbar.set_postfix(loss=f"{loss_f:.4f}")
 
     prior_trained, q_trained = model_tuple
     return prior_trained, q_trained, losses
@@ -257,14 +298,14 @@ def continue_training(
     prior_trained: Any,
     q_trained: Any,
     moments_jnp: jax.Array,
-    odd_moments_jnp: jax.Array,
+    centroid_moments_jnp: jax.Array,
     cov_jnp: jax.Array,
     dm_dg_jnp: jax.Array,
     d2m_dg2_jnp: jax.Array,
     weights: jax.Array,
     raw2standard: Any,
     *,
-    steps: int = 10_000,
+    steps: int = 5_000,
     learning_rate: float = 1e-3,
     weight_decay: float = 1e-4,
     grad_clip: float = 0.3,
@@ -288,7 +329,7 @@ def continue_training(
         Previously trained q flow to resume from.
     moments_jnp : jax.Array, shape (N, 4)
         Raw template moments.
-    odd_moments_jnp : jax.Array, shape (N, 2)
+    centroid_moments_jnp : jax.Array, shape (N, 2)
         First-order Fourier moments (centroid moments) for each template.
         Passed as ``data_X`` to ``make_elbo_loss`` for centroid likelihood
         weighting during training.
@@ -335,18 +376,15 @@ def continue_training(
     weights_np = np.array(weights)
     weights_np = weights_np / weights_np.sum()
 
-    loss = make_elbo_loss(
-        data_y=moments_jnp,
-        data_Sigma=cov_jnp,
-        data_dg=dm_dg_jnp,
-        data_d2g=d2m_dg2_jnp,
-        data_X=odd_moments_jnp,
+    elbo = make_elbo_loss(
+        N=moments_jnp.shape[0],
         batch_size=batch_size,
         num_samples=num_samples,
         weights=jnp.asarray(weights_np),
         log_scale_range=log_scale_range,
         e_max=e_max,
         n_sx_train=n_sx_train,
+        use_sx=(log_scale_range is not None),
         raw2standard=raw2standard,
         mean_log_diag=mean_log_diag,
         std_log_diag=std_log_diag,
@@ -354,22 +392,38 @@ def continue_training(
         std_off=std_off,
     )
 
-    key, sub = jr.split(key)
-
     optimizer = optax.chain(
         optax.clip_by_global_norm(grad_clip),
         optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay),
     )
 
     model_tuple = (prior_trained, q_trained)
+    opt_state = optimizer.init(eqx.filter(model_tuple, eqx.is_inexact_array))
 
-    model_tuple, losses = fit_to_key_based_loss(
-        sub,
-        model_tuple,
-        loss_fn=loss,
-        steps=steps,
-        optimizer=optimizer,
-    )
+    @eqx.filter_jit
+    def train_step(
+        model, data_y, data_Sigma, data_dg, data_d2g, data_X, opt_state, key
+    ):
+        loss_val, grads = eqx.filter_value_and_grad(
+            lambda m: elbo(m, data_y, data_Sigma, data_dg, data_d2g, data_X, key)
+        )(model)
+        updates, new_opt_state = optimizer.update(
+            grads, opt_state, eqx.filter(model, eqx.is_inexact_array)
+        )
+        return eqx.apply_updates(model, updates), new_opt_state, loss_val
+
+    losses = []
+    pbar = tqdm(range(steps))
+    for _ in pbar:
+        key, subkey = jr.split(key)
+        model_tuple, opt_state, loss_val = train_step(
+            model_tuple,
+            moments_jnp, cov_jnp, dm_dg_jnp, d2m_dg2_jnp, centroid_moments_jnp,
+            opt_state, subkey,
+        )
+        loss_f = float(loss_val)
+        losses.append(loss_f)
+        pbar.set_postfix(loss=f"{loss_f:.4f}")
 
     prior_trained, q_trained = model_tuple
 
@@ -447,7 +501,7 @@ def load_models(
 def load_or_train(
     key: jax.Array,
     moments_jnp: jax.Array,
-    odd_moments_jnp: jax.Array,
+    centroid_moments_jnp: jax.Array,
     cov_jnp: jax.Array,
     dm_dg_jnp: jax.Array,
     d2m_dg2_jnp: jax.Array,
@@ -465,7 +519,7 @@ def load_or_train(
         JAX PRNG key.
     moments_jnp : jax.Array, shape (N, 4)
         Raw template moments.
-    odd_moments_jnp : jax.Array, shape (N, 2)
+    centroid_moments_jnp : jax.Array, shape (N, 2)
         First-order Fourier moments (centroid moments) for each template.
         Forwarded to :func:`train_model` as ``data_X`` for centroid likelihood
         weighting.
@@ -527,7 +581,7 @@ def load_or_train(
         prior_trained, q_trained, losses = train_model(
             key,
             moments_jnp,
-            odd_moments_jnp,
+            centroid_moments_jnp,
             cov_jnp,
             dm_dg_jnp,
             d2m_dg2_jnp,

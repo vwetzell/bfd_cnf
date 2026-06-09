@@ -47,6 +47,7 @@ from ..config import (
     r_off,
     c_off,
     g_scale,
+    target_flux_min,
 )
 
 # ---------------------------------------------------------------------------
@@ -332,6 +333,37 @@ def _sx_cond_to_CX(sx_cond: jax.Array) -> jax.Array:
     return half_T * jnp.array([[1.0 + e1, e2], [e2, 1.0 - e1]])
 
 
+def cx_to_sx_cond(CX: jax.Array) -> jax.Array:
+    """Convert a 2×2 centroid noise covariance C_X to ``[log_scale, e1, e2]``.
+
+    Inverse of :func:`_sx_cond_to_CX`.  The parameterisation is::
+
+        C_X = (T/2) * [[1+e1, e2], [e2, 1-e1]]
+
+    so that::
+
+        log_scale = 0.5 * log det(C_X)
+        e1 = (C_X[0,0] - C_X[1,1]) / (C_X[0,0] + C_X[1,1])
+        e2 = 2 * C_X[0,1]           / (C_X[0,0] + C_X[1,1])
+
+    Parameters
+    ----------
+    CX : jax.Array, shape (2, 2)
+        Centroid noise covariance (positive definite, symmetric).
+
+    Returns
+    -------
+    jax.Array, shape (3,)
+        ``[log_scale, e1, e2]`` condition vector.
+    """
+    _, logdet = jnp.linalg.slogdet(CX)
+    log_scale = 0.5 * logdet
+    trace = CX[0, 0] + CX[1, 1]
+    e1 = (CX[0, 0] - CX[1, 1]) / jnp.maximum(trace, 1e-30)
+    e2 = 2.0 * CX[0, 1]        / jnp.maximum(trace, 1e-30)
+    return jnp.array([log_scale, e1, e2])
+
+
 def _log_L_X(X_G: jax.Array, sx_cond: jax.Array) -> jax.Array:
     """Evaluate ``log L(X_G | C_X)`` — the Gaussian centroid weight from Eq. 36.
 
@@ -403,11 +435,7 @@ def _normalised_importance_weights(log_w: jax.Array) -> jax.Array:
 
 
 def make_elbo_loss(
-    data_y: jax.Array,
-    data_Sigma: jax.Array,
-    data_dg: jax.Array,
-    data_d2g: jax.Array,
-    data_X: jax.Array,
+    N: int,
     *,
     batch_size: int = 128,
     num_samples: int = 8,
@@ -415,6 +443,7 @@ def make_elbo_loss(
     log_scale_range: tuple[float, float] | None = None,
     e_max: float = 0.0,
     n_sx_train: int = 8,
+    use_sx: bool = True,
     raw2standard: Any = None,
     mean_log_diag: jax.Array | None = None,
     std_log_diag: jax.Array | None = None,
@@ -423,24 +452,17 @@ def make_elbo_loss(
 ) -> Callable:
     """Build the ELBO loss function for training the (prior_flow, q_flow) pair.
 
-    The returned loss function accepts ``(params, static, key)`` as expected
-    by ``flowjax.train.loops.fit_to_key_based_loss``.
+    The returned function has signature
+    ``(model_tuple, data_y, data_Sigma, data_dg, data_d2g, data_X, key) -> scalar``.
+    The large data arrays are passed as dynamic arguments rather than captured
+    in the closure, so they are never embedded as XLA constants in the compiled
+    CUBIN — only the small ``weights_cdf`` array (proportional to N floats) is
+    kept in the closure.
 
     Parameters
     ----------
-    data_y : array-like, shape (N, D)
-        Raw template moments used for training.
-    data_Sigma : array-like, shape (N, D, D)
-        Per-object raw-moment covariance matrices.
-    data_dg : array-like, shape (N, D, 2)
-        First shear derivatives of the moments.
-    data_d2g : array-like, shape (N, D, 2, 2)
-        Second shear derivatives of the moments.
-    data_X : array-like, shape (N, 2) or None
-        First-order Fourier moments (centroid moments) for each template.
-        Used to compute the per-object centroid likelihood weight
-        ``log L(X_G | C_X) = log N(X_G; 0, C_X)`` when ``log_scale_range``
-        is not ``None``.  Pass ``None`` to disable.
+    N : int
+        Number of training examples.
     batch_size : int, optional
         Mini-batch size.  Default is 128.
     num_samples : int, optional
@@ -455,43 +477,28 @@ def make_elbo_loss(
         Maximum PSF ellipticity magnitude.  Default is 0.
     n_sx_train : int, optional
         Number of Σ_X conditions sampled per gradient step when
-        ``log_scale_range`` is not ``None``.  The ELBO is evaluated at each
-        sampled condition (reusing the same ``z ~ q`` draw) and the losses are
-        averaged.  Higher values reduce gradient variance from the single-PSF
-        estimate at the cost of ``n_sx_train`` × prior evaluations per step.
-        Default is 1 (original behaviour).
+        ``log_scale_range`` is not ``None``.  Default is 1.
+    use_sx : bool, optional
+        Whether to use Σ_X marginalisation.  Must be consistent with
+        ``log_scale_range``.  Default is ``True``.
     raw2standard : RawMomentStandardize or None, optional
-        Bijection from raw to standardised moment coordinates.  Must be
-        supplied when ``log_scale_range`` is not ``None``.
-    mean_log_diag : jax.Array or None, optional
-        Whitening mean for Cholesky log-diagonal features.
-    std_log_diag : jax.Array or None, optional
-        Whitening std for Cholesky log-diagonal features.
-    mean_off : jax.Array or None, optional
-        Whitening mean for off-diagonal correlation features.
-    std_off : jax.Array or None, optional
-        Whitening std for off-diagonal correlation features.
+        Bijection from raw to standardised moment coordinates.
+    mean_log_diag, std_log_diag, mean_off, std_off : jax.Array or None
+        Whitening statistics for Cholesky conditioning features.
 
     Returns
     -------
     callable
-        Loss function ``(params, static, key) -> scalar`` suitable for use
-        with ``fit_to_key_based_loss``.
+        ``(model_tuple, data_y, data_Sigma, data_dg, data_d2g, data_X, key) -> scalar``
     """
-    data_y = jnp.asarray(data_y)
-    data_Sigma = jnp.asarray(data_Sigma)
-    data_dg = jnp.asarray(data_dg)
-    data_d2g = jnp.asarray(data_d2g)
-    N = data_y.shape[0]
-
-    use_sx = (log_scale_range is not None) and (data_X is not None)
-    if use_sx:
-        data_X = jnp.asarray(data_X)
+    _use_sx = use_sx and (log_scale_range is not None)
 
     if weights is not None:
         weights = jnp.asarray(weights)
-        weights = weights / jnp.mean(weights)
-        weights_cdf = jnp.cumsum(weights / jnp.sum(weights))
+        # Guard against float32 underflow when most raw weights are near zero:
+        # if mean underflows to 0, dividing produces inf/NaN in the CDF.
+        weights = weights / jnp.maximum(jnp.mean(weights), jnp.finfo(jnp.float32).tiny)
+        weights_cdf = jnp.cumsum(weights / jnp.maximum(jnp.sum(weights), jnp.finfo(jnp.float32).tiny))
     else:
         weights_cdf = None
 
@@ -513,24 +520,37 @@ def make_elbo_loss(
     G = g.shape[1]
     g2d = g.reshape(G, -1)  # (G, 2)
 
+    # Floor on log P_sel so the selection correction -log P_sel stays bounded.
+    # σ_f = sqrt(var_mf) is tiny for high-SNR templates, so a q sample drawn below
+    # the flux threshold makes logsf((threshold-mf)/σ_f) astronomically negative and
+    # -log P_sel explode (seen as a -2.9e9 loss spike at init).  The floor only
+    # engages for such pathological samples; legitimate near-threshold corrections
+    # are O(1-10) and unaffected.  P_sel >= exp(-30) ≈ 9e-14.
+    _LOG_PSEL_FLOOR = -30.0
+
     def _log_p_select_given_x_raw(mf_true, var_mf, threshold):
         sigma = jnp.sqrt(jnp.maximum(var_mf, 0.0) + 1e-12)
-        return jstats.norm.logsf((threshold - mf_true) / sigma)
+        return jnp.maximum(jstats.norm.logsf((threshold - mf_true) / sigma), _LOG_PSEL_FLOOR)
 
     # Import here to avoid circular at module level
     from ..data import transform_dataset_to_standard
 
-    def plain_loss(params, static, key):
-        model = eqx.combine(params, static)
-        prior_flow, q_flow = model
+    def plain_loss(model_tuple, data_y, data_Sigma, data_dg, data_d2g, data_X, key):
+        prior_flow, q_flow = model_tuple
 
         # ── sample batch indices ──────────────────────────────────────
         key, subkey = jr.split(key)
         if weights_cdf is not None:
             u = jr.uniform(subkey, shape=(batch_size,))
             idx = jnp.clip(jnp.searchsorted(weights_cdf, u, side="right"), 0, N - 1)
+            # SNIS correction: oversampled (high-weight) objects are downweighted so
+            # the gradient targets p_original, not the reweighted distribution.
+            w_b = jnp.maximum(weights[idx], jnp.finfo(jnp.float32).tiny)  # guard 1/0
+            is_corr = 1.0 / w_b                       # correction ∝ p_hat
+            is_corr = is_corr / jnp.maximum(jnp.mean(is_corr), jnp.finfo(jnp.float32).tiny)
         else:
             idx = jr.choice(subkey, N, shape=(batch_size,), replace=True)
+            is_corr = jnp.ones(batch_size)
 
         y_b = data_y[idx]  # (B, D)   raw template moments
         S_b = data_Sigma[idx]  # (B, D, D)
@@ -584,52 +604,58 @@ def make_elbo_loss(
 
         z0_0 = z.reshape(S * BG, -1)[:, 0] * raw2standard.std[0] + raw2standard.mean[0]
         mf_true = jnp.power(10.0, z0_0).reshape(S, BG)
+        # var_mf uses the template's own flux variance (S_b[:, 0, 0]) rather than a
+        # fixed target noise. This makes the selection correction per-template: bright
+        # low-noise templates get P_sel ≈ 1 (negligible correction); templates near
+        # the flux threshold get a smooth, gradient-friendly correction. The physical
+        # target noise would be larger (shallower survey), making the true transition
+        # wider. If you need to match B16 Eq. (34) exactly, replace with a fixed
+        # representative target noise (e.g., config.target_flux_var = (f_min/SNR_min)^2).
         var_mf = jnp.broadcast_to(S_b[:, 0, 0][:, None], (batch_size, G)).reshape(BG)
-        log_p_sel = _log_p_select_given_x_raw(mf_true, var_mf[None, :], 1000).reshape(
+        log_p_sel = _log_p_select_given_x_raw(mf_true, var_mf[None, :], target_flux_min).reshape(
             S, batch_size, G
         )
 
         log_p_y_minus_sel = log_p_y - log_p_sel  # (S, B, G)
 
-        # ── Σ_X marginalisation: average loss over n_sx_train PSF draws ──────
-        if use_sx:
+        # ── Σ_X marginalisation: learn the X-marginal per drawn C_X ──────────
+        # For each randomly drawn centroid covariance C_X, the prior p(z|g,C_X) is
+        # trained to be the template distribution *marginalised over the centroid
+        # offset* X, weighting each copy by L(X|C_X)=N(X;0,C_X) computed from the TRUE
+        # 1st-order centroid moments X=[MX,MY].  (Copies with large |X| have lower M0
+        # and lower MR/M0 by the BFD convexity requirement, so down-weighting them
+        # recovers the near-centre distribution.)  We therefore condition the prior on
+        # C_X, form the per-copy ELBO, and take the L(X|C_X)-weighted batch mean — NOT
+        # the old per-template softmax *over* C_X draws.  Losses for the n_sx random
+        # C_X draws are then averaged.
+        if _use_sx:
             key, k_sx = jr.split(key)
             sx_conds = _sample_sx_conds(
                 k_sx, log_scale_range, e_max, n_sx_train
             )  # (n_sx, 3)
-            X_b = data_X[idx]  # (B, 2)
+            X_b = data_X[idx]  # (B, 2)  true centroid moments [MX, MY]
             z_SBG = z.reshape(S, BG, -1)  # (S, BG, D)
+            log_is_corr = jnp.log(is_corr)  # (B,) SNIS density-flattening correction
 
-            def _elbo_for_sx(sx_cond):
-                # Returns per-object IWAE estimate and centroid log-likelihood
-                # for one PSF draw, to be combined across draws via logsumexp.
-                log_w_b = _batch_log_L_X(X_b, sx_cond)  # (B,)
+            def _loss_for_sx(sx_cond):
+                # ELBO of every copy under the prior conditioned on this C_X.
                 sx_tiled = jnp.broadcast_to(sx_cond[None, :], (BG, 3))
                 cond_p = jnp.concatenate([g_flat_batch, sx_tiled], axis=-1)  # (BG, 5)
-                log_pz_i = jax.vmap(
+                log_pz = jax.vmap(
                     lambda z_s: prior_flow.log_prob(z_s, condition=cond_p)
-                )(z_SBG).reshape(
-                    S, batch_size, G
-                )  # (S, B, G)
-                elbo_i = log_p_y_minus_sel + log_pz_i - log_q  # (S, B, G)
-                lse_i = logsumexp(elbo_i, axis=0) - jnp.log(S)  # (B, G)
-                lse_b_i = jnp.mean(lse_i, axis=-1)  # (B,)
-                return lse_b_i, log_w_b  # (B,), (B,)
+                )(z_SBG).reshape(S, batch_size, G)  # (S, B, G)
+                elbo = log_p_y_minus_sel + log_pz - log_q  # (S, B, G)
+                lse = logsumexp(elbo, axis=0) - jnp.log(S)  # (B, G)
+                lse_b = jnp.mean(lse, axis=-1)  # (B,)
+                # Per-copy weight = L(X|C_X) · SNIS-correction, self-normalised over the
+                # batch ⇒ the X-marginal target for this C_X.
+                log_w_b = _batch_log_L_X(X_b, sx_cond) + log_is_corr  # (B,)
+                w_b = jax.nn.softmax(log_w_b)  # (B,) sums to 1
+                return -jnp.sum(w_b * lse_b)  # scalar: −E_{X∼L(·|C_X)}[ELBO]
 
-            # lse_all: (n_sx, B)  log_w_all: (n_sx, B)
-            lse_all, log_w_all = jax.lax.map(_elbo_for_sx, sx_conds)
-            # Self-normalised IS marginalisation over Σ_X, per object (eq. 35-36).
-            # Σ_j softmax_j(log_w_b) * exp(lse_b_j)  in log-space:
-            #   logsumexp_j(log_w_b_j + lse_b_j) - logsumexp_j(log_w_b_j)
-            # Dividing by Σ_j w_b_j removes the absolute scale of log L(X|C_X),
-            # which varies hugely across PSF draws and causes noise.
-            marginal_lse_b = logsumexp(log_w_all + lse_all, axis=0) - logsumexp(
-                log_w_all, axis=0
-            )  # (B,)
-            if weights is not None:
-                loss = -jnp.mean(marginal_lse_b / weights[idx])
-            else:
-                loss = -jnp.mean(marginal_lse_b)
+            # jax.checkpoint keeps lax.map from holding all n_sx residuals at once.
+            losses_sx = jax.lax.map(jax.checkpoint(_loss_for_sx), sx_conds)  # (n_sx,)
+            loss = jnp.mean(losses_sx)
         else:
             # prior conditioned on [g1, g2, log_scale=0, e1=0, e2=0]
             cond_p = jnp.concatenate(
@@ -645,10 +671,7 @@ def make_elbo_loss(
             lse = logsumexp(elbo, axis=0) - jnp.log(S)  # (B, G)
             lse_b = jnp.mean(lse, axis=-1)  # (B,)
 
-            if weights is not None:
-                loss = -jnp.mean(lse_b / weights[idx])
-            else:
-                loss = -jnp.mean(lse_b)
+            loss = -jnp.mean(is_corr * lse_b)
 
         return loss
 
@@ -763,7 +786,6 @@ def build_flows(
         last_layer_cond_dim=5,  # was 2 — full [g1, g2, log_scale, e1, e2]
         invert=True,
         quadratic_last=True,
-        cross_terms_last=True,
         sigmax_cond_dim=5,  # enables SigmaXCouplingLayer
         sigmax_nn_width=prior_sigmax_nn_width,
         sigmax_nn_depth=prior_sigmax_nn_depth,

@@ -747,8 +747,7 @@ class ExplicitPolyLast(AbstractBijection):
     Implements an affine coupling layer whose scale and shift coefficients
     are polynomials in the shear components ``(g1, g2)`` with network-
     generated coefficients conditioned on the transformed spin-0 inputs.
-    Optionally includes quadratic (``|g|²``) and cross-term (``g1·g2``)
-    features.
+    Optionally includes quadratic (``|g|²``) features.
 
     Parameters
     ----------
@@ -761,8 +760,6 @@ class ExplicitPolyLast(AbstractBijection):
         dimensions such as Σ_X parameters are silently ignored).
     use_quadratic : bool
         Whether to include ``|g|²`` as an even feature.
-    use_cross : bool
-        Whether to include the ``g1 * g2`` cross term.
     last_width : int
         Hidden width for the coefficient networks.
     last_depth : int
@@ -777,7 +774,6 @@ class ExplicitPolyLast(AbstractBijection):
     n_even: int = eqx.field(static=True)
     n_odd: int = eqx.field(static=True)
     use_quadratic: bool = eqx.field(static=True)
-    use_cross: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -785,7 +781,6 @@ class ExplicitPolyLast(AbstractBijection):
         dim,
         raw_cond_dim,
         use_quadratic,
-        use_cross,
         last_width,
         last_depth,
         activation,
@@ -793,7 +788,6 @@ class ExplicitPolyLast(AbstractBijection):
         self.dim = dim
         self.raw_cond_dim = raw_cond_dim
         self.use_quadratic = use_quadratic
-        self.use_cross = use_cross
         self.n_even = 1 + (1 if use_quadratic else 0)
         self.n_odd = 2
         k_list = jr.split(key, 3)
@@ -1130,7 +1124,6 @@ def new_masked_autoregressive_flow(
     invert: bool = True,
     last_layer_cond_dim: int | None = None,
     quadratic_last: bool = True,
-    cross_terms_last: bool = True,
     last_layer_nn_width: int | None = None,
     last_layer_nn_depth: int | None = None,
     # Σ_X coupling layer — set sigmax_cond_dim=5 to enable
@@ -1172,8 +1165,6 @@ def new_masked_autoregressive_flow(
     quadratic_last : bool, optional
         Whether to include ``|g|²`` features in the last layer.  Default
         is ``True``.
-    cross_terms_last : bool, optional
-        Whether to include ``g1·g2`` cross terms.  Default is ``True``.
     last_layer_nn_width : int or None, optional
         Hidden width for the last-layer networks.  Falls back to
         ``nn_width`` if ``None``.
@@ -1225,7 +1216,6 @@ def new_masked_autoregressive_flow(
         dim,
         last_layer_cond_dim,
         quadratic_last,
-        cross_terms_last,
         _last_width,
         _last_depth,
         nn_activation,

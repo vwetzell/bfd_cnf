@@ -6,63 +6,69 @@ correct order to reproduce the notebook analysis.
 
 Usage
 -----
-    python run.py
+    # from the repo root so the package import resolves:
+    cd /home/vwetzell/gitrepos/bfd_cnf
+    python -m bfd_cnf.run
 """
 
 from __future__ import annotations
 
-import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
+
+from .config import (
+    GRID_M_PATH,
+    GRID_P_PATH,
+    PRIOR_FLOW_PATH,
+    Q_FLOW_PATH,
+    Sigma0,
+    e_max,
+    log_scale_range,
+    n_sx_train,
+    prior_flow_layers,
+    q_flow_layers,
+)
 
 # ---------------------------------------------------------------------------
 # Imports from this package
 # ---------------------------------------------------------------------------
 from .config import (
     key as _base_key,
-    Sigma0,
-    PRIOR_FLOW_PATH,
-    Q_FLOW_PATH,
-    GRID_P_PATH,
-    GRID_M_PATH,
-    prior_flow_layers,
-    q_flow_layers,
-    n_sx_train,
-    log_scale_range,
-    e_max,
 )
 from .data import load_data, transform_dataset_to_standard
-from .models.flows import build_flows, batch_cholesky_of_sym, cov2corr
-from .training import (
-    load_or_train,
-    compute_std_stats,
-    continue_training,
-    save_models,
-)
 from .inference import (
-    make_flow_prob_and_derivs,
-    sample_trunc_mvn_noise_first_lower,
-    rqmc_pqr_grid,
-    rqmc_integrate_pqr_jax,
-    load_grid_data,
-    assemble_pqr_from_flow,
-    prob_template,
     _halton_sequence,
+    assemble_pqr_from_flow,
+    integrate_grid_pqr,
+    load_grid_data,
+    make_flow_prob_and_derivs,
+    prob_template,
+    rqmc_integrate_pqr_jax,
+    rqmc_pqr_grid,
+    sample_trunc_mvn_noise_first_lower,
 )
+from .models.flows import batch_cholesky_of_sym, build_flows, cov2corr, cx_to_sx_cond
 from .statistics import (
+    bootstrap_total_mult_bias,
+    clipR,
     pqr2g,
     pqr2multbias,
-    clipR,
-    bootstrap_total_mult_bias,
+)
+from .training import (
+    compute_std_stats,
+    continue_training,
+    load_or_train,
+    save_models,
 )
 from .viz import (
-    plot_snr_histograms,
     plot_flow_vs_obs_corner,
     plot_g_distributions,
+    plot_mult_bias_hexbin,
     plot_Q_distributions,
     plot_R_distributions,
-    plot_mult_bias_hexbin,
+    plot_snr_histograms,
 )
 
 
@@ -88,7 +94,7 @@ def main() -> None:
     print("Loading data...")
     data = load_data(key=key)
     moments_jnp = data["moments_jnp"]
-    odd_moments_jnp = data["odd_moments_jnp"]
+    centroid_moments_jnp = data["centroid_moments_jnp"]
     cov_jnp = data["cov_jnp"]
     dm_dg_jnp = data["dm_dg_jnp"]
     d2m_dg2_jnp = data["d2m_dg2_jnp"]
@@ -102,18 +108,9 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # 2. Load or train flows
     # -----------------------------------------------------------------------
-    print("Loading / training flows...")
-    prior_trained, q_trained, losses = load_or_train(
-        key,
-        moments_jnp,
-        odd_moments_jnp,
-        cov_jnp,
-        dm_dg_jnp,
-        d2m_dg2_jnp,
-        weights,
-        raw2standard,
-        prior_path=PRIOR_FLOW_PATH,
-        q_path=Q_FLOW_PATH,
+    import os as _os
+
+    train_kwargs = dict(
         steps=20_000,
         learning_rate=1e-4,
         weight_decay=1e-5,
@@ -123,13 +120,42 @@ def main() -> None:
         n_sx_train=n_sx_train,
     )
 
+    if _os.path.exists(PRIOR_FLOW_PATH) and _os.path.exists(Q_FLOW_PATH):
+        print("Saved flow weights found — loading and continuing training...")
+        prior_trained, q_trained, losses = load_or_train(
+            key,
+            moments_jnp, centroid_moments_jnp, cov_jnp, dm_dg_jnp, d2m_dg2_jnp,
+            weights, raw2standard,
+            prior_path=PRIOR_FLOW_PATH, q_path=Q_FLOW_PATH,
+        )
+        key, subkey = jr.split(key)
+        prior_trained, q_trained, losses = continue_training(
+            subkey,
+            prior_trained, q_trained,
+            moments_jnp, centroid_moments_jnp, cov_jnp, dm_dg_jnp, d2m_dg2_jnp,
+            weights, raw2standard,
+            **train_kwargs,
+        )
+    else:
+        print("No saved weights found — training from scratch...")
+        prior_trained, q_trained, losses = load_or_train(
+            key,
+            moments_jnp, centroid_moments_jnp, cov_jnp, dm_dg_jnp, d2m_dg2_jnp,
+            weights, raw2standard,
+            prior_path=PRIOR_FLOW_PATH, q_path=Q_FLOW_PATH,
+            **train_kwargs,
+        )
+
     # -----------------------------------------------------------------------
-    # 3. Build inference functions
+    # 3. Build inference functions (used for single-object sanity check)
     # -----------------------------------------------------------------------
     flow_prob_and_derivs = make_flow_prob_and_derivs(prior_trained)
 
+    _log_scale_ref = 0.5 * (log_scale_range[0] + log_scale_range[1])
+
     def log_flow_fn(x):
-        return prior_trained.log_prob(x, condition=jnp.array([0.0, 0.0]))
+        condition = jnp.array([0.0, 0.0, _log_scale_ref, 0.0, 0.0])
+        return prior_trained.log_prob(x, condition=condition)
 
     # -----------------------------------------------------------------------
     # 4. Single-object RQMC PQR sanity check
@@ -190,141 +216,38 @@ def main() -> None:
     print("Loading galaxy grid data...")
     joined_grid = load_grid_data(GRID_P_PATH, GRID_M_PATH)
 
-    import bfd
-
-    pqr_sim_p = bfd.stripMuPqr(joined_grid["pqr_p"])
-    pqr_sim_m = bfd.stripMuPqr(joined_grid["pqr_m"])
-
-    target_p_moments = jnp.array(joined_grid["moments_p"][:, :4])
-    target_m_moments = jnp.array(joined_grid["moments_m"][:, :4])
-
-    selected_templates = target_p_moments[:, 0] > 1500.0
-    selected_templates &= target_p_moments[:, 0] < 90000.0
-    selected_templates &= (target_p_moments[:, 1] / target_p_moments[:, 0]) > 2.2
-    selected_templates &= (target_p_moments[:, 1] / target_p_moments[:, 0]) < 3.5
-
-    targets_p = target_p_moments[selected_templates]
-    targets_m = target_m_moments[selected_templates]
-
-    pqr_sim_p_sel = pqr_sim_p[selected_templates]
-    pqr_sim_m_sel = pqr_sim_m[selected_templates]
-
-    mask = (pqr_sim_p_sel[:, 0] >= 1e-10) & (pqr_sim_m_sel[:, 0] >= 1e-10)
-    targets_p = targets_p[mask]
-    targets_m = targets_m[mask]
-    pqr_sim_p_sel = pqr_sim_p_sel[mask]
-    pqr_sim_m_sel = pqr_sim_m_sel[mask]
-
-    N_targets = targets_p.shape[0]
-    key, subkey = jr.split(key)
-    idx = jr.choice(subkey, N_targets, shape=(100_000,), replace=False)
-
-    targets_p_10k = targets_p[idx]
-    targets_m_10k = targets_m[idx]
-
-    packed_p = joined_grid["covariance_p"][selected_templates]
-    packed_p_10k = packed_p[idx]
-    CM_raw_grid_p = np.zeros((packed_p_10k.shape[0], 5, 5), dtype=float)
-    j = 0
-    for i in range(5):
-        nvals = 5 - i
-        CM_raw_grid_p[:, i, i:] = packed_p_10k[:, j : j + nvals]
-        CM_raw_grid_p[:, i:, i] = packed_p_10k[:, j : j + nvals]
-        j += nvals
-    CM_raw_grid_p = CM_raw_grid_p[:, :4, :4]
-
-    mu_std_p, sigma_std_p = transform_dataset_to_standard(
-        raw2standard, targets_p_10k, CM_raw_grid_p
-    )
-
     jax.config.update("jax_debug_nans", False)
 
-    print("Running flow-based RQMC PQR on grid (+shear)...")
-    (
-        P_p,
-        P_se_p,
-        Q1_p,
-        Q1_se_p,
-        Q2_p,
-        Q2_se_p,
-        R11_p,
-        R11_se_p,
-        R22_p,
-        R22_se_p,
-        R12_p,
-        R12_se_p,
-    ) = rqmc_pqr_grid(
-        mu_std_p,
-        sigma_std_p,
-        targets_p_10k,
-        CM_raw_grid_p,
+    # Per-target Σ_X is built from the [M+, Mx] (index 2,3) sub-block of each
+    # target's moment covariance via cx_to_sx_cond; see inference.integrate_grid_pqr.
+    print("Running flow-based RQMC PQR on grid (+/- shear)...")
+    key, k_int = jr.split(key)
+    grid_res = integrate_grid_pqr(
+        joined_grid,
+        raw2standard,
+        prior_trained,
+        key=k_int,
+        n_targets=100_000,
         n_points=2**10,
         n_replicates=16,
         batch_size=512,
-        raw2standard=raw2standard,
-        flow_prob_and_derivs=flow_prob_and_derivs,
-        log_flow_fn=log_flow_fn,
     )
 
-    packed_m = joined_grid["covariance_m"][selected_templates]
-    packed_m_10k = packed_m[idx]
-    CM_raw_grid_m = np.zeros((packed_m_10k.shape[0], 5, 5), dtype=float)
-    j = 0
-    for i in range(5):
-        nvals = 5 - i
-        CM_raw_grid_m[:, i, i:] = packed_m_10k[:, j : j + nvals]
-        CM_raw_grid_m[:, i:, i] = packed_m_10k[:, j : j + nvals]
-        j += nvals
-    CM_raw_grid_m = CM_raw_grid_m[:, :4, :4]
-
-    mu_std_m, sigma_std_m = transform_dataset_to_standard(
-        raw2standard, targets_m_10k, CM_raw_grid_m
-    )
-
-    print("Running flow-based RQMC PQR on grid (-shear)...")
     (
-        P_m,
-        P_se_m,
-        Q1_m,
-        Q1_se_m,
-        Q2_m,
-        Q2_se_m,
-        R11_m,
-        R11_se_m,
-        R22_m,
-        R22_se_m,
-        R12_m,
-        R12_se_m,
-    ) = rqmc_pqr_grid(
-        mu_std_m,
-        sigma_std_m,
-        targets_m_10k,
-        CM_raw_grid_m,
-        n_points=2**10,
-        n_replicates=16,
-        batch_size=512,
-        raw2standard=raw2standard,
-        flow_prob_and_derivs=flow_prob_and_derivs,
-        log_flow_fn=log_flow_fn,
-    )
+        P_p, P_se_p, Q1_p, Q1_se_p, Q2_p, Q2_se_p,
+        R11_p, R11_se_p, R22_p, R22_se_p, R12_p, R12_se_p,
+    ) = grid_res["components_p"]
+    (
+        P_m, P_se_m, Q1_m, Q1_se_m, Q2_m, Q2_se_m,
+        R11_m, R11_se_m, R22_m, R22_se_m, R12_m, R12_se_m,
+    ) = grid_res["components_m"]
+
+    targets_p_10k = grid_res["targets_p"]
 
     # -----------------------------------------------------------------------
     # 6. Assemble PQR and compute shear
     # -----------------------------------------------------------------------
-    pqr_arr_p, pqr_arr_m = assemble_pqr_from_flow(
-        P_p,
-        Q1_p,
-        Q2_p,
-        R11_p,
-        R22_p,
-        R12_p,
-        P_m,
-        Q1_m,
-        Q2_m,
-        R11_m,
-        R22_m,
-        R12_m,
-    )
+    pqr_arr_p, pqr_arr_m = grid_res["pqr_p"], grid_res["pqr_m"]
 
     Q_p_vec = jnp.stack([Q1_p, Q2_p], axis=-1)
     R_p_mat = jnp.stack(

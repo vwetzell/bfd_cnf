@@ -1,0 +1,14 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Large, regenerable artifacts
+*.npz
+/data/
+
+# Run logs
+*.log
+/logs/
+
+# Timestamped flow-weight backups (current prior_flow_xy.eqx / q_flow_xy.eqx stay tracked)
+*.eqx.bak-*

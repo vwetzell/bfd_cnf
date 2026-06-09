@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 import bfd
+import fitsio
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -21,7 +22,9 @@ from jax import random as jr
 
 from .config import (
     FITS_PATH,
+    SUMMARY_FITS_PATH,
     key as _initial_key,
+    target_flux_min,
 )
 
 # ---------------------------------------------------------------------------
@@ -212,6 +215,99 @@ def transform_dataset_to_standard(
     return data_y_std, Sigma_std
 
 
+
+
+# ---------------------------------------------------------------------------
+# Quality cuts (shared between loaders)
+# ---------------------------------------------------------------------------
+
+
+def quality_cut_mask(moments: np.ndarray, cov: np.ndarray) -> np.ndarray:
+    """Boolean mask of templates passing the moment + covariance quality cuts.
+
+    Mirrors the moment- and covariance-level cuts applied inside
+    :func:`load_data` so that auxiliary loaders (e.g.
+    :func:`load_summary_moments`, used for diagnostic corner plots) select the
+    same template population.  Operates on raw moments ``[Mf, Mr, M1, M2]`` and
+    their 4×4 covariance matrices, in numpy on the CPU.
+
+    Parameters
+    ----------
+    moments : np.ndarray, shape (N, 4)
+        Raw template moments ``[Mf, Mr, M1, M2]``.
+    cov : np.ndarray, shape (N, 4, 4)
+        Per-object raw-moment covariance matrices.
+
+    Returns
+    -------
+    np.ndarray, shape (N,)
+        Boolean mask, ``True`` where the template passes every cut.
+    """
+    good_moments = moments[:, 0] / np.sqrt(cov[:, 0, 0]) > 5.0
+    good_moments &= moments[:, 0] > target_flux_min
+    good_moments &= moments[:, 1] > 0.0
+    good_moments &= np.all(np.isfinite(moments), axis=1)
+    good_moments &= (
+        np.hypot(moments[:, 2] / moments[:, 1], moments[:, 3] / moments[:, 1]) < 0.99
+    )
+
+    m1mr = moments[:, 2] / moments[:, 1]
+    m2mr = moments[:, 3] / moments[:, 1]
+
+    m1mr_err = np.abs(m1mr) * np.sqrt(
+        cov[:, 1, 1] / moments[:, 1] ** 2
+        + cov[:, 2, 2] / moments[:, 2] ** 2
+        - 2 * cov[:, 1, 2] / (moments[:, 1] * moments[:, 2])
+    )
+    m2mr_err = np.abs(m2mr) * np.sqrt(
+        cov[:, 1, 1] / moments[:, 1] ** 2
+        + cov[:, 3, 3] / moments[:, 3] ** 2
+        - 2 * cov[:, 1, 3] / (moments[:, 1] * moments[:, 3])
+    )
+
+    mrmf = moments[:, 1] / moments[:, 0]
+    mrmf_err = np.abs(mrmf) * np.sqrt(
+        cov[:, 0, 0] / moments[:, 0] ** 2
+        + cov[:, 1, 1] / moments[:, 1] ** 2
+        - 2 * cov[:, 0, 1] / (moments[:, 0] * moments[:, 1])
+    )
+
+    good_cov = (np.hypot(m1mr, m2mr) + 1 * np.hypot(m1mr_err, m2mr_err)) < 0.95
+    good_cov &= (mrmf - 5 * mrmf_err) < 3.976167
+    good_cov &= (moments[:, 0]) > 1.0
+
+    return good_moments & good_cov
+
+
+def load_summary_moments(fits_path: str = SUMMARY_FITS_PATH) -> np.ndarray:
+    """Load quality-cut raw moments from the deep-field summary-template table.
+
+    Reads ``summary_templates_new.fits`` — the 1.37M-galaxy deep-field template
+    library — and returns the raw moments ``[Mf, Mr, M1, M2]`` of the templates
+    that pass :func:`quality_cut_mask`.  Unlike ``tmpl_t04_joined.fits``, this
+    catalogue holds one row per template galaxy with no sub-pixel-shifted
+    copies, so it is the appropriate source for diagnostic corner plots of the
+    underlying moment distribution.
+
+    Parameters
+    ----------
+    fits_path : str, optional
+        Path to the summary-template FITS table.  Defaults to
+        ``config.SUMMARY_FITS_PATH``.
+
+    Returns
+    -------
+    np.ndarray, shape (N, 4)
+        Quality-cut raw template moments ``[Mf, Mr, M1, M2]`` (float64).
+    """
+    with fitsio.FITS(fits_path) as fits:
+        h = fits[1]
+        moments = h.read_column("moments")[:, :4].astype(np.float64)
+        cov = bfd.MomentCovariance.bulkUnpack(h.read_column("covariance"))[:, :4, :4]
+
+    return moments[quality_cut_mask(moments, cov)]
+
+
 # ---------------------------------------------------------------------------
 # Main data-loading pipeline
 # ---------------------------------------------------------------------------
@@ -247,12 +343,13 @@ def load_data(
 
         moments_jnp : jax.Array, shape (N, 4)
             Filtered raw template moments ``[Mf, Mr, M1, M2]``.
-        odd_moments_jnp : jax.Array, shape (N, 2)
-            First-order Fourier moments (centroid moments) ``[M1, M2]`` for
-            each template after quality filtering.  Equivalent to
-            ``moments_jnp[:, 2:]``.  Used as ``data_X`` in the ELBO loss to
-            compute the per-object centroid likelihood weight
-            ``log N(X_G; 0, C_X)``.
+        centroid_moments_jnp : jax.Array, shape (N, 2)
+            True 1st-order centroid ("odd") moments ``[MX, MY]`` (cols 5,6 of the
+            on-disk 7-vector ``[M0, MR, M1, M2, MC, MX, MY]``) for each template
+            after quality filtering.  Used as ``data_X`` in the ELBO loss to compute
+            the per-object centroid likelihood weight ``log N(X_G; 0, C_X)``.
+            (Previously this erroneously held the 2nd-order ellipticity moments
+            ``moments_jnp[:, 2:]``.)
         cov_jnp : jax.Array, shape (N, 4, 4)
             Per-object moment covariance matrices.
         dm_dg_jnp : jax.Array, shape (N, 4, 2)
@@ -289,53 +386,63 @@ def load_data(
         key = _initial_key
 
     # -------------------------------------------------------------------
-    # Load from FITS
+    # Memory-frugal column-by-column read.
+    #
+    # The table is ~18 GB (N≈44M rows) and most of its columns are unused.
+    # Reading the whole table with fitsio.read() and then casting every used
+    # column to float64 while the table is still alive peaks near ~38 GB.
+    # Instead we open the HDU and pull only the six columns we need one at a
+    # time, immediately reducing each to its final shape/dtype and freeing the
+    # raw column before reading the next.  The covariance is unpacked in chunks
+    # so the full (N, 5, 5) intermediate is never materialised.  This keeps the
+    # peak near ~17 GB while producing byte-identical arrays.
     # -------------------------------------------------------------------
-    template_tbl = bfd.TemplateTable(
-        weightSpecs={"weightSigma": 0.65}, sampleSpecs={"fluxMin": 1500.0}
-    ).readOldFITS(fits_path)
+    import gc as _gc
 
-    moments = template_tbl.getMoments()
-    cov_pkgd = template_tbl.tab["covariance"]
-    cov = bfd.MomentCovariance.bulkUnpack(cov_pkgd)[:, :4, :4]
+    fits = fitsio.FITS(fits_path)
+    try:
+        h = fits[1]
 
-    # print(template_tbl.tab.columns)
+        # moments: (N, 7) f4 on disk = [M0, MR, M1, M2, MC, MX, MY] (5 evens + 2 odds,
+        # per bfd.moment.Moment).  Keep the first 4 evens [M0, MR, M1, M2] as the modelled
+        # moment vector, and the LAST two [MX, MY] (cols 5,6) as the true 1st-order
+        # centroid ("odd") moments used for the L(X|C_X) centroid weight.  NOTE: this is
+        # NOT moments[:, 2:4] (= the 2nd-order ellipticity moments M1, M2) — that earlier
+        # slice was a moment-order bug.
+        moments_full = h.read_column("moments")
+        moments = moments_full[:, :4].astype(np.float64)
+        centroid_moments = moments_full[:, 5:7].astype(np.float64)  # [MX, MY]
+        del moments_full
+        N_rows = moments.shape[0]
 
-    # m, dm_dg, d2m_dg2 = template_tbl.getDerivs()
+        # covariance: packed (N, 15) f8 → unpack to (N, 4, 4) in chunks so the
+        # full (N, 5, 5) (~8.75 GB) intermediate is never materialised.
+        cov_pkgd = h.read_column("covariance")
+        cov = np.empty((N_rows, 4, 4), dtype=np.float64)
+        _CHUNK = 4_000_000
+        for _s in range(0, N_rows, _CHUNK):
+            _e = min(_s + _CHUNK, N_rows)
+            cov[_s:_e] = bfd.MomentCovariance.bulkUnpack(cov_pkgd[_s:_e])[:, :4, :4]
+        del cov_pkgd
+        _gc.collect()
 
-    dm_dg = np.stack(
-        [
-            np.array(template_tbl.tab["moments_dg1"]),
-            np.array(template_tbl.tab["moments_dg2"]),
-        ],
-        axis=-1,
-    )[:, :4, :]
+        # first shear derivatives → (N, 4, 2); read straight into the slots so
+        # no per-column float64 temporary survives.
+        dm_dg = np.empty((N_rows, 4, 2), dtype=np.float64)
+        dm_dg[..., 0] = h.read_column("moments_dg1")[:, :4]
+        dm_dg[..., 1] = h.read_column("moments_dg2")[:, :4]
 
-    d2m_dg2 = np.stack(
-        [
-            np.stack(
-                [
-                    np.array(template_tbl.tab["moments_dg1_dg1"]),
-                    np.array(template_tbl.tab["moments_dg1_dg2"]),
-                ],
-                axis=-1,
-            ),
-            np.stack(
-                [
-                    np.array(template_tbl.tab["moments_dg1_dg2"]),
-                    np.array(template_tbl.tab["moments_dg2_dg2"]),
-                ],
-                axis=-1,
-            ),
-        ],
-        axis=-2,
-    )[:, :4, :, :]
-
-    moments = np.array(moments)[:, :4]
-    odd_moments = moments[:, -2:]
-
-    # Free the FITS table and packed covariance — no longer needed
-    del template_tbl, cov_pkgd
+        # second shear derivatives → (N, 4, 2, 2), symmetric in the last two axes.
+        d2m_dg2 = np.empty((N_rows, 4, 2, 2), dtype=np.float64)
+        d2m_dg2[..., 0, 0] = h.read_column("moments_dg1_dg1")[:, :4]
+        _cross = h.read_column("moments_dg1_dg2")[:, :4]
+        d2m_dg2[..., 0, 1] = _cross
+        d2m_dg2[..., 1, 0] = _cross
+        del _cross
+        d2m_dg2[..., 1, 1] = h.read_column("moments_dg2_dg2")[:, :4]
+    finally:
+        fits.close()
+    _gc.collect()
 
     # -------------------------------------------------------------------
     # Optional subsampling (before quality cuts to maximise memory savings)
@@ -348,52 +455,20 @@ def load_data(
             np.array(jr.choice(subkey, n_total, shape=(n_keep,), replace=False))
         )
         moments = moments[sub_idx]
-        odd_moments = odd_moments[sub_idx]
+        centroid_moments = centroid_moments[sub_idx]
         cov = cov[sub_idx]
         dm_dg = dm_dg[sub_idx]
         d2m_dg2 = d2m_dg2[sub_idx]
 
     # -------------------------------------------------------------------
-    # Quality cuts on moments
+    # Quality cuts on moments + covariance
     # -------------------------------------------------------------------
-    good_moments = moments[:, 0] / np.sqrt(cov[:, 0, 0]) > 5.0
-    good_moments &= moments[:, 0] > 1000.0
-    good_moments &= moments[:, 1] > 0.0
-    good_moments &= np.all(np.isfinite(moments), axis=1)
-    good_moments &= (
-        np.hypot(moments[:, 2] / moments[:, 1], moments[:, 3] / moments[:, 1]) < 0.99
-    )
-
-    m1mr = moments[:, 2] / moments[:, 1]
-    m2mr = moments[:, 3] / moments[:, 1]
-
-    m1mr_err = np.abs(m1mr) * np.sqrt(
-        cov[:, 1, 1] / moments[:, 1] ** 2
-        + cov[:, 2, 2] / moments[:, 2] ** 2
-        - 2 * cov[:, 1, 2] / (moments[:, 1] * moments[:, 2])
-    )
-    m2mr_err = np.abs(m2mr) * np.sqrt(
-        cov[:, 1, 1] / moments[:, 1] ** 2
-        + cov[:, 3, 3] / moments[:, 3] ** 2
-        - 2 * cov[:, 1, 3] / (moments[:, 1] * moments[:, 3])
-    )
-
-    mrmf = moments[:, 1] / moments[:, 0]
-    mrmf_err = np.abs(mrmf) * np.sqrt(
-        cov[:, 0, 0] / moments[:, 0] ** 2
-        + cov[:, 1, 1] / moments[:, 1] ** 2
-        - 2 * cov[:, 0, 1] / (moments[:, 0] * moments[:, 1])
-    )
-
-    good_cov = (np.hypot(m1mr, m2mr) + 1 * np.hypot(m1mr_err, m2mr_err)) < 0.95
-    good_cov &= (mrmf - 5 * mrmf_err) < 3.976167
-    good_cov &= (moments[:, 0]) > 1.0
-
-    moments = moments[good_moments & good_cov]
-    odd_moments = odd_moments[good_moments & good_cov]
-    cov = cov[good_moments & good_cov]
-    dm_dg = dm_dg[good_moments & good_cov]
-    d2m_dg2 = d2m_dg2[good_moments & good_cov]
+    keep = quality_cut_mask(moments, cov)
+    moments = moments[keep]
+    centroid_moments = centroid_moments[keep]
+    cov = cov[keep]
+    dm_dg = dm_dg[keep]
+    d2m_dg2 = d2m_dg2[keep]
 
     # -------------------------------------------------------------------
     # Quality cuts on derivatives (in numpy — keep everything on CPU)
@@ -407,7 +482,7 @@ def load_data(
     good_derivs = np.all(good_dm_dg, axis=(1, 2)) & np.all(good_d2m_dg2, axis=(1, 2, 3))
 
     moments = moments[good_derivs]
-    odd_moments = odd_moments[good_derivs]
+    centroid_moments = centroid_moments[good_derivs]
     cov = cov[good_derivs]
     dm_dg = dm_dg[good_derivs]
     d2m_dg2 = d2m_dg2[good_derivs]
@@ -416,9 +491,9 @@ def load_data(
     # Single GPU transfer — after all filtering is done
     # -------------------------------------------------------------------
     moments_jnp = jnp.array(moments)
-    odd_moments_jnp = jnp.array(odd_moments)
+    centroid_moments_jnp = jnp.array(centroid_moments)
     cov_jnp = jnp.array(cov)
-    del moments, odd_moments, cov
+    del moments, centroid_moments, cov
     dm_dg_jnp = jnp.array(dm_dg)
     del dm_dg
     d2m_dg2_jnp = jnp.array(d2m_dg2)
@@ -582,7 +657,7 @@ def load_data(
 
     return dict(
         moments_jnp=moments_jnp,
-        odd_moments_jnp=odd_moments_jnp,
+        centroid_moments_jnp=centroid_moments_jnp,
         cov_jnp=cov_jnp,
         dm_dg_jnp=dm_dg_jnp,
         d2m_dg2_jnp=d2m_dg2_jnp,

@@ -23,13 +23,24 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax.scipy.special import ndtr, ndtri
+import equinox as eqx
 import jaxopt
 
-from .config import B_RAW_JNP, Sigma0, GRID_P_PATH, GRID_M_PATH, prior_sigmax_log_scale_mean
+from .config import (
+    B_RAW_JNP,
+    Sigma0,
+    GRID_P_PATH,
+    GRID_M_PATH,
+    prior_sigmax_log_scale_mean,
+    log_scale_range,
+    e_max,
+    target_flux_min,
+)
 from .models.bijections import (
     _raw2std_jacobian_single_jax,
     propagate_cov_to_std_jax,
 )
+from .models.flows import cx_to_sx_cond
 from .data import (
     augment_moments_raw_jax,
     make_augmentation_noise_raw_jax,
@@ -731,24 +742,23 @@ def rqmc_integrate_pqr_jax(
 # ---------------------------------------------------------------------------
 
 
-@partial(jax.jit, static_argnames=("n_points", "n_replicates", "batch_size", "flow_prob_and_derivs", "log_flow_fn"))
 def rqmc_pqr_grid(
     mu_std_all,
     cov_std_all,
     mu_raw_all,
     CM_raw_all,
+    sx_conds_all=None,
     n_points=2**10,
     n_replicates=16,
     batch_size=128,
     *,
     raw2standard,
-    flow_prob_and_derivs,
-    log_flow_fn,
+    prior_flow,
 ):
     """Compute RQMC PQR for a grid of galaxy templates in batches.
 
     Halton points are generated once and shared across all templates for
-    efficiency.  Noise augmentation is applied per object.
+    efficiency.  Noise augmentation and PSF conditioning are applied per object.
 
     Parameters
     ----------
@@ -760,6 +770,11 @@ def rqmc_pqr_grid(
         Raw observed moments (needed for noise augmentation).
     CM_raw_all : jax.Array, shape (N, D, D)
         Raw measurement covariances (needed for noise augmentation).
+    sx_conds_all : jax.Array, shape (N, 3) or None
+        Per-target ``[log_scale, e1, e2]`` PSF condition vectors computed via
+        :func:`~models.flows.cx_to_sx_cond`.  If ``None``, a fixed reference
+        circular PSF (``prior_sigmax_log_scale_mean``, e=0) is used for all
+        targets — reproducing the old fixed-reference behaviour.
     n_points : int, optional
         RQMC quadrature points per replicate.  Default is 2¹⁰.
     n_replicates : int, optional
@@ -768,10 +783,9 @@ def rqmc_pqr_grid(
         Number of templates processed per ``lax.map`` call.  Default is 128.
     raw2standard : RawMomentStandardize
         Bijection from raw to standardised moment coordinates.
-    flow_prob_and_derivs : callable
-        Batched function from :func:`make_flow_prob_and_derivs`.
-    log_flow_fn : callable
-        Function ``(x: (1, D),) -> (log_p: (1,),)`` evaluating log p at g=0.
+    prior_flow : equinox pytree
+        Trained prior normalizing flow.  Passed as a traced (non-static)
+        argument so that per-target ``sx_cond`` can be vmapped over it.
 
     Returns
     -------
@@ -790,6 +804,12 @@ def rqmc_pqr_grid(
     """
     N = mu_std_all.shape[0]
     dim = mu_std_all.shape[1]
+
+    if sx_conds_all is None:
+        sx_conds_all = jnp.broadcast_to(
+            jnp.array([prior_sigmax_log_scale_mean, 0.0, 0.0]), (N, 3)
+        )
+
     n_batches = (N + batch_size - 1) // batch_size
     pad = n_batches * batch_size - N
 
@@ -801,11 +821,13 @@ def rqmc_pqr_grid(
     cov_std_pad = pad_front(cov_std_all)
     mu_raw_pad = pad_front(mu_raw_all)
     CM_raw_pad = pad_front(CM_raw_all)
+    sx_conds_pad = pad_front(sx_conds_all)
 
     mu_std_b = mu_std_pad.reshape(n_batches, batch_size, dim)
     cov_std_b = cov_std_pad.reshape(n_batches, batch_size, dim, dim)
     mu_raw_b = mu_raw_pad.reshape(n_batches, batch_size, dim)
     CM_raw_b = CM_raw_pad.reshape(n_batches, batch_size, dim, dim)
+    sx_conds_b = sx_conds_pad.reshape(n_batches, batch_size, 3)
 
     # ── Generate ALL Halton points once, outside lax.map ──────────────────────
     # Shape: (n_replicates, n_points, dim)
@@ -816,7 +838,7 @@ def rqmc_pqr_grid(
     u_all = jnp.clip(u_all, 1e-8, 1.0 - 1e-8)  # clip once here too
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _single(mu_std, cov_std, mu_raw, CM_raw):
+    def _single(prior_flow, mu_std, cov_std, mu_raw, CM_raw, sx_cond):
 
         # jax.debug.print(60 * "=")
 
@@ -892,6 +914,40 @@ def rqmc_pqr_grid(
                 jnp.log(J_augmented) - jnp.log(J_base_val),
                 jnp.zeros(x.shape[0]),
             )
+
+        # ── Per-target flow evaluation closures ───────────────────────────────
+        # The 5-dim condition is [g1, g2, log_scale, e1, e2].
+        # At g=0 the prior gives log p(z | g=0, Σ_X_target).
+        # jax.grad differentiates the log-prob w.r.t. g1 and g2.
+        def _log_p_g(x_single, g1, g2):
+            cond = jnp.concatenate([jnp.array([g1, g2]), sx_cond])
+            return prior_flow.log_prob(x_single, condition=cond)
+
+        _dlp_dg1     = jax.grad(_log_p_g, argnums=1)
+        _dlp_dg2     = jax.grad(_log_p_g, argnums=2)
+        _d2lp_dg1dg1 = jax.grad(_dlp_dg1, argnums=1)
+        _d2lp_dg2dg2 = jax.grad(_dlp_dg2, argnums=2)
+        _d2lp_dg1dg2 = jax.grad(_dlp_dg1, argnums=2)
+
+        def flow_prob_and_derivs(x_batch):
+            """log p + 5 shear derivatives at g=0 for each row of x_batch."""
+            def _one(xi):
+                return (
+                    _log_p_g(xi, 0.0, 0.0),
+                    _dlp_dg1(xi, 0.0, 0.0),
+                    _dlp_dg2(xi, 0.0, 0.0),
+                    _d2lp_dg1dg1(xi, 0.0, 0.0),
+                    _d2lp_dg2dg2(xi, 0.0, 0.0),
+                    _d2lp_dg1dg2(xi, 0.0, 0.0),
+                )
+            return jax.vmap(_one)(x_batch)
+
+        def log_flow_fn(x):
+            """log p(x | g=0, Σ_X_target) for a single point; x shape (1, D) → (1,)."""
+            cond = jnp.concatenate([jnp.zeros(2), sx_cond])
+            return prior_flow.log_prob(x[0], condition=cond)[None]
+
+        # ─────────────────────────────────────────────────────────────────────
 
         def neg_log_integrand(x):
             def base_fn(x_):
@@ -982,12 +1038,20 @@ def rqmc_pqr_grid(
 
         return P, P_se, Q1, Q1_se, Q2, Q2_se, R11, R11_se, R22, R22_se, R12, R12_se
 
-    _single_batch = jax.vmap(_single, in_axes=(0, 0, 0, 0))
-
-    batched = jax.lax.map(
-        lambda args: _single_batch(*args),
-        (mu_std_b, cov_std_b, mu_raw_b, CM_raw_b),
+    # eqx.filter_jit handles the non-array leaves in prior_flow (e.g. triangular.fn)
+    # by treating them as static cache keys rather than traced arrays.
+    _single_batch = eqx.filter_jit(
+        eqx.filter_vmap(_single, in_axes=(None, 0, 0, 0, 0, 0))
     )
+
+    results = []
+    for i in range(n_batches):
+        result = _single_batch(
+            prior_flow,
+            mu_std_b[i], cov_std_b[i], mu_raw_b[i], CM_raw_b[i], sx_conds_b[i],
+        )
+        results.append(result)
+    batched = jax.tree.map(lambda *xs: jnp.stack(xs), *results)
 
     # Flatten batches and remove padding
     out = jax.tree.map(lambda x: x.reshape(-1)[:N], batched)
@@ -1065,3 +1129,271 @@ def assemble_pqr_from_flow(
     pqr_arr_p = jnp.stack([P_p, Q1_p, Q2_p, R11_p, R22_p, R12_p], axis=-1)
     pqr_arr_m = jnp.stack([P_m, Q1_m, Q2_m, R11_m, R22_m, R12_m], axis=-1)
     return pqr_arr_p, pqr_arr_m
+
+
+# ---------------------------------------------------------------------------
+# Grid covariance unpacking + end-to-end grid integration
+# ---------------------------------------------------------------------------
+
+
+def unpack_packed_cov(
+    packed: np.ndarray, n: int = 5, keep: int = 4
+) -> np.ndarray:
+    """Unpack BFD packed upper-triangular covariance rows to dense sub-blocks.
+
+    The grid ``covariance`` field stores each object's symmetric ``n×n`` moment
+    covariance as the ``n*(n+1)//2`` upper-triangular entries in row-major order
+    (the layout produced by ``bfd.MomentCovariance``).  This expands them to a
+    dense ``(N, keep, keep)`` array, keeping the leading ``keep×keep`` sub-block
+    (``keep=4`` drops the 5th moment Mc).
+
+    Parameters
+    ----------
+    packed : numpy.ndarray, shape (N, n*(n+1)//2)
+        Packed covariance rows.
+    n : int, optional
+        Dimension of the packed symmetric matrix.  Default 5.
+    keep : int, optional
+        Size of the leading sub-block to return.  Default 4.
+
+    Returns
+    -------
+    numpy.ndarray, shape (N, keep, keep)
+        Dense symmetric covariance sub-blocks.
+    """
+    packed = np.asarray(packed)
+    N = packed.shape[0]
+    C = np.zeros((N, n, n), dtype=float)
+    j = 0
+    for i in range(n):
+        nvals = n - i
+        C[:, i, i:] = packed[:, j : j + nvals]
+        C[:, i:, i] = packed[:, j : j + nvals]
+        j += nvals
+    return C[:, :keep, :keep]
+
+
+def integrate_grid_pqr(
+    joined_grid: np.ndarray,
+    raw2standard: Any,
+    prior_flow: Any,
+    *,
+    key: jax.Array,
+    n_targets: int | None = None,
+    flux_min: float = target_flux_min,
+    flux_max: float = 90000.0,
+    mr_mf_lo: float = 2.2,
+    mr_mf_hi: float = 3.5,
+    n_points: int = 2**10,
+    n_replicates: int = 16,
+    batch_size: int = 512,
+    fixed_sx_cond: tuple[float, float, float] | None = None,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Run flow-based RQMC PQR over the ±shear simulation-grid targets.
+
+    Reproduces the grid-integration step of the BFD cNF workflow:
+
+    1. Apply the moment selection cuts (``flux_min < Mf < flux_max`` and
+       ``mr_mf_lo < Mr/Mf < mr_mf_hi``) plus a PQR-positivity mask
+       (``P_sim >= 1e-10`` on both shear sides).
+    2. Optionally subsample to ``n_targets`` objects.
+    3. Derive a per-target Σ_X condition from the 2×2 ``[2:4, 2:4]`` sub-block of
+       each object's moment covariance (the ``[M+, Mx]`` noise block) via
+       :func:`~bfd_cnf.models.flows.cx_to_sx_cond` → ``[log_scale, e1, e2]``.
+    4. Integrate both shear sides with :func:`rqmc_pqr_grid`.
+
+    Selection, masking and subsampling are applied with a single shared index so
+    the returned ``_p`` / ``_m`` arrays are row-aligned.
+
+    Parameters
+    ----------
+    joined_grid : numpy.ndarray (structured)
+        Output of :func:`load_grid_data` (``_p`` / ``_m`` suffixed fields and a
+        shared ``id``).
+    raw2standard : RawMomentStandardize
+        Raw→standardised bijection; must match the one the flow was trained with.
+    prior_flow : equinox pytree
+        Trained prior flow conditioned on ``[g1, g2, log_scale, e1, e2]``.
+    key : jax.Array
+        JAX PRNG key for the optional target subsample.
+    n_targets : int or None, optional
+        Subsample this many selected targets (without replacement).  ``None``
+        (default) keeps all selected targets.
+    flux_min, flux_max : float, optional
+        ``Mf`` selection bounds.  Defaults ``config.target_flux_min`` and 90000.
+    mr_mf_lo, mr_mf_hi : float, optional
+        ``Mr/Mf`` selection bounds.  Defaults 2.2 and 3.5.
+    n_points, n_replicates, batch_size : int, optional
+        RQMC controls forwarded to :func:`rqmc_pqr_grid`.
+    fixed_sx_cond : tuple of float or None, optional
+        If given, use this single ``(log_scale, e1, e2)`` Σ_X condition for
+        **every** target instead of deriving a per-target Σ_X from the
+        covariance block.  Useful as a diagnostic — e.g. ``(13.0, 0.0, 0.0)``
+        keeps every target inside the trained ``log_scale`` range.  The
+        per-target Σ_X correspondence self-check is skipped in this mode.
+    verbose : bool, optional
+        Print per-target ``log_scale`` / ``|e|`` ranges against the training
+        config (``config.log_scale_range`` / ``config.e_max``), including a
+        count of targets whose ``log_scale`` falls outside the trained range.
+
+    Returns
+    -------
+    dict
+        ``ids`` (N,); ``targets_p`` / ``targets_m`` (N, 4) raw moments;
+        ``sx_conds_p`` / ``sx_conds_m`` (N, 3); ``pqr_p`` / ``pqr_m`` (N, 6) flow
+        PQR in ``[P, Q1, Q2, R11, R22, R12]`` order; ``pqr_sim_p`` /
+        ``pqr_sim_m`` (N, 6) the simulation's analytic BFD PQR in the **same**
+        column order; ``components_p`` / ``components_m`` — the 12-tuple
+        ``(P, P_se, Q1, Q1_se, Q2, Q2_se, R11, R11_se, R22, R22_se, R12, R12_se)``
+        returned by :func:`rqmc_pqr_grid`.
+    """
+    import bfd
+
+    # ── moments + selection (cuts use the +shear catalogue, like the notebook) ─
+    mom_p = np.asarray(joined_grid["moments_p"][:, :4])
+    mom_m = np.asarray(joined_grid["moments_m"][:, :4])
+
+    mf = mom_p[:, 0]
+    mr_mf = mom_p[:, 1] / mom_p[:, 0]
+    sel = (mf > flux_min) & (mf < flux_max) & (mr_mf > mr_mf_lo) & (mr_mf < mr_mf_hi)
+
+    # Simulation's own analytic PQR (magnification terms stripped) →
+    # BFD column order [P, Q1, Q2, R11, R12, R22].
+    pqr_sim_p_all = np.asarray(bfd.stripMuPqr(joined_grid["pqr_p"]))
+    pqr_sim_m_all = np.asarray(bfd.stripMuPqr(joined_grid["pqr_m"]))
+    sel = sel & (pqr_sim_p_all[:, 0] >= 1e-10) & (pqr_sim_m_all[:, 0] >= 1e-10)
+
+    sel_idx = np.where(sel)[0]
+
+    # ── optional subsample (shared across both shear sides) ───────────────────
+    if n_targets is not None and n_targets < sel_idx.shape[0]:
+        sub = np.asarray(
+            jr.choice(key, sel_idx.shape[0], shape=(n_targets,), replace=False)
+        )
+        sel_idx = np.sort(sel_idx[sub])
+
+    ids = np.asarray(joined_grid["id"][sel_idx])
+    targets_p = jnp.asarray(mom_p[sel_idx])
+    targets_m = jnp.asarray(mom_m[sel_idx])
+
+    # Reorder BFD [P,Q1,Q2,R11,R12,R22] → flow [P,Q1,Q2,R11,R22,R12].
+    _to_flow = [0, 1, 2, 3, 5, 4]
+    pqr_sim_p = jnp.asarray(pqr_sim_p_all[sel_idx][:, _to_flow])
+    pqr_sim_m = jnp.asarray(pqr_sim_m_all[sel_idx][:, _to_flow])
+
+    # ── covariance blocks (4×4 measurement covariance per object) ─────────────
+    CM_raw_p = jnp.asarray(unpack_packed_cov(joined_grid["covariance_p"][sel_idx]))
+    CM_raw_m = jnp.asarray(unpack_packed_cov(joined_grid["covariance_m"][sel_idx]))
+
+    # ── standardise ───────────────────────────────────────────────────────────
+    mu_std_p, sigma_std_p = transform_dataset_to_standard(
+        raw2standard, targets_p, CM_raw_p
+    )
+    mu_std_m, sigma_std_m = transform_dataset_to_standard(
+        raw2standard, targets_m, CM_raw_m
+    )
+
+    # ── per-target Σ_X from the [M+, Mx] (index 2,3) covariance sub-block ──────
+    # (or a single fixed Σ_X for every target, when fixed_sx_cond is given).
+    if fixed_sx_cond is not None:
+        _fix = jnp.asarray(fixed_sx_cond, dtype=jnp.float32)
+        sx_conds_p = jnp.broadcast_to(_fix, (targets_p.shape[0], 3))
+        sx_conds_m = jnp.broadcast_to(_fix, (targets_m.shape[0], 3))
+    else:
+        sx_conds_p = jax.vmap(cx_to_sx_cond)(CM_raw_p[:, 2:4, 2:4])  # (N, 3)
+        sx_conds_m = jax.vmap(cx_to_sx_cond)(CM_raw_m[:, 2:4, 2:4])
+
+    # ── ±shear pairing integrity ──────────────────────────────────────────────
+    # Shape-noise cancellation requires the +shear and -shear targets to be the
+    # SAME galaxy.  load_grid_data joins on 'id', so each joined row pairs the
+    # +/- versions, and the single shared sel_idx above keeps
+    # targets_p[i] <-> targets_m[i] id-matched.  Unique ids => the join is
+    # strictly 1:1 (no cartesian-product duplicates from join_by).
+    if np.unique(ids).size != ids.size:
+        raise ValueError(
+            "Duplicate ids among selected targets: +/- pairing is not 1:1, so "
+            "shape-noise cancellation would be invalid."
+        )
+
+    # In per-target mode, independently confirm each Σ_X corresponds to that
+    # target's own covariance block, by looking the id back up in joined_grid
+    # (rather than reusing sel_idx) — a guard against any index misalignment.
+    if fixed_sx_cond is None:
+        grid_ids = np.asarray(joined_grid["id"])
+        _sample = np.random.default_rng(0).choice(
+            ids.shape[0], size=int(min(8, ids.shape[0])), replace=False
+        )
+        for k in _sample:
+            row = int(np.flatnonzero(grid_ids == ids[k])[0])
+            for side, packed_field, sx in (
+                ("p", "covariance_p", sx_conds_p),
+                ("m", "covariance_m", sx_conds_m),
+            ):
+                blk = unpack_packed_cov(
+                    joined_grid[packed_field][row][None]
+                )[0, 2:4, 2:4]
+                expect = np.asarray(cx_to_sx_cond(jnp.asarray(blk)))
+                got = np.asarray(sx[k])
+                if not np.allclose(expect, got, atol=1e-4, rtol=1e-4):
+                    raise AssertionError(
+                        f"Sigma_X mismatch (side {side}) at selected row {k} "
+                        f"(id {int(ids[k])}): expected {expect}, got {got}"
+                    )
+
+    if verbose:
+        if fixed_sx_cond is None:
+            print(
+                f"Selected {sel_idx.shape[0]} grid targets "
+                f"(+/- id-matched 1:1; per-target Sigma_X, cross-check passed)."
+            )
+        else:
+            print(
+                f"Selected {sel_idx.shape[0]} grid targets (+/- id-matched 1:1).  "
+                f"FIXED Sigma_X for all targets: log_scale={float(_fix[0]):.2f}, "
+                f"e=({float(_fix[1]):.3f}, {float(_fix[2]):.3f})."
+            )
+        for lbl, sx in (("+shear", sx_conds_p), ("-shear", sx_conds_m)):
+            ls = sx[:, 0]
+            em = jnp.hypot(sx[:, 1], sx[:, 2])
+            n_oor = int(
+                jnp.sum((ls < log_scale_range[0]) | (ls > log_scale_range[1]))
+            )
+            print(
+                f"  [{lbl}] log_scale [{float(ls.min()):.2f}, {float(ls.max()):.2f}] "
+                f"(train {log_scale_range}; {n_oor} out-of-range)   "
+                f"|e| [{float(em.min()):.4f}, {float(em.max()):.4f}] (e_max {e_max})"
+            )
+
+    # ── integrate both shear sides ────────────────────────────────────────────
+    components_p = rqmc_pqr_grid(
+        mu_std_p, sigma_std_p, targets_p, CM_raw_p, sx_conds_p,
+        n_points=n_points, n_replicates=n_replicates, batch_size=batch_size,
+        raw2standard=raw2standard, prior_flow=prior_flow,
+    )
+    components_m = rqmc_pqr_grid(
+        mu_std_m, sigma_std_m, targets_m, CM_raw_m, sx_conds_m,
+        n_points=n_points, n_replicates=n_replicates, batch_size=batch_size,
+        raw2standard=raw2standard, prior_flow=prior_flow,
+    )
+
+    (P_p, _, Q1_p, _, Q2_p, _, R11_p, _, R22_p, _, R12_p, _) = components_p
+    (P_m, _, Q1_m, _, Q2_m, _, R11_m, _, R22_m, _, R12_m, _) = components_m
+    pqr_p, pqr_m = assemble_pqr_from_flow(
+        P_p, Q1_p, Q2_p, R11_p, R22_p, R12_p,
+        P_m, Q1_m, Q2_m, R11_m, R22_m, R12_m,
+    )
+
+    return dict(
+        ids=ids,
+        targets_p=targets_p,
+        targets_m=targets_m,
+        sx_conds_p=sx_conds_p,
+        sx_conds_m=sx_conds_m,
+        pqr_p=pqr_p,
+        pqr_m=pqr_m,
+        pqr_sim_p=pqr_sim_p,
+        pqr_sim_m=pqr_sim_m,
+        components_p=components_p,
+        components_m=components_m,
+    )
