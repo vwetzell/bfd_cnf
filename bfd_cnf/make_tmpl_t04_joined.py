@@ -19,7 +19,7 @@ import os
 import numpy as np
 import fitsio
 
-BFD_CNF_DIR = "/home/vwetzell/Documents/BFD_cNF"
+BFD_CNF_DIR = os.environ.get("BFD_DATA_DIR", "/home/vwetzell/Documents/BFD_cNF")
 
 T04_PATH      = f"{BFD_CNF_DIR}/tmpl_t04.fits"
 SUMMARY_PATH  = f"{BFD_CNF_DIR}/summary_templates_new.fits"
