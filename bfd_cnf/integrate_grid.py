@@ -7,8 +7,9 @@ trained prior flow (``prior_flow_xy.eqx``).
 
 This is the lightweight counterpart to :mod:`run` — it only loads the trained
 prior flow and integrates the grid; it does **not** (re)train.  The per-target
-PSF/noise condition Σ_X is built from the 2×2 ``[2:4, 2:4]`` sub-block of each
-target's moment covariance via :func:`bfd_cnf.models.flows.cx_to_sx_cond`.
+centroid condition Σ_X is built from each target's odd-moment covariance ``C_X``
+(:func:`bfd_cnf.models.flows.even_cov_to_CX`, from the even cov's flux row), then
+mapped to ``[log_scale, e1, e2]`` via :func:`bfd_cnf.models.flows.cx_to_sx_cond`.
 
 Usage
 -----
@@ -40,10 +41,15 @@ from .config import (
     key as _base_key,
     target_flux_min,
 )
-from .inference import integrate_grid_pqr, load_grid_data
+from .inference import integrate_catalog_pqr, integrate_grid_pqr, load_grid_data
 from .models.bijections import RawMomentStandardize
 from .models.flows import build_flows
-from .statistics import bootstrap_total_mult_bias, pqr2g, pqr2multbias
+from .statistics import (
+    bootstrap_independent_mult_bias,
+    bootstrap_total_mult_bias,
+    pqr2g,
+    pqr2multbias,
+)
 from .training import load_models
 
 DEFAULT_STATS_FILE = os.path.join(DATA_DIR, "raw2standard_stats.npz")
@@ -103,6 +109,72 @@ def load_prior_flow(key, prior_path: str = PRIOR_FLOW_PATH, q_path: str = Q_FLOW
     return prior_trained
 
 
+def _run_independent(args, key, raw2standard, prior_flow) -> None:
+    """Integrate the +/- catalogues independently and report the ensemble m-bias.
+
+    The two grid catalogues are independent injection realisations over the same
+    footprint (only ~0.8% are genuine ring pairs), so the unbiased way to use all
+    the data is to integrate each side separately — each selected on its own
+    moments — and compare the aggregate sum-PQR shears.
+    """
+    print("INDEPENDENT-ENSEMBLE mode: integrating +/- catalogues separately "
+          "(no ring-pair matching).")
+    cat_p = np.load(GRID_P_PATH)
+    cat_m = np.load(GRID_M_PATH)
+
+    common = dict(
+        n_targets=args.n_targets, flux_min=args.flux_min, flux_max=args.flux_max,
+        n_points=args.n_points, n_replicates=args.n_replicates,
+        batch_size=args.batch_size,
+        fixed_sx_cond=(args.fixed_log_scale, args.fixed_e1, args.fixed_e2)
+        if args.fixed_log_scale is not None else None,
+    )
+
+    key, kp, km = jr.split(key, 3)
+    print("\n[+shear catalogue]")
+    res_p = integrate_catalog_pqr(cat_p, raw2standard, prior_flow, key=kp, **common)
+    print("\n[-shear catalogue]")
+    res_m = integrate_catalog_pqr(cat_m, raw2standard, prior_flow, key=km, **common)
+
+    pqr_p, pqr_m = res_p["pqr"], res_m["pqr"]
+    g_p, g_m = pqr2g(pqr_p), pqr2g(pqr_m)
+    g_p_sim, g_m_sim = pqr2g(res_p["pqr_sim"]), pqr2g(res_m["pqr_sim"])
+    m_flow = float((g_p[0] - g_m[0]) / 0.04 - 1.0)
+    m_sim = float((g_p_sim[0] - g_m_sim[0]) / 0.04 - 1.0)
+
+    print("\n=== Independent-ensemble shear recovery (expect g(+)~+0.02, g(-)~-0.02) ===")
+    print(f"flow  g(+) = {np.asarray(g_p)}   g(-) = {np.asarray(g_m)}")
+    print(f"BFD   g(+) = {np.asarray(g_p_sim)}   g(-) = {np.asarray(g_m_sim)}")
+    print(f"flow  multiplicative bias m = {m_flow:+.4f}")
+    print(f"BFD   multiplicative bias m = {m_sim:+.4f}")
+    print(f"n_used: +shear {pqr_p.shape[0]}, -shear {pqr_m.shape[0]}")
+
+    stats = bootstrap_independent_mult_bias(
+        pqr_p, pqr_m, n_boot=5000, delta_g=0.04, key=jr.PRNGKey(42)
+    )
+    print("\n=== Independent bootstrap multiplicative bias (flow) ===")
+    print(
+        f"m point={float(stats['m_point']):+.4f}  mean={float(stats['m_mean']):+.4f}  "
+        f"std={float(stats['m_std']):.4f}  "
+        f"16-84%=[{float(stats['m_p16']):+.4f}, {float(stats['m_p84']):+.4f}]  "
+        f"n=({stats['n_used_p']}, {stats['n_used_m']})"
+    )
+
+    out = args.out
+    if out == os.path.join(DATA_DIR, "pqr_grid.npz"):
+        out = os.path.join(DATA_DIR, "pqr_grid_independent.npz")
+    np.savez(
+        out,
+        ids_p=np.asarray(res_p["ids"]), ids_m=np.asarray(res_m["ids"]),
+        pqr_p=np.asarray(pqr_p), pqr_m=np.asarray(pqr_m),
+        pqr_sim_p=np.asarray(res_p["pqr_sim"]), pqr_sim_m=np.asarray(res_m["pqr_sim"]),
+        sx_conds_p=np.asarray(res_p["sx_conds"]), sx_conds_m=np.asarray(res_m["sx_conds"]),
+        targets_p=np.asarray(res_p["targets"]), targets_m=np.asarray(res_m["targets"]),
+    )
+    print(f"\nSaved independent-ensemble PQR results to {out} "
+          "(+/- arms have different lengths; not row-paired).")
+
+
 def main() -> None:
     """Parse CLI args, run the grid integration, report and save results."""
     ap = argparse.ArgumentParser(
@@ -116,6 +188,10 @@ def main() -> None:
         "--flux-min", type=float, default=target_flux_min,
         help=f"Minimum template flux Mf for the selection cut "
              f"(default config target_flux_min={target_flux_min}).",
+    )
+    ap.add_argument(
+        "--flux-max", type=float, default=90000.0,
+        help="Maximum template flux Mf for the selection cut (default 90000).",
     )
     ap.add_argument("--n-points", type=int, default=2**10,
                     help="RQMC quadrature points per replicate (default 1024).")
@@ -138,6 +214,19 @@ def main() -> None:
                     help="e1 used with --fixed-log-scale (default 0).")
     ap.add_argument("--fixed-e2", type=float, default=0.0,
                     help="e2 used with --fixed-log-scale (default 0).")
+    ap.add_argument("--prior", type=str, default=None,
+                    help="Prior-flow .eqx to integrate (default: config canonical). "
+                         "Pair with the matching --stats-file for the new-template flow.")
+    ap.add_argument("--q", type=str, default=None,
+                    help="Q-flow .eqx (needed by load_models; default: config canonical).")
+    ap.add_argument(
+        "--independent", action="store_true",
+        help="Independent-ensemble mode: integrate the +/- catalogues SEPARATELY, "
+             "each selected on its own moments (no ring-pair matching), and report "
+             "the aggregate m from sum-PQR shears.  Use this to exploit the full "
+             "catalogues; the default (paired) mode uses only the ~40k position-"
+             "matched ring pairs.",
+    )
     args = ap.parse_args()
 
     fixed_sx_cond = None
@@ -149,7 +238,13 @@ def main() -> None:
     raw2standard = load_raw2standard(args.stats_file, rebuild=args.rebuild_stats)
 
     key, k_flow = jr.split(key)
-    prior_flow = load_prior_flow(k_flow)
+    prior_flow = load_prior_flow(
+        k_flow, args.prior or PRIOR_FLOW_PATH, args.q or Q_FLOW_PATH
+    )
+
+    if args.independent:
+        _run_independent(args, key, raw2standard, prior_flow)
+        return
 
     print("Loading galaxy grid data...")
     joined_grid = load_grid_data(GRID_P_PATH, GRID_M_PATH)
@@ -162,6 +257,7 @@ def main() -> None:
         key=k_int,
         n_targets=args.n_targets,
         flux_min=args.flux_min,
+        flux_max=args.flux_max,
         n_points=args.n_points,
         n_replicates=args.n_replicates,
         batch_size=args.batch_size,

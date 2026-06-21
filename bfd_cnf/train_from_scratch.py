@@ -44,8 +44,9 @@ from .config import (
     key as _base_key,
     log_scale_range,
     n_sx_train,
+    train_chunk_size,
 )
-from .data import load_data
+from .data import load_training_dataset
 from .training import save_models, train_model
 
 
@@ -79,7 +80,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # Must be set before any tracing/compilation (incl. the jnp ops in load_data).
+    # Must be set before any tracing/compilation (incl. the jnp ops in the loader).
     jax.config.update("jax_debug_nans", args.debug_nans)
     print(f"jax_debug_nans = {jax.config.jax_debug_nans}")
     print(f"devices: {jax.devices()}")
@@ -88,7 +89,7 @@ def main() -> int:
 
     # ------------------------------------------------------------------ data
     print("Loading data...")
-    data = load_data(key=key)
+    data = load_training_dataset(key=key)
     key = data["key"]
 
     # ------------------------------------------------------------- training
@@ -104,6 +105,7 @@ def main() -> int:
             data["d2m_dg2_jnp"],
             data["weights"],
             data["raw2standard"],
+            nda=data["nda"],
             steps=args.steps,
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
@@ -111,6 +113,9 @@ def main() -> int:
             log_scale_range=log_scale_range,
             e_max=e_max,
             n_sx_train=n_sx_train,
+            # NaNs cannot be localised inside a lax.scan, so debug runs use the
+            # eager per-step loop; normal runs use the fast fused-scan loop.
+            chunk_size=1 if args.debug_nans else train_chunk_size,
         )
     except FloatingPointError:
         # jax_debug_nans raises this the moment a NaN/Inf is produced.

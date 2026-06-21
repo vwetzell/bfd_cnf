@@ -14,8 +14,6 @@ from .bijections import (
     _bounded_log_scale,
     _bounded_scale,
     _inv_bounded_scale,
-    make_lower_tri_index,
-    lower_tri_flat,
     _raw2std_jacobian_single_jax,
     propagate_cov_to_std_jax,
 )
@@ -36,8 +34,6 @@ __all__ = [
     "_bounded_log_scale",
     "_bounded_scale",
     "_inv_bounded_scale",
-    "make_lower_tri_index",
-    "lower_tri_flat",
     "_raw2std_jacobian_single_jax",
     "propagate_cov_to_std_jax",
     "build_flows",

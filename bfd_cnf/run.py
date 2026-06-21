@@ -37,7 +37,7 @@ from .config import (
 from .config import (
     key as _base_key,
 )
-from .data import load_data, transform_dataset_to_standard
+from .data import load_training_dataset, transform_dataset_to_standard
 from .inference import (
     _halton_sequence,
     assemble_pqr_from_flow,
@@ -92,7 +92,7 @@ def main() -> None:
     # 1. Load and pre-process data
     # -----------------------------------------------------------------------
     print("Loading data...")
-    data = load_data(key=key)
+    data = load_training_dataset(key=key)
     moments_jnp = data["moments_jnp"]
     centroid_moments_jnp = data["centroid_moments_jnp"]
     cov_jnp = data["cov_jnp"]

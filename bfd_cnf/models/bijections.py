@@ -10,8 +10,7 @@ Custom flowjax bijection classes used in the bfd_cnf normalizing-flow model:
   - new_masked_autoregressive_flow
 
 Helper functions: _bounded_log_scale, _bounded_scale, _inv_bounded_scale,
-make_lower_tri_index, lower_tri_flat, _raw2std_jacobian_single_jax,
-propagate_cov_to_std_jax.
+_raw2std_jacobian_single_jax, propagate_cov_to_std_jax.
 """
 
 from __future__ import annotations
@@ -99,48 +98,6 @@ def _bounded_log_scale(
     log_min = jnp.log(min_scale)
     log_max = jnp.log(max_scale)
     return log_min + (log_max - log_min) * jax.nn.sigmoid(u)
-
-
-# ---------------------------------------------------------------------------
-# Lower-triangular index helpers
-# ---------------------------------------------------------------------------
-
-
-def make_lower_tri_index(D: int) -> tuple[jax.Array, jax.Array]:
-    """Return row and column indices of all lower-triangular elements of a D×D matrix.
-
-    Parameters
-    ----------
-    D : int
-        Matrix dimension.
-
-    Returns
-    -------
-    tuple of jax.Array
-        ``(row_indices, col_indices)`` of length ``D*(D+1)//2``.
-    """
-    mask = jnp.tril(jnp.ones((D, D), dtype=bool))
-    return jnp.where(mask)
-
-
-def lower_tri_flat(L: jax.Array, r_idx: jax.Array, c_idx: jax.Array) -> jax.Array:
-    """Extract lower-triangular elements from a batch of matrices.
-
-    Parameters
-    ----------
-    L : jax.Array, shape (..., D, D)
-        Batch of matrices.
-    r_idx : jax.Array, shape (K,)
-        Row indices of the lower-triangular elements.
-    c_idx : jax.Array, shape (K,)
-        Column indices of the lower-triangular elements.
-
-    Returns
-    -------
-    jax.Array, shape (..., K)
-        Flattened lower-triangular values.
-    """
-    return L[..., r_idx, c_idx]
 
 
 # ---------------------------------------------------------------------------
@@ -631,9 +588,10 @@ class Spin0AutoregressiveLayer(AbstractBijection):
 class Spin2CouplingLayer(AbstractBijection):
     """Coupling bijection on the spin-2 (shape) components conditioned on spin-0.
 
-    Transforms components 2 and 3 with a shared affine scale conditioned
-    on the already-transformed spin-0 components (0, 1).  The coupling
-    preserves the spin-2 equivariance of the distribution.
+    Transforms components 2 and 3 with a single shared bounded log-scale
+    ``s2`` conditioned on the already-transformed spin-0 components (0, 1).
+    Both components are scaled by ``exp(-s2)``, which preserves the spin-2
+    equivariance of the distribution.
 
     Parameters
     ----------
@@ -650,7 +608,7 @@ class Spin2CouplingLayer(AbstractBijection):
     net: CoeffNet
 
     def __init__(self, key, nn_width, nn_depth, activation):
-        self.net = CoeffNet(key, 2, 2, nn_width, nn_depth, activation)
+        self.net = CoeffNet(key, 2, 1, nn_width, nn_depth, activation)
 
     @property
     def shape(self):
@@ -660,24 +618,20 @@ class Spin2CouplingLayer(AbstractBijection):
     def cond_shape(self):
         return None
 
-    def _coeffs(self, z0_t, z1_t):
+    def _log_scale_each(self, z0_t, z1_t):
         out = self.net(jnp.array([z0_t, z1_t]))
-        log_scale = _bounded_log_scale(out[0])
-        c = 0.9 * jnn.tanh(out[1])
-        log_one_minus_c = jnp.log1p(-c)
-        return log_scale, c, log_one_minus_c
+        s2 = _bounded_log_scale(out[0])
+        return -s2  # log alpha_2 = -s2, the per-component log scale
 
     def transform_and_log_det(self, x, condition=None):
-        log_scale, c, log_one_minus_c = self._coeffs(x[0], x[1])
-        log_det_each = log_one_minus_c - log_scale
+        log_det_each = self._log_scale_each(x[0], x[1])
         y2 = x[2] * jnp.exp(log_det_each)
         y3 = x[3] * jnp.exp(log_det_each)
         y = x.at[2].set(y2).at[3].set(y3)
         return y, log_det_each + log_det_each
 
     def inverse_and_log_det(self, y, condition=None):
-        log_scale, c, log_one_minus_c = self._coeffs(y[0], y[1])
-        log_det_each = log_one_minus_c - log_scale
+        log_det_each = self._log_scale_each(y[0], y[1])
         x2 = y[2] * jnp.exp(-log_det_each)
         x3 = y[3] * jnp.exp(-log_det_each)
         x = y.at[2].set(x2).at[3].set(x3)
@@ -866,52 +820,78 @@ class ExplicitPolyLast(AbstractBijection):
 # ---------------------------------------------------------------------------
 
 
+def _zero_last_layer(net: CoeffNet) -> CoeffNet:
+    """Return ``net`` with its final Linear layer zeroed (so it outputs 0 at init)."""
+    last = net.layers[-1]
+    return eqx.tree_at(
+        lambda n: (n.layers[-1].weight, n.layers[-1].bias),
+        net,
+        (jnp.zeros_like(last.weight), jnp.zeros_like(last.bias)),
+    )
+
+
 class SigmaXCouplingLayer(AbstractBijection):
-    """PSF noise covariance (Σ_X) conditioned coupling bijection.
+    """Centroid-covariance (C_X) conditioned coupling bijection.
 
-    Provides an additional bijection layer conditioned on the PSF noise
-    covariance parameters ``[g1, g2, log_scale, e1, e2]`` where
-    ``log_scale = 0.5 * log det(Σ_X)``.  This allows the flow to learn
-    how galaxy shape probabilities vary with PSF ellipticity and size.
+    The final, conditional layer of the prior flow.  It carries the entire
+    dependence of the moment prior on the target's **centroid uncertainty** C_X
+    (the integral over the unknown centroid), conditioned on
+    ``[g1, g2, log_scale, e1, e2]`` with ``log_scale = ½ log det C_X`` and
+    ``(e1, e2)`` the ellipticity of C_X.  ``g1, g2`` are ignored (shear is handled
+    by :class:`ExplicitPolyLast`).
 
-    The transform is factored into:
+    The transform is a *physically constrained* map — it allows only the changes
+    the centroid marginalisation produces to leading order (analogous to
+    :class:`ExplicitPolyLast` for shear, but a different effect):
 
-    * **Spin-0 autoregressive**: components 0–1 scaled by networks
-      conditioned on ``log_scale``.
-    * **Spin-2 coupling**: components 2–3 transformed by the linear map
-      ``A = s·I + c·E`` where ``E = [[e1, e2], [e2, -e1]]``, ensuring
-      first-order sensitivity to PSF ellipticity.
+    * **Flux** ``z0`` → translation ``z0 + s0`` (the C_X-dependent flux-mean tilt).
+    * **Size** ``z1`` → *locked* scaling ``κ·z1 + c1·(κ−1)``, ``κ = exp(g_s)``,
+      ``c1 = μ1/σ1``.  This equals ``κ × (Mr/Mf)`` on the un-centred ratio, so the
+      multiplicative knob produces the physical size *mean* shift.
+    * **Ellipticity** ``(z2, z3)`` → ``(1/κ)·[(I + c·E)·(z2, z3) + D·(e1, e2)]``:
+      the **same** ``κ`` (reciprocal lock — size inflation shrinks the ellipticity
+      ratio), an additive **dipole** ``D·(e1, e2)`` (leading O(e) centring bias),
+      and an anisotropic-broadening **quadrupole** ``c·E``,
+      ``E = [[e1, e2], [e2, −e1]]`` (O(C_X²)).
+
+    Conditioning: the locked scale ``g_s`` depends on flux + C_X only (preserving a
+    closed-form inverse); the directional terms ``D, c`` additionally depend on
+    size ``z1`` (where the small size-dependent corrections live).  Nets are
+    zero-initialised, so the layer starts at the identity (a small perturbation).
+
+    ``log|det J| = −g_s + log(1 − c²|e|²)``.
 
     Parameters
     ----------
     key : jax.Array
         JAX PRNG key.
-    nn_width : int, optional
-        Hidden width.  Default is 32.
-    nn_depth : int, optional
-        Number of hidden layers.  Default is 2.
+    nn_width, nn_depth : int, optional
+        Coupling-network hidden width / depth.  Defaults 32, 2.
     activation : callable, optional
-        Activation function.  Default is ``jax.nn.silu``.
+        Activation.  Default ``jax.nn.silu``.
     full_cond_dim : int, optional
-        Total conditioning dimension (must be 5 for
-        ``[g1, g2, log_scale, e1, e2]``).  Default is 5.
-    log_scale_mean : float, optional
-        Prior mean of ``log_scale`` for normalisation.  Default is 12.
-    log_scale_std : float, optional
-        Prior std of ``log_scale`` for normalisation.  Default is 3.
+        Conditioning dimension (5 for ``[g1, g2, log_scale, e1, e2]``).
+    log_scale_mean, log_scale_std : float, optional
+        Normalisation of ``log_scale`` for the network inputs.
     e_max : float, optional
-        Maximum PSF ellipticity magnitude used to normalise ``e_mag²``.
-        Default is 0.1.
+        Reference ellipticity magnitude; ``|e|²`` is normalised by ``e_max²``.
+        Default 0.2.
+    size_loc : float, optional
+        The constant ``c1 = μ1/σ1`` for the locked size transform.  Default 0.
+    g_s_max : float, optional
+        Bound ``|g_s| ≤ g_s_max`` keeping ``κ`` in a sane range.  Default 1.
     """
 
-    net_s0: CoeffNet  # (log_scale_n,)                          → (1,)
-    net_s1: CoeffNet  # (x0, log_scale_n)                       → (1,)
-    net_avg: CoeffNet  # (x0, x1, log_scale_n, e_mag_sq_n)      → (1,)
-    net_c: CoeffNet  # same inputs                             → (1,)  coupling strength
+    net_flux: CoeffNet  # (log_scale_n, ehat2)           → (1,)  s0  flux shift
+    net_size: CoeffNet  # (z0, log_scale_n, ehat2)       → (1,)  g_s size log-scale
+    net_dip: CoeffNet   # (z0, z1, log_scale_n, ehat2)   → (1,)  D   dipole amplitude
+    net_quad: CoeffNet  # (z0, z1, log_scale_n, ehat2)   → (1,)  c   quadrupole (pre-tanh)
     _cond_dim: int = eqx.field(static=True)
     _log_scale_mean: float = eqx.field(static=True)
     _log_scale_std: float = eqx.field(static=True)
     _e_mag_sq_scale: float = eqx.field(static=True)
+    _size_loc: float = eqx.field(static=True)
+    _g_s_max: float = eqx.field(static=True)
 
     def __init__(
         self,
@@ -922,17 +902,28 @@ class SigmaXCouplingLayer(AbstractBijection):
         full_cond_dim=5,
         log_scale_mean=12.0,
         log_scale_std=3.0,
-        e_max=0.1,
+        e_max=0.2,
+        size_loc=0.0,
+        g_s_max=1.0,
     ):
         self._cond_dim = full_cond_dim
         self._log_scale_mean = float(log_scale_mean)
         self._log_scale_std = float(log_scale_std)
         self._e_mag_sq_scale = float(e_max**2)
+        self._size_loc = float(size_loc)
+        self._g_s_max = float(g_s_max)
         k0, k1, k2, k3 = jr.split(key, 4)
-        self.net_s0 = CoeffNet(k0, 1, 1, nn_width, nn_depth, activation)
-        self.net_s1 = CoeffNet(k1, 2, 1, nn_width, nn_depth, activation)
-        self.net_avg = CoeffNet(k2, 4, 1, nn_width, nn_depth, activation)
-        self.net_c = CoeffNet(k3, 4, 1, nn_width, nn_depth, activation)
+        nets = [
+            CoeffNet(k0, 2, 1, nn_width, nn_depth, activation),  # net_flux
+            CoeffNet(k1, 3, 1, nn_width, nn_depth, activation),  # net_size
+            CoeffNet(k2, 4, 1, nn_width, nn_depth, activation),  # net_dip
+            CoeffNet(k3, 4, 1, nn_width, nn_depth, activation),  # net_quad
+        ]
+        # Zero each net's final layer → all outputs start at 0, so the layer is the
+        # identity at init (κ=1, D=0, c=0, s0=0): training starts from a small
+        # perturbation of the C_X-independent base shape.
+        nets = [_zero_last_layer(n) for n in nets]
+        self.net_flux, self.net_size, self.net_dip, self.net_quad = nets
 
     @property
     def shape(self):
@@ -951,66 +942,64 @@ class SigmaXCouplingLayer(AbstractBijection):
         e_mag_sq_n = e_mag_sq / (self._e_mag_sq_scale + 1e-8)
         return log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n
 
-    def _spin2_coeffs(self, x0, x1, log_scale_n, e_mag_sq, e_mag_sq_n):
-        s2_in = jnp.array([x0, x1, log_scale_n, e_mag_sq_n])
-
-        s = jnp.exp(-_bounded_log_scale(self.net_avg(s2_in)[0]))  # > 0
-
-        # FIX: c = tanh * s  (first-order in ellipticity, not second-order).
-        # Previously c = tanh * s * e_mag, which made the directional asymmetry
-        # O(e^2) — ~0.8% for e_mag=0.09 and invisible in any plot.
-        #
-        # With c = tanh * s:
-        #   A = s*I + c*E,  E = [[e1,e2],[e2,-e1]]
-        #   det(A) = s^2 - c^2 * e_mag^2
-        #          = s^2 * (1 - tanh^2 * e_mag^2)
-        #          >= s^2 * (1 - e_max^2)  > 0  for e_max < 1
-        # Bijectivity is preserved; directional asymmetry is now first-order.
-        c = jnn.tanh(self.net_c(s2_in)[0]) * s
-
-        return s, c
-
-    def _spin0_coeffs(self, x0, log_scale_n):
-        ls0 = _bounded_log_scale(self.net_s0(jnp.array([log_scale_n]))[0])
-        ls1 = _bounded_log_scale(self.net_s1(jnp.array([x0, log_scale_n]))[0])
-        return ls0, ls1
+    def _coeffs(self, x0, x1, log_scale_n, e_mag_sq_n):
+        # flux shift s0 (C_X only); size log-scale g_s (flux + C_X, bounded);
+        # dipole D and quadrupole c (flux + size + C_X).
+        s0 = self.net_flux(jnp.array([log_scale_n, e_mag_sq_n]))[0]
+        g_s = self._g_s_max * jnn.tanh(
+            self.net_size(jnp.array([x0, log_scale_n, e_mag_sq_n]))[0]
+        )
+        dq_in = jnp.array([x0, x1, log_scale_n, e_mag_sq_n])
+        D = self.net_dip(dq_in)[0]
+        c = jnn.tanh(self.net_quad(dq_in)[0])  # |c| < 1 ⇒ det(I+cE)=1-c²|e|² > 0
+        return s0, g_s, D, c
 
     def transform_and_log_det(self, x, condition=None):
         log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n = self._unpack(condition)
+        s0, g_s, D, c = self._coeffs(x[0], x[1], log_scale_n, e_mag_sq_n)
+        kappa = jnp.exp(g_s)
+        c1 = self._size_loc
 
-        # spin-0 (autoregressive)
-        ls0, ls1 = self._spin0_coeffs(x[0], log_scale_n)
-        y0 = x[0] * jnp.exp(-ls0)
-        y1 = x[1] * jnp.exp(-ls1)
+        # flux: translation;  size: locked scale + loc-shift (= κ × Mr/Mf)
+        y0 = x[0] + s0
+        y1 = kappa * x[1] + c1 * (kappa - 1.0)
+        # ellipticity: (1/κ)[(I + c·E)(z2,z3) + D·(e1,e2)],  E=[[e1,e2],[e2,-e1]]
+        m2 = (1.0 + c * e1) * x[2] + c * e2 * x[3] + D * e1
+        m3 = c * e2 * x[2] + (1.0 - c * e1) * x[3] + D * e2
+        y2 = m2 / kappa
+        y3 = m3 / kappa
 
-        # spin-2 coupling — A = s*I + c*E,  E = [[e1,e2],[e2,-e1]]
-        s, c = self._spin2_coeffs(x[0], x[1], log_scale_n, e_mag_sq, e_mag_sq_n)
-        y2 = s * x[2] + c * (e1 * x[2] + e2 * x[3])
-        y3 = s * x[3] + c * (e2 * x[2] - e1 * x[3])
-
-        # det(A) = s^2 - c^2 * |e|^2,  guaranteed > 0 by construction
-        log_det_spin2 = jnp.log(s**2 - c**2 * e_mag_sq)
-
-        return jnp.stack([y0, y1, y2, y3]), -(ls0 + ls1) + log_det_spin2
+        # block-triangular Jacobian: 0 (flux) + g_s (size) − 2g_s + log det(I+cE)
+        log_det = -g_s + jnp.log(1.0 - c**2 * e_mag_sq)
+        return jnp.stack([y0, y1, y2, y3]), log_det
 
     def inverse_and_log_det(self, y, condition=None):
         log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n = self._unpack(condition)
 
-        # spin-0: exact autoregressive inverse
-        ls0 = _bounded_log_scale(self.net_s0(jnp.array([log_scale_n]))[0])
-        x0 = y[0] * jnp.exp(ls0)
-        ls1 = _bounded_log_scale(self.net_s1(jnp.array([x0, log_scale_n]))[0])
-        x1 = y[1] * jnp.exp(ls1)
+        # s0, g_s depend only on the recoverable z0 (and z1 for D, c) ⇒ closed form.
+        s0 = self.net_flux(jnp.array([log_scale_n, e_mag_sq_n]))[0]
+        x0 = y[0] - s0
+        g_s = self._g_s_max * jnn.tanh(
+            self.net_size(jnp.array([x0, log_scale_n, e_mag_sq_n]))[0]
+        )
+        kappa = jnp.exp(g_s)
+        c1 = self._size_loc
+        x1 = (y[1] - c1 * (kappa - 1.0)) / kappa
 
-        # spin-2: A^{-1} = (s*I - c*E) / det(A)
-        s, c = self._spin2_coeffs(x0, x1, log_scale_n, e_mag_sq, e_mag_sq_n)
-        det = s**2 - c**2 * e_mag_sq  # > 0 by construction
-        x2 = (s * y[2] - c * (e1 * y[2] + e2 * y[3])) / det
-        x3 = (s * y[3] - c * (e2 * y[2] - e1 * y[3])) / det
+        dq_in = jnp.array([x0, x1, log_scale_n, e_mag_sq_n])
+        D = self.net_dip(dq_in)[0]
+        c = jnn.tanh(self.net_quad(dq_in)[0])
 
-        log_det_spin2 = jnp.log(det)
+        # invert (y2,y3) = (1/κ)[(I+cE)(z2,z3) + D·e]  ⇒
+        #   (z2,z3) = (I+cE)^{-1}[κ(y2,y3) − D·e],  (I+cE)^{-1} = (I−cE)/(1−c²|e|²)
+        r2 = kappa * y[2] - D * e1
+        r3 = kappa * y[3] - D * e2
+        det_e = 1.0 - c**2 * e_mag_sq
+        x2 = ((1.0 - c * e1) * r2 - c * e2 * r3) / det_e
+        x3 = (-c * e2 * r2 + (1.0 + c * e1) * r3) / det_e
 
-        return jnp.stack([x0, x1, x2, x3]), ls0 + ls1 - log_det_spin2
+        log_det = g_s - jnp.log(1.0 - c**2 * e_mag_sq)
+        return jnp.stack([x0, x1, x2, x3]), log_det
 
 
 # ---------------------------------------------------------------------------
@@ -1132,6 +1121,8 @@ def new_masked_autoregressive_flow(
     sigmax_nn_depth: int = 2,
     sigmax_log_scale_mean: float = 2.0 * 5.991464547107982,  # 2*log(400)
     sigmax_log_scale_std: float = 1.0,
+    sigmax_e_max: float = 0.2,
+    sigmax_size_loc: float = 0.0,
 ) -> Transformed:
     """Construct a masked autoregressive normalizing flow for BFD galaxy moments.
 
@@ -1235,8 +1226,17 @@ def new_masked_autoregressive_flow(
             full_cond_dim=sigmax_cond_dim,
             log_scale_mean=sigmax_log_scale_mean,
             log_scale_std=sigmax_log_scale_std,
+            e_max=sigmax_e_max,
+            size_loc=sigmax_size_loc,
         )
-        last = Chain([explicit_with_perm, sigmax]).merge_chains()
+        # NO spin-2-swapping permute between the two conditional layers: both
+        # ExplicitPolyLast (shear g) and SigmaXCouplingLayer (centroid ellipticity
+        # e) couple to EXTERNAL spin-2 vectors in the *data* frame, so their spin-2
+        # inputs must stay aligned with (M1, M2).  _add_equivariant_permute swaps
+        # 2↔3, which rotates the e-coupling 90° (off-diagonal response: e1→M2,
+        # e2→M1) and makes the dipole/quadrupole terms unable to match the diagonal
+        # target — the directional terms then never train.  Use `explicit` directly.
+        last = Chain([explicit, sigmax]).merge_chains()
     else:
         last = explicit_with_perm
 

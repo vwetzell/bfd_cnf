@@ -40,7 +40,7 @@ from .models.bijections import (
     _raw2std_jacobian_single_jax,
     propagate_cov_to_std_jax,
 )
-from .models.flows import cx_to_sx_cond
+from .models.flows import cx_to_sx_cond, even_cov_to_CX
 from .data import (
     augment_moments_raw_jax,
     make_augmentation_noise_raw_jax,
@@ -754,6 +754,8 @@ def rqmc_pqr_grid(
     *,
     raw2standard,
     prior_flow,
+    hessian_scale=3.0,
+    return_ess=False,
 ):
     """Compute RQMC PQR for a grid of galaxy templates in batches.
 
@@ -974,7 +976,6 @@ def rqmc_pqr_grid(
         eigvals_h, eigvecs_h = jnp.linalg.eigh(hess)
         eigvals_h = jnp.maximum(eigvals_h, 1e-6)
         proposal_cov = (eigvecs_h / eigvals_h) @ eigvecs_h.T
-        hessian_scale = 3.0
         proposal_cov = proposal_cov * hessian_scale**2
         proposal_cov = proposal_cov + 1e-6 * jnp.eye(dim)
         proposal_mu = mode
@@ -1011,20 +1012,33 @@ def rqmc_pqr_grid(
             w_raw = jnp.exp(log_w)
             w_raw = jnp.where(jnp.isfinite(w_raw), w_raw, jnp.zeros_like(w_raw))
 
+            # Per-point contribution to the P integral (>=0): c_i = w_raw * p_flow.
+            # Effective sample size ESS = (sum c)^2 / sum(c^2) measures how well the
+            # proposal covers the integrand (ESS << n_points => few points dominate
+            # => proposal under-covers); maxw = largest single-point weight share.
+            c = w_raw * p_flow
+            sum_c = jnp.nansum(c)
+            sum_c2 = jnp.nansum(c * c)
+            ess_rep = jnp.where(sum_c2 > 0, sum_c * sum_c / sum_c2, 0.0)
+            maxw_rep = jnp.where(sum_c > 0, jnp.nanmax(c) / sum_c, jnp.nan)
+
             return (
-                jnp.nanmean(w_raw * p_flow),
-                jnp.nanmean(w_raw * p_flow * dlp1),
-                jnp.nanmean(w_raw * p_flow * dlp2),
-                jnp.nanmean(w_raw * p_flow * (d2lp11 + dlp1 * dlp1)),
-                jnp.nanmean(w_raw * p_flow * (d2lp22 + dlp2 * dlp2)),
-                jnp.nanmean(w_raw * p_flow * (d2lp12 + dlp1 * dlp2)),
+                jnp.nanmean(c),
+                jnp.nanmean(c * dlp1),
+                jnp.nanmean(c * dlp2),
+                jnp.nanmean(c * (d2lp11 + dlp1 * dlp1)),
+                jnp.nanmean(c * (d2lp22 + dlp2 * dlp2)),
+                jnp.nanmean(c * (d2lp12 + dlp1 * dlp2)),
+                ess_rep,
+                maxw_rep,
             )
 
         # Process replicates sequentially with lax.map to avoid materialising
         # a (batch_size, n_replicates, n_points, dim) tensor through the flow.
         # Each map step allocates (batch_size, n_points, dim) intermediates instead.
         stacked = jax.lax.map(single_replicate, u_all)
-        P_ests, Q1_ests, Q2_ests, R11_ests, R22_ests, R12_ests = stacked
+        (P_ests, Q1_ests, Q2_ests, R11_ests, R22_ests, R12_ests,
+         ess_reps, maxw_reps) = stacked
 
         def _mean_se(vals):
             return jnp.nanmean(vals), jnp.nanstd(vals, ddof=1) / jnp.sqrt(n_replicates)
@@ -1036,7 +1050,11 @@ def rqmc_pqr_grid(
         R22, R22_se = _mean_se(R22_ests)
         R12, R12_se = _mean_se(R12_ests)
 
-        return P, P_se, Q1, Q1_se, Q2, Q2_se, R11, R11_se, R22, R22_se, R12, R12_se
+        out = (P, P_se, Q1, Q1_se, Q2, Q2_se, R11, R11_se, R22, R22_se, R12, R12_se)
+        if return_ess:
+            # Per-target ESS / max-weight share, averaged over replicates.
+            out = out + (jnp.nanmean(ess_reps), jnp.nanmean(maxw_reps))
+        return out
 
     # eqx.filter_jit handles the non-array leaves in prior_flow (e.g. triangular.fn)
     # by treating them as static cache keys rather than traced arrays.
@@ -1066,31 +1084,82 @@ def rqmc_pqr_grid(
 def load_grid_data(
     grid_p_path: str = GRID_P_PATH,
     grid_m_path: str = GRID_M_PATH,
+    match_radius_arcsec: float = 0.1,
 ) -> np.ndarray:
-    """Load the +/- shear galaxy grid files and join them on the object ID.
+    """Load the +/- shear grid catalogues and join them into +/- ring pairs.
+
+    The two catalogues are independent injection realisations over the *same*
+    survey footprint (the same 395 DES tiles).  Only the subset of galaxies
+    injected at identical sky positions in both runs are genuine +/- ring pairs;
+    the rest (~99%) are different objects.  The ``id`` field is **not** a usable
+    cross-catalogue key — the same numeric id denotes different galaxies in the
+    two files (only ~3% of id-matches are real, flux correlation ~0.05).  So we
+    match on sky position ``(ra, dec)`` with a KD-tree: a pair is kept when the
+    nearest neighbour is within ``match_radius_arcsec``.  Position-coincident
+    pairs share flux/size moments to <1% (the same galaxy under +/-0.02 shear),
+    as required for shape-noise cancellation; widening the radius beyond ~0.1"
+    only admits unrelated neighbours (the true overlap is ~40k objects).
 
     Parameters
     ----------
-    grid_p_path : str, optional
-        Path to the +shear numpy structured array file.  Defaults to
-        ``config.GRID_P_PATH``.
-    grid_m_path : str, optional
-        Path to the -shear numpy structured array file.  Defaults to
-        ``config.GRID_M_PATH``.
+    grid_p_path, grid_m_path : str, optional
+        Paths to the +/- shear numpy structured-array files.  Default to
+        ``config.GRID_P_PATH`` / ``config.GRID_M_PATH``.
+    match_radius_arcsec : float, optional
+        Maximum angular separation for a +/- match.  Default 0.1".
 
     Returns
     -------
     numpy.ndarray (structured)
-        Joined structured array keyed on ``'id'`` with ``_p`` / ``_m`` field
-        suffixes for the + and - shear catalogues respectively.
+        Row-aligned ring pairs mirroring the old ``join_by`` schema: an
+        unsuffixed ``id`` (from the +shear catalogue) plus every source field
+        with ``_p`` / ``_m`` suffixes for the + and - catalogues.
     """
-    from numpy.lib.recfunctions import join_by
+    from scipy.spatial import cKDTree
 
     grid_gal_p = np.load(grid_p_path)
     grid_gal_m = np.load(grid_m_path)
 
-    joined_grid = join_by(
-        "id", grid_gal_p, grid_gal_m, usemask=False, r1postfix="_p", r2postfix="_m"
+    # cos(dec)-corrected tangent-plane coords (deg) so the match radius is a true
+    # angular separation regardless of declination.
+    Xp = np.column_stack(
+        [grid_gal_p["ra"] * np.cos(np.deg2rad(grid_gal_p["dec"])), grid_gal_p["dec"]]
+    )
+    Xm = np.column_stack(
+        [grid_gal_m["ra"] * np.cos(np.deg2rad(grid_gal_m["dec"])), grid_gal_m["dec"]]
+    )
+    dist, idx = cKDTree(Xm).query(Xp, k=1, workers=-1)
+
+    tol_deg = match_radius_arcsec / 3600.0
+    keep = dist < tol_deg
+    sel_p = np.flatnonzero(keep)
+    sel_m = idx[keep]
+
+    # Enforce a strict 1:1 pairing.  Each +galaxy is queried once so sel_p is
+    # already unique; only -galaxies can be claimed twice (essentially never at
+    # 0.1" — median NN separation is ~9").  Sort by distance and keep the closest
+    # +match for each -galaxy.
+    order = np.argsort(dist[sel_p])
+    _, first = np.unique(sel_m[order], return_index=True)
+    keep_idx = np.sort(order[first])
+    sel_p, sel_m = sel_p[keep_idx], sel_m[keep_idx]
+
+    names = list(grid_gal_p.dtype.names)
+    out_dtype = (
+        [("id", grid_gal_p.dtype["id"])]
+        + [(f"{n}_p", grid_gal_p.dtype[n]) for n in names]
+        + [(f"{n}_m", grid_gal_m.dtype[n]) for n in names]
+    )
+    joined_grid = np.empty(sel_p.size, dtype=out_dtype)
+    joined_grid["id"] = grid_gal_p["id"][sel_p]
+    for n in names:
+        joined_grid[f"{n}_p"] = grid_gal_p[n][sel_p]
+        joined_grid[f"{n}_m"] = grid_gal_m[n][sel_m]
+
+    print(
+        f"load_grid_data: matched {sel_p.size:,} +/- ring pairs within "
+        f"{match_radius_arcsec}\" (from {grid_gal_p.size:,}/{grid_gal_m.size:,} "
+        f"+/- objects)."
     )
     return joined_grid
 
@@ -1187,6 +1256,8 @@ def integrate_grid_pqr(
     n_points: int = 2**10,
     n_replicates: int = 16,
     batch_size: int = 512,
+    hessian_scale: float = 3.0,
+    return_ess: bool = False,
     fixed_sx_cond: tuple[float, float, float] | None = None,
     verbose: bool = True,
 ) -> dict[str, Any]:
@@ -1198,8 +1269,9 @@ def integrate_grid_pqr(
        ``mr_mf_lo < Mr/Mf < mr_mf_hi``) plus a PQR-positivity mask
        (``P_sim >= 1e-10`` on both shear sides).
     2. Optionally subsample to ``n_targets`` objects.
-    3. Derive a per-target Σ_X condition from the 2×2 ``[2:4, 2:4]`` sub-block of
-       each object's moment covariance (the ``[M+, Mx]`` noise block) via
+    3. Derive a per-target Σ_X condition from each object's centroid covariance
+       ``C_X`` — the odd-moment covariance built from the even cov's flux row via
+       :func:`~bfd_cnf.models.flows.even_cov_to_CX`, then
        :func:`~bfd_cnf.models.flows.cx_to_sx_cond` → ``[log_scale, e1, e2]``.
     4. Integrate both shear sides with :func:`rqmc_pqr_grid`.
 
@@ -1294,22 +1366,26 @@ def integrate_grid_pqr(
         raw2standard, targets_m, CM_raw_m
     )
 
-    # ── per-target Σ_X from the [M+, Mx] (index 2,3) covariance sub-block ──────
+    # ── per-target centroid C_X → Σ_X condition ───────────────────────────────
+    # C_X is the target's odd-moment (centroid) covariance, a fixed linear
+    # function of the even cov's flux row (even_cov_to_CX); it is NOT the
+    # [M+, Mx] ellipticity sub-block (a different, spin-2 quantity).
     # (or a single fixed Σ_X for every target, when fixed_sx_cond is given).
     if fixed_sx_cond is not None:
         _fix = jnp.asarray(fixed_sx_cond, dtype=jnp.float32)
         sx_conds_p = jnp.broadcast_to(_fix, (targets_p.shape[0], 3))
         sx_conds_m = jnp.broadcast_to(_fix, (targets_m.shape[0], 3))
     else:
-        sx_conds_p = jax.vmap(cx_to_sx_cond)(CM_raw_p[:, 2:4, 2:4])  # (N, 3)
-        sx_conds_m = jax.vmap(cx_to_sx_cond)(CM_raw_m[:, 2:4, 2:4])
+        sx_conds_p = jax.vmap(cx_to_sx_cond)(even_cov_to_CX(CM_raw_p))  # (N, 3)
+        sx_conds_m = jax.vmap(cx_to_sx_cond)(even_cov_to_CX(CM_raw_m))
 
     # ── ±shear pairing integrity ──────────────────────────────────────────────
     # Shape-noise cancellation requires the +shear and -shear targets to be the
-    # SAME galaxy.  load_grid_data joins on 'id', so each joined row pairs the
-    # +/- versions, and the single shared sel_idx above keeps
-    # targets_p[i] <-> targets_m[i] id-matched.  Unique ids => the join is
-    # strictly 1:1 (no cartesian-product duplicates from join_by).
+    # SAME galaxy.  load_grid_data pairs them by sky position (the 'id' field is
+    # NOT a valid cross-catalogue key), so each joined row is a genuine ring pair
+    # and the single shared sel_idx above keeps targets_p[i] <-> targets_m[i]
+    # position-matched.  ids are unique (carried from the +shear catalogue) =>
+    # the pairing is strictly 1:1.
     if np.unique(ids).size != ids.size:
         raise ValueError(
             "Duplicate ids among selected targets: +/- pairing is not 1:1, so "
@@ -1330,10 +1406,12 @@ def integrate_grid_pqr(
                 ("p", "covariance_p", sx_conds_p),
                 ("m", "covariance_m", sx_conds_m),
             ):
-                blk = unpack_packed_cov(
+                cov4 = unpack_packed_cov(
                     joined_grid[packed_field][row][None]
-                )[0, 2:4, 2:4]
-                expect = np.asarray(cx_to_sx_cond(jnp.asarray(blk)))
+                )[0]
+                expect = np.asarray(
+                    cx_to_sx_cond(even_cov_to_CX(jnp.asarray(cov4)))
+                )
                 got = np.asarray(sx[k])
                 if not np.allclose(expect, got, atol=1e-4, rtol=1e-4):
                     raise AssertionError(
@@ -1345,11 +1423,11 @@ def integrate_grid_pqr(
         if fixed_sx_cond is None:
             print(
                 f"Selected {sel_idx.shape[0]} grid targets "
-                f"(+/- id-matched 1:1; per-target Sigma_X, cross-check passed)."
+                f"(+/- position-matched 1:1; per-target Sigma_X, cross-check passed)."
             )
         else:
             print(
-                f"Selected {sel_idx.shape[0]} grid targets (+/- id-matched 1:1).  "
+                f"Selected {sel_idx.shape[0]} grid targets (+/- position-matched 1:1).  "
                 f"FIXED Sigma_X for all targets: log_scale={float(_fix[0]):.2f}, "
                 f"e=({float(_fix[1]):.3f}, {float(_fix[2]):.3f})."
             )
@@ -1370,12 +1448,21 @@ def integrate_grid_pqr(
         mu_std_p, sigma_std_p, targets_p, CM_raw_p, sx_conds_p,
         n_points=n_points, n_replicates=n_replicates, batch_size=batch_size,
         raw2standard=raw2standard, prior_flow=prior_flow,
+        hessian_scale=hessian_scale, return_ess=return_ess,
     )
     components_m = rqmc_pqr_grid(
         mu_std_m, sigma_std_m, targets_m, CM_raw_m, sx_conds_m,
         n_points=n_points, n_replicates=n_replicates, batch_size=batch_size,
         raw2standard=raw2standard, prior_flow=prior_flow,
+        hessian_scale=hessian_scale, return_ess=return_ess,
     )
+
+    # When return_ess, rqmc_pqr_grid appends (ess, maxw) after the 12-tuple.
+    ess_p = ess_m = maxw_p = maxw_m = None
+    if return_ess:
+        *components_p, ess_p, maxw_p = components_p
+        *components_m, ess_m, maxw_m = components_m
+        components_p, components_m = tuple(components_p), tuple(components_m)
 
     (P_p, _, Q1_p, _, Q2_p, _, R11_p, _, R22_p, _, R12_p, _) = components_p
     (P_m, _, Q1_m, _, Q2_m, _, R11_m, _, R22_m, _, R12_m, _) = components_m
@@ -1396,4 +1483,158 @@ def integrate_grid_pqr(
         pqr_sim_m=pqr_sim_m,
         components_p=components_p,
         components_m=components_m,
+        ess_p=ess_p,
+        ess_m=ess_m,
+        maxw_p=maxw_p,
+        maxw_m=maxw_m,
+    )
+
+
+def _standardize_and_sx_chunked(
+    raw2standard: Any,
+    targets: jax.Array,
+    CM_raw: jax.Array,
+    fixed_sx_cond: tuple[float, float, float] | None,
+    chunk_size: int = 200_000,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Chunk the (un-batched) standardisation + Σ_X preprocessing over targets.
+
+    Both :func:`~bfd_cnf.data.transform_dataset_to_standard` and the Σ_X
+    derivation (``cx_to_sx_cond ∘ even_cov_to_CX``) are pure per-target maps, but
+    the covariance second-order term allocates an ``O(N·16·16)`` intermediate —
+    for multi-million-target full-catalogue runs that alone exhausts the GPU
+    (a ~4.6 GiB einsum on 4.5M targets).  Processing in ``chunk_size`` blocks and
+    concatenating bounds the peak at ``O(chunk_size·16·16)`` while leaving the
+    result identical (chunking is over the independent target axis).
+    """
+    N = targets.shape[0]
+    if N <= chunk_size:
+        mu, sig = transform_dataset_to_standard(raw2standard, targets, CM_raw)
+        if fixed_sx_cond is not None:
+            sx = jnp.broadcast_to(jnp.asarray(fixed_sx_cond, jnp.float32), (N, 3))
+        else:
+            sx = jax.vmap(cx_to_sx_cond)(even_cov_to_CX(CM_raw))
+        return mu, sig, sx
+
+    mu_parts, sig_parts, sx_parts = [], [], []
+    for s in range(0, N, chunk_size):
+        e = min(s + chunk_size, N)
+        cm_c = CM_raw[s:e]
+        mu_c, sig_c = transform_dataset_to_standard(raw2standard, targets[s:e], cm_c)
+        if fixed_sx_cond is not None:
+            sx_c = jnp.broadcast_to(jnp.asarray(fixed_sx_cond, jnp.float32), (e - s, 3))
+        else:
+            sx_c = jax.vmap(cx_to_sx_cond)(even_cov_to_CX(cm_c))
+        mu_parts.append(mu_c)
+        sig_parts.append(sig_c)
+        sx_parts.append(sx_c)
+    return (
+        jnp.concatenate(mu_parts, axis=0),
+        jnp.concatenate(sig_parts, axis=0),
+        jnp.concatenate(sx_parts, axis=0),
+    )
+
+
+def integrate_catalog_pqr(
+    catalog: np.ndarray,
+    raw2standard: Any,
+    prior_flow: Any,
+    *,
+    key: jax.Array,
+    n_targets: int | None = None,
+    flux_min: float = target_flux_min,
+    flux_max: float = 90000.0,
+    mr_mf_lo: float = 2.2,
+    mr_mf_hi: float = 3.5,
+    n_points: int = 2**10,
+    n_replicates: int = 16,
+    batch_size: int = 512,
+    hessian_scale: float = 3.0,
+    return_ess: bool = False,
+    fixed_sx_cond: tuple[float, float, float] | None = None,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Flow-based RQMC PQR over a SINGLE shear catalogue, selected on its own moments.
+
+    Independent-ensemble counterpart to :func:`integrate_grid_pqr`: there is **no**
+    +/- pairing.  The +shear and -shear grid catalogues are independent injection
+    realisations over the same footprint (only ~0.8% are genuine ring pairs — see
+    :func:`load_grid_data`), so the way to use *all* the data without a bogus
+    pairing is to integrate each catalogue separately, each selected on its own
+    moments, and compare the aggregate sum-PQR shears:
+    ``m = (g1_p - g1_m) / (2*delta_g) - 1``.
+
+    Parameters mirror :func:`integrate_grid_pqr` but act on one unsuffixed
+    structured catalogue (fields ``moments``, ``pqr``, ``covariance``, ``id``).
+
+    Returns
+    -------
+    dict
+        ``ids`` (N,); ``targets`` (N, 4); ``sx_conds`` (N, 3); ``pqr`` (N, 6) flow
+        PQR in ``[P, Q1, Q2, R11, R22, R12]`` order; ``pqr_sim`` (N, 6) analytic
+        BFD PQR (same order); ``components`` (12-tuple); ``ess`` / ``maxw`` (or
+        ``None``).
+    """
+    import bfd
+
+    mom = np.asarray(catalog["moments"][:, :4])
+    mf = mom[:, 0]
+    mr_mf = mom[:, 1] / mom[:, 0]
+    sel = (mf > flux_min) & (mf < flux_max) & (mr_mf > mr_mf_lo) & (mr_mf < mr_mf_hi)
+
+    pqr_sim_all = np.asarray(bfd.stripMuPqr(catalog["pqr"]))
+    sel = sel & (pqr_sim_all[:, 0] >= 1e-10)
+    sel_idx = np.where(sel)[0]
+
+    if n_targets is not None and n_targets < sel_idx.shape[0]:
+        sub = np.asarray(
+            jr.choice(key, sel_idx.shape[0], shape=(n_targets,), replace=False)
+        )
+        sel_idx = np.sort(sel_idx[sub])
+
+    ids = np.asarray(catalog["id"][sel_idx])
+    targets = jnp.asarray(mom[sel_idx])
+    _to_flow = [0, 1, 2, 3, 5, 4]  # BFD [P,Q1,Q2,R11,R12,R22] → flow [P,Q1,Q2,R11,R22,R12]
+    pqr_sim = jnp.asarray(pqr_sim_all[sel_idx][:, _to_flow])
+
+    CM_raw = jnp.asarray(unpack_packed_cov(catalog["covariance"][sel_idx]))
+    mu_std, sigma_std, sx_conds = _standardize_and_sx_chunked(
+        raw2standard, targets, CM_raw, fixed_sx_cond
+    )
+
+    if verbose:
+        ls = sx_conds[:, 0]
+        em = jnp.hypot(sx_conds[:, 1], sx_conds[:, 2])
+        n_oor = int(jnp.sum((ls < log_scale_range[0]) | (ls > log_scale_range[1])))
+        print(
+            f"Selected {sel_idx.shape[0]} targets (single catalogue).  "
+            f"log_scale [{float(ls.min()):.2f}, {float(ls.max()):.2f}] "
+            f"(train {log_scale_range}; {n_oor} out-of-range)   "
+            f"|e| [{float(em.min()):.4f}, {float(em.max()):.4f}] (e_max {e_max})"
+        )
+
+    components = rqmc_pqr_grid(
+        mu_std, sigma_std, targets, CM_raw, sx_conds,
+        n_points=n_points, n_replicates=n_replicates, batch_size=batch_size,
+        raw2standard=raw2standard, prior_flow=prior_flow,
+        hessian_scale=hessian_scale, return_ess=return_ess,
+    )
+
+    ess = maxw = None
+    if return_ess:
+        *components, ess, maxw = components
+        components = tuple(components)
+
+    (P, _, Q1, _, Q2, _, R11, _, R22, _, R12, _) = components
+    pqr = jnp.stack([P, Q1, Q2, R11, R22, R12], axis=-1)
+
+    return dict(
+        ids=ids,
+        targets=targets,
+        sx_conds=sx_conds,
+        pqr=pqr,
+        pqr_sim=pqr_sim,
+        components=components,
+        ess=ess,
+        maxw=maxw,
     )

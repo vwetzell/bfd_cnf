@@ -29,6 +29,7 @@ from .config import (
     g_scale,
     max_scale,
     min_scale,
+    nda_clip_percentile,
     num_samples,
     prior_early_nn_depth,
     prior_early_nn_width,
@@ -44,6 +45,8 @@ from .config import (
     q_nn_width,
     r_idx,
     r_off,
+    train_chunk_size,
+    use_nda_weight,
 )
 from .config import (
     e_max as _e_max,
@@ -60,6 +63,7 @@ from .models.flows import (
     build_flows,
     cov2corr,
     make_elbo_loss,
+    make_nll_loss,
 )
 
 # ---------------------------------------------------------------------------
@@ -132,6 +136,137 @@ def compute_std_stats(
 
 
 # ---------------------------------------------------------------------------
+# Training loop (shared by train_model / continue_training)
+# ---------------------------------------------------------------------------
+
+
+def _make_train_step(elbo: Any, optimizer: Any) -> Any:
+    """Build the eager single-step update used by the per-step fallback loop."""
+
+    @eqx.filter_jit
+    def train_step(
+        model, data_y, data_Sigma, data_dg, data_d2g, data_X, opt_state, key
+    ):
+        loss_val, grads = eqx.filter_value_and_grad(
+            lambda m: elbo(m, data_y, data_Sigma, data_dg, data_d2g, data_X, key)
+        )(model)
+        updates, new_opt_state = optimizer.update(
+            grads, opt_state, eqx.filter(model, eqx.is_inexact_array)
+        )
+        return eqx.apply_updates(model, updates), new_opt_state, loss_val
+
+    return train_step
+
+
+def _make_chunk_runner(elbo: Any, optimizer: Any, chunk_len: int) -> Any:
+    """Build a function that runs ``chunk_len`` update steps in one ``lax.scan``.
+
+    The whole chunk lowers to a single XLA dispatch, so the GPU runs the steps
+    back-to-back with no per-step host round-trip (the source of the per-step
+    stall).  The large data arrays are passed as dynamic arguments — never
+    closed over — so they are not embedded as compile-time constants.
+
+    The equinox model is partitioned into array leaves + static structure so it
+    can be carried through the scan (``eqx.partition`` / ``eqx.combine``).
+    ``opt_state`` is a plain JAX pytree (optax NamedTuples) and is passed
+    directly in the carry — routing it through ``eqx.partition`` causes equinox
+    to reconstruct optax NamedTuples as plain tuples, breaking ``state.count``
+    lookups when a schedule function is used (e.g. cosine decay).
+    """
+
+    @eqx.filter_jit
+    def run_chunk(
+        model, opt_state, key, data_y, data_Sigma, data_dg, data_d2g, data_X
+    ):
+        model_arrays, model_static = eqx.partition(model, eqx.is_array)
+
+        def body(carry, _):
+            model_arrays, opt_state, key = carry
+            model = eqx.combine(model_arrays, model_static)
+            key, subkey = jr.split(key)
+            loss_val, grads = eqx.filter_value_and_grad(
+                lambda m: elbo(m, data_y, data_Sigma, data_dg, data_d2g, data_X, subkey)
+            )(model)
+            updates, opt_state = optimizer.update(
+                grads, opt_state, eqx.filter(model, eqx.is_inexact_array)
+            )
+            model = eqx.apply_updates(model, updates)
+            model_arrays, _ = eqx.partition(model, eqx.is_array)
+            return (model_arrays, opt_state, key), loss_val
+
+        (model_arrays, opt_state, key), losses = jax.lax.scan(
+            body, (model_arrays, opt_state, key), xs=None, length=chunk_len
+        )
+        model = eqx.combine(model_arrays, model_static)
+        return model, opt_state, key, losses
+
+    return run_chunk
+
+
+def _run_training_loop(
+    model_tuple: Any,
+    opt_state: Any,
+    optimizer: Any,
+    elbo: Any,
+    data: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    key: jax.Array,
+    steps: int,
+    chunk_size: int,
+    runners: dict[int, Any] | None = None,
+) -> tuple[Any, Any, list[float]]:
+    """Run ``steps`` ELBO updates, fusing ``chunk_size`` steps per dispatch.
+
+    ``data`` is ``(moments, cov, dm_dg, d2m_dg2, centroid)``.  With
+    ``chunk_size <= 1`` this is the original eager per-step loop (one
+    device→host sync per step); otherwise steps are fused via
+    :func:`_make_chunk_runner`, with one host sync per chunk.  RNG threading is
+    identical in both paths, so results match bit-for-bit at ``chunk_size=1``.
+
+    Returns ``(model_tuple, opt_state, losses)``.
+    """
+    moments_jnp, cov_jnp, dm_dg_jnp, d2m_dg2_jnp, centroid_moments_jnp = data
+    losses: list[float] = []
+
+    if chunk_size <= 1:
+        train_step = _make_train_step(elbo, optimizer)
+        pbar = tqdm(range(steps))
+        for _ in pbar:
+            key, subkey = jr.split(key)
+            model_tuple, opt_state, loss_val = train_step(
+                model_tuple, moments_jnp, cov_jnp, dm_dg_jnp, d2m_dg2_jnp,
+                centroid_moments_jnp, opt_state, subkey,
+            )
+            loss_f = float(loss_val)
+            losses.append(loss_f)
+            pbar.set_postfix(loss=f"{loss_f:.4f}")
+        return model_tuple, opt_state, losses
+
+    # Cache one compiled runner per distinct chunk length (full + final remainder).
+    # A caller-supplied dict is REUSED across blocks so the jitted runner (and its
+    # compiled XLA executable) persists — rebuilding it per block leaks GPU memory
+    # (each fresh eqx.filter_jit compiles a new executable that is never freed).
+    if runners is None:
+        runners = {}
+    pbar = tqdm(total=steps)
+    done = 0
+    while done < steps:
+        n = min(chunk_size, steps - done)
+        if n not in runners:
+            runners[n] = _make_chunk_runner(elbo, optimizer, n)
+        model_tuple, opt_state, key, chunk_losses = runners[n](
+            model_tuple, opt_state, key,
+            moments_jnp, cov_jnp, dm_dg_jnp, d2m_dg2_jnp, centroid_moments_jnp,
+        )
+        chunk_losses = np.asarray(chunk_losses)  # single host sync for the chunk
+        losses.extend(chunk_losses.tolist())
+        done += n
+        pbar.update(n)
+        pbar.set_postfix(loss=f"{chunk_losses[-1]:.4f}")
+    pbar.close()
+    return model_tuple, opt_state, losses
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -153,6 +288,10 @@ def train_model(
     log_scale_range: tuple[float, float] = _log_scale_range,
     e_max: float = _e_max,
     n_sx_train: int = _n_sx_train,
+    chunk_size: int = train_chunk_size,
+    nda: jax.Array | None = None,
+    use_nda_weight: bool = use_nda_weight,
+    nda_clip_percentile: float | None = nda_clip_percentile,
 ) -> tuple[Any, Any, list[float]]:
     """Build flows, construct the ELBO loss, and run training.
 
@@ -193,6 +332,22 @@ def train_model(
         evaluated at each and the losses are averaged, reducing gradient
         variance from the single-PSF estimate.  Default is 1 (original
         behaviour); try 4–8 to widen the learned marginal distribution.
+    chunk_size : int, optional
+        Number of gradient steps fused into one ``jax.lax.scan`` dispatch
+        (≈1.7x faster, identical math).  Default from ``config.train_chunk_size``.
+        Set to 1 for the eager per-step loop (e.g. under ``jax_debug_nans``).
+    nda : jax.Array or None, optional
+        Per-template BFD ``nda = sky_density × da`` weight (the FITS ``weight``
+        column).  When ``use_nda_weight`` is True, each template's loss
+        contribution is scaled by ``nda`` so the flow learns the *nda-weighted*
+        template prior, matching the traditional BFD integration.  ``None``
+        (default) leaves the loss unweighted.
+    use_nda_weight : bool, optional
+        Master switch for the ``nda`` weighting.  Defaults to
+        ``config.use_nda_weight``.
+    nda_clip_percentile : float or None, optional
+        Optional top-tail percentile clip on ``nda`` for gradient-variance
+        control.  Defaults to ``config.nda_clip_percentile``.
 
     Returns
     -------
@@ -240,6 +395,8 @@ def train_model(
         batch_size=batch_size,
         num_samples=num_samples,
         weights=jnp.asarray(weights_np),
+        nda=(jnp.asarray(nda) if (use_nda_weight and nda is not None) else None),
+        nda_clip_percentile=nda_clip_percentile,
         log_scale_range=log_scale_range,
         e_max=e_max,
         n_sx_train=n_sx_train,
@@ -259,35 +416,16 @@ def train_model(
     model_tuple = (prior_flow, q_flow)
     opt_state = optimizer.init(eqx.filter(model_tuple, eqx.is_inexact_array))
 
-    @eqx.filter_jit
-    def train_step(
-        model, data_y, data_Sigma, data_dg, data_d2g, data_X, opt_state, key
-    ):
-        loss_val, grads = eqx.filter_value_and_grad(
-            lambda m: elbo(m, data_y, data_Sigma, data_dg, data_d2g, data_X, key)
-        )(model)
-        updates, new_opt_state = optimizer.update(
-            grads, opt_state, eqx.filter(model, eqx.is_inexact_array)
-        )
-        return eqx.apply_updates(model, updates), new_opt_state, loss_val
-
-    losses = []
-    pbar = tqdm(range(steps))
-    for _ in pbar:
-        key, subkey = jr.split(key)
-        model_tuple, opt_state, loss_val = train_step(
-            model_tuple,
-            moments_jnp,
-            cov_jnp,
-            dm_dg_jnp,
-            d2m_dg2_jnp,
-            centroid_moments_jnp,
-            opt_state,
-            subkey,
-        )
-        loss_f = float(loss_val)
-        losses.append(loss_f)
-        pbar.set_postfix(loss=f"{loss_f:.4f}")
+    model_tuple, opt_state, losses = _run_training_loop(
+        model_tuple,
+        opt_state,
+        optimizer,
+        elbo,
+        (moments_jnp, cov_jnp, dm_dg_jnp, d2m_dg2_jnp, centroid_moments_jnp),
+        key,
+        steps,
+        chunk_size,
+    )
 
     prior_trained, q_trained = model_tuple
     return prior_trained, q_trained, losses
@@ -312,6 +450,10 @@ def continue_training(
     log_scale_range: tuple[float, float] = _log_scale_range,
     e_max: float = _e_max,
     n_sx_train: int = _n_sx_train,
+    chunk_size: int = train_chunk_size,
+    nda: jax.Array | None = None,
+    use_nda_weight: bool = use_nda_weight,
+    nda_clip_percentile: float | None = nda_clip_percentile,
 ) -> tuple[Any, Any, list[float]]:
     """Continue training from saved model weights.
 
@@ -359,6 +501,22 @@ def continue_training(
         Number of Σ_X conditions sampled per gradient step.  Losses are
         averaged over all conditions.  Default is 1 (original behaviour);
         try 4–8 to widen the learned marginal distribution.
+    chunk_size : int, optional
+        Number of gradient steps fused into one ``jax.lax.scan`` dispatch
+        (≈1.7x faster, identical math).  Default from ``config.train_chunk_size``.
+        Set to 1 for the eager per-step loop (e.g. under ``jax_debug_nans``).
+    nda : jax.Array or None, optional
+        Per-template BFD ``nda = sky_density × da`` weight (the FITS ``weight``
+        column).  When ``use_nda_weight`` is True, each template's loss
+        contribution is scaled by ``nda`` so the flow learns the *nda-weighted*
+        template prior, matching the traditional BFD integration.  ``None``
+        (default) leaves the loss unweighted.
+    use_nda_weight : bool, optional
+        Master switch for the ``nda`` weighting.  Defaults to
+        ``config.use_nda_weight``.
+    nda_clip_percentile : float or None, optional
+        Optional top-tail percentile clip on ``nda`` for gradient-variance
+        control.  Defaults to ``config.nda_clip_percentile``.
 
     Returns
     -------
@@ -381,6 +539,8 @@ def continue_training(
         batch_size=batch_size,
         num_samples=num_samples,
         weights=jnp.asarray(weights_np),
+        nda=(jnp.asarray(nda) if (use_nda_weight and nda is not None) else None),
+        nda_clip_percentile=nda_clip_percentile,
         log_scale_range=log_scale_range,
         e_max=e_max,
         n_sx_train=n_sx_train,
@@ -400,30 +560,16 @@ def continue_training(
     model_tuple = (prior_trained, q_trained)
     opt_state = optimizer.init(eqx.filter(model_tuple, eqx.is_inexact_array))
 
-    @eqx.filter_jit
-    def train_step(
-        model, data_y, data_Sigma, data_dg, data_d2g, data_X, opt_state, key
-    ):
-        loss_val, grads = eqx.filter_value_and_grad(
-            lambda m: elbo(m, data_y, data_Sigma, data_dg, data_d2g, data_X, key)
-        )(model)
-        updates, new_opt_state = optimizer.update(
-            grads, opt_state, eqx.filter(model, eqx.is_inexact_array)
-        )
-        return eqx.apply_updates(model, updates), new_opt_state, loss_val
-
-    losses = []
-    pbar = tqdm(range(steps))
-    for _ in pbar:
-        key, subkey = jr.split(key)
-        model_tuple, opt_state, loss_val = train_step(
-            model_tuple,
-            moments_jnp, cov_jnp, dm_dg_jnp, d2m_dg2_jnp, centroid_moments_jnp,
-            opt_state, subkey,
-        )
-        loss_f = float(loss_val)
-        losses.append(loss_f)
-        pbar.set_postfix(loss=f"{loss_f:.4f}")
+    model_tuple, opt_state, losses = _run_training_loop(
+        model_tuple,
+        opt_state,
+        optimizer,
+        elbo,
+        (moments_jnp, cov_jnp, dm_dg_jnp, d2m_dg2_jnp, centroid_moments_jnp),
+        key,
+        steps,
+        chunk_size,
+    )
 
     prior_trained, q_trained = model_tuple
 
@@ -431,6 +577,73 @@ def continue_training(
     eqx.tree_serialise_leaves(Q_FLOW_PATH, q_trained)
 
     return prior_trained, q_trained, losses
+
+
+def pretrain_prior(
+    key: jax.Array,
+    moments_jnp: jax.Array,
+    centroid_moments_jnp: jax.Array,
+    cov_jnp: jax.Array,
+    dm_dg_jnp: jax.Array,
+    d2m_dg2_jnp: jax.Array,
+    weights: jax.Array,
+    raw2standard: Any,
+    prior_flow: Any,
+    *,
+    steps: int = 80_000,
+    learning_rate: float = 1e-4,
+    weight_decay: float = 1e-5,
+    grad_clip: float = 0.5,
+    log_scale_range: tuple[float, float] = _log_scale_range,
+    e_max: float = _e_max,
+    n_sx_train: int = _n_sx_train,
+    chunk_size: int = train_chunk_size,
+    nda: jax.Array | None = None,
+    use_nda_weight: bool = use_nda_weight,
+    nda_clip_percentile: float | None = nda_clip_percentile,
+) -> tuple[Any, list[float]]:
+    """Pre-train only the prior flow using direct NLL on template moments (z ≈ y).
+
+    Gives all three prior stages — base shape, shear response, C_X response —
+    a clean gradient signal without Q-sampling noise.  Run this before
+    converge_train.py (joint ELBO fine-tuning) to give both flows a warm start.
+
+    Parameters mirror train_model; prior_flow is the (possibly freshly built)
+    prior to train in-place.  Returns (prior_trained, losses).
+    """
+    weights_np = np.array(weights)
+    weights_np = weights_np / weights_np.sum()
+
+    nll = make_nll_loss(
+        N=moments_jnp.shape[0],
+        batch_size=batch_size,
+        weights=jnp.asarray(weights_np),
+        nda=(jnp.asarray(nda) if (use_nda_weight and nda is not None) else None),
+        nda_clip_percentile=nda_clip_percentile,
+        log_scale_range=log_scale_range,
+        e_max=e_max,
+        n_sx_train=n_sx_train,
+        use_sx=(log_scale_range is not None),
+        raw2standard=raw2standard,
+    )
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(grad_clip),
+        optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay),
+    )
+    opt_state = optimizer.init(eqx.filter(prior_flow, eqx.is_inexact_array))
+
+    prior_trained, _, losses = _run_training_loop(
+        prior_flow,
+        opt_state,
+        optimizer,
+        nll,
+        (moments_jnp, cov_jnp, dm_dg_jnp, d2m_dg2_jnp, centroid_moments_jnp),
+        key,
+        steps,
+        chunk_size,
+    )
+    return prior_trained, losses
 
 
 # ---------------------------------------------------------------------------

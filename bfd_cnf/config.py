@@ -10,12 +10,10 @@ from __future__ import annotations
 
 import os
 
-# BFC allocator with a fixed 95% memory reservation: pre-empts the desktop GPU so a
-# KDE/compositor spike cannot starve the job mid-run (the desktop yields instead).
-# The environment can still override either var before importing this module.
+# Platform allocator reserving 85% of GPU memory. The environment can still
+# override either var before importing this module.
 os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "default")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.85")
-# os.environ["XLA_FLAGS"] = "--xla_dump_to=/tmp/xla_dump --xla_dump_hlo_as_text"
 
 import jax
 
@@ -34,8 +32,6 @@ key = jr.key(18061998)
 # ---------------------------------------------------------------------------
 # Hyperparameters / model architecture constants
 # ---------------------------------------------------------------------------
-# Config cell
-
 prior_early_nn_width = 32
 prior_early_nn_depth = 2
 prior_last_nn_width = 32
@@ -187,24 +183,7 @@ g_scale = jnp.array([0.01, 0.01])
 # ---------------------------------------------------------------------------
 # Lower-triangular index arrays (shared across modules)
 # ---------------------------------------------------------------------------
-def _make_lower_tri_index(D: int) -> tuple[jax.Array, jax.Array]:
-    """Return row and column indices of the lower-triangular elements of a D×D matrix.
-
-    Parameters
-    ----------
-    D : int
-        Dimension of the square matrix.
-
-    Returns
-    -------
-    tuple of jax.Array
-        ``(row_indices, col_indices)`` each of length ``D*(D+1)//2``.
-    """
-    mask = jnp.tril(jnp.ones((D, D), dtype=bool))
-    return jnp.where(mask)
-
-
-r_idx, c_idx = _make_lower_tri_index(4)
+r_idx, c_idx = jnp.tril_indices(4)
 off_mask = r_idx != c_idx
 r_off = r_idx[off_mask]
 c_off = c_idx[off_mask]

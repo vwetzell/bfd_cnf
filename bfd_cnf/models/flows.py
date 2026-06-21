@@ -38,6 +38,7 @@ from ..config import (
     prior_sigmax_nn_depth,
     prior_sigmax_log_scale_mean,
     prior_sigmax_log_scale_std,
+    prior_size_loc_c1,
     prior_flow_layers,
     q_nn_width,
     q_nn_depth,
@@ -48,6 +49,7 @@ from ..config import (
     c_off,
     g_scale,
     target_flux_min,
+    e_max,
 )
 
 # ---------------------------------------------------------------------------
@@ -333,6 +335,45 @@ def _sx_cond_to_CX(sx_cond: jax.Array) -> jax.Array:
     return half_T * jnp.array([[1.0 + e1, e2], [e2, 1.0 - e1]])
 
 
+def even_cov_to_CX(even_cov: jax.Array) -> jax.Array:
+    """Centroid (odd-moment) noise covariance ``C_X`` from the even covariance.
+
+    BFD does not store the odd-parity covariance separately: it is a fixed
+    linear function of the even-moment covariance's flux row (see
+    ``bfd.moment.MomentCovariance.__init__``).  With the even moments ordered
+    ``[Mf, Mr, M+, Mx]`` (indices 0..3)::
+
+        C_X[X, X] = ½ (Cov[Mf, Mr] + Cov[Mf, M+])
+        C_X[Y, Y] = ½ (Cov[Mf, Mr] − Cov[Mf, M+])
+        C_X[X, Y] = ½  Cov[Mf, Mx]
+
+    This is the per-*target* centroid measurement covariance that conditions the
+    prior flow (feed it through :func:`cx_to_sx_cond`).  It is NOT the
+    ``[M+, Mx]`` ellipticity sub-block, which is a different (spin-2) quantity.
+
+    Parameters
+    ----------
+    even_cov : jax.Array, shape (..., 4, 4) or (..., 5, 5)
+        Even-moment covariance in raw moment units.  Only the flux-row entries
+        ``[0, 1:4]`` are read, so either the 4×4 or full 5×5 block works.
+
+    Returns
+    -------
+    jax.Array, shape (..., 2, 2)
+        Symmetric (positive-definite for valid inputs) centroid covariance
+        ``C_X``.
+    """
+    c_mr = even_cov[..., 0, 1]  # Cov[Mf, Mr]
+    c_m1 = even_cov[..., 0, 2]  # Cov[Mf, M+]
+    c_m2 = even_cov[..., 0, 3]  # Cov[Mf, Mx]
+    cxx = 0.5 * (c_mr + c_m1)
+    cyy = 0.5 * (c_mr - c_m1)
+    cxy = 0.5 * c_m2
+    row0 = jnp.stack([cxx, cxy], axis=-1)
+    row1 = jnp.stack([cxy, cyy], axis=-1)
+    return jnp.stack([row0, row1], axis=-2)
+
+
 def cx_to_sx_cond(CX: jax.Array) -> jax.Array:
     """Convert a 2×2 centroid noise covariance C_X to ``[log_scale, e1, e2]``.
 
@@ -440,6 +481,8 @@ def make_elbo_loss(
     batch_size: int = 128,
     num_samples: int = 8,
     weights: jax.Array | None = None,
+    nda: jax.Array | None = None,
+    nda_clip_percentile: float | None = None,
     log_scale_range: tuple[float, float] | None = None,
     e_max: float = 0.0,
     n_sx_train: int = 8,
@@ -470,6 +513,15 @@ def make_elbo_loss(
         Default is 8.
     weights : array-like or None, optional
         Per-object importance weights.  If ``None``, uniform weights are used.
+    nda : array-like or None, optional
+        Per-template BFD ``nda = sky_density × da`` weight (the FITS ``weight``
+        column).  When provided, each copy's loss contribution is multiplied by
+        ``nda`` (in addition to the centroid weight ``L(X|C_X)``) so the flow
+        learns the *nda-weighted* template prior, matching the traditional BFD
+        integration.  ``None`` (default) reproduces the unweighted loss.
+    nda_clip_percentile : float or None, optional
+        If set, clip ``nda`` at this top percentile before use to bound per-batch
+        gradient variance.  ``None`` (default) applies no clip.
     log_scale_range : tuple of float or None, optional
         Range of ``0.5 * log det(Σ_X)`` for Σ_X marginalisation.  Pass
         ``None`` (default) to disable Σ_X conditioning.
@@ -501,6 +553,18 @@ def make_elbo_loss(
         weights_cdf = jnp.cumsum(weights / jnp.maximum(jnp.sum(weights), jnp.finfo(jnp.float32).tiny))
     else:
         weights_cdf = None
+
+    # Per-template nda (area/density) weight, optionally tail-clipped and normalised to
+    # mean 1.  Folded multiplicatively into the per-copy loss weight below so the flow
+    # learns the nda-weighted template prior.  None ⇒ unweighted (pre-change behaviour).
+    if nda is not None:
+        nda_arr = jnp.asarray(nda).astype(jnp.float32)
+        if nda_clip_percentile is not None:
+            cap = jnp.percentile(nda_arr, nda_clip_percentile)
+            nda_arr = jnp.minimum(nda_arr, cap)
+        nda_arr = nda_arr / jnp.maximum(jnp.mean(nda_arr), jnp.finfo(jnp.float32).tiny)
+    else:
+        nda_arr = None
 
     g0 = jnp.array([[[0.0, 0.0]]])
     sqrt2 = 1.0 / jnp.sqrt(2.0)
@@ -552,10 +616,24 @@ def make_elbo_loss(
             idx = jr.choice(subkey, N, shape=(batch_size,), replace=True)
             is_corr = jnp.ones(batch_size)
 
+        # Per-template nda (area/density) weight for this batch; 1.0 when disabled.
+        nda_b = nda_arr[idx] if nda_arr is not None else jnp.ones(batch_size)
+
         y_b = data_y[idx]  # (B, D)   raw template moments
         S_b = data_Sigma[idx]  # (B, D, D)
         dg_b = data_dg[idx]  # (B, D, K)
         d2g_b = data_d2g[idx]  # (B, D, K, K)
+
+        # detj = 0.25 (MR² − M1² − M2²): the moment-vs-shift Jacobian (convexity
+        # factor; bfd.momentcalc:540).  nda = da is the centroid grid-cell area in
+        # SKY units; L(X|C_X) is in MOMENT units — converting the moment-space
+        # centroid integral to the sky-space copy sum needs da·detj, not da alone.
+        # BFD's own centroid integral uses Σ da·detj·N (momentcalc:568); omitting
+        # detj makes da-only weighting collapse ~1470× toward bright (small da,
+        # large detj) and starves high-flux templates.  Fold it into the per-copy
+        # weight so Σ nda·detj·L is ~flat per template across flux.
+        detj_b = 0.25 * (y_b[:, 1] ** 2 - y_b[:, 2] ** 2 - y_b[:, 3] ** 2)  # (B,)
+        log_detj_b = jnp.log(jnp.maximum(detj_b, jnp.finfo(jnp.float32).tiny))  # (B,)
 
         BG = batch_size * G
         S = num_samples
@@ -636,6 +714,11 @@ def make_elbo_loss(
             X_b = data_X[idx]  # (B, 2)  true centroid moments [MX, MY]
             z_SBG = z.reshape(S, BG, -1)  # (S, BG, D)
             log_is_corr = jnp.log(is_corr)  # (B,) SNIS density-flattening correction
+            # nda (area/density) weight in log space; folded into the per-copy weight
+            # below (with detj) so each copy is weighted by nda·detj·L(X|C_X) — the
+            # correct X-marginal integrand, matching traditional BFD's Σ nda·detj·kernel.
+            # nda is C_X-independent.
+            log_nda_b = jnp.log(jnp.maximum(nda_b, jnp.finfo(jnp.float32).tiny))  # (B,)
 
             def _loss_for_sx(sx_cond):
                 # ELBO of every copy under the prior conditioned on this C_X.
@@ -647,9 +730,13 @@ def make_elbo_loss(
                 elbo = log_p_y_minus_sel + log_pz - log_q  # (S, B, G)
                 lse = logsumexp(elbo, axis=0) - jnp.log(S)  # (B, G)
                 lse_b = jnp.mean(lse, axis=-1)  # (B,)
-                # Per-copy weight = L(X|C_X) · SNIS-correction, self-normalised over the
-                # batch ⇒ the X-marginal target for this C_X.
-                log_w_b = _batch_log_L_X(X_b, sx_cond) + log_is_corr  # (B,)
+                # Per-copy weight = nda · detj · L(X|C_X) · SNIS-correction,
+                # self-normalised over the batch ⇒ the nda-weighted X-marginal target
+                # for this C_X.  detj restores the centroid-integral normalisation so
+                # each template carries ~equal weight across flux (no bright starving).
+                log_w_b = (
+                    _batch_log_L_X(X_b, sx_cond) + log_is_corr + log_nda_b + log_detj_b
+                )  # (B,)
                 w_b = jax.nn.softmax(log_w_b)  # (B,) sums to 1
                 return -jnp.sum(w_b * lse_b)  # scalar: −E_{X∼L(·|C_X)}[ELBO]
 
@@ -671,11 +758,144 @@ def make_elbo_loss(
             lse = logsumexp(elbo, axis=0) - jnp.log(S)  # (B, G)
             lse_b = jnp.mean(lse, axis=-1)  # (B,)
 
-            loss = -jnp.mean(is_corr * lse_b)
+            # nda·detj-weighted, SNIS-corrected mean (self-normalised so the loss scale
+            # is independent of the nda normalisation).  detj restores the centroid
+            # integration measure (see above).  nda_b ≡ 1 reproduces -mean(is_corr·detj·lse).
+            w_b = is_corr * nda_b * jnp.maximum(detj_b, jnp.finfo(jnp.float32).tiny)
+            w_b = w_b / jnp.maximum(jnp.mean(w_b), jnp.finfo(jnp.float32).tiny)
+            loss = -jnp.mean(w_b * lse_b)
 
         return loss
 
     return plain_loss
+
+
+# ---------------------------------------------------------------------------
+# NLL loss factory (prior pre-training, z ≈ y)
+# ---------------------------------------------------------------------------
+
+
+def make_nll_loss(
+    N: int,
+    *,
+    batch_size: int = 128,
+    weights: jax.Array | None = None,
+    nda: jax.Array | None = None,
+    nda_clip_percentile: float | None = None,
+    log_scale_range: tuple[float, float] | None = None,
+    e_max: float = 0.0,
+    n_sx_train: int = 8,
+    use_sx: bool = True,
+    raw2standard: Any = None,
+) -> Callable:
+    """Direct NLL loss for prior-only pre-training (z ≈ y approximation).
+
+    Treats each template's moments y as a direct sample from the prior p(z|g,C_X),
+    valid when templates have high SNR.  Unlike make_elbo_loss, no Q flow is
+    involved — the prior is supervised directly on log p(y_std | g, C_X), averaged
+    over the shear g-grid and n_sx_train C_X draws, weighted by nda·detj·L(X|C_X).
+
+    Returned signature:
+        (prior_flow, data_y, data_Sigma, data_dg, data_d2g, data_X, key) -> scalar
+
+    Parameters match make_elbo_loss; omitted parameters (num_samples, mean_log_diag,
+    etc.) are not needed here — no Q conditioning features are computed.
+    """
+    _use_sx = use_sx and (log_scale_range is not None)
+
+    if weights is not None:
+        weights = jnp.asarray(weights)
+        weights = weights / jnp.maximum(jnp.mean(weights), jnp.finfo(jnp.float32).tiny)
+        weights_cdf = jnp.cumsum(
+            weights / jnp.maximum(jnp.sum(weights), jnp.finfo(jnp.float32).tiny)
+        )
+    else:
+        weights_cdf = None
+
+    if nda is not None:
+        nda_arr = jnp.asarray(nda).astype(jnp.float32)
+        if nda_clip_percentile is not None:
+            cap = jnp.percentile(nda_arr, nda_clip_percentile)
+            nda_arr = jnp.minimum(nda_arr, cap)
+        nda_arr = nda_arr / jnp.maximum(jnp.mean(nda_arr), jnp.finfo(jnp.float32).tiny)
+    else:
+        nda_arr = None
+
+    g0 = jnp.array([[[0.0, 0.0]]])
+    sqrt2 = 1.0 / jnp.sqrt(2.0)
+    g_grid = jnp.array(
+        [
+            [0.0, 1.0], [sqrt2, sqrt2], [1.0, 0.0], [sqrt2, -sqrt2],
+            [0.0, -1.0], [-sqrt2, -sqrt2], [-1.0, 0.0], [-sqrt2, sqrt2],
+        ]
+    )[jnp.newaxis, :, :]
+    g = jnp.concatenate([g0, 0.01 * g_grid], axis=1)  # (1, G, 2)
+    G = g.shape[1]
+    g2d = g.reshape(G, -1)  # (G, 2)
+
+    def nll_loss(prior_flow, data_y, data_Sigma, data_dg, data_d2g, data_X, key):
+        # ── batch sampling (identical to make_elbo_loss) ─────────────────
+        key, subkey = jr.split(key)
+        if weights_cdf is not None:
+            u = jr.uniform(subkey, shape=(batch_size,))
+            idx = jnp.clip(jnp.searchsorted(weights_cdf, u, side="right"), 0, N - 1)
+            w_b = jnp.maximum(weights[idx], jnp.finfo(jnp.float32).tiny)
+            is_corr = 1.0 / w_b
+            is_corr = is_corr / jnp.maximum(jnp.mean(is_corr), jnp.finfo(jnp.float32).tiny)
+        else:
+            idx = jr.choice(subkey, N, shape=(batch_size,), replace=True)
+            is_corr = jnp.ones(batch_size)
+
+        nda_b = nda_arr[idx] if nda_arr is not None else jnp.ones(batch_size)
+        y_b = data_y[idx]     # (B, 4)
+        dg_b = data_dg[idx]   # (B, 4, 2)
+        d2g_b = data_d2g[idx] # (B, 4, 2, 2)
+
+        detj_b = 0.25 * (y_b[:, 1] ** 2 - y_b[:, 2] ** 2 - y_b[:, 3] ** 2)  # (B,)
+        log_detj_b = jnp.log(jnp.maximum(detj_b, jnp.finfo(jnp.float32).tiny))
+        log_nda_b = jnp.log(jnp.maximum(nda_b, jnp.finfo(jnp.float32).tiny))
+        log_is_corr = jnp.log(is_corr)
+
+        BG = batch_size * G
+
+        # ── shear copies + standardise (z ≈ y) ───────────────────────────
+        y_sheared = shear(y_b, g, dg_b, d2g_b)  # (B, G, 4)
+        y_flat = y_sheared.reshape(BG, -1)        # (BG, 4)
+        g_flat_batch = jnp.broadcast_to(g2d[None, :, :], (batch_size, G, 2)).reshape(BG, 2)
+
+        transform_and_logdet = raw2standard.transform_and_log_det
+        y_std = jax.vmap(transform_and_logdet)(y_flat)[0]  # (BG, 4)
+
+        # ── Σ_X marginalisation ───────────────────────────────────────────
+        if _use_sx:
+            key, k_sx = jr.split(key)
+            sx_conds = _sample_sx_conds(k_sx, log_scale_range, e_max, n_sx_train)
+            X_b = data_X[idx]  # (B, 2)
+
+            def _loss_for_sx(sx_cond):
+                sx_tiled = jnp.broadcast_to(sx_cond[None, :], (BG, 3))
+                cond_p = jnp.concatenate([g_flat_batch, sx_tiled], axis=-1)  # (BG, 5)
+                log_p = prior_flow.log_prob(y_std, condition=cond_p)  # (BG,)
+                lp_b = jnp.mean(log_p.reshape(batch_size, G), axis=-1)  # (B,)
+                log_w_b = (
+                    _batch_log_L_X(X_b, sx_cond) + log_is_corr + log_nda_b + log_detj_b
+                )
+                w_b = jax.nn.softmax(log_w_b)  # (B,) sums to 1
+                return -jnp.sum(w_b * lp_b)
+
+            losses_sx = jax.lax.map(jax.checkpoint(_loss_for_sx), sx_conds)
+            return jnp.mean(losses_sx)
+        else:
+            cond_p = jnp.concatenate(
+                [g_flat_batch, jnp.zeros((BG, 3), dtype=g_flat_batch.dtype)], axis=-1
+            )
+            log_p = prior_flow.log_prob(y_std, condition=cond_p).reshape(batch_size, G)
+            lp_b = jnp.mean(log_p, axis=-1)  # (B,)
+            w_b = is_corr * nda_b * jnp.maximum(detj_b, jnp.finfo(jnp.float32).tiny)
+            w_b = w_b / jnp.maximum(jnp.mean(w_b), jnp.finfo(jnp.float32).tiny)
+            return -jnp.mean(w_b * lp_b)
+
+    return nll_loss
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +916,8 @@ def build_flows(
     prior_sigmax_nn_depth: int = prior_sigmax_nn_depth,
     prior_sigmax_log_scale_mean: float = prior_sigmax_log_scale_mean,
     prior_sigmax_log_scale_std: float = prior_sigmax_log_scale_std,
+    prior_size_loc_c1: float = prior_size_loc_c1,
+    prior_e_max: float = e_max,
     q_flow_layers: int = q_flow_layers,
     q_nn_width: int = q_nn_width,
     q_nn_depth: int = q_nn_depth,
@@ -791,6 +1013,8 @@ def build_flows(
         sigmax_nn_depth=prior_sigmax_nn_depth,
         sigmax_log_scale_mean=prior_sigmax_log_scale_mean,
         sigmax_log_scale_std=prior_sigmax_log_scale_std,
+        sigmax_e_max=prior_e_max,
+        sigmax_size_loc=prior_size_loc_c1,
     )
 
     q_flow = masked_autoregressive_flow(

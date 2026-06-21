@@ -1,0 +1,335 @@
+We want to describe the cost function for the BFD cNF.  Let
+$\mathbf{z}=(z_0,z_1,z_2,z_3)$ denote the standardised moment vector and
+$\mathbf{u}\sim\mathcal{N}(\mathbf{0},\mathbf{I}_4)$ the base-space variable.
+The prior flow $p_\theta(\mathbf{z}\mid\mathbf{g},C_X)$ is defined by a chain of bijections
+\begin{equation}
+  \mathbf{u}
+  = B_{\mathrm{PSF}} \circ \Pi_{\mathrm{rand}} \circ B_{\mathrm{shear}}
+  \circ\,\Pi_{N_L-1}\circ B_{N_L-1}\circ\cdots
+  \circ\,\Pi_1\circ B_1(\mathbf{z}),
+  \label{eq:chain}
+\end{equation}
+and the recognition (variational) flow $q_\phi(\mathbf{z}\mid\mathbf{M}_{noisy},\tilde{\mathbf{C}}_M,\mathbf{g})$
+is an inverse-autoregressive flow conditioned on the observation features.
+All four flow components are described below.
+
+% ============================================================
+\subsection*{Component 1: Coordinate standardisation}
+% ============================================================
+
+The raw BFD moment vector $\mathbf{M}_{raw}=(M_f,M_r,M_+,M_\times)$ is first
+mapped to physically motivated, approximately whitened coordinates.  Define
+the nonlinear bijection $\phi$:
+\begin{equation}
+  \phi\colon\mathbf{M}_{raw}\longmapsto
+  \begin{pmatrix}
+    z_0 \\ z_1 \\ z_2 \\ z_3
+  \end{pmatrix}
+  =
+  \begin{pmatrix}
+    \bigl(\log_{10}M_f - \mu_0\bigr)/\sigma_0 \\
+    \bigl(M_r/M_f       - \mu_1\bigr)/\sigma_1 \\
+    \bigl(M_+/M_r       - \mu_2\bigr)/\sigma_2 \\
+    \bigl(M_\times/M_r  - \mu_3\bigr)/\sigma_3
+  \end{pmatrix},
+  \label{eq:phi}
+\end{equation}
+where $\mu_i$ and $\sigma_i$ are the training-set mean and standard deviation
+of each component.  Because $\phi$ is a lower-triangular map, its Jacobian
+determinant is the product of the diagonal entries:
+\begin{equation}
+  \log\bigl|\det J_\phi\bigr|
+  = -2\log M_f - 2\log M_r - \log(\ln 10)
+    - \sum_{i=0}^{3}\log\sigma_i,
+\end{equation}
+where the $z_0=\log_{10}M_f$ diagonal entry $\partial z_0/\partial M_f
+=1/(M_f\ln 10)$ contributes $-\log M_f-\log(\ln 10)$; the $-\log(\ln 10)$
+constant is independent of the moments.
+The noise covariance $\mathbf{C}_M^{raw}$ is propagated through $\phi$ by a
+first- plus second-order Jacobian correction to give the standardised noise
+covariance $\tilde{\mathbf{C}}_M$ used in the ELBO.
+
+% ============================================================
+\subsection*{Component 2: Equivariant denoising layers}
+% ============================================================
+
+The $N_L-1$ unconditional bijections $B_1,\ldots,B_{N_L-1}$ in
+Eq.~\eqref{eq:chain} each consist of a \emph{spin-0 autoregressive step}
+followed by a \emph{spin-2 coupling step}, forming the
+\texttt{EquivariantAutoregressiveLayer}.
+
+\paragraph{Spin-0 autoregressive step.}
+Components $z_0$ and $z_1$ are scalar moments (invariant under galaxy
+rotation); they are transformed autoregressively:
+\begin{align}
+  y_0 &= z_0\,e^{-s_0}, \label{eq:spin0_0}\\
+  y_1 &= \bigl(z_1 - m_1(y_0)\bigr)e^{-s_1(y_0)}, \label{eq:spin0_1}
+\end{align}
+where $s_0$ is a learned scalar and $(m_1,\tilde{s}_1)=\mathrm{NN}^{(s0)}_1(y_0)$
+with $s_1=\sigma_{ls}(\tilde{s}_1)$ (a bounded log-scale).
+Components $z_2,z_3$ pass through unchanged.
+
+\paragraph{Spin-2 coupling step.}
+The ellipticity components $(y_2,y_3)$ transform as a spin-2 field
+$(y_2+iy_3)\to e^{2i\alpha}(y_2+iy_3)$ under rotation by $\alpha$.
+They are coupled to the already-transformed spin-0 outputs through a
+single shared log-scale:
+\begin{align}
+  \tilde{s}_2
+    &= \mathrm{NN}^{(s2)}\!\bigl(y_0,\,y_1\bigr),
+    \quad s_2=\sigma_{ls}(\tilde{s}_2),
+    \label{eq:spin2_coeff}\\
+  z_2' &= y_2\,e^{-s_2}, \label{eq:spin2_2}\\
+  z_3' &= y_3\,e^{-s_2}. \label{eq:spin2_3}
+\end{align}
+Both ellipticity components share the same scale factor
+$\alpha_2=e^{-s_2}$, which preserves the spin-2 symmetry: if
+$(y_2,y_3)\to e^{2i\alpha}(y_2,y_3)$ then $(z_2',z_3')\to
+e^{2i\alpha}(z_2',z_3')$.
+
+The combined log-det of one \texttt{EquivariantAutoregressiveLayer} is
+\begin{equation}
+  \log|\det J_{B_\ell}| = -(s_0+s_1) - 2 s_2.
+\end{equation}
+Between the early layers a \emph{deterministic} permutation $\Pi_\ell$ swaps
+the spin-0 pair $(z_0\leftrightarrow z_1)$ on odd-indexed layers and is the
+identity otherwise; the spin-2 pair is left in place.  A single \emph{random}
+spin-equivariant permutation $\Pi_{\mathrm{rand}}$ -- swapping
+$(z_0\leftrightarrow z_1)$ and/or $(z_2\leftrightarrow z_3)$ each with
+probability $\tfrac{1}{2}$, drawn once at initialisation -- is inserted after
+the shear layer $B_{\mathrm{shear}}$ and before $B_{\mathrm{PSF}}$
+(Eq.~\eqref{eq:chain}).  All permutations have $|\det J|=1$ and vary the
+autoregressive conditioning order without breaking the spin-block structure.
+
+\paragraph{Recognition flow.}
+The variational posterior $q_\phi(\mathbf{z}\mid\mathbf{M}_{noisy},\tilde{\mathbf{C}}_M,\mathbf{g})$
+used for denoising is a standard inverse-autoregressive flow (IAF) with
+no explicit symmetry constraints, conditioned on the feature vector
+\begin{equation}
+  \mathbf{c}_q
+  = \Bigl[\tilde{\mathbf{M}}_{noisy},\;
+          \text{off-diag correlations of }\tilde{\mathbf{C}}_M,\;
+          \log\text{-diag of }L_{\tilde{C}_M},\;
+          \mathbf{g}/g_{scale}\Bigr]
+  \in\mathbb{R}^{c_q},
+\end{equation}
+where $L_{\tilde{C}_M}$ is the Cholesky factor of $\tilde{\mathbf{C}}_M$.
+The IAF layers apply affine maps $y_d=(x_d-m_d(\mathbf{x}_{<d},\mathbf{c}_q))
+/s_d(\mathbf{x}_{<d},\mathbf{c}_q)$ to each component in turn.
+
+% ============================================================
+\subsection*{Component 3: Shear-conditioning layer ($B_{\mathrm{shear}}$)}
+% ============================================================
+
+The \texttt{ExplicitPolyLast} layer makes the distribution conditional on the
+reduced shear $\mathbf{g}=(g_1,g_2)$ with an at-most-quadratic polynomial
+dependence, consistent with the BFD second-order Taylor expansion
+$P(\mathbf{M}\mid\mathbf{g})\approx P+\mathbf{Q}\cdot\mathbf{g}+\frac{1}{2}\mathbf{g}\cdot\mathbf{R}\cdot\mathbf{g}$.
+
+Define the shear-feature vectors
+\begin{equation}
+  \boldsymbol{\phi}_+=(1,\,|\mathbf{g}|^2)\in\mathbb{R}^2,
+  \qquad
+  \boldsymbol{\phi}_-=(g_1,\,g_2)\in\mathbb{R}^2,
+\end{equation}
+where $|\mathbf{g}|^2=g_1^2+g_2^2$.
+
+\paragraph{Spin-0 components.}
+The scalar moments are rescaled but not shifted by shear (their population
+mean is zero at first order in $\mathbf{g}$ by rotational symmetry):
+\begin{align}
+  s_0 &= \sigma_{ls}\!\bigl(\boldsymbol{\alpha}_0\cdot\boldsymbol{\phi}_+\bigr),
+  \quad
+  \boldsymbol{\alpha}_0=\mathrm{NN}^{(p0)}_0(\mathbf{1})
+  \in\mathbb{R}^2,\label{eq:poly_s0}\\
+  s_1(z_0) &= \sigma_{ls}\!\bigl(\boldsymbol{\alpha}_1(z_0)\cdot\boldsymbol{\phi}_+\bigr),
+  \quad
+  \boldsymbol{\alpha}_1(z_0)=\mathrm{NN}^{(p0)}_1(z_0)
+  \in\mathbb{R}^2,\label{eq:poly_s1}\\
+  y_0 &= z_0\,e^{-s_0},\quad y_1 = z_1\,e^{-s_1(z_0)}.\label{eq:poly_y01}
+\end{align}
+The effective scales $e^{-s_0}$ and $e^{-s_1}$ depend on $|\mathbf{g}|^2$ but
+not on $(g_1,g_2)$ individually, encoding the even (spin-0) nature of the
+correction.
+
+\paragraph{Spin-2 components.}
+The ellipticity components acquire both a first-order shift ($\mathbf{Q}$ term)
+and a second-order scale correction ($\mathbf{R}$ term):
+\begin{align}
+  \bigl[c(z_0,z_1),\;\boldsymbol{\beta}(z_0,z_1)\bigr]
+    &= \mathrm{NN}^{(p2)}\!\bigl(z_0+z_1,\;z_0 z_1\bigr)
+    \in\mathbb{R}^{1+2},\label{eq:poly_net2}\\
+  s_2(z_0,z_1) &= \sigma_{ls}\!\bigl(\boldsymbol{\beta}\cdot\boldsymbol{\phi}_+\bigr),\label{eq:poly_s2}\\
+  y_2 &= \bigl(z_2 - c(z_0,z_1)\,g_1\bigr)e^{-s_2},\label{eq:poly_y2}\\
+  y_3 &= \bigl(z_3 - c(z_0,z_1)\,g_2\bigr)e^{-s_2}.\label{eq:poly_y3}
+\end{align}
+The coupling coefficient $c(z_0,z_1)$ is the amplitude of the
+$\mathbf{Q}$-term: it shifts each ellipticity component by an amount proportional
+to the corresponding shear component.  The network takes the
+permutation-invariant combinations $(z_0+z_1,z_0 z_1)$ to respect the
+residual symmetry under swap $z_0\leftrightarrow z_1$.
+
+The log-det of $B_{\mathrm{shear}}$ is
+\begin{equation}
+  \log|\det J_{B_{\mathrm{shear}}}| = -(s_0+s_1+2s_2).
+\end{equation}
+
+% ============================================================
+\subsection*{Component 4: PSF centering-bias layer ($B_{\mathrm{PSF}}$)}
+% ============================================================
+
+The \texttt{SigmaXCouplingLayer} accounts for the centering bias introduced
+by an elliptical PSF.  It is conditioned on the five-vector
+$[g_1,g_2,\lambda,e_1,e_2]$ where
+\begin{equation}
+  \lambda = \tfrac{1}{2}\log\det(C_X),\qquad
+  (e_1,e_2) = \text{PSF ellipticity of }C_X.
+\end{equation}
+Let $\lambda_n=(\lambda-\bar\lambda)/\delta\lambda$ be the normalised log-scale,
+and $|e|^2=e_1^2+e_2^2$.  Define the input feature vector
+$\mathbf{f}=(z_0,z_1,\lambda_n,|e|^2/e_{max}^2)$.
+
+\paragraph{Spin-0 autoregressive step.}
+\begin{align}
+  s_0^{(X)} &= \sigma_{ls}\!\bigl(\mathrm{NN}^{(X0)}(\lambda_n)\bigr),\quad
+  y_0 = z_0\,e^{-s_0^{(X)}},\label{eq:sx_0}\\
+  s_1^{(X)} &= \sigma_{ls}\!\bigl(\mathrm{NN}^{(X1)}(z_0,\lambda_n)\bigr),\quad
+  y_1 = z_1\,e^{-s_1^{(X)}}.\label{eq:sx_1}
+\end{align}
+
+\paragraph{Spin-2 coupling step.}
+The spin-2 transformation is the \emph{affine} map
+$\mathbf{A}\,(z_2,z_3)^T + d\,(e_1,e_2)^T$, with
+$\mathbf{A} = s\,\mathbf{I} + c\,\mathbf{E}$ and
+$\mathbf{E}=\bigl(\begin{smallmatrix}e_1&e_2\\e_2&-e_1\end{smallmatrix}\bigr)$
+the centroid-covariance ($C_X$) ellipticity tensor:
+\begin{align}
+  s &= \exp\!\bigl(-\sigma_{ls}(\mathrm{NN}_{avg}(\mathbf{f}))\bigr)>0,\label{eq:sx_s}\\
+  c &= \tanh\!\bigl(\mathrm{NN}_c(\mathbf{f})\bigr)\cdot s,\label{eq:sx_c}\\
+  d &= \mathrm{NN}_d(\mathbf{f}),\label{eq:sx_d}\\
+  \begin{pmatrix}y_2\\y_3\end{pmatrix}
+    &= \mathbf{A}\begin{pmatrix}z_2\\z_3\end{pmatrix} + d\begin{pmatrix}e_1\\e_2\end{pmatrix}
+    = \begin{pmatrix}(s+ce_1)z_2+ce_2 z_3 + d e_1\\
+                     ce_2 z_2+(s-ce_1)z_3 + d e_2\end{pmatrix}.\label{eq:sx_A}
+\end{align}
+The \emph{additive} term $d\,(e_1,e_2)$ is the leading, $O(e)$ effect of
+marginalising over an elliptical centroid uncertainty $C_X$.  The centroid
+moment $\mathbf{X}$ is spin-1; measuring the ellipticity about an offset center
+injects a spin-2 term \emph{quadratic} in the offset, so the $C_X$-marginal has a
+nonzero mean
+$\mathbb{E}[\Delta M_1,\Delta M_2]=\kappa\,\mathrm{tr}(C_X)\,(e_1,e_2)$ — a
+translation of the $(M_1,M_2)$ distribution, exactly analogous to the shear
+$\mathbf{Q}$-term in Eqs.~\eqref{eq:poly_y2}--\eqref{eq:poly_y3}.  A purely linear
+map ($s\mathbf{I}+c\mathbf{E}$) fixes the origin and cannot represent this
+dipole; the linear $c\,\mathbf{E}$ term is only the subleading anisotropic
+stretch (quadrupole).  Because $d\,(e_1,e_2)$ is independent of $(z_2,z_3)$ it
+does not enter the Jacobian.  The matrix $\mathbf{A}$ has determinant
+$\det(\mathbf{A})=s^2-c^2|e|^2>0$ (since $|c|\le s$ and $|e|<1$); for a round PSF
+($|e|\to 0$) the whole map reduces to $s\mathbf{I}$.
+
+The log-det of $B_{\mathrm{PSF}}$ is
+\begin{equation}
+  \log|\det J_{B_{\mathrm{PSF}}}|
+  = -(s_0^{(X)}+s_1^{(X)}) + \log(s^2-c^2|e|^2).
+\end{equation}
+
+% ============================================================
+\subsection*{Combined training loss}
+% ============================================================
+
+All four components are trained simultaneously.  Let a mini-batch consist
+of $B$ template galaxies, each with standardised noisy moments
+$\mathbf{M}_{noisy,i}$, standardised noise covariance $\tilde{\mathbf{C}}_{M,i}$
+(with Cholesky factor $L_i$), precomputed shear derivatives
+$(\partial\mathbf{M}_i^G/\partial\mathbf{g},\;\partial^2\mathbf{M}_i^G/\partial\mathbf{g}^2)$,
+and centroid moments $\mathbf{X}_i^G\in\mathbb{R}^2$.
+
+\paragraph{Step 1 — Shear augmentation.}
+For each template $i$ and each shear value $\mathbf{g}\in\mathcal{G}$ ($|\mathcal{G}|=G$,
+one zero-shear point plus eight $|\mathbf{g}|=0.01$ values), compute:
+\begin{equation}
+  \mathbf{M}_{i,\mathbf{g}} = \mathbf{M}_{noisy,i}
+    + \frac{\partial\mathbf{M}_i^G}{\partial\mathbf{g}}\cdot\mathbf{g}
+    + \tfrac{1}{2}\,\mathbf{g}^T\frac{\partial^2\mathbf{M}_i^G}{\partial\mathbf{g}^2}\mathbf{g}.
+\end{equation}
+
+\paragraph{Step 2 — Variational samples.}
+For each $(i,\mathbf{g})$ draw $K$ samples $\mathbf{v}_k\sim q_\phi$ and
+record their log-probabilities:
+\begin{equation}
+  \mathbf{v}_k\sim q_\phi(\cdot\mid\mathbf{M}_{i,\mathbf{g}},\tilde{\mathbf{C}}_{M,i},\mathbf{g}),
+  \qquad k=1,\ldots,K.
+\end{equation}
+
+\paragraph{Step 3 — IWAE with selection correction.}
+For each template $i$, shear $\mathbf{g}$, and PSF condition $C_{X,j}$
+(sampled from the PSF prior), condition the prior on $C_{X,j}$ and compute the
+per-object importance-weighted ELBO:
+\begin{equation}
+  \mathcal{L}_{IW}^{(i,j)}(\mathbf{g})
+  = \log\frac{1}{K}\sum_{k=1}^{K}
+    \frac{
+      \mathcal{N}\!\bigl(\mathbf{M}_{i,\mathbf{g}};\;\mathbf{v}_k,\,\tilde{\mathbf{C}}_{M,i}\bigr)
+      \cdot p_\theta\!\bigl(\mathbf{v}_k\mid\mathbf{g},\,C_{X,j}\bigr)
+    }{
+      P_{sel}(\mathbf{v}_k\mid\mathbf{C}_{M,i})
+      \cdot q_\phi\!\bigl(\mathbf{v}_k\mid\mathbf{M}_{i,\mathbf{g}},\tilde{\mathbf{C}}_{M,i},\mathbf{g}\bigr)
+    },
+  \label{eq:IWAE}
+\end{equation}
+where the selection probability corrects for the flux threshold $f>f_{min}$:
+\begin{equation}
+  P_{sel}(\mathbf{v}_k\mid\mathbf{C}_{M,i})
+  = 1-\Phi\!\left(\frac{f_{min}-10^{v_0}}{\sigma_{f,i}}\right),
+  \qquad \sigma_{f,i}=\sqrt{(\mathbf{C}_{M,i}^{raw})_{ff}}.
+\end{equation}
+Here $10^{v_0}$ is the raw flux reconstructed from the standardised log-flux
+sample $v_0$, and $\sigma_{f,i}$ is the template's \emph{own} (raw) flux-moment
+noise -- a per-template approximation to the survey flux selection
+(B16 Eq.~34).  In code $-\log P_{sel}$ is floored so that pathological
+sub-threshold samples cannot destabilise the loss.  Averaging over the shear
+grid gives the per-object, per-PSF objective
+\begin{equation}
+  \ell_i^{(j)}
+  = \frac{1}{G}\sum_{\mathbf{g}\in\mathcal{G}}\mathcal{L}_{IW}^{(i,j)}(\mathbf{g}).
+  \label{eq:per_obj}
+\end{equation}
+
+\paragraph{Step 4 — Centroid-marginalised PSF training.}
+Rather than marginalising each object \emph{over} the PSF draws, every drawn
+covariance $C_{X,j}$ defines its \emph{own} target: the prior
+$p_\theta(\mathbf{z}\mid\mathbf{g},C_{X,j})$ is trained to be the template
+distribution \emph{marginalised over the unknown centroid offset}
+$\mathbf{X}$, weighting each template copy by its centroid likelihood
+$\mathcal{N}(\mathbf{X}_i^G;\mathbf{0},C_{X,j})$ (BFD Eq.\ 36).  Within the
+mini-batch this marginal is estimated by self-normalised importance sampling
+over the $B$ templates:
+\begin{equation}
+  w_i^{(j)} = \operatorname*{softmax}_{i}\!\Bigl(
+      \log\mathcal{N}\!\bigl(\mathbf{X}_i^G;\,\mathbf{0},\,C_{X,j}\bigr)
+      + \log r_i \Bigr),
+  \qquad
+  \mathcal{L}^{(j)} = -\sum_{i=1}^{B} w_i^{(j)}\,\ell_i^{(j)},
+  \label{eq:PSF_marg}
+\end{equation}
+where $r_i = 1/\rho_i$ undoes the density-flattening probability
+$\rho_i\propto\text{weight}_i$ with which template $i$ was drawn into the
+mini-batch, so the weights target the original (uniform) template population
+reweighted by the centroid likelihood.
+
+\paragraph{Full loss.}
+The total loss averages the per-PSF losses over the $N_{sx}$ draws
+$\{C_{X,j}\}_{j=1}^{N_{sx}}$:
+\begin{equation}
+  \boxed{
+  \mathcal{L}_{total}
+  = \frac{1}{N_{sx}}\sum_{j=1}^{N_{sx}}\mathcal{L}^{(j)}
+  = -\frac{1}{N_{sx}}\sum_{j=1}^{N_{sx}}\sum_{i=1}^{B}
+    w_i^{(j)}\,\ell_i^{(j)}.
+  }
+  \label{eq:loss}
+\end{equation}
+This replaces the earlier per-object softmax \emph{over} PSF draws with a
+per-PSF, centroid-weighted batch mean: each $C_{X,j}$ supplies its own
+$\mathbf{X}$-marginal target and the batch is reweighted by
+$\mathcal{N}(\mathbf{X};\mathbf{0},C_{X,j})$.
