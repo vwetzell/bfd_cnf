@@ -119,7 +119,7 @@ def main() -> int:
 
     # ---------------------------------------------------------- build / load
     key, k_build = jr.split(key)
-    prior_flow, q_flow = build_flows(k_build, latent_dim=4, cond_dim=16)
+    prior_flow, q_flow = build_flows(k_build, latent_dim=4, cond_dim=16, raw2standard=raw2standard)
 
     if args.from_scratch:
         prior = prior_flow
@@ -191,13 +191,16 @@ def main() -> int:
           f"n_nonfinite={int(np.sum(~np.isfinite(losses_arr)))}")
 
     # ----------------------------------------------------------- save
+    from .models.bijections import save_stats
     eqx.tree_serialise_leaves(args.prior_out, prior_trained)
+    save_stats(args.prior_out, raw2standard)
     print(f"Saved pre-trained prior → {args.prior_out}")
 
     if args.save_fresh_q:
         if os.path.exists(args.q_out) and not args.no_backup:
             _backup(args.q_out, f"pre-nll-{_ts()}")
         eqx.tree_serialise_leaves(args.q_out, q_flow)
+        save_stats(args.q_out, raw2standard)
         print(f"Saved fresh Q init → {args.q_out}")
     else:
         print("Q flow not saved (pass --save-fresh-q to write a fresh Q checkpoint "

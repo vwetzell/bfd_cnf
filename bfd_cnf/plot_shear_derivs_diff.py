@@ -66,14 +66,13 @@ def main() -> None:
     args = parse_args()
     log10mf = args.log10mf
     mf_raw = 10.0**log10mf
-    mean, std = load_standardiser(args.stats)
-
     prior_path = args.prior or PRIOR_FLOW_PATH
     q_path = args.q or Q_FLOW_PATH
+    mean, std = load_standardiser(prior_path, args.stats)
     print("Loading flow...")
     if not (os.path.exists(prior_path) and os.path.exists(q_path)):
         raise FileNotFoundError(f"Trained flow weights not found:\n  {prior_path}\n  {q_path}")
-    prior_flow, q_flow = build_flows(base_key, latent_dim=4, cond_dim=16)
+    prior_flow, q_flow = build_flows(base_key, latent_dim=4, cond_dim=16, prior_size_loc_c1=float(mean[1] / std[1]))
     prior_trained, _ = load_models(prior_flow, q_flow, prior_path, q_path)
 
     common = dict(log10mf=log10mf, mrmf=args.mrmf, log_scale=args.log_scale,

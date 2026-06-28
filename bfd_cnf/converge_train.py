@@ -80,7 +80,8 @@ from .convergence_metrics import (
     stage_converged,
 )
 from .data import load_training_dataset, transform_dataset_to_standard
-from .models.flows import build_flows, make_elbo_loss
+from .models.bijections import save_stats
+from .models.flows import build_flows, make_elbo_loss, make_nll_loss
 from .training import _run_training_loop, compute_std_stats, load_models
 
 _LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
@@ -124,8 +125,9 @@ def main() -> int:
     p.add_argument("--block-steps", type=int, default=10_000, help="Gradient steps per block.")
     p.add_argument("--max-blocks", type=int, default=10, help="Hard cap on number of blocks.")
     p.add_argument("--min-blocks", type=int, default=2, help="Always run at least this many blocks.")
-    p.add_argument("--start-steps", type=int, default=50_000,
-                   help="Step count already trained (for labelling/backups only).")
+    p.add_argument("--start-steps", type=int, default=None,
+                   help="Step count already trained (for labelling/backups only). "
+                        "Default: 0 with --from-scratch, else 50000.")
     p.add_argument("--learning-rate", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--grad-clip", type=float, default=0.5)
@@ -149,7 +151,12 @@ def main() -> int:
                         "non-improving blocks again (lets the new LR settle; default 0 = off).")
     p.add_argument("--lr-min", type=float, default=1e-6,
                    help="plateau: LR floor; convergence requires LR at this floor + gates.")
-    p.add_argument("--n-val", type=int, default=20_000, help="Validation-set size for functional metrics.")
+    p.add_argument("--n-val", type=int, default=100_000, help="Validation-set size for functional metrics.")
+    # Defaults: 1500 < Mf < 90000 (in log10) and 2.2 < Mr/Mf < 3.5.
+    p.add_argument("--val-logmf-min", type=float, default=np.log10(1500), help="Min log10(Mf) for validation sample.")
+    p.add_argument("--val-logmf-max", type=float, default=np.log10(90000), help="Max log10(Mf) for validation sample.")
+    p.add_argument("--val-mrmf-min", type=float, default=2.2, help="Min Mr/Mf for validation sample.")
+    p.add_argument("--val-mrmf-max", type=float, default=3.5, help="Max Mr/Mf for validation sample.")
     p.add_argument("--tau-param", type=float, default=0.03,
                    help="Param rel-delta below this = stage params plateaued.")
     p.add_argument("--tau-func", type=float, default=0.05,
@@ -165,9 +172,19 @@ def main() -> int:
     p.add_argument("--q-out", type=str, default=Q_FLOW_PATH)
     p.add_argument("--prior-in", type=str, default=PRIOR_FLOW_PATH)
     p.add_argument("--q-in", type=str, default=Q_FLOW_PATH)
+    p.add_argument("--loss", choices=["elbo", "nll"], default="elbo",
+                   help="Training objective. 'elbo' (default) jointly trains prior+q. "
+                        "'nll' trains the prior alone on direct template NLL (z≈y, no q flow) "
+                        "with the same per-stage convergence gates — for isolating ELBO/q issues.")
     p.add_argument("--from-scratch", action="store_true",
                    help="Initialise fresh flows (skip load_models) and train from random init "
                         "rather than resuming from a checkpoint.")
+    p.add_argument("--no-nda-clip", action="store_true",
+                   help="Disable the top-percentile nda clip (config default %.1f). REQUIRED when "
+                        "training on the importance-subsampled template_train.fits: its nda column "
+                        "is the Horvitz-Thompson weight (nda/p) whose heavy tail IS the correction "
+                        "for down-weighted far-MX/MY copies — clipping it reintroduces the bias. "
+                        "See dev/subsample.py." % (nda_clip_percentile or float('nan')))
     p.add_argument("--no-backup", action="store_true", help="Do not write per-block .bak copies.")
     p.add_argument("--subsample", type=int, default=1,
                    help="Keep roughly 1/subsample of the training templates (sampled before cuts). "
@@ -177,6 +194,9 @@ def main() -> int:
                    default=os.path.join(_LOG_DIR, "converge_metrics.json"))
     p.add_argument("--no-plots", action="store_true")
     args = p.parse_args()
+    if args.start_steps is None:
+        args.start_steps = 0 if args.from_scratch else 50_000
+    nda_clip = None if args.no_nda_clip else nda_clip_percentile
 
     print(f"devices: {jax.devices()}")
     print(f"Σ_X conditioning: log_scale_range={log_scale_range} e_max={e_max} "
@@ -203,7 +223,7 @@ def main() -> int:
 
     # ------------------------------------------------ build / load flows
     key, k_build = jr.split(key)
-    prior_flow, q_flow = build_flows(k_build, latent_dim=4, cond_dim=16)
+    prior_flow, q_flow = build_flows(k_build, latent_dim=4, cond_dim=16, raw2standard=raw2standard)
     if args.from_scratch:
         print("Initialising FRESH flows from scratch (random init, no checkpoint load).")
         prior, q = prior_flow, q_flow  # build_flows pulls arch from config → canonical structure
@@ -213,8 +233,21 @@ def main() -> int:
 
     # ------------------------------------------------ validation set
     key, k_val = jr.split(key)
-    n_val = min(args.n_val, N)
-    val_idx = jr.choice(k_val, N, shape=(n_val,), replace=False)
+    # Restrict candidates by raw log10(Mf) and Mr/Mf before sampling n_val.
+    # cols: [0]=Mf, [1]=Mr, [2]=M1, [3]=M2
+    m_all = np.asarray(moments_jnp)
+    log_mf = np.log10(np.maximum(m_all[:, 0], np.finfo(np.float32).tiny))
+    mr_mf = m_all[:, 1] / m_all[:, 0]
+    keep = np.ones(N, bool)
+    if args.val_logmf_min is not None: keep &= log_mf >= args.val_logmf_min
+    if args.val_logmf_max is not None: keep &= log_mf <= args.val_logmf_max
+    if args.val_mrmf_min is not None: keep &= mr_mf >= args.val_mrmf_min
+    if args.val_mrmf_max is not None: keep &= mr_mf <= args.val_mrmf_max
+    cand = np.flatnonzero(keep)
+    if cand.size < N:
+        print(f"  validation cut: {cand.size}/{N} templates pass log10(Mf)/Mr/Mf limits")
+    n_val = min(args.n_val, cand.size)
+    val_idx = cand[jr.choice(k_val, cand.size, shape=(n_val,), replace=False)]
     z_val, _ = transform_dataset_to_standard(
         raw2standard, moments_jnp[val_idx], cov_jnp[val_idx]
     )
@@ -230,16 +263,30 @@ def main() -> int:
     )
     w_np = np.asarray(weights)
     w_np = w_np / w_np.sum()
-    elbo = make_elbo_loss(
-        N=N, batch_size=batch_size, num_samples=num_samples,
-        weights=jnp.asarray(w_np),
-        nda=(jnp.asarray(nda) if use_nda_weight else None),
-        nda_clip_percentile=nda_clip_percentile,
-        log_scale_range=log_scale_range, e_max=e_max,
-        n_sx_train=n_sx_train, use_sx=(log_scale_range is not None),
-        raw2standard=raw2standard, mean_log_diag=mean_log_diag,
-        std_log_diag=std_log_diag, mean_off=mean_off, std_off=std_off,
-    )
+    if args.loss == "nll":
+        # q-free: prior is supervised directly on log p(y_std | g, C_X) (z≈y).
+        loss_fn = make_nll_loss(
+            N=N, batch_size=batch_size,
+            weights=jnp.asarray(w_np),
+            nda=(jnp.asarray(nda) if use_nda_weight else None),
+            nda_clip_percentile=nda_clip,
+            log_scale_range=log_scale_range, e_max=e_max,
+            n_sx_train=n_sx_train, use_sx=(log_scale_range is not None),
+            raw2standard=raw2standard,
+        )
+        print("Loss: NLL (q-free, prior-only direct template NLL)")
+    else:
+        loss_fn = make_elbo_loss(
+            N=N, batch_size=batch_size, num_samples=num_samples,
+            weights=jnp.asarray(w_np),
+            nda=(jnp.asarray(nda) if use_nda_weight else None),
+            nda_clip_percentile=nda_clip,
+            log_scale_range=log_scale_range, e_max=e_max,
+            n_sx_train=n_sx_train, use_sx=(log_scale_range is not None),
+            raw2standard=raw2standard, mean_log_diag=mean_log_diag,
+            std_log_diag=std_log_diag, mean_off=mean_off, std_off=std_off,
+        )
+        print("Loss: ELBO (joint prior+q)")
     def make_opt(lr):
         # A scalar LR is applied at update time (not stored in Adam's state), so the
         # opt_state structure is identical for any scalar lr — letting the 'plateau'
@@ -276,7 +323,8 @@ def main() -> int:
         base_lr = args.learning_rate
         print(f"LR schedule: constant {args.learning_rate:.1e}")
 
-    model_tuple = (prior, q)
+    # The optimised model is the (prior, q) pair for ELBO, or the prior alone for NLL.
+    model_tuple = (prior, q) if args.loss == "elbo" else prior
     _init_lr = base_lr if args.lr_schedule == "cosine" else args.learning_rate
     opt_state = make_opt(_init_lr).init(eqx.filter(model_tuple, eqx.is_inexact_array))
 
@@ -284,7 +332,8 @@ def main() -> int:
     if not args.no_backup:
         tag0 = f"{args.tag}-pre{args.start_steps // 1000}k-{_ts()}"
         _backup(args.prior_out, tag0)
-        _backup(args.q_out, tag0)
+        if args.loss == "elbo":
+            _backup(args.q_out, tag0)
         print(f"  backed up resume checkpoint with tag '{tag0}'")
 
     # ------------------------------------------------ baseline (block 0) metrics
@@ -332,11 +381,13 @@ def main() -> int:
             last_opt_lr = current_lr
         key, k_train = jr.split(key)
         model_tuple, opt_state, losses = _run_training_loop(
-            model_tuple, opt_state, optimizer, elbo,
+            model_tuple, opt_state, optimizer, loss_fn,
             (moments_jnp, cov_jnp, dm_dg_jnp, d2m_dg2_jnp, centroid_moments_jnp),
             k_train, args.block_steps, train_chunk_size, runners=runners,
         )
-        prior, q = model_tuple
+        prior = model_tuple[0] if args.loss == "elbo" else model_tuple
+        if args.loss == "elbo":
+            q = model_tuple[1]
         total_steps += args.block_steps
 
         losses_arr = np.asarray(losses)
@@ -356,11 +407,15 @@ def main() -> int:
         # checkpoint (only overwrite canonical paths if the block stayed finite)
         if loss_stats["n_nonfinite"] == 0:
             eqx.tree_serialise_leaves(args.prior_out, prior)
-            eqx.tree_serialise_leaves(args.q_out, q)
+            save_stats(args.prior_out, raw2standard)
+            if args.loss == "elbo":
+                eqx.tree_serialise_leaves(args.q_out, q)
+                save_stats(args.q_out, raw2standard)
             if not args.no_backup:
                 tag = f"{args.tag}{total_steps // 1000}k-{_ts()}"
                 _backup(args.prior_out, tag)
-                _backup(args.q_out, tag)
+                if args.loss == "elbo":
+                    _backup(args.q_out, tag)
         else:
             print(f"  WARNING: {loss_stats['n_nonfinite']} non-finite losses in block "
                   f"{block}; NOT overwriting canonical checkpoint.")

@@ -756,8 +756,21 @@ def rqmc_pqr_grid(
     prior_flow,
     hessian_scale=3.0,
     return_ess=False,
+    bruteforce=False,
+    augment=False,
 ):
     """Compute RQMC PQR for a grid of galaxy templates in batches.
+
+    If ``bruteforce`` is True, bypass the entire importance-sampling scheme
+    (mode-find, Laplace Gaussian proposal, scrambled-Halton ±5.6σ clip) and
+    instead estimate each integral by plain Monte Carlo: draw ``n_points``
+    samples directly from the (augmented) Gaussian noise kernel with ordinary
+    pseudo-random normals (no proposal, no low-discrepancy points, no clip) and
+    average the SAME integrand (same noise augmentation, same BFD Jacobian
+    correction, same flow evaluation).  This shares zero machinery with the
+    production estimator's proposal/sampler, so agreement between the two proves
+    the integration scheme — not the flow — is unbiased.  Use a large
+    ``n_points`` (brute MC has no variance reduction).
 
     Halton points are generated once and shared across all templates for
     efficiency.  Noise augmentation and PSF conditioning are applied per object.
@@ -836,8 +849,13 @@ def rqmc_pqr_grid(
     # Each replicate gets its own scrambling key, same as before —
     # but now this happens once for the entire grid rather than N_grid times.
     rqmc_keys = jr.split(jr.key(42), n_replicates)
-    u_all = jax.vmap(lambda k: _halton_sequence(k, n_points, dim))(rqmc_keys)
-    u_all = jnp.clip(u_all, 1e-8, 1.0 - 1e-8)  # clip once here too
+    if bruteforce:
+        # Plain pseudo-random standard normals: no low-discrepancy, no clip.
+        z_all = jax.vmap(lambda k: jr.normal(k, (n_points, dim)))(rqmc_keys)
+    else:
+        u_all = jax.vmap(lambda k: _halton_sequence(k, n_points, dim))(rqmc_keys)
+        u_all = jnp.clip(u_all, 1e-8, 1.0 - 1e-8)  # clip once here too
+        z_all = jax.scipy.stats.norm.ppf(u_all)
     # ──────────────────────────────────────────────────────────────────────────
 
     def _single(prior_flow, mu_std, cov_std, mu_raw, CM_raw, sx_cond):
@@ -846,16 +864,18 @@ def rqmc_pqr_grid(
 
         current_snr = mu_raw[0] / jnp.sqrt(CM_raw[0, 0])
 
-        CA_raw = make_augmentation_noise_raw_jax(
-            CM_raw, current_snr=current_snr, target_snr=20.0
-        )
-
-        # CA_raw = jnp.zeros_like(CM_raw)
+        if augment:
+            CA_raw = make_augmentation_noise_raw_jax(
+                CM_raw, current_snr=current_snr, target_snr=20.0
+            )
+        else:
+            CA_raw = jnp.zeros_like(CM_raw)
 
         dim = mu_std.shape[0]
         not_zero = jnp.any(CA_raw != 0.0)
 
         std_scales = jnp.asarray(raw2standard.std)
+        mean_scales = jnp.asarray(raw2standard.mean)
         eye_dim = jnp.eye(dim, dtype=cov_std.dtype)
 
         def _aug_branch(_):
@@ -964,21 +984,24 @@ def rqmc_pqr_grid(
             grad = jnp.where(jnp.isfinite(grad), grad, jnp.zeros_like(grad))
             return neg_val, grad
 
-        # Laplace proposal
-        mode, _ = _find_mode_jax(neg_log_integrand, mu_std, n_steps=20)
+        if bruteforce:
+            # Proposal = the (augmented) kernel itself => weights reduce to the
+            # jac-correction and x is drawn straight from N(mu_std, cov_std_use).
+            proposal_mu = mu_std
+            proposal_cov = cov_std_use
+        else:
+            # Laplace proposal
+            mode, _ = _find_mode_jax(neg_log_integrand, mu_std, n_steps=20)
 
-        # jax.debug.print("Target mu (std space): {m}", m=mu_std)
-        # jax.debug.print("Mode found at: {m}", m=mode)
-
-        mode = jnp.where(jnp.isfinite(mode), mode, mu_std)
-        hess = _finite_diff_hessian(neg_log_integrand, mode, eps=0.05)
-        hess = 0.5 * (hess + hess.T)
-        eigvals_h, eigvecs_h = jnp.linalg.eigh(hess)
-        eigvals_h = jnp.maximum(eigvals_h, 1e-6)
-        proposal_cov = (eigvecs_h / eigvals_h) @ eigvecs_h.T
-        proposal_cov = proposal_cov * hessian_scale**2
-        proposal_cov = proposal_cov + 1e-6 * jnp.eye(dim)
-        proposal_mu = mode
+            mode = jnp.where(jnp.isfinite(mode), mode, mu_std)
+            hess = _finite_diff_hessian(neg_log_integrand, mode, eps=0.05)
+            hess = 0.5 * (hess + hess.T)
+            eigvals_h, eigvecs_h = jnp.linalg.eigh(hess)
+            eigvals_h = jnp.maximum(eigvals_h, 1e-6)
+            proposal_cov = (eigvecs_h / eigvals_h) @ eigvecs_h.T
+            proposal_cov = proposal_cov * hessian_scale**2
+            proposal_cov = proposal_cov + 1e-6 * jnp.eye(dim)
+            proposal_mu = mode
 
         # proposal_mu = mu_std
         # proposal_cov = cov_std_use
@@ -994,9 +1017,9 @@ def rqmc_pqr_grid(
             v = jax.scipy.linalg.solve_triangular(L_prop, diff.T, lower=True)
             return prop_const - 0.5 * jnp.sum(v**2, axis=0)
 
-        # single_replicate now receives pre-clipped u instead of a key
-        def single_replicate(u):  # u: (n_points, dim)
-            z = jax.scipy.stats.norm.ppf(u)
+        # single_replicate receives standard-normal samples z (Halton-ppf for the
+        # IS path, plain normals for bruteforce); both map x = mu + z @ L_prop.T.
+        def single_replicate(z):  # z: (n_points, dim)
             x = proposal_mu + z @ L_prop.T
 
             log_gauss = log_gaussian(x)
@@ -1022,6 +1045,34 @@ def rqmc_pqr_grid(
             ess_rep = jnp.where(sum_c2 > 0, sum_c * sum_c / sum_c2, 0.0)
             maxw_rep = jnp.where(sum_c > 0, jnp.nanmax(c) / sum_c, jnp.nan)
 
+            # Skewness of the INTEGRAND p_flow*N (weights c).  The standardized
+            # coords ARE [log10(Mf), Mr/Mf, M1/Mr, M2/Mr] (RawMomentStandardize),
+            # so per-axis skew along dims 0,1 = skew of log10(Mf), Mr/Mf (skewness
+            # is invariant under the per-axis (z0-mean)/std affine).
+            cn = jnp.where(jnp.isfinite(c), c, 0.0)
+            W = jnp.maximum(jnp.sum(cn), 1e-30)
+            mu_c = jnp.sum(cn[:, None] * x, axis=0) / W
+            dxc = x - mu_c
+            m2 = jnp.sum(cn[:, None] * dxc**2, axis=0) / W
+            m3 = jnp.sum(cn[:, None] * dxc**3, axis=0) / W
+            skew_axis = m3 / (m2**1.5 + 1e-30)  # (dim,) marginal per-axis skew
+
+            # 2D DIRECTIONAL skewness in the (log10Mf, Mr/Mf) plane -- catches a
+            # diagonal/banana skew that the marginals miss.  Whiten the 2D integrand,
+            # then max_theta |E_c[(u_theta . y)^3]| over a direction grid.
+            y2 = x[:, :2] * std_scales[:2] + mean_scales[:2]  # (n,2) = (log10Mf, Mr/Mf)
+            mu2 = jnp.sum(cn[:, None] * y2, axis=0) / W
+            dy2 = y2 - mu2
+            cov2 = jnp.einsum("n,ni,nj->ij", cn, dy2, dy2) / W + 1e-12 * jnp.eye(2)
+            L2 = jnp.linalg.cholesky(cov2)
+            wy = jax.scipy.linalg.solve_triangular(L2, dy2.T, lower=True).T  # whitened
+            ang = jnp.linspace(0.0, jnp.pi, 24, endpoint=False)
+            dirs = jnp.stack([jnp.cos(ang), jnp.sin(ang)], axis=0)  # (2,24)
+            proj = wy @ dirs  # (n,24)
+            sdir = jnp.sum(cn[:, None] * proj**3, axis=0) / W  # (24,)
+            skew2d = jnp.max(jnp.abs(sdir))
+            skew_rep = jnp.concatenate([skew_axis, skew2d[None]])  # (dim+1,)
+
             return (
                 jnp.nanmean(c),
                 jnp.nanmean(c * dlp1),
@@ -1031,14 +1082,15 @@ def rqmc_pqr_grid(
                 jnp.nanmean(c * (d2lp12 + dlp1 * dlp2)),
                 ess_rep,
                 maxw_rep,
+                skew_rep,
             )
 
         # Process replicates sequentially with lax.map to avoid materialising
         # a (batch_size, n_replicates, n_points, dim) tensor through the flow.
         # Each map step allocates (batch_size, n_points, dim) intermediates instead.
-        stacked = jax.lax.map(single_replicate, u_all)
+        stacked = jax.lax.map(single_replicate, z_all)
         (P_ests, Q1_ests, Q2_ests, R11_ests, R22_ests, R12_ests,
-         ess_reps, maxw_reps) = stacked
+         ess_reps, maxw_reps, skew_reps) = stacked
 
         def _mean_se(vals):
             return jnp.nanmean(vals), jnp.nanstd(vals, ddof=1) / jnp.sqrt(n_replicates)
@@ -1052,8 +1104,13 @@ def rqmc_pqr_grid(
 
         out = (P, P_se, Q1, Q1_se, Q2, Q2_se, R11, R11_se, R22, R22_se, R12, R12_se)
         if return_ess:
-            # Per-target ESS / max-weight share, averaged over replicates.
-            out = out + (jnp.nanmean(ess_reps), jnp.nanmean(maxw_reps))
+            # Per-target ESS / max-weight share / integrand skewness (per dim),
+            # averaged over replicates.
+            out = out + (
+                jnp.nanmean(ess_reps),
+                jnp.nanmean(maxw_reps),
+                jnp.nanmean(skew_reps, axis=0),
+            )
         return out
 
     # eqx.filter_jit handles the non-array leaves in prior_flow (e.g. triangular.fn)
@@ -1072,7 +1129,9 @@ def rqmc_pqr_grid(
     batched = jax.tree.map(lambda *xs: jnp.stack(xs), *results)
 
     # Flatten batches and remove padding
-    out = jax.tree.map(lambda x: x.reshape(-1)[:N], batched)
+    # Flatten the (n_batches, batch_size, ...) leaves to (N, ...), preserving any
+    # trailing per-target axes (e.g. the (4,) integrand-skewness vector).
+    out = jax.tree.map(lambda x: x.reshape((-1,) + x.shape[2:])[:N], batched)
     return out
 
 
@@ -1458,10 +1517,10 @@ def integrate_grid_pqr(
     )
 
     # When return_ess, rqmc_pqr_grid appends (ess, maxw) after the 12-tuple.
-    ess_p = ess_m = maxw_p = maxw_m = None
+    ess_p = ess_m = maxw_p = maxw_m = skew_p = skew_m = None
     if return_ess:
-        *components_p, ess_p, maxw_p = components_p
-        *components_m, ess_m, maxw_m = components_m
+        *components_p, ess_p, maxw_p, skew_p = components_p
+        *components_m, ess_m, maxw_m, skew_m = components_m
         components_p, components_m = tuple(components_p), tuple(components_m)
 
     (P_p, _, Q1_p, _, Q2_p, _, R11_p, _, R22_p, _, R12_p, _) = components_p
@@ -1487,6 +1546,8 @@ def integrate_grid_pqr(
         ess_m=ess_m,
         maxw_p=maxw_p,
         maxw_m=maxw_m,
+        skew_p=skew_p,
+        skew_m=skew_m,
     )
 
 
@@ -1553,6 +1614,8 @@ def integrate_catalog_pqr(
     return_ess: bool = False,
     fixed_sx_cond: tuple[float, float, float] | None = None,
     verbose: bool = True,
+    bruteforce: bool = False,
+    augment: bool = False,
 ) -> dict[str, Any]:
     """Flow-based RQMC PQR over a SINGLE shear catalogue, selected on its own moments.
 
@@ -1617,12 +1680,13 @@ def integrate_catalog_pqr(
         mu_std, sigma_std, targets, CM_raw, sx_conds,
         n_points=n_points, n_replicates=n_replicates, batch_size=batch_size,
         raw2standard=raw2standard, prior_flow=prior_flow,
-        hessian_scale=hessian_scale, return_ess=return_ess,
+        hessian_scale=hessian_scale, return_ess=return_ess, bruteforce=bruteforce,
+        augment=augment,
     )
 
-    ess = maxw = None
+    ess = maxw = skew = None
     if return_ess:
-        *components, ess, maxw = components
+        *components, ess, maxw, skew = components
         components = tuple(components)
 
     (P, _, Q1, _, Q2, _, R11, _, R22, _, R12, _) = components
@@ -1637,4 +1701,5 @@ def integrate_catalog_pqr(
         components=components,
         ess=ess,
         maxw=maxw,
+        skew=skew,
     )

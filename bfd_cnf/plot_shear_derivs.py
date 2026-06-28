@@ -38,7 +38,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from bfd_cnf.data import load_data
 from bfd_cnf.models.flows import build_flows
 from bfd_cnf.training import load_models
 from bfd_cnf.config import PLOTS_DIR, PRIOR_FLOW_PATH, Q_FLOW_PATH
@@ -109,11 +108,12 @@ def main() -> None:
     r = args.m_range
 
     # ── Load data (for the standardisation) and the trained prior flow ──────────
-    print("Loading data (for standardisation mean/std)...")
-    data = load_data()
-    key = data["key"]
-    data_mean = np.array(data["data_mean"])
-    data_std = np.array(data["data_std"])
+    print("Loading standardiser from the flow's sidecar...")
+    from bfd_cnf.models.bijections import load_stats
+    _r2s = load_stats(PRIOR_FLOW_PATH)
+    key = jax.random.key(0)
+    data_mean = np.array(_r2s.mean)
+    data_std = np.array(_r2s.std)
 
     print("Loading flow...")
     if not (os.path.exists(PRIOR_FLOW_PATH) and os.path.exists(Q_FLOW_PATH)):
@@ -123,7 +123,10 @@ def main() -> None:
             "Train the flows first (e.g. `python -m bfd_cnf.train_from_scratch`). "
             "This script only loads and evaluates the prior flow."
         )
-    prior_flow, q_flow = build_flows(key, latent_dim=4, cond_dim=16)
+    from bfd_cnf.models.bijections import load_stats
+    prior_flow, q_flow = build_flows(
+        key, latent_dim=4, cond_dim=16, raw2standard=load_stats(PRIOR_FLOW_PATH)
+    )
     prior_trained, _ = load_models(prior_flow, q_flow, PRIOR_FLOW_PATH, Q_FLOW_PATH)
 
     # ── Build the M1/Mr – M2/Mr grid at fixed (log10 Mf, Mr/Mf) ─────────────────

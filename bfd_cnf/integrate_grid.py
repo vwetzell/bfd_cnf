@@ -42,7 +42,7 @@ from .config import (
     target_flux_min,
 )
 from .inference import integrate_catalog_pqr, integrate_grid_pqr, load_grid_data
-from .models.bijections import RawMomentStandardize
+from .models.bijections import RawMomentStandardize, load_stats
 from .models.flows import build_flows
 from .statistics import (
     bootstrap_independent_mult_bias,
@@ -61,9 +61,10 @@ def load_raw2standard(
     """Return the :class:`RawMomentStandardize` matching the trained flow.
 
     The flow must be standardised with exactly the ``(mean, std)`` it was trained
-    with.  Those come from :func:`bfd_cnf.data.load_data`, which reads the
-    multi-GB FITS template table.  To avoid that cost on every integration run we
-    cache the two 4-vectors to ``stats_file`` and reuse them.
+    with.  With ``rebuild=True`` these are recomputed from the training table via
+    :func:`bfd_cnf.backfill_stats.rebuild_standardize_full`; otherwise the cached
+    4-vectors in ``stats_file`` are reused.  (The flow's sidecar
+    ``<flow>.eqx.stats.npz`` is the preferred source — see ``load_stats``.)
 
     Parameters
     ----------
@@ -83,18 +84,18 @@ def load_raw2standard(
             mean=jnp.asarray(d["mean"]), std=jnp.asarray(d["std"])
         )
 
-    print("Rebuilding standardiser stats from the FITS template table "
+    print("Rebuilding standardiser stats from the training table "
           "(this reads the large FITS once)...")
-    from .data import load_data
+    from .backfill_stats import rebuild_standardize_full
 
-    data = load_data(key=_base_key)
+    r2s = rebuild_standardize_full()
     np.savez(
         stats_file,
-        mean=np.asarray(data["data_mean"]),
-        std=np.asarray(data["data_std"]),
+        mean=np.asarray(r2s.mean),
+        std=np.asarray(r2s.std),
     )
     print(f"Saved standardiser stats to {stats_file}")
-    return data["raw2standard"]
+    return r2s
 
 
 def load_prior_flow(key, prior_path: str = PRIOR_FLOW_PATH, q_path: str = Q_FLOW_PATH):
@@ -104,7 +105,9 @@ def load_prior_flow(key, prior_path: str = PRIOR_FLOW_PATH, q_path: str = Q_FLOW
     deserialised because :func:`bfd_cnf.training.load_models` expects both
     template pytrees, but it is otherwise unused here.
     """
-    prior_flow, q_flow = build_flows(key, latent_dim=4, cond_dim=16)
+    prior_flow, q_flow = build_flows(
+        key, latent_dim=4, cond_dim=16, raw2standard=load_stats(prior_path)
+    )
     prior_trained, _ = load_models(prior_flow, q_flow, prior_path, q_path)
     return prior_trained
 
@@ -125,9 +128,10 @@ def _run_independent(args, key, raw2standard, prior_flow) -> None:
     common = dict(
         n_targets=args.n_targets, flux_min=args.flux_min, flux_max=args.flux_max,
         n_points=args.n_points, n_replicates=args.n_replicates,
-        batch_size=args.batch_size,
+        batch_size=args.batch_size, hessian_scale=args.hessian_scale,
         fixed_sx_cond=(args.fixed_log_scale, args.fixed_e1, args.fixed_e2)
         if args.fixed_log_scale is not None else None,
+        augment=args.augment,
     )
 
     key, kp, km = jr.split(key, 3)
@@ -199,12 +203,23 @@ def main() -> None:
                     help="Independent RQMC replicates for SE (default 16).")
     ap.add_argument("--batch-size", type=int, default=512,
                     help="Templates processed per batch (default 512).")
+    ap.add_argument("--augment", action="store_true",
+                    help="Turn ON SNR->20 noise augmentation (default OFF: integrate "
+                         "against the raw measurement covariance N(x; M, Sigma)).")
+    ap.add_argument("--hessian-scale", type=float, default=3.0,
+                    help="Laplace-proposal width multiplier (default 3.0).  Sweep "
+                         "this to test whether aggregate m depends on proposal "
+                         "coverage (it should not if the integrator is unbiased).")
     ap.add_argument("--out", type=str, default=os.path.join(DATA_DIR, "pqr_grid.npz"),
                     help="Output .npz path for the PQR arrays (default data/pqr_grid.npz).")
-    ap.add_argument("--stats-file", type=str, default=DEFAULT_STATS_FILE,
-                    help="Cache file for the standardiser (mean, std).")
+    ap.add_argument("--stats-file", type=str, default=None,
+                    help="Explicit standardiser (mean, std) npz override.  By "
+                         "default the flow's sidecar <prior>.eqx.stats.npz is "
+                         "used; passing this must AGREE with the sidecar or the "
+                         "run aborts (guards against the wrong-stats trap).")
     ap.add_argument("--rebuild-stats", action="store_true",
-                    help="Rebuild the standardiser stats from the FITS.")
+                    help="Legacy: rebuild the standardiser stats from the FITS "
+                         "(bypasses the sidecar; only for flows without one).")
     ap.add_argument(
         "--fixed-log-scale", type=float, default=None,
         help="Diagnostic: use a single fixed Sigma_X log_scale for ALL targets "
@@ -235,11 +250,17 @@ def main() -> None:
 
     key = _base_key
 
-    raw2standard = load_raw2standard(args.stats_file, rebuild=args.rebuild_stats)
+    prior_path = args.prior or PRIOR_FLOW_PATH
+    if args.rebuild_stats:
+        raw2standard = load_raw2standard(
+            args.stats_file or DEFAULT_STATS_FILE, rebuild=True
+        )
+    else:
+        raw2standard = load_stats(prior_path, override=args.stats_file)
 
     key, k_flow = jr.split(key)
     prior_flow = load_prior_flow(
-        k_flow, args.prior or PRIOR_FLOW_PATH, args.q or Q_FLOW_PATH
+        k_flow, prior_path, args.q or Q_FLOW_PATH
     )
 
     if args.independent:
@@ -261,6 +282,7 @@ def main() -> None:
         n_points=args.n_points,
         n_replicates=args.n_replicates,
         batch_size=args.batch_size,
+        hessian_scale=args.hessian_scale,
         fixed_sx_cond=fixed_sx_cond,
     )
 

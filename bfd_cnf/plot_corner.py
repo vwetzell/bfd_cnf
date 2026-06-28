@@ -1,16 +1,10 @@
 """
 Corner plot of the template moment distribution vs. the trained prior flow.
 
-One pipeline, four template sources (``--source``):
+One pipeline, two template sources (``--source``), both reading ``templates_train.fits``
+— the file the flow actually trains on:
 
-  summary  Deep-field summary templates (one row per galaxy, no shifted copies)
-           from ``summary_templates_new.fits`` via ``load_summary_moments``.
-           ``--weighted-joined`` instead uses the tmpl_t04_joined copies
-           importance-resampled by nda × N(X;0,C_X) (the X-marginal the flow learned).
-  new      The NEW template set (``templates_summary.fits`` + row-aligned
-           ``templates.hdf5``), streamed in blocks, with the pipeline quality cuts
-           and nda × N(X|C_X) [× detj] centroid weighting. ``--no-cut`` / ``--no-weight``.
-  train    The huge ``templates_train.fits`` (~34 GB), streamed and detj × nda weighted.
+  train    ``templates_train.fits`` (~34 GB), streamed and detj × nda weighted.
   draw     1M templates drawn EXACTLY as training selects batches (``ds["weights"]``),
            optionally × detj × nda. Data-only by default (the distribution the loss sees).
 
@@ -20,8 +14,6 @@ selection-box (green) + stellar-locus (red) overlays.
 
 Pure load — never trains. Examples::
 
-    python -m bfd_cnf.plot_corner                       # summary vs canonical flow
-    python -m bfd_cnf.plot_corner --source new --detj
     python -m bfd_cnf.plot_corner --source train --mf-cut 800
     python -m bfd_cnf.plot_corner --source draw --detj-nda-weight
 """
@@ -44,9 +36,8 @@ PLOT_RANGE = ((np.log10(500), np.log10(200000)), (1.2, 5.5), (-0.8, 0.8), (-0.8,
 LABEL_FONTSIZE, TICK_LABELSIZE = 34, 24
 STELLAR = 3.976167  # Mr/Mf stellar locus reference
 
-# Per-source default Σ_X log_scale to condition the prior on.  None for "new" means
-# "use the set's native scale 2·ln(sigmaXY) from the HDF5 metadata".
-_DEFAULT_LOG_SCALE = {"summary": 13.27, "new": None, "train": 11.94, "draw": 11.94}
+# Per-source default Σ_X log_scale to condition the prior on.
+_DEFAULT_LOG_SCALE = {"train": 11.94, "draw": 11.94}
 
 
 def to_coords(m):
@@ -75,87 +66,6 @@ def resample(m, w, n, label):
 
 
 # ── Source loaders: each returns (raw_moments (N,4), weights (N,) or None, label) ──
-def load_summary(args):
-    from bfd_cnf.data import load_data, load_summary_moments
-    if args.weighted_joined:
-        print("Building nda-weighted joined-template reference...")
-        data = load_data()
-        m = np.asarray(data["moments_jnp"], dtype=np.float64)
-        X = np.asarray(data["centroid_moments_jnp"], dtype=np.float64)
-        nda = np.asarray(data["nda"], dtype=np.float64)
-        var_xy = float(np.exp(args._log_scale))
-        log_w = np.log(np.maximum(nda, np.finfo(np.float64).tiny)) \
-            - 0.5 * (X[:, 0] ** 2 + X[:, 1] ** 2) / var_xy
-        log_w -= log_w.max()
-        return m, np.exp(log_w), "nda×N(X|C_X) joined"
-    print("Loading deep-field summary templates...")
-    sm = np.asarray(load_summary_moments())
-    print(f"  {sm.shape[0]:,} summary templates after quality cuts")
-    return sm, None, "Observed Templates"
-
-
-def load_new(args):
-    import bfd
-    import fitsio
-    import h5py
-    from bfd_cnf.data import quality_cut_mask
-    need_hdf5 = not args.no_weight
-    print(f"Reading {args.summary}" + (f" + {args.hdf5}" if need_hdf5 else "") + " (blocked)...")
-    m_keep, x_keep, nda_keep = [], [], []
-    n_read = n_kept = 0
-    fsum = fitsio.FITS(args.summary)
-    hf = h5py.File(args.hdf5, "r") if need_hdf5 else None
-    try:
-        hsum = fsum[1]
-        N = hsum.get_nrows()
-        ds = hf["templates"] if need_hdf5 else None
-        if ds is not None and ds.shape[0] != N:
-            raise ValueError(f"row-count mismatch: summary {N} vs hdf5 {ds.shape[0]}")
-        pool = N if args.pool <= 0 else min(args.pool, N)
-        block = pool // 24
-        for s in np.linspace(0, N - block, 24).astype(np.int64):
-            s = int(s)
-            rows = np.arange(s, s + block)
-            mom = hsum.read_column("moments", rows=rows)[:, :4].astype(np.float64)
-            if args.no_cut:
-                m = np.all(np.isfinite(mom), axis=1)
-            else:
-                cov = bfd.MomentCovariance.bulkUnpack(
-                    hsum.read_column("covariance", rows=rows))[:, :4, :4]
-                m = quality_cut_mask(mom, cov)
-            if need_hdf5:
-                rec = ds[s:s + block]
-                if not np.array_equal(rec["id"], hsum.read_column("id", rows=rows)):
-                    raise ValueError(f"files not row-aligned in block at row {s}")
-                x_keep.append(rec["derivs"][:, 5:7, 0].astype(np.float64)[m])
-                nda_keep.append(rec["nda"].astype(np.float64)[m])
-            m_keep.append(mom[m])
-            n_read += len(mom)
-            n_kept += int(m.sum())
-    finally:
-        fsum.close()
-        if hf is not None:
-            hf.close()
-    m_sub = np.concatenate(m_keep, axis=0)
-    print(f"  cut survival: {n_kept:,}/{n_read:,} = {100.0 * n_kept / n_read:.1f}%")
-    label = "New Templates (" + ("raw" if args.no_cut else "cut")
-    if args.no_weight:
-        return m_sub, None, label + ")"
-    X = np.concatenate(x_keep, axis=0)
-    nda = np.concatenate(nda_keep, axis=0)
-    var_xy = float(np.exp(args._log_scale))
-    log_w = np.log(np.maximum(nda, np.finfo(np.float64).tiny)) \
-        - 0.5 * (X[:, 0] ** 2 + X[:, 1] ** 2) / var_xy
-    if args.detj:
-        detj = 0.25 * (m_sub[:, 1] ** 2 - m_sub[:, 2] ** 2 - m_sub[:, 3] ** 2)
-        log_w += np.log(np.maximum(detj, np.finfo(np.float64).tiny))
-        label += ", nda·detj-wtd)"
-    else:
-        label += ", nda-wtd)"
-    log_w[~np.isfinite(log_w)] = -np.inf
-    log_w -= np.nanmax(log_w)
-    return m_sub, np.exp(log_w), label
-
 
 def load_train(args):
     import fitsio
@@ -163,21 +73,27 @@ def load_train(args):
     N = h.get_nrows()
     keep_frac = min(1.0, args.n_sub / (N * 0.92))  # ~92% pass mf>800
     rng = np.random.default_rng(0)
-    m_keep, nda_keep, n_read = [], [], 0
+    m_keep, nda_keep, x_keep, n_read = [], [], [], 0
     for s in range(0, N, args.chunk):
         rows = np.arange(s, min(s + args.chunk, N))
-        blk = h.read(rows=rows, columns=["moments", "nda"])
+        blk = h.read(rows=rows, columns=["moments", "nda", "centroid"])
         m, nda = blk["moments"][:, :4].astype(np.float64), blk["nda"].astype(np.float64)
+        x = blk["centroid"][:, :2].astype(np.float64)  # [MX, MY] true centroid moments
         sel = (m[:, 0] > args.mf_cut) & np.all(np.isfinite(m), axis=1) & (nda > 0)
         sel &= rng.random(len(m)) < keep_frac
-        m_keep.append(m[sel]); nda_keep.append(nda[sel])
+        m_keep.append(m[sel]); nda_keep.append(nda[sel]); x_keep.append(x[sel])
         n_read += len(rows)
         print(f"  {n_read:,}/{N:,} read, {sum(len(x) for x in m_keep):,} kept", end="\r")
     print()
-    m = np.concatenate(m_keep); nda = np.concatenate(nda_keep)
+    m = np.concatenate(m_keep); nda = np.concatenate(nda_keep); X = np.concatenate(x_keep)
     detj = 0.25 * (m[:, 1] ** 2 - m[:, 2] ** 2 - m[:, 3] ** 2)
     good = detj > 0
-    return m[good], nda[good] * detj[good], f"Templates (Mf>{args.mf_cut:g}, detj×nda)"
+    # Per-copy ELBO weight nda·detj·N(X|C_X), C_X isotropic at the reference scale:
+    # var_xy = exp(0.5·logdet C_X) = exp(args._log_scale) (e=0), matching flows._log_L_X.
+    var_xy = float(np.exp(args._log_scale))
+    L_X = np.exp(-0.5 * (X[:, 0] ** 2 + X[:, 1] ** 2) / var_xy)
+    w = nda[good] * detj[good] * L_X[good]
+    return m[good], w, f"Templates (Mf>{args.mf_cut:g}, nda·detj·N(X|C_X))"
 
 
 def load_draw(args):
@@ -192,7 +108,7 @@ def load_draw(args):
     return m, w, "training draw"
 
 
-LOADERS = {"summary": load_summary, "new": load_new, "train": load_train, "draw": load_draw}
+LOADERS = {"train": load_train, "draw": load_draw}
 
 
 def load_flow(args, source):
@@ -201,19 +117,14 @@ def load_flow(args, source):
     import jax.random as jr
     from bfd_cnf.models.flows import build_flows
     from bfd_cnf.training import load_models
+    from bfd_cnf.models.bijections import load_stats
     prior_path, q_path = args.prior or PRIOR_FLOW_PATH, args.q or Q_FLOW_PATH
     if not (os.path.exists(prior_path) and os.path.exists(q_path)):
         raise FileNotFoundError(f"Trained flow weights not found:\n  {prior_path}\n  {q_path}")
-    if args.stats:
-        from bfd_cnf.models.bijections import RawMomentStandardize
-        s = np.load(args.stats)
-        raw2standard = RawMomentStandardize(mean=jnp.asarray(s["mean"]), std=jnp.asarray(s["std"]))
-        key = jr.key(0)
-    else:
-        from bfd_cnf.data import load_data
-        data = load_data()
-        key, raw2standard = data["key"], data["raw2standard"]
-    prior_flow, q_flow = build_flows(key, latent_dim=4, cond_dim=16)
+    # Prefer the flow's sidecar; an explicit --stats must agree with it.
+    raw2standard = load_stats(prior_path, override=args.stats)
+    key = jr.key(0)
+    prior_flow, q_flow = build_flows(key, latent_dim=4, cond_dim=16, raw2standard=raw2standard)
     prior_trained, _ = load_models(prior_flow, q_flow, prior_path, q_path)
     return prior_trained, raw2standard, key
 
@@ -267,7 +178,7 @@ def draw_overlay(fig):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--source", choices=list(LOADERS), default="summary")
+    ap.add_argument("--source", choices=list(LOADERS), default="train")
     ap.add_argument("--log-scale", type=float, default=None,
                     help="Σ_X log_scale to condition the prior on / weight the X-marginal at "
                          "(default: per-source).")
@@ -275,21 +186,11 @@ def main():
     ap.add_argument("--prior", default=None, help="prior flow .eqx (default: canonical)")
     ap.add_argument("--q", default=None, help="q flow .eqx (default: canonical)")
     ap.add_argument("--stats", default=None,
-                    help="raw2standard stats npz the flow was trained with (new-template flows); "
-                         "default reads it via load_data (legacy set, canonical flow).")
+                    help="raw2standard stats npz override; default reads the flow's "
+                         "sidecar <flow>.eqx.stats.npz.")
     ap.add_argument("--no-flow", action="store_true", help="data cloud only, no flow overlay.")
     ap.add_argument("--no-overlay", action="store_true",
                     help="skip selection-box + stellar-locus reference lines.")
-    # summary
-    ap.add_argument("--weighted-joined", action="store_true",
-                    help="[summary] nda×N(X|C_X)-resampled tmpl_t04_joined copies as the reference.")
-    # new
-    ap.add_argument("--summary", default="data/templates_summary.fits", help="[new] moments+cov FITS")
-    ap.add_argument("--hdf5", default="data/templates.hdf5", help="[new] row-aligned derivs+nda HDF5")
-    ap.add_argument("--pool", type=int, default=0, help="[new] rows to read (0 = full file)")
-    ap.add_argument("--no-cut", action="store_true", help="[new] skip quality_cut_mask")
-    ap.add_argument("--no-weight", action="store_true", help="[new] skip nda×N(X|C_X) weighting")
-    ap.add_argument("--detj", action="store_true", help="[new] fold detj into the weight")
     # train
     ap.add_argument("--file", default="data/templates_train.fits", help="[train] templates_train.fits")
     ap.add_argument("--mf-cut", type=float, default=800.0, help="[train] keep Mf > this")
@@ -306,12 +207,8 @@ def main():
         args.no_overlay = True
 
     # Resolve the conditioning/weighting log_scale.
-    if args.log_scale is not None:
-        log_scale = float(args.log_scale)
-    elif args.source == "new":
-        log_scale = _read_native_log_scale(args.hdf5)
-    else:
-        log_scale = _DEFAULT_LOG_SCALE[args.source]
+    log_scale = float(args.log_scale) if args.log_scale is not None \
+        else _DEFAULT_LOG_SCALE[args.source]
     args._log_scale = log_scale
     print(f"Source={args.source}  log_scale={log_scale:.3f}")
 
@@ -353,26 +250,6 @@ def main():
                        f"{'_dataonly' if args.no_flow else ''}.png")
     fig.savefig(out, dpi=150, bbox_inches="tight")
     print(f"Saved to {out}")
-
-
-def _read_native_log_scale(hdf5_path):
-    """[new] 2·ln(sigmaXY) from the HDF5 column-meta blob, else 11.98 fallback."""
-    import h5py
-    import yaml
-    if os.path.exists(hdf5_path):
-        with h5py.File(hdf5_path, "r") as f:
-            meta_ds = f.get("templates.__table_column_meta__")
-            if meta_ds is not None:
-                blob = "\n".join(bytes(x).decode("latin1") for x in meta_ds[:])
-                try:
-                    for item in yaml.safe_load(blob).get("meta", []):
-                        if isinstance(item, dict) and "sigmaXY" in item:
-                            return 2.0 * float(np.log(item["sigmaXY"]))
-                        if isinstance(item, (tuple, list)) and len(item) == 2 and item[0] == "sigmaXY":
-                            return 2.0 * float(np.log(item[1]))
-                except Exception:
-                    pass
-    return 11.98
 
 
 if __name__ == "__main__":

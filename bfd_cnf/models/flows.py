@@ -268,41 +268,59 @@ def _moment_jacobian_det(m_raw: jax.Array) -> jax.Array:
 def _sample_sx_conds(
     key: jax.Array, log_scale_range: tuple[float, float], e_max: float, n_sx: int
 ) -> jax.Array:
-    """Sample PSF noise covariance condition vectors uniformly.
+    """Build PSF noise covariance condition vectors on a fixed e-stencil.
 
     Each condition vector is ``[log_scale, e1, e2]`` where
 
-    * ``log_scale = 0.5 * log det(Σ_X)`` (spin-0 noise level),
-    * ``e1, e2 = e_mag * (cos 2φ, sin 2φ)`` (spin-2 PSF ellipticity).
+    * ``log_scale = 0.5 * log det(Σ_X)`` (spin-0 noise level) — **random**,
+    * ``(e1, e2)`` (spin-2 PSF ellipticity) — a **fixed stencil**: one centre
+      ``e=0`` plus two 8-direction rings at ``|e| = e_max/2`` and ``|e| = e_max``
+      (17 points total).
 
-    ``φ`` is sampled in ``[0, π)`` — the half-circle respects the Z₂
-    symmetry ``e → −e``.
+    Why a stencil (mirrors the fixed ``g``-ring in the ELBO loss): with a random
+    ``φ`` draw the spin-2 dipole/quadrupole signal lands at a different azimuth
+    every step, so the ``net_dip``/``net_quad`` gradient is azimuthally smeared and
+    high-variance — the SigmaX centring response is small and was being starved by
+    that noise.  Hitting the *same* e-directions every step gives a consistent,
+    low-variance finite-difference of the e-response.  Two non-zero magnitudes
+    (``e_max/2`` and ``e_max``, not just ``e_max``) sample the e-response *curvature*,
+    not only its slope.  ``log_scale`` stays random: it's the smooth spin-0 ``T``
+    magnitude the net interpolates well, and one random draw per stencil point keeps
+    its coverage.
 
     Parameters
     ----------
     key : jax.Array
-        JAX PRNG key (split into three sub-keys internally).
+        JAX PRNG key (only ``log_scale`` is random now).
     log_scale_range : tuple of float
         ``(min, max)`` for the uniform distribution over ``log_scale``.
     e_max : float
-        Maximum PSF ellipticity magnitude.
+        PSF ellipticity magnitude of the outer stencil ring (inner ring = e_max/2).
     n_sx : int
-        Number of condition vectors to sample.
+        Retained for call-site compatibility but no longer sets the e-count: the
+        stencil is a fixed 1 + 8 + 8 = 17 points.
 
     Returns
     -------
-    jax.Array, shape (n_sx, 3)
-        Sampled condition vectors ``[log_scale, e1, e2]``.
+    jax.Array, shape (17, 3)
+        Condition vectors ``[log_scale, e1, e2]``.
     """
-    k1, k2, k3 = jr.split(key, 3)
+    # Fixed e-stencil: centre e=0 plus 8-direction rings at |e| = e_max/2 and e_max.
+    # Same 8 azimuths every step (low-variance finite-difference); two non-zero
+    # magnitudes sample the e-response curvature, not just its slope.  The full 2φ
+    # circle spans ±e1, ±e2 (Z₂ e→−e covered by antipodal pairs).
+    n_dir = 8
+    e_mags = jnp.array([0.5 * e_max, e_max])  # inner + outer ring
+    two_phi = 2.0 * jnp.pi * jnp.arange(n_dir) / n_dir  # (8,)
+    ring_e1 = (e_mags[:, None] * jnp.cos(two_phi)[None, :]).reshape(-1)  # (16,)
+    ring_e2 = (e_mags[:, None] * jnp.sin(two_phi)[None, :]).reshape(-1)
+    e1 = jnp.concatenate([jnp.zeros(1), ring_e1])  # (17,)
+    e2 = jnp.concatenate([jnp.zeros(1), ring_e2])
+    # One random log_scale per stencil point.
     log_scale = jr.uniform(
-        k1, shape=(n_sx,), minval=log_scale_range[0], maxval=log_scale_range[1]
+        key, shape=(e1.shape[0],), minval=log_scale_range[0], maxval=log_scale_range[1]
     )
-    e_mag = jr.uniform(k2, shape=(n_sx,), minval=0.0, maxval=e_max)
-    phi = jr.uniform(k3, shape=(n_sx,), minval=0.0, maxval=jnp.pi)
-    e1 = e_mag * jnp.cos(2.0 * phi)
-    e2 = e_mag * jnp.sin(2.0 * phi)
-    return jnp.stack([log_scale, e1, e2], axis=-1)  # (n_sx, 3)
+    return jnp.stack([log_scale, e1, e2], axis=-1)  # (17, 3)
 
 
 def _sx_cond_to_CX(sx_cond: jax.Array) -> jax.Array:
@@ -580,7 +598,7 @@ def make_elbo_loss(
             [-sqrt2, sqrt2],
         ]
     )[jnp.newaxis, :, :]
-    g = jnp.concatenate([g0, 0.01 * g_grid], axis=1)  # (1, G, 2)
+    g = jnp.concatenate([g0, 0.01 * g_grid, 0.02 * g_grid], axis=1)  # (1, G, 2) centre + 2 rings
     G = g.shape[1]
     g2d = g.reshape(G, -1)  # (G, 2)
 
@@ -829,7 +847,7 @@ def make_nll_loss(
             [0.0, -1.0], [-sqrt2, -sqrt2], [-1.0, 0.0], [-sqrt2, sqrt2],
         ]
     )[jnp.newaxis, :, :]
-    g = jnp.concatenate([g0, 0.01 * g_grid], axis=1)  # (1, G, 2)
+    g = jnp.concatenate([g0, 0.01 * g_grid, 0.02 * g_grid], axis=1)  # (1, G, 2) centre + 2 rings
     G = g.shape[1]
     g2d = g.reshape(G, -1)  # (G, 2)
 
@@ -917,6 +935,7 @@ def build_flows(
     prior_sigmax_log_scale_mean: float = prior_sigmax_log_scale_mean,
     prior_sigmax_log_scale_std: float = prior_sigmax_log_scale_std,
     prior_size_loc_c1: float = prior_size_loc_c1,
+    raw2standard: Any = None,
     prior_e_max: float = e_max,
     q_flow_layers: int = q_flow_layers,
     q_nn_width: int = q_nn_width,
@@ -993,6 +1012,15 @@ def build_flows(
         Variational q flow conditioned on the moment + covariance features.
     """
     k1, k2 = jr.split(key)
+
+    # The SigmaX locked-size constant c1 MUST equal the standardiser's
+    # mean[1]/std[1] (Mr/Mf); see SigmaXCouplingLayer and config.prior_size_loc_c1.
+    # Derive it from the live standardiser so it can never go stale relative to the
+    # data the flow is trained on (the config value is only a legacy fallback for
+    # stats-less builds).  c1 is a *static* field, so a flow must be retrained if
+    # this value differs from what it was trained with.
+    if raw2standard is not None:
+        prior_size_loc_c1 = float(raw2standard.mean[1] / raw2standard.std[1])
 
     prior = new_masked_autoregressive_flow(
         k1,

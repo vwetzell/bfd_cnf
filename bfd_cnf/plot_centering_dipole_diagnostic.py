@@ -80,17 +80,24 @@ def parse_args() -> argparse.Namespace:
                    help="Max |g2| for the shear sweep (linear, so any small value works).")
     p.add_argument("--n-sweep", type=int, default=9,
                    help="Number of points in each parameter sweep.")
+    p.add_argument("--stats", type=str, default=None,
+                   help="Standardiser npz (pass the newtmpl stats for new-set flows).")
+    p.add_argument("--prior", type=str, default=None, help="Override prior flow path.")
+    p.add_argument("--q", type=str, default=None, help="Override q flow path.")
     return p.parse_args()
 
 
-def load_prior():
+def load_prior(prior_path=PRIOR_FLOW_PATH, q_path=Q_FLOW_PATH):
     """Load the trained prior flow (mirrors plot_shear_derivs_compare)."""
-    if not (os.path.exists(PRIOR_FLOW_PATH) and os.path.exists(Q_FLOW_PATH)):
+    if not (os.path.exists(prior_path) and os.path.exists(q_path)):
         raise FileNotFoundError(
-            f"Trained flow weights not found:\n  {PRIOR_FLOW_PATH}\n  {Q_FLOW_PATH}"
+            f"Trained flow weights not found:\n  {prior_path}\n  {q_path}"
         )
-    prior_flow, q_flow = build_flows(base_key, latent_dim=4, cond_dim=16)
-    prior_trained, _ = load_models(prior_flow, q_flow, PRIOR_FLOW_PATH, Q_FLOW_PATH)
+    from bfd_cnf.models.bijections import load_stats
+    prior_flow, q_flow = build_flows(
+        base_key, latent_dim=4, cond_dim=16, raw2standard=load_stats(prior_path)
+    )
+    prior_trained, _ = load_models(prior_flow, q_flow, prior_path, q_path)
     return prior_trained
 
 
@@ -159,9 +166,10 @@ def main() -> None:
     mrmf = args.mrmf
     ls = args.log_scale
 
-    mean, std = load_standardiser()
+    mean, std = load_standardiser(args.stats)
     print("Loading flow...")
-    prior_trained = load_prior()
+    from bfd_cnf.config import PRIOR_FLOW_PATH as _PP, Q_FLOW_PATH as _QP
+    prior_trained = load_prior(args.prior or _PP, args.q or _QP)
     prob_v = make_density_fn(prior_trained)
 
     m1, m2, m1_flat, m2_flat, x_std = build_grid(

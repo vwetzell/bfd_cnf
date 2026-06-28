@@ -52,8 +52,12 @@ prior_sigmax_log_scale_std: float = 2.0  # maps log_scale_range (10.5, 13.0) to 
 # z1 = (Mr/Mf - mean[1])/std[1].  Used by SigmaXCouplingLayer's locked size
 # transform z1' = κ·z1 + c1·(κ-1)  (≡ scaling the un-centred Mr/Mf by κ), which
 # turns the multiplicative size knob into the physical size *mean* shift.
-# Provenance: data/raw2standard_stats.npz (must match the standardiser the flow
-# is trained with).  Recompute if the standardiser changes.
+# Provenance: must equal mean[1]/std[1] of the standardiser the flow is trained
+# with (persisted per-flow as the sidecar <flow>.eqx.stats.npz).  build_flows now
+# DERIVES c1 from the live standardiser when one is passed (raw2standard=...), so
+# this constant is only a legacy fallback for stats-less builds — do NOT rely on it
+# for real training/inference.  Changing c1 changes the static architecture, so a
+# flow must be retrained if its c1 differs from what it was trained with.
 prior_size_loc_c1: float = 5.784213542938232
 
 q_nn_width = 32
@@ -63,8 +67,8 @@ q_flow_layers = 4
 min_scale = 1e-2
 max_scale = 100.0
 
-batch_size = 1024
-num_samples = 4
+batch_size = 2048
+num_samples = 8
 
 # Number of gradient steps fused into a single ``jax.lax.scan`` dispatch during
 # training.  The flows are many tiny kernels per step, so the training loop is
@@ -108,7 +112,7 @@ nda_clip_percentile: float | None = 99.9
 # Σ_X conditioning / training parameters
 # ---------------------------------------------------------------------------
 # Number of Σ_X conditions sampled per gradient step; losses are averaged.
-n_sx_train: int = 8
+n_sx_train: int = 5
 # Range of log_scale = 0.5*log det(C_X) (centroid noise) sampled uniformly each step.
 # Derived from the grid TARGETS' per-object centroid covariance C_X — the odd-moment
 # covariance built from each target's even cov via models.flows.even_cov_to_CX (NOT the
@@ -143,23 +147,12 @@ DATA_DIR = os.path.join(_REPO_ROOT, "data")
 # External input data (not in the repo). Override the directory on a new
 # machine (e.g. HPC) with BFD_DATA_DIR; falls back to the local workstation path.
 _EXT_DIR = os.environ.get("BFD_DATA_DIR", "/home/vwetzell/Documents/BFD_cNF")
-FITS_PATH = os.path.join(_EXT_DIR, "tmpl_t04_joined.fits")
-# Deep-field summary template library: one row per galaxy (1.37M), with no
-# sub-pixel-shifted copies.  Used as the observed-template source for diagnostic
-# corner plots so the shifted replicas in tmpl_t04_joined don't inflate density.
-SUMMARY_FITS_PATH = os.path.join(_EXT_DIR, "summary_templates_new.fits")
 # New template set, pre-joined into one lean training table by
 # bfd_cnf.build_training_table (columns already in trainer-native shapes:
 # moments(4), cov(4,4), dm_dg(4,2), d2m_dg2(4,2,2), centroid(2), nda, id).
 TRAIN_FITS_PATH = os.environ.get(
     "BFD_TRAIN_FITS", os.path.join(DATA_DIR, "templates_train.fits")
 )
-# Training template-set selector (see bfd_cnf.data.load_training_dataset):
-#   True  → the new pre-joined set (TRAIN_FITS_PATH via load_training_table)
-#   False → the legacy tmpl_t04 set (FITS_PATH via load_data)
-# Plot/inference scripts keep calling load_data directly so their raw2standard
-# still matches the currently-saved flow weights.
-train_on_new_templates: bool = True
 GRID_P_PATH = os.path.join(_EXT_DIR, "merged_masked_bfd_grid_p.npy")
 GRID_M_PATH = os.path.join(_EXT_DIR, "merged_masked_bfd_grid_m.npy")
 

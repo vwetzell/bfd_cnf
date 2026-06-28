@@ -5,8 +5,9 @@ Data loading from the BFD FITS template table, moment extraction,
 quality filtering, 2-D density histogram fitting in (log10 Mf, Mr/Mf) space,
 importance weighting / resampling, and standardisation utilities.
 
-The main entry point is ``load_data()``, which runs the full pipeline and
-returns all key data objects needed by the rest of the package.
+The main entry point is ``load_training_dataset()`` (a thin wrapper over
+``load_training_table()``), which runs the full pipeline and returns all key
+data objects needed by the rest of the package.
 """
 
 from __future__ import annotations
@@ -21,8 +22,6 @@ import jax.numpy as jnp
 from jax import random as jr
 
 from .config import (
-    FITS_PATH,
-    SUMMARY_FITS_PATH,
     TRAIN_FITS_PATH,
     key as _initial_key,
     template_flux_min,
@@ -227,9 +226,9 @@ def quality_cut_mask(moments: np.ndarray, cov: np.ndarray) -> np.ndarray:
     """Boolean mask of templates passing the moment + covariance quality cuts.
 
     Mirrors the moment- and covariance-level cuts applied inside
-    :func:`load_data` so that auxiliary loaders (e.g.
-    :func:`load_summary_moments`, used for diagnostic corner plots) select the
-    same template population.  Operates on raw moments ``[Mf, Mr, M1, M2]`` and
+    :func:`load_training_table` so that auxiliary loaders (e.g. the chunked
+    standardiser rebuild in ``backfill_stats``) select the same template
+    population.  Operates on raw moments ``[Mf, Mr, M1, M2]`` and
     their 4×4 covariance matrices, in numpy on the CPU.
 
     Parameters
@@ -280,244 +279,6 @@ def quality_cut_mask(moments: np.ndarray, cov: np.ndarray) -> np.ndarray:
     return good_moments & good_cov
 
 
-def load_summary_moments(fits_path: str = SUMMARY_FITS_PATH) -> np.ndarray:
-    """Load quality-cut raw moments from the deep-field summary-template table.
-
-    Reads ``summary_templates_new.fits`` — the 1.37M-galaxy deep-field template
-    library — and returns the raw moments ``[Mf, Mr, M1, M2]`` of the templates
-    that pass :func:`quality_cut_mask`.  Unlike ``tmpl_t04_joined.fits``, this
-    catalogue holds one row per template galaxy with no sub-pixel-shifted
-    copies, so it is the appropriate source for diagnostic corner plots of the
-    underlying moment distribution.
-
-    Parameters
-    ----------
-    fits_path : str, optional
-        Path to the summary-template FITS table.  Defaults to
-        ``config.SUMMARY_FITS_PATH``.
-
-    Returns
-    -------
-    np.ndarray, shape (N, 4)
-        Quality-cut raw template moments ``[Mf, Mr, M1, M2]`` (float64).
-    """
-    with fitsio.FITS(fits_path) as fits:
-        h = fits[1]
-        moments = h.read_column("moments")[:, :4].astype(np.float64)
-        cov = bfd.MomentCovariance.bulkUnpack(h.read_column("covariance"))[:, :4, :4]
-
-    return moments[quality_cut_mask(moments, cov)]
-
-
-# ---------------------------------------------------------------------------
-# Main data-loading pipeline
-# ---------------------------------------------------------------------------
-
-
-def load_data(
-    fits_path: str = FITS_PATH,
-    key: jax.Array | None = None,
-    subsample: int = 1,
-) -> dict[str, Any]:
-    """Load the BFD template table and run the full data-preparation pipeline.
-
-    Reads the FITS file, applies quality cuts on moments and derivatives,
-    fits a 2-D quadratic log-density in (log10 Mf, Mr/Mf) space, computes
-    importance weights for approximately flat coverage inside the selection
-    box, performs importance-weighted resampling, and builds the
-    :class:`~bfd_cnf.models.bijections.RawMomentStandardize` bijection.
-
-    Parameters
-    ----------
-    fits_path : str, optional
-        Path to the BFD FITS template table.  Defaults to ``config.FITS_PATH``.
-    key : jax.Array or None, optional
-        JAX PRNG key.  If ``None``, ``config.key`` is used.
-    subsample : int, optional
-        Keep roughly ``1/subsample`` of the templates chosen at random before
-        any quality cuts.  ``1`` (default) keeps all templates.
-
-    Returns
-    -------
-    dict
-        Dictionary with the following keys:
-
-        moments_jnp : jax.Array, shape (N, 4)
-            Filtered raw template moments ``[Mf, Mr, M1, M2]``.
-        centroid_moments_jnp : jax.Array, shape (N, 2)
-            True 1st-order centroid ("odd") moments ``[MX, MY]`` (cols 5,6 of the
-            on-disk 7-vector ``[M0, MR, M1, M2, MC, MX, MY]``) for each template
-            after quality filtering.  Used as ``data_X`` in the ELBO loss to compute
-            the per-object centroid likelihood weight ``log N(X_G; 0, C_X)``.
-            (Previously this erroneously held the 2nd-order ellipticity moments
-            ``moments_jnp[:, 2:]``.)
-        cov_jnp : jax.Array, shape (N, 4, 4)
-            Per-object moment covariance matrices.
-        dm_dg_jnp : jax.Array, shape (N, 4, 2)
-            First shear derivatives of the moments.
-        d2m_dg2_jnp : jax.Array, shape (N, 4, 2, 2)
-            Second shear derivatives of the moments.
-        weights : jax.Array, shape (N,)
-            Importance weights (sum to 1) for flat (log10 Mf, Mr/Mf) coverage.
-        resampled : np.ndarray, shape (N, 4)
-            Importance-resampled data in
-            ``[log10 Mf, Mr/Mf, M1/Mr, M2/Mr]`` coordinates.
-        x_lo, x_hi : float
-            Lower / upper bounds of the log10 Mf selection box.
-        y_lo, y_hi : float
-            Lower / upper bounds of the Mr/Mf selection box.
-        a0..a5 : float
-            Coefficients of the fitted quadratic log-density
-            ``log p ≈ a0 + a1 x + a2 y + a3 x² + a4 y² + a5 xy``.
-        data_mean : jax.Array, shape (4,)
-            Empirical mean of the transformed moments used for standardisation.
-        data_std : jax.Array, shape (4,)
-            Empirical std of the transformed moments used for standardisation.
-        raw2standard : RawMomentStandardize
-            Bijection from raw to standardised coordinates.
-        log_p_hat : callable
-            Fitted quadratic log-density function ``(x, y) -> float``.
-        key : jax.Array
-            Updated PRNG key.
-    """
-    if key is None:
-        key = _initial_key
-
-    # -------------------------------------------------------------------
-    # Memory-frugal column-by-column read.
-    #
-    # The table is ~18 GB (N≈44M rows) and most of its columns are unused.
-    # Reading the whole table with fitsio.read() and then casting every used
-    # column to float64 while the table is still alive peaks near ~38 GB.
-    # Instead we open the HDU and pull only the six columns we need one at a
-    # time, immediately reducing each to its final shape/dtype and freeing the
-    # raw column before reading the next.  The covariance is unpacked in chunks
-    # so the full (N, 5, 5) intermediate is never materialised.  This keeps the
-    # peak near ~17 GB while producing byte-identical arrays.
-    # -------------------------------------------------------------------
-    import gc as _gc
-
-    fits = fitsio.FITS(fits_path)
-    try:
-        h = fits[1]
-
-        # moments: (N, 7) f4 on disk = [M0, MR, M1, M2, MC, MX, MY] (5 evens + 2 odds,
-        # per bfd.moment.Moment).  Keep the first 4 evens [M0, MR, M1, M2] as the modelled
-        # moment vector, and the LAST two [MX, MY] (cols 5,6) as the true 1st-order
-        # centroid ("odd") moments used for the L(X|C_X) centroid weight.  NOTE: this is
-        # NOT moments[:, 2:4] (= the 2nd-order ellipticity moments M1, M2) — that earlier
-        # slice was a moment-order bug.
-        moments_full = h.read_column("moments")
-        moments = moments_full[:, :4].astype(np.float64)
-        centroid_moments = moments_full[:, 5:7].astype(np.float64)  # [MX, MY]
-        del moments_full
-        N_rows = moments.shape[0]
-
-        # covariance: packed (N, 15) f8 → unpack to (N, 4, 4) in chunks so the
-        # full (N, 5, 5) (~8.75 GB) intermediate is never materialised.
-        cov_pkgd = h.read_column("covariance")
-        cov = np.empty((N_rows, 4, 4), dtype=np.float64)
-        _CHUNK = 4_000_000
-        for _s in range(0, N_rows, _CHUNK):
-            _e = min(_s + _CHUNK, N_rows)
-            cov[_s:_e] = bfd.MomentCovariance.bulkUnpack(cov_pkgd[_s:_e])[:, :4, :4]
-        del cov_pkgd
-        _gc.collect()
-
-        # first shear derivatives → (N, 4, 2); read straight into the slots so
-        # no per-column float64 temporary survives.
-        dm_dg = np.empty((N_rows, 4, 2), dtype=np.float64)
-        dm_dg[..., 0] = h.read_column("moments_dg1")[:, :4]
-        dm_dg[..., 1] = h.read_column("moments_dg2")[:, :4]
-
-        # second shear derivatives → (N, 4, 2, 2), symmetric in the last two axes.
-        d2m_dg2 = np.empty((N_rows, 4, 2, 2), dtype=np.float64)
-        d2m_dg2[..., 0, 0] = h.read_column("moments_dg1_dg1")[:, :4]
-        _cross = h.read_column("moments_dg1_dg2")[:, :4]
-        d2m_dg2[..., 0, 1] = _cross
-        d2m_dg2[..., 1, 0] = _cross
-        del _cross
-        d2m_dg2[..., 1, 1] = h.read_column("moments_dg2_dg2")[:, :4]
-
-        # nda = sky_density × da, the BFD per-template area/density weight (the FITS
-        # `weight` column IS nda; see bfd/momenttable.py:608).  Used to match the
-        # traditional BFD integration `p = Σ nda·kernel` (bfd/probabilities_jax.py:236).
-        # Carried through every filter applied to the moments below so it stays aligned.
-        nda = h.read_column("weight").astype(np.float64)
-    finally:
-        fits.close()
-    _gc.collect()
-
-    # -------------------------------------------------------------------
-    # Optional subsampling (before quality cuts to maximise memory savings)
-    # -------------------------------------------------------------------
-    if subsample > 1:
-        key, subkey = jr.split(key)
-        n_total = moments.shape[0]
-        n_keep = max(1, n_total // subsample)
-        sub_idx = np.sort(
-            np.array(jr.choice(subkey, n_total, shape=(n_keep,), replace=False))
-        )
-        moments = moments[sub_idx]
-        centroid_moments = centroid_moments[sub_idx]
-        cov = cov[sub_idx]
-        dm_dg = dm_dg[sub_idx]
-        d2m_dg2 = d2m_dg2[sub_idx]
-        nda = nda[sub_idx]
-
-    # -------------------------------------------------------------------
-    # Quality cuts on moments + covariance
-    # -------------------------------------------------------------------
-    keep = quality_cut_mask(moments, cov)
-    moments = moments[keep]
-    centroid_moments = centroid_moments[keep]
-    cov = cov[keep]
-    dm_dg = dm_dg[keep]
-    d2m_dg2 = d2m_dg2[keep]
-    nda = nda[keep]
-
-    # -------------------------------------------------------------------
-    # Quality cuts on derivatives (in numpy — keep everything on CPU)
-    # -------------------------------------------------------------------
-    good_dm_dg = (dm_dg >= np.percentile(dm_dg, 0.01, axis=0)) & (
-        dm_dg <= np.percentile(dm_dg, 99.99, axis=0)
-    )
-    good_d2m_dg2 = (d2m_dg2 >= np.percentile(d2m_dg2, 0.01, axis=0)) & (
-        d2m_dg2 <= np.percentile(d2m_dg2, 99.99, axis=0)
-    )
-    good_derivs = np.all(good_dm_dg, axis=(1, 2)) & np.all(good_d2m_dg2, axis=(1, 2, 3))
-
-    moments = moments[good_derivs]
-    centroid_moments = centroid_moments[good_derivs]
-    cov = cov[good_derivs]
-    dm_dg = dm_dg[good_derivs]
-    d2m_dg2 = d2m_dg2[good_derivs]
-    nda = nda[good_derivs]
-
-    # -------------------------------------------------------------------
-    # Single GPU transfer — after all filtering is done
-    # -------------------------------------------------------------------
-    moments_jnp = jnp.array(moments)
-    centroid_moments_jnp = jnp.array(centroid_moments)
-    cov_jnp = jnp.array(cov)
-    nda_jnp = jnp.array(nda)
-    del moments, centroid_moments, cov, nda
-    dm_dg_jnp = jnp.array(dm_dg)
-    del dm_dg
-    d2m_dg2_jnp = jnp.array(d2m_dg2)
-    del d2m_dg2
-
-    return _finalize_dataset(
-        moments_jnp,
-        centroid_moments_jnp,
-        cov_jnp,
-        dm_dg_jnp,
-        d2m_dg2_jnp,
-        nda_jnp,
-        key,
-    )
-
-
 def _finalize_dataset(
     moments_jnp: jax.Array,
     centroid_moments_jnp: jax.Array,
@@ -540,7 +301,7 @@ def _finalize_dataset(
 
     Takes the already-filtered (quality- and derivative-cut) training arrays —
     identical in meaning regardless of which template file they came from — and
-    builds the dict returned by :func:`load_data` / :func:`load_training_table`.
+    builds the dict returned by :func:`load_training_table`.
     """
     # Import here to avoid circular imports
     from .models.bijections import RawMomentStandardize
@@ -758,11 +519,10 @@ def load_training_table(
     subsample: int = 1,
     weight_clip_percentile: float = 99.0,
 ) -> dict[str, Any]:
-    """Load the pre-joined new-template training table and run the same pipeline.
+    """Load the pre-joined training table and run the full pipeline.
 
-    Drop-in alternative to :func:`load_data` for the new template set.  The file
-    stores the RAW BFD layout, so (like :func:`load_data`) cov is bulkUnpacked and
-    the derivative vectors are sliced/reshaped to trainer-native shapes:
+    The file stores the RAW BFD layout, so cov is bulkUnpacked and the
+    derivative vectors are sliced/reshaped to trainer-native shapes:
 
         moments  (N, 5)      → keep [:, :4] = [Mf, Mr, M1, M2]
         cov      (N, 15)     packed → bulkUnpack → (N, 4, 4)
@@ -774,8 +534,8 @@ def load_training_table(
     The file is ~34 GB, so it is read in chunks and quality-cut per chunk (only
     survivors are kept in memory) rather than column-at-once.
 
-    Applies the identical quality- and derivative-cuts as :func:`load_data` and
-    returns the same dict (see :func:`load_data` for the key descriptions).
+    Applies the standard quality- and derivative-cuts and returns the dataset
+    dict assembled by :func:`_finalize_dataset` (see it for the key descriptions).
 
     Parameters
     ----------
@@ -841,7 +601,7 @@ def load_training_table(
     nda = np.concatenate(nda_l)
 
     # -------------------------------------------------------------------
-    # Quality cuts on derivatives (identical to load_data)
+    # Quality cuts on derivatives
     # -------------------------------------------------------------------
     good_dm_dg = (dm_dg >= np.percentile(dm_dg, 0.01, axis=0)) & (
         dm_dg <= np.percentile(dm_dg, 99.99, axis=0)
@@ -886,20 +646,13 @@ def load_training_dataset(
     subsample: int = 1,
     weight_clip_percentile: float = 99.0,
 ) -> dict[str, Any]:
-    """Load the configured training template set.
+    """Load the training template set (``TRAIN_FITS_PATH`` via :func:`load_training_table`).
 
-    Dispatches on ``config.train_on_new_templates``: the new pre-joined set via
-    :func:`load_training_table` (default), or the legacy tmpl_t04 set via
-    :func:`load_data`.  Both return the identical dict, so this is a transparent
-    swap for the training entry points (``train_from_scratch``, ``run``).
+    Thin wrapper kept as the stable entry point for the training scripts
+    (``train_from_scratch``, ``converge_train``, ``pretrain_prior``, ``run``).
     """
-    from .config import train_on_new_templates
-
-    if train_on_new_templates:
-        print(f"Training set: NEW pre-joined templates ({TRAIN_FITS_PATH})")
-        return load_training_table(
-            key=key, subsample=subsample,
-            weight_clip_percentile=weight_clip_percentile,
-        )
-    print(f"Training set: legacy tmpl_t04 ({FITS_PATH})")
-    return load_data(key=key, subsample=subsample)
+    print(f"Training set: {TRAIN_FITS_PATH}")
+    return load_training_table(
+        key=key, subsample=subsample,
+        weight_clip_percentile=weight_clip_percentile,
+    )

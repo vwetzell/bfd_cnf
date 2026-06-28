@@ -12,7 +12,7 @@ whose only unique column is the covariance (its derivs/moments are bit-identical
 the HDF5's).  Neither file alone is trainable: the HDF5 lacks cov, and the summary
 lacks the centroid (MX,MY) and nda the ELBO's L(X|C_X) centroid weighting and the
 nda weighting need.  This writes exactly the columns the trainer consumes
-(see bfd_cnf.training.train / bfd_cnf.data.load_data) plus the coadd id:
+(see bfd_cnf.data.load_training_table, which consumes them) plus the coadd id:
 
   id        i8            coadd id                                   (hdf5)
   moments   f4 (4,)       [Mf, Mr, M1, M2]            = derivs[0:4,0] (hdf5)

@@ -82,22 +82,17 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_standardiser(stats_file: str | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """Return the cached ``(mean, std)`` the prior flow was standardised with.
+def load_standardiser(
+    prior_path: str, override: str | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the ``(mean, std)`` the prior flow at ``prior_path`` was trained with.
 
-    ``stats_file`` defaults to the legacy ``STATS_FILE``; pass the new-template
-    npz when plotting a flow trained on the new set.
+    Prefers the flow's sidecar ``<prior_path>.stats.npz``; an explicit
+    ``override`` (``--stats``) must agree with it or this raises.
     """
-    stats_file = stats_file or STATS_FILE
-    if not os.path.exists(stats_file):
-        raise FileNotFoundError(
-            f"Cached standardiser stats not found at {stats_file}.\n"
-            "Generate them once with `bfd_cnf.integrate_grid.load_raw2standard()` "
-            "(it reads the FITS table and caches mean/std)."
-        )
-    d = np.load(stats_file)
-    print(f"Loaded standardiser stats from {stats_file}")
-    return np.asarray(d["mean"], np.float32), np.asarray(d["std"], np.float32)
+    from bfd_cnf.models.bijections import load_stats
+    r2s = load_stats(prior_path, override=override)
+    return np.asarray(r2s.mean, np.float32), np.asarray(r2s.std, np.float32)
 
 
 def compute_planes(prior_trained, mean, std, *, log10mf, mrmf, log_scale,
@@ -187,14 +182,14 @@ def main() -> None:
     log10mf = math.log10(args.mf) if args.mf is not None else args.log10mf
     mf_raw = 10.0**log10mf
 
-    mean, std = load_standardiser(args.stats)
-
     print("Loading flow...")
     prior_path = args.prior or PRIOR_FLOW_PATH
     q_path = args.q or Q_FLOW_PATH
+    mean, std = load_standardiser(prior_path, args.stats)
+
     if not (os.path.exists(prior_path) and os.path.exists(q_path)):
         raise FileNotFoundError(f"Trained flow weights not found:\n  {prior_path}\n  {q_path}")
-    prior_flow, q_flow = build_flows(base_key, latent_dim=4, cond_dim=16)
+    prior_flow, q_flow = build_flows(base_key, latent_dim=4, cond_dim=16, prior_size_loc_c1=float(mean[1] / std[1]))
     prior_trained, _ = load_models(prior_flow, q_flow, prior_path, q_path)
 
     # ── Evaluate every requested e2 slice first ─────────────────────────────────

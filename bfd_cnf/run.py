@@ -218,8 +218,9 @@ def main() -> None:
 
     jax.config.update("jax_debug_nans", False)
 
-    # Per-target Σ_X is built from the [M+, Mx] (index 2,3) sub-block of each
-    # target's moment covariance via cx_to_sx_cond; see inference.integrate_grid_pqr.
+    # Per-target Σ_X is built from each target's even-moment covariance via
+    # even_cov_to_CX (the exact odd-cov identity) → cx_to_sx_cond; it is NOT the
+    # [M1, M2] ellipticity sub-block.  See inference.integrate_grid_pqr.
     print("Running flow-based RQMC PQR on grid (+/- shear)...")
     key, k_int = jr.split(key)
     grid_res = integrate_grid_pqr(

@@ -38,7 +38,7 @@ from .config import (
     log_scale_range,
     n_sx_train,
 )
-from .data import load_data
+from .data import load_training_dataset
 from .models.flows import build_flows
 from .training import continue_training, load_models
 
@@ -78,13 +78,13 @@ def main() -> int:
 
     # ------------------------------------------------------------------ data
     print("Loading data (reads the FITS template table)...")
-    data = load_data(key=key)
+    data = load_training_dataset(key=key)
     key = data["key"]
 
     # ----------------------------------------------------- load checkpoints
     print("Building architecture and loading existing checkpoints...")
     key, k_build = jr.split(key)
-    prior_flow, q_flow = build_flows(k_build, latent_dim=4, cond_dim=16)
+    prior_flow, q_flow = build_flows(k_build, latent_dim=4, cond_dim=16, raw2standard=data["raw2standard"])
     prior_trained, q_trained = load_models(
         prior_flow, q_flow, PRIOR_FLOW_PATH, Q_FLOW_PATH
     )

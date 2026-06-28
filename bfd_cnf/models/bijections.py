@@ -15,9 +15,11 @@ _raw2std_jacobian_single_jax, propagate_cov_to_std_jax.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import Any, ClassVar
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.nn as jnn
@@ -368,6 +370,61 @@ class RawMomentStandardize(AbstractBijection):
         x, _ = self._inverse_transform(y)
         lad_fwd = self.transform_and_log_det(x)[1]
         return x, -lad_fwd
+
+
+# ---------------------------------------------------------------------------
+# Standardiser <-> flow provenance (sidecar)
+# ---------------------------------------------------------------------------
+# A flow .eqx is only valid with the exact (mean, std) it was trained with.
+# Coupling them by adjacency — <flow>.eqx.stats.npz next to the weights —
+# means you cannot grab the wrong stats, and a later FITS change cannot poison
+# them (they are frozen at train time). See data/raw2standard_stats*.npz for
+# the legacy uncoupled files this replaces.
+
+
+def stats_sidecar_path(flow_path: str) -> str:
+    """Path of the standardiser stats paired with ``flow_path`` by adjacency."""
+    return flow_path + ".stats.npz"
+
+
+def save_stats(flow_path: str, raw2standard: "RawMomentStandardize") -> str:
+    """Write the flow's standardiser ``(mean, std)`` to its sidecar."""
+    p = stats_sidecar_path(flow_path)
+    np.savez(p, mean=np.asarray(raw2standard.mean), std=np.asarray(raw2standard.std))
+    return p
+
+
+def load_stats(
+    flow_path: str, override: str | None = None, rtol: float = 1e-5
+) -> "RawMomentStandardize":
+    """Load the standardiser paired with ``flow_path``.
+
+    Prefers the sidecar ``<flow_path>.stats.npz`` written at train time.  If
+    ``override`` (an explicit ``--stats`` npz) is given it must agree with the
+    sidecar when one exists; a disagreement raises rather than silently warping
+    contours.  Raises if neither a sidecar nor an override is available.
+    """
+    side = stats_sidecar_path(flow_path)
+    have_side = os.path.exists(side)
+    if override is not None:
+        o = np.load(override)
+        if have_side:
+            s = np.load(side)
+            if not (np.allclose(o["mean"], s["mean"], rtol=rtol)
+                    and np.allclose(o["std"], s["std"], rtol=rtol)):
+                raise ValueError(
+                    f"--stats {override} disagrees with the flow's sidecar "
+                    f"{side}; they encode different standardisers, so the flow "
+                    "would be evaluated in the wrong coordinates."
+                )
+        return RawMomentStandardize(mean=jnp.asarray(o["mean"]), std=jnp.asarray(o["std"]))
+    if not have_side:
+        raise FileNotFoundError(
+            f"No standardiser sidecar {side} and no --stats override. "
+            "Backfill it with `python -m bfd_cnf.backfill_stats`."
+        )
+    s = np.load(side)
+    return RawMomentStandardize(mean=jnp.asarray(s["mean"]), std=jnp.asarray(s["std"]))
 
 
 # ---------------------------------------------------------------------------
@@ -859,6 +916,14 @@ class SigmaXCouplingLayer(AbstractBijection):
     size ``z1`` (where the small size-dependent corrections live).  Nets are
     zero-initialised, so the layer starts at the identity (a small perturbation).
 
+    Analytic C_X scaling: the leading marginalisation response is known in closed
+    form — the mean shifts ``s0, g_s, D`` are ``O(tr C_X)`` and the broadening ``c``
+    is ``O(tr C_X²)``.  We factor ``T_n ∝ exp(log_scale)`` (and ``T_n²``) out of the
+    coeff nets, so each net only learns the slowly-varying ``(flux, size)`` form
+    factor.  NOTE: factoring T out spreads the (already weak, ``|e|≤e_max``) dipole
+    gradient across ``log_scale`` and dropped its SNR — empirically it killed the
+    dipole at 550k steps unless paired with the fixed e-ring stencil below.
+
     ``log|det J| = −g_s + log(1 − c²|e|²)``.
 
     Parameters
@@ -940,23 +1005,31 @@ class SigmaXCouplingLayer(AbstractBijection):
         e_mag_sq = e1**2 + e2**2
         log_scale_n = (log_scale - self._log_scale_mean) / (self._log_scale_std + 1e-8)
         e_mag_sq_n = e_mag_sq / (self._e_mag_sq_scale + 1e-8)
-        return log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n
+        # T_n ∝ tr(C_X) = exp(log_scale)/exp(mean) (=1 at the reference log_scale_n=0).
+        # Leading C_X response is analytic: mean shifts (s0, g_s, D) are O(T), the
+        # anisotropic broadening (c) is O(T²).  Factoring these powers of T out of the
+        # coeff nets leaves them learning only the (flux,size) form factor.
+        # ponytail: dropped the 1/√(1−|e|²) factor in T (≤1.001 at e_max=0.05).
+        T_n = jnp.exp(self._log_scale_std * log_scale_n)
+        return log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n
 
-    def _coeffs(self, x0, x1, log_scale_n, e_mag_sq_n):
-        # flux shift s0 (C_X only); size log-scale g_s (flux + C_X, bounded);
-        # dipole D and quadrupole c (flux + size + C_X).
-        s0 = self.net_flux(jnp.array([log_scale_n, e_mag_sq_n]))[0]
+    def _coeffs(self, x0, x1, log_scale_n, e_mag_sq_n, T_n):
+        # Analytic C_X scaling factored out (s0,g_s,D ∝ T; c ∝ T²); nets learn the
+        # (flux,size) form factor only.  flux shift s0 (C_X only); size log-scale g_s
+        # (flux + C_X, bounded); dipole D and quadrupole c (flux + size + C_X).
+        s0 = T_n * self.net_flux(jnp.array([log_scale_n, e_mag_sq_n]))[0]
         g_s = self._g_s_max * jnn.tanh(
-            self.net_size(jnp.array([x0, log_scale_n, e_mag_sq_n]))[0]
+            T_n * self.net_size(jnp.array([x0, log_scale_n, e_mag_sq_n]))[0]
         )
         dq_in = jnp.array([x0, x1, log_scale_n, e_mag_sq_n])
-        D = self.net_dip(dq_in)[0]
-        c = jnn.tanh(self.net_quad(dq_in)[0])  # |c| < 1 ⇒ det(I+cE)=1-c²|e|² > 0
+        D = T_n * self.net_dip(dq_in)[0]
+        # |c| < 1 ⇒ det(I+cE)=1-c²|e|² > 0
+        c = jnn.tanh(T_n**2 * self.net_quad(dq_in)[0])
         return s0, g_s, D, c
 
     def transform_and_log_det(self, x, condition=None):
-        log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n = self._unpack(condition)
-        s0, g_s, D, c = self._coeffs(x[0], x[1], log_scale_n, e_mag_sq_n)
+        log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n = self._unpack(condition)
+        s0, g_s, D, c = self._coeffs(x[0], x[1], log_scale_n, e_mag_sq_n, T_n)
         kappa = jnp.exp(g_s)
         c1 = self._size_loc
 
@@ -974,21 +1047,22 @@ class SigmaXCouplingLayer(AbstractBijection):
         return jnp.stack([y0, y1, y2, y3]), log_det
 
     def inverse_and_log_det(self, y, condition=None):
-        log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n = self._unpack(condition)
+        log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n = self._unpack(condition)
 
+        # Same analytic T-scaling as the forward pass (see _coeffs).
         # s0, g_s depend only on the recoverable z0 (and z1 for D, c) ⇒ closed form.
-        s0 = self.net_flux(jnp.array([log_scale_n, e_mag_sq_n]))[0]
+        s0 = T_n * self.net_flux(jnp.array([log_scale_n, e_mag_sq_n]))[0]
         x0 = y[0] - s0
         g_s = self._g_s_max * jnn.tanh(
-            self.net_size(jnp.array([x0, log_scale_n, e_mag_sq_n]))[0]
+            T_n * self.net_size(jnp.array([x0, log_scale_n, e_mag_sq_n]))[0]
         )
         kappa = jnp.exp(g_s)
         c1 = self._size_loc
         x1 = (y[1] - c1 * (kappa - 1.0)) / kappa
 
         dq_in = jnp.array([x0, x1, log_scale_n, e_mag_sq_n])
-        D = self.net_dip(dq_in)[0]
-        c = jnn.tanh(self.net_quad(dq_in)[0])
+        D = T_n * self.net_dip(dq_in)[0]
+        c = jnn.tanh(T_n**2 * self.net_quad(dq_in)[0])
 
         # invert (y2,y3) = (1/κ)[(I+cE)(z2,z3) + D·e]  ⇒
         #   (z2,z3) = (I+cE)^{-1}[κ(y2,y3) − D·e],  (I+cE)^{-1} = (I−cE)/(1−c²|e|²)

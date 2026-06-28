@@ -30,7 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from bfd_cnf.config import PLOTS_DIR, key as base_key
-from bfd_cnf.data import load_data
+from bfd_cnf.data import load_training_dataset
 from bfd_cnf.models.flows import _batch_log_L_X
 from bfd_cnf.plot_centering_dipole_diagnostic import (
     build_grid,
@@ -48,8 +48,8 @@ E2S = np.linspace(0.0, 0.2, 9)
 
 
 def data_target_curve():
-    print("Loading data (28M templates)...")
-    data = load_data(key=base_key)
+    print("Loading data (templates_train)...")
+    data = load_training_dataset(key=base_key)
     M = np.asarray(data["moments_jnp"])
     X = np.asarray(data["centroid_moments_jnp"])
     log10mf = np.log10(M[:, 0])

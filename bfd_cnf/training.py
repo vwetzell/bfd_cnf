@@ -371,6 +371,7 @@ def train_model(
         sub,
         latent_dim=4,
         cond_dim=16,
+        raw2standard=raw2standard,
         prior_flow_layers=prior_flow_layers,
         prior_early_nn_width=prior_early_nn_width,
         prior_early_nn_depth=prior_early_nn_depth,
@@ -573,8 +574,7 @@ def continue_training(
 
     prior_trained, q_trained = model_tuple
 
-    eqx.tree_serialise_leaves(PRIOR_FLOW_PATH, prior_trained)
-    eqx.tree_serialise_leaves(Q_FLOW_PATH, q_trained)
+    save_models(prior_trained, q_trained, PRIOR_FLOW_PATH, Q_FLOW_PATH, raw2standard)
 
     return prior_trained, q_trained, losses
 
@@ -656,6 +656,7 @@ def save_models(
     q_trained: Any,
     prior_path: str = PRIOR_FLOW_PATH,
     q_path: str = Q_FLOW_PATH,
+    raw2standard: Any = None,
 ) -> None:
     """Serialise trained flow models to disk using equinox.
 
@@ -671,10 +672,19 @@ def save_models(
     q_path : str, optional
         Output path for the q flow weights.  Defaults to
         ``config.Q_FLOW_PATH``.
+    raw2standard : RawMomentStandardize, optional
+        The standardiser the flow was trained with.  When given, its
+        ``(mean, std)`` are written to a sidecar next to each flow
+        (``<path>.stats.npz``) so inference/plot tools load the matching
+        standardiser by adjacency.  Strongly recommended.
     """
     # Save the trained models
     eqx.tree_serialise_leaves(prior_path, prior_trained)
     eqx.tree_serialise_leaves(q_path, q_trained)
+    if raw2standard is not None:
+        from .models.bijections import save_stats
+        save_stats(prior_path, raw2standard)
+        save_stats(q_path, raw2standard)
 
 
 def load_models(
@@ -769,6 +779,7 @@ def load_or_train(
         sub,
         latent_dim=4,
         cond_dim=16,
+        raw2standard=raw2standard,
         prior_flow_layers=prior_flow_layers,
         prior_early_nn_width=prior_early_nn_width,
         prior_early_nn_depth=prior_early_nn_depth,
@@ -802,5 +813,5 @@ def load_or_train(
             raw2standard,
             **train_kwargs,
         )
-        save_models(prior_trained, q_trained, prior_path, q_path)
+        save_models(prior_trained, q_trained, prior_path, q_path, raw2standard)
         return prior_trained, q_trained, losses

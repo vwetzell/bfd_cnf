@@ -33,10 +33,14 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 from .config import PLOTS_DIR
 
 DELTA_G = 0.04
+STELLAR = 3.976167  # Mr/Mf stellar locus reference (matches plot_corner.py)
+BOX_MF = (1500.0, 90000.0)  # green selection box flux bounds
+BOX_MRMF = (2.2, 3.5)  # green selection box Mr/Mf bounds
 
 
 def _g_from_pqr(pqr: np.ndarray) -> np.ndarray:
@@ -92,6 +96,10 @@ def main() -> None:
                     help="Size axis: Mr/Mf (default, filled band) or log10 Mr.")
     ap.add_argument("--nboot", type=int, default=50,
                     help="Bootstrap resamples per cell for the m error σ (default 50).")
+    ap.add_argument("--mf-lim", type=float, nargs=2, default=(1000.0, 150000.0),
+                    help="x-axis Mf range (linear; default 1000 150000).")
+    ap.add_argument("--y-lim", type=float, nargs=2, default=(2.0, 4.1),
+                    help="y-axis Mr/Mf range (default 2.0 4.1; mr_mf only).")
     args = ap.parse_args()
 
     d = np.load(args.inp)
@@ -138,10 +146,12 @@ def main() -> None:
         return float(np.nanstd(ms))
 
     if args.yaxis == "mr_mf":
-        ylo, yhi = max(y_all.min(), 1.5), min(y_all.max(), 5.0)
+        xlo, xhi = np.log10(args.mf_lim[0]), np.log10(args.mf_lim[1])
+        ylo, yhi = args.y_lim
     else:
+        xlo, xhi = x_all.min(), x_all.max()
         ylo, yhi = y_all.min(), y_all.max()
-    extent = (x_all.min(), x_all.max(), ylo, yhi)
+    extent = (xlo, xhi, ylo, yhi)
     hexkw = dict(gridsize=args.gridsize, extent=extent)
 
     fig, ax = plt.subplots(1, 3, figsize=(23, 6.6))
@@ -186,17 +196,22 @@ def main() -> None:
     print(f"per-cell σ: median={np.nanmedian(s_vals):.4f}; "
           f"|m/σ|>2 in {100*np.mean(np.abs(zfin) > 2):.1f}% of cells")
 
-    # Mr/Mf selection band (2.2-3.5): horizontal in the Mr/Mf plane, diagonal in
-    # the log10 Mr plane.
+    # Selection box (green) + stellar locus (red), matching plot_corner.py.
     xline = np.array(extent[:2])
+    bx0, bx1 = np.log10(BOX_MF[0]), np.log10(BOX_MF[1])
     for a in ax:
         a.set_xlabel(r"$\log_{10} M_f$  (flux)", fontsize=13)
         a.set_ylabel(ylabel, fontsize=13)
-        for r in (2.2, 3.5):
-            if args.yaxis == "mr_mf":
-                a.axhline(r, color="green", ls="--", lw=1)
-            else:
-                a.plot(xline, xline + np.log10(r), color="green", ls="--", lw=1)
+        if args.yaxis == "mr_mf":
+            a.add_patch(mpatches.Rectangle(
+                (bx0, BOX_MRMF[0]), bx1 - bx0, BOX_MRMF[1] - BOX_MRMF[0],
+                lw=1.3, edgecolor="tab:green", facecolor="none", zorder=100))
+            a.axhline(STELLAR, color="tab:red", lw=1.3, zorder=100)
+        else:
+            for r in BOX_MRMF:
+                a.plot(xline, xline + np.log10(r), color="tab:green", ls="--", lw=1)
+            a.plot(xline, xline + np.log10(STELLAR), color="tab:red", lw=1)
+        a.set_xlim(extent[0], extent[1])
         a.set_ylim(extent[2], extent[3])
 
     fig.tight_layout()

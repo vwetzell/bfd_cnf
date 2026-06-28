@@ -106,6 +106,12 @@ def main() -> int:
             data["weights"],
             data["raw2standard"],
             nda=data["nda"],
+            # The importance-subsampled template_train.fits stores Horvitz-Thompson
+            # weights (nda/p); its heavy top tail IS the correction for the
+            # down-weighted far-MX/MY copies, so it must NOT be clipped (the config
+            # default 99.9 would truncate it and reintroduce the MX/MY bias).
+            # See dev/subsample.py. Drop this override if training the raw (non-subsampled) table.
+            nda_clip_percentile=None,
             steps=args.steps,
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
@@ -138,7 +144,8 @@ def main() -> int:
     if args.no_save:
         print("--no-save set; not writing weights.")
     else:
-        save_models(prior_trained, q_trained, PRIOR_FLOW_PATH, Q_FLOW_PATH)
+        save_models(prior_trained, q_trained, PRIOR_FLOW_PATH, Q_FLOW_PATH,
+                    data["raw2standard"])
         print(f"Saved weights to:\n  {PRIOR_FLOW_PATH}\n  {Q_FLOW_PATH}")
 
     return 0
