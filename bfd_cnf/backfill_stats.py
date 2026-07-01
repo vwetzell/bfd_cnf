@@ -11,9 +11,9 @@ fit + resampling are irrelevant to mean/std and OOM on a low-RAM box).  The
 derivative tail-cuts are skipped: they trim ~0.02%/dim and move mean/std by
 <1e-3 (the table is stable to <1e-3 on a 10M-row sample).
 
-Provenance report: prints the rebuilt ``c1 = mean[1]/std[1]`` next to
-``config.prior_size_loc_c1`` (the size constant baked into the flow architecture)
-and next to ``--reference`` (the npz the flow was last known to match).  A
+Provenance report: prints the rebuilt ``c1 = mean[1]/std[1]`` (the size constant
+baked into the flow architecture, derived per-run from the standardiser) next to
+``--reference`` (the npz the flow was last known to match).  A
 mismatch with the reference means the template table changed since the flow was
 trained, so the rebuilt stats would warp this flow — heed the warning.
 
@@ -33,7 +33,7 @@ import fitsio
 import numpy as np
 
 from .config import (
-    DATA_DIR, PRIOR_FLOW_PATH, Q_FLOW_PATH, TRAIN_FITS_PATH, prior_size_loc_c1,
+    DATA_DIR, PRIOR_FLOW_PATH, Q_FLOW_PATH, TRAIN_FITS_PATH,
 )
 from .data import quality_cut_mask
 from .models.bijections import RawMomentStandardize, save_stats
@@ -98,7 +98,7 @@ def main() -> int:
     mean, std = np.asarray(r2s.mean), np.asarray(r2s.std)
     c1 = float(mean[1] / std[1])
     print(f"\n  rebuilt mean={np.round(mean, 5)} std={np.round(std, 5)}")
-    print(f"  rebuilt c1 = {c1:.6f}   config.prior_size_loc_c1 = {prior_size_loc_c1:.6f}")
+    print(f"  rebuilt c1 = mean[1]/std[1] = {c1:.6f}  (derived per-run; saved in the sidecar)")
 
     matches_ref = None
     if os.path.exists(args.reference):

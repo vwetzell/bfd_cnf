@@ -48,18 +48,6 @@ import math as _math
 prior_sigmax_log_scale_mean: float = 2.0 * _math.log(400.0)  # ≈ 11.98 (log_scale_n=0 at reference)
 prior_sigmax_log_scale_std: float = 2.0  # maps log_scale_range (10.5, 13.0) to ~[-0.74, 0.51]
 
-# Standardised-coordinate offset of the size ratio, c1 = mean[1]/std[1] for
-# z1 = (Mr/Mf - mean[1])/std[1].  Used by SigmaXCouplingLayer's locked size
-# transform z1' = κ·z1 + c1·(κ-1)  (≡ scaling the un-centred Mr/Mf by κ), which
-# turns the multiplicative size knob into the physical size *mean* shift.
-# Provenance: must equal mean[1]/std[1] of the standardiser the flow is trained
-# with (persisted per-flow as the sidecar <flow>.eqx.stats.npz).  build_flows now
-# DERIVES c1 from the live standardiser when one is passed (raw2standard=...), so
-# this constant is only a legacy fallback for stats-less builds — do NOT rely on it
-# for real training/inference.  Changing c1 changes the static architecture, so a
-# flow must be retrained if its c1 differs from what it was trained with.
-prior_size_loc_c1: float = 5.784213542938232
-
 q_nn_width = 32
 q_nn_depth = 2
 q_flow_layers = 4
@@ -76,7 +64,7 @@ num_samples = 8
 # per-step host round-trip (≈1.7x faster, GPU SM 97%→100%, identical math).
 # Set to 1 to fall back to the eager per-step loop (needed for jax_debug_nans,
 # which cannot localise a NaN inside a scan).
-train_chunk_size = 50
+train_chunk_size = 100
 
 # ---------------------------------------------------------------------------
 # Selection / flux threshold

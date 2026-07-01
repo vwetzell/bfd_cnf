@@ -38,7 +38,6 @@ from ..config import (
     prior_sigmax_nn_depth,
     prior_sigmax_log_scale_mean,
     prior_sigmax_log_scale_std,
-    prior_size_loc_c1,
     prior_flow_layers,
     q_nn_width,
     q_nn_depth,
@@ -878,7 +877,7 @@ def build_flows(
     prior_sigmax_nn_depth: int = prior_sigmax_nn_depth,
     prior_sigmax_log_scale_mean: float = prior_sigmax_log_scale_mean,
     prior_sigmax_log_scale_std: float = prior_sigmax_log_scale_std,
-    prior_size_loc_c1: float = prior_size_loc_c1,
+    prior_size_loc_c1: float | None = None,
     raw2standard: Any = None,
     prior_e_max: float = e_max,
     q_flow_layers: int = q_flow_layers,
@@ -957,14 +956,18 @@ def build_flows(
     """
     k1, k2 = jr.split(key)
 
-    # The SigmaX locked-size constant c1 MUST equal the standardiser's
-    # mean[1]/std[1] (Mr/Mf); see SigmaXCouplingLayer and config.prior_size_loc_c1.
-    # Derive it from the live standardiser so it can never go stale relative to the
-    # data the flow is trained on (the config value is only a legacy fallback for
-    # stats-less builds).  c1 is a *static* field, so a flow must be retrained if
-    # this value differs from what it was trained with.
+    # The SigmaX locked-size constant c1 MUST equal the standardiser's mean[1]/std[1]
+    # (Mr/Mf); see SigmaXCouplingLayer.  Always DERIVE it from the live standardiser so
+    # it is recomputed per training run and travels with the flow via the sidecar stats
+    # (<flow>.eqx.stats.npz), never a hardcoded constant.  c1 is a *static* field, so a
+    # flow must be retrained if this value differs from what it was trained with.
     if raw2standard is not None:
         prior_size_loc_c1 = float(raw2standard.mean[1] / raw2standard.std[1])
+    elif prior_size_loc_c1 is None:
+        raise ValueError(
+            "build_flows needs raw2standard to derive the SigmaX size constant "
+            "c1 = mean[1]/std[1] (or pass prior_size_loc_c1 explicitly)."
+        )
 
     prior = new_masked_autoregressive_flow(
         k1,
