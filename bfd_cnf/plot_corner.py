@@ -1,12 +1,14 @@
 """
 Corner plot of the template moment distribution vs. the trained prior flow.
 
-One pipeline, two template sources (``--source``), both reading ``templates_train.fits``
-— the file the flow actually trains on:
+One pipeline, two template sources (``--source``), both from
+``load_training_dataset`` — the exact set the flow trains on:
 
-  train    ``templates_train.fits`` (~34 GB), streamed and detj × nda weighted.
+  train    the EXACT training population (quality + derivative cuts, selection box),
+           nda·N(X|C_X) weighted — NO per-copy detj, matching the nll Σ_X loss the
+           flow was trained on.
   draw     1M templates drawn EXACTLY as training selects batches (``ds["weights"]``),
-           optionally × detj × nda. Data-only by default (the distribution the loss sees).
+           optionally × nda. Data-only by default (the distribution the loss sees).
 
 Shared across sources: g=0, e=0 flow sampling at ``--log-scale``; the
 [log10 Mf, Mr/Mf, M1/Mr, M2/Mr] coordinates; count equalisation; and the
@@ -14,8 +16,8 @@ selection-box (green) + stellar-locus (red) overlays.
 
 Pure load — never trains. Examples::
 
-    python -m bfd_cnf.plot_corner --source train --mf-cut 800
-    python -m bfd_cnf.plot_corner --source draw --detj-nda-weight
+    python -m bfd_cnf.plot_corner --source train --log-scale 11.94
+    python -m bfd_cnf.plot_corner --source draw
 """
 
 import argparse
@@ -68,44 +70,28 @@ def resample(m, w, n, label):
 # ── Source loaders: each returns (raw_moments (N,4), weights (N,) or None, label) ──
 
 def load_train(args):
-    import fitsio
-    h = fitsio.FITS(args.file)[1]
-    N = h.get_nrows()
-    keep_frac = min(1.0, args.n_sub / (N * 0.92))  # ~92% pass mf>800
-    rng = np.random.default_rng(0)
-    m_keep, nda_keep, x_keep, n_read = [], [], [], 0
-    for s in range(0, N, args.chunk):
-        rows = np.arange(s, min(s + args.chunk, N))
-        blk = h.read(rows=rows, columns=["moments", "nda", "centroid"])
-        m, nda = blk["moments"][:, :4].astype(np.float64), blk["nda"].astype(np.float64)
-        x = blk["centroid"][:, :2].astype(np.float64)  # [MX, MY] true centroid moments
-        sel = (m[:, 0] > args.mf_cut) & np.all(np.isfinite(m), axis=1) & (nda > 0)
-        sel &= rng.random(len(m)) < keep_frac
-        m_keep.append(m[sel]); nda_keep.append(nda[sel]); x_keep.append(x[sel])
-        n_read += len(rows)
-        print(f"  {n_read:,}/{N:,} read, {sum(len(x) for x in m_keep):,} kept", end="\r")
-    print()
-    m = np.concatenate(m_keep); nda = np.concatenate(nda_keep); X = np.concatenate(x_keep)
-    detj = 0.25 * (m[:, 1] ** 2 - m[:, 2] ** 2 - m[:, 3] ** 2)
-    good = detj > 0
-    # Per-copy ELBO weight nda·detj·N(X|C_X), C_X isotropic at the reference scale:
-    # var_xy = exp(0.5·logdet C_X) = exp(args._log_scale) (e=0), matching flows._log_L_X.
+    # Blue = the EXACT training population via load_training_dataset (same quality +
+    # derivative cuts the flow saw), weighted by the per-copy objective weight
+    # nda·N(X|C_X) — the ONLY weights the loss uses (BFD template weight nda, already
+    # HT-corrected; and the centroid marginalisation L).  No per-copy detj, no box;
+    # C_X isotropic at var_xy = exp(args._log_scale) (e=0), matching flows._log_L_X.
+    from bfd_cnf.data import load_training_dataset
+    ds = load_training_dataset()
+    m = np.asarray(ds["moments_jnp"], dtype=np.float64)                  # (N,4) post cuts
+    X = np.asarray(ds["centroid_moments_jnp"], dtype=np.float64)[:, :2]  # [MX,MY] at g=0
+    nda = np.asarray(ds["nda"], dtype=np.float64)                        # BFD template weight (HT)
     var_xy = float(np.exp(args._log_scale))
     L_X = np.exp(-0.5 * (X[:, 0] ** 2 + X[:, 1] ** 2) / var_xy)
-    w = nda[good] * detj[good] * L_X[good]
-    return m[good], w, f"Templates (Mf>{args.mf_cut:g}, nda·detj·N(X|C_X))"
+    return m, nda * L_X, "Templates (training cuts, nda·N(X|C_X))"
 
 
 def load_draw(args):
+    # ds["weights"] is now the batch-sampling proposal ∝ nda (the loss samples ∝ this).
     from bfd_cnf.data import load_training_dataset
     ds = load_training_dataset()
     m = np.asarray(ds["moments_jnp"], dtype=np.float64)
-    w = np.asarray(ds["weights"], dtype=np.float64)  # training selection distribution
-    if args.detj_nda_weight:
-        detj = np.clip(0.25 * (m[:, 1] ** 2 - m[:, 2] ** 2 - m[:, 3] ** 2), 0.0, None)
-        w = w * detj * np.asarray(ds["nda"], dtype=np.float64)
-        return m, w, "training draw × detj×nda"
-    return m, w, "training draw"
+    w = np.asarray(ds["weights"], dtype=np.float64)  # ∝ nda (batch-sampling proposal)
+    return m, w, "training draw (∝ nda)"
 
 
 LOADERS = {"train": load_train, "draw": load_draw}
@@ -191,14 +177,6 @@ def main():
     ap.add_argument("--no-flow", action="store_true", help="data cloud only, no flow overlay.")
     ap.add_argument("--no-overlay", action="store_true",
                     help="skip selection-box + stellar-locus reference lines.")
-    # train
-    ap.add_argument("--file", default="data/templates_train.fits", help="[train] templates_train.fits")
-    ap.add_argument("--mf-cut", type=float, default=800.0, help="[train] keep Mf > this")
-    ap.add_argument("--n-sub", type=int, default=3_000_000, help="[train] survivors before weighting")
-    ap.add_argument("--chunk", type=int, default=5_000_000, help="[train] stream chunk size")
-    # draw
-    ap.add_argument("--detj-nda-weight", action="store_true",
-                    help="[draw] weight drawn templates by detj×nda (the per-copy ELBO weight)")
     args = ap.parse_args()
 
     # draw is a data-only diagnostic by default (no flow, no selection overlay).

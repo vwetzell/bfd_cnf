@@ -145,9 +145,7 @@ def main() -> int:
     nll = make_nll_loss(
         N=N,
         batch_size=batch_size,
-        weights=jnp.asarray(weights_np),
-        nda=(jnp.asarray(nda) if use_nda_weight else None),
-        nda_clip_percentile=nda_clip_percentile,
+        weights=(jnp.asarray(weights_np) if use_nda_weight else None),
         log_scale_range=log_scale_range,
         e_max=e_max,
         n_sx_train=n_sx_train,

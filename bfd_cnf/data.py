@@ -327,145 +327,22 @@ def _finalize_dataset(
     ).T[resampled_idx]
 
     # -------------------------------------------------------------------
-    # 2-D density histogram fitting in (log10 Mf, Mr/Mf) space
+    # Batch-sampling proposal = the BFD template weight nda.
     # -------------------------------------------------------------------
-    # --- Rectangle bounds ---
-    x_lo, x_hi = jnp.log10(template_flux_min), jnp.log10(500000)  # log10 Mf
+    # The FITS `nda` column is already the Horvitz-Thompson weight nda_orig/p for our
+    # importance subsample (momentcalc.py:556 sets nda=sky_density·da; dev/subsample.py
+    # stores nda_orig/p).  Sampling the training batch ∝ nda makes the proposal match
+    # the loss objective's static part, so the ONLY residual per-copy weight in the loss
+    # is the BFD centroid marginalisation L(X|C_X) (see make_nll_loss / make_elbo_loss).
+    # No density-flattening 1/p̂ proposal, no per-copy detj, no clip: those were
+    # unrequired variance machinery whose 1/p̂ proposal anti-correlated with the nda·L
+    # objective (<1% per-batch ESS) and biased the finite-batch SNIS toward high flux.
+    nda_f = jnp.asarray(nda_jnp)
+    weights = nda_f / jnp.maximum(jnp.mean(nda_f), jnp.finfo(jnp.float32).tiny)
+
+    # Population bounds kept only as optional viz overlay hints (no longer gate training).
+    x_lo, x_hi = float(jnp.log10(template_flux_min)), float(jnp.log10(500000))  # log10 Mf
     y_lo, y_hi = 0.5, 9.0  # Mr/Mf
-
-    x = resampled[:, 0]
-    y = resampled[:, 1]
-
-    mask = (x >= x_lo) & (x <= x_hi) & (y >= y_lo) & (y <= y_hi)
-
-    # --- Compute detj*nda weights for the polynomial density fit.
-    # detj = 0.25*(MR^2 - M1^2 - M2^2) is the centroid-integral Jacobian.
-    # Fitting p_hat to the detj*nda-weighted density (rather than the raw count
-    # density) calibrates the batch sampler so that the SNIS correction is
-    # proportional to the actual per-template contribution to the ELBO.
-    _mr = np.array(moments_jnp[:, 1])
-    _m1 = np.array(moments_jnp[:, 2])
-    _m2 = np.array(moments_jnp[:, 3])
-    _detj_nda = np.maximum(0.25 * (_mr**2 - _m1**2 - _m2**2), 0.0) * np.array(nda_jnp)
-
-    x_all_np = np.log10(np.array(moments_jnp[:, 0]))
-    y_all_np = _mr / np.array(moments_jnp[:, 0])
-    mask_all = (
-        (x_all_np >= float(x_lo))
-        & (x_all_np <= float(x_hi))
-        & (y_all_np >= y_lo)
-        & (y_all_np <= y_hi)
-    )
-    x_box = x_all_np[mask_all]
-    y_box = y_all_np[mask_all]
-    w_hist = _detj_nda[mask_all]
-
-    # --- Build 2D histogram of detj*nda-weighted log-density inside the box ---
-    n_bins = 40
-    counts, x_edges, y_edges = np.histogram2d(
-        x_box, y_box, bins=n_bins, weights=w_hist, density=True
-    )
-
-    x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
-    y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
-    XX, YY = np.meshgrid(x_centers, y_centers, indexing="ij")
-
-    # Flatten and mask out empty bins
-    flat_counts = counts.ravel()
-    valid = flat_counts > 0
-    log_p = np.log(flat_counts[valid])
-    X_flat = XX.ravel()[valid]
-    Y_flat = YY.ravel()[valid]
-
-    # --- Design matrix for quadratic: [1, x, y, x^2, y^2, x*y] ---
-    def design_matrix(x, y):
-        return np.column_stack(
-            [
-                np.ones_like(x),  # a0 (intercept)
-                x,  # a1
-                y,  # a2
-                x**2,  # a3
-                y**2,  # a4
-                x * y,  # a5  <-- correlation term
-            ]
-        )
-
-    A = design_matrix(X_flat, Y_flat)
-
-    # --- Weighted least squares (weight by counts for stability) ---
-    W = np.diag(flat_counts[valid])
-    coeffs, _, _, _ = np.linalg.lstsq(A.T @ W @ A, A.T @ W @ log_p, rcond=None)
-    a0, a1, a2, a3, a4, a5 = coeffs
-
-    print(
-        "Fitted log p(x,y) = "
-        f"{a0:.3f} + {a1:.3f}x + {a2:.3f}y "
-        f"+ {a3:.3f}x^2 + {a4:.3f}y^2 + {a5:.3f}xy"
-    )
-
-    # --- Evaluate fitted log-density at all sample points ---
-    def log_p_hat(x, y):
-        """Quadratic approximation to log p(x,y) inside the box."""
-        return a0 + a1 * x + a2 * y + a3 * x**2 + a4 * y**2 + a5 * x * y
-
-    # --- Weights = 1/p_hat (inside box only) ---
-    log_w = -log_p_hat(x, y)
-    log_w -= log_w[mask].max()  # numerical stability: normalize in log space
-    w = np.exp(log_w)
-    w[~mask] = 0.0  # zero weight outside box
-
-    # --- Clip to control variance (weight_clip_percentile; >=100 disables) ---
-    if weight_clip_percentile < 100.0:
-        clip_val = np.percentile(w[mask], weight_clip_percentile)
-        w = np.minimum(w, clip_val)
-    w /= w.sum()
-
-    # --- Diagnostics ---
-    n_eff = 1.0 / np.sum(w[mask] ** 2) / mask.sum()
-    print(f"ESS fraction inside box: {n_eff:.3f}  (weight clip pct = {weight_clip_percentile})")
-
-    # -------------------------------------------------------------------
-    # Importance-weighted resampling
-    # -------------------------------------------------------------------
-    key, subkey = jr.split(key)
-    resampled_idx = jr.choice(
-        subkey,
-        np.arange(resampled.shape[0]),
-        shape=(resampled.shape[0],),
-        replace=True,
-        p=w,
-    )
-
-    resampled = np.array(
-        [
-            resampled[:, 0],
-            resampled[:, 1],
-            resampled[:, 2],
-            resampled[:, 3],
-        ]
-    ).T[resampled_idx]
-
-    # -------------------------------------------------------------------
-    # Re-compute weights for training (on the full moments_jnp array)
-    # -------------------------------------------------------------------
-    x_full = jnp.log10(moments_jnp[:, 0])
-    y_full = moments_jnp[:, 1] / moments_jnp[:, 0]
-
-    mask_full = (
-        (x_full >= x_lo) & (x_full <= x_hi) & (y_full >= y_lo) & (y_full <= y_hi)
-    )
-
-    log_w_full = -log_p_hat(x_full, y_full)
-    log_w_full -= log_w_full[mask_full].max()
-    w_full = jnp.exp(log_w_full)
-    w_full = w_full.at[~mask_full].set(0.0)
-
-    if weight_clip_percentile < 100.0:
-        clip_val_full = jnp.percentile(w_full[mask_full], weight_clip_percentile)
-        w_full = jnp.minimum(w_full, clip_val_full)
-    w_full /= w_full.sum()
-
-    weights = jnp.asarray(w_full)
 
     # -------------------------------------------------------------------
     # Standardisation bijection
@@ -499,17 +376,10 @@ def _finalize_dataset(
         x_hi=x_hi,
         y_lo=y_lo,
         y_hi=y_hi,
-        a0=a0,
-        a1=a1,
-        a2=a2,
-        a3=a3,
-        a4=a4,
-        a5=a5,
         data_mean=data_mean,
         data_std=data_std,
         raw2standard=raw2standard,
         key=key,
-        log_p_hat=log_p_hat,
     )
 
 
@@ -561,6 +431,10 @@ def load_training_table(
     fits = fitsio.FITS(fits_path)
     try:
         h = fits[1]
+        # HT-importance subsample (dev/subsample.py) stores nda as the Horvitz-Thompson
+        # weight nda/p; its heavy tail IS the correction, so it must NOT be nda-clipped.
+        # Surfaced as nda_is_ht so trainers can refuse to clip it (see converge_train).
+        nda_is_ht = str(h.read_header().get("SUBSAMP", "")).strip().upper().startswith("HT")
         n_total = h.get_nrows()
         for s in range(0, n_total, _CHUNK):
             e = min(s + _CHUNK, n_total)
@@ -577,13 +451,18 @@ def load_training_table(
             raw_dm = blk["dm_dg"][keep].astype(np.float64)              # (n,2,7)
             raw_d2 = blk["d2m_dg2"][keep].astype(np.float64)           # (n,3,7)
             n_keep = int(keep.sum())
-            dm = np.stack([raw_dm[:, 0, :4], raw_dm[:, 1, :4]], axis=-1)  # (n,4,2)
-            d2 = np.empty((n_keep, 4, 2, 2), np.float64)
-            d2[..., 0, 0] = raw_d2[:, 0, :4]
-            cross = raw_d2[:, 1, :4]
+            # Keep even moments [Mf,Mr,M1,M2] AND the odd centroid pair [MX,MY]
+            # (raw indices 5,6) so the loss can shear the centroid weight L(X|C_X)
+            # with g — the BFD centroid shear response (probabilities_jax.py:197,238
+            # use all 7 moments).  Drop Mc (index 4).  Layout: (n,6,2) = even4+odd2.
+            sel = [0, 1, 2, 3, 5, 6]
+            dm = np.stack([raw_dm[:, 0, sel], raw_dm[:, 1, sel]], axis=-1)  # (n,6,2)
+            d2 = np.empty((n_keep, 6, 2, 2), np.float64)
+            d2[..., 0, 0] = raw_d2[:, 0, sel]
+            cross = raw_d2[:, 1, sel]
             d2[..., 0, 1] = cross
             d2[..., 1, 0] = cross
-            d2[..., 1, 1] = raw_d2[:, 2, :4]
+            d2[..., 1, 1] = raw_d2[:, 2, sel]
             m_l.append(mom[keep])
             cov_l.append(cov[keep])
             x_l.append(blk["centroid"][keep].astype(np.float64))         # (n,2)
@@ -629,7 +508,7 @@ def load_training_table(
     dm_dg_jnp = jnp.array(dm_dg)
     d2m_dg2_jnp = jnp.array(d2m_dg2)
 
-    return _finalize_dataset(
+    ds = _finalize_dataset(
         moments_jnp,
         centroid_moments_jnp,
         cov_jnp,
@@ -639,6 +518,8 @@ def load_training_table(
         key,
         weight_clip_percentile=weight_clip_percentile,
     )
+    ds["nda_is_ht"] = nda_is_ht
+    return ds
 
 
 def load_training_dataset(

@@ -64,7 +64,6 @@ from .config import (
     key as _base_key,
     log_scale_range,
     n_sx_train,
-    nda_clip_percentile,
     num_samples,
     prior_sigmax_log_scale_mean,
     train_chunk_size,
@@ -179,12 +178,6 @@ def main() -> int:
     p.add_argument("--from-scratch", action="store_true",
                    help="Initialise fresh flows (skip load_models) and train from random init "
                         "rather than resuming from a checkpoint.")
-    p.add_argument("--no-nda-clip", action="store_true",
-                   help="Disable the top-percentile nda clip (config default %.1f). REQUIRED when "
-                        "training on the importance-subsampled template_train.fits: its nda column "
-                        "is the Horvitz-Thompson weight (nda/p) whose heavy tail IS the correction "
-                        "for down-weighted far-MX/MY copies — clipping it reintroduces the bias. "
-                        "See dev/subsample.py." % (nda_clip_percentile or float('nan')))
     p.add_argument("--no-backup", action="store_true", help="Do not write per-block .bak copies.")
     p.add_argument("--subsample", type=int, default=1,
                    help="Keep roughly 1/subsample of the training templates (sampled before cuts). "
@@ -196,7 +189,6 @@ def main() -> int:
     args = p.parse_args()
     if args.start_steps is None:
         args.start_steps = 0 if args.from_scratch else 50_000
-    nda_clip = None if args.no_nda_clip else nda_clip_percentile
 
     print(f"devices: {jax.devices()}")
     print(f"Σ_X conditioning: log_scale_range={log_scale_range} e_max={e_max} "
@@ -215,8 +207,7 @@ def main() -> int:
     dm_dg_jnp = data["dm_dg_jnp"]
     d2m_dg2_jnp = data["d2m_dg2_jnp"]
     centroid_moments_jnp = data["centroid_moments_jnp"]
-    weights = data["weights"]
-    nda = data["nda"]
+    weights = data["weights"]   # batch-sampling proposal ∝ nda (BFD template weight)
     raw2standard = data["raw2standard"]
     N = moments_jnp.shape[0]
     print(f"  N templates = {N}")
@@ -261,15 +252,16 @@ def main() -> int:
     mean_log_diag, std_log_diag, mean_off, std_off = compute_std_stats(
         raw2standard, moments_jnp, cov_jnp
     )
+    # Proposal ∝ nda (use_nda_weight=False ⇒ uniform sampling).  The per-copy weight is
+    # L(X|C_X) alone inside the loss — see make_nll_loss / make_elbo_loss.
     w_np = np.asarray(weights)
     w_np = w_np / w_np.sum()
+    sampling_weights = jnp.asarray(w_np) if use_nda_weight else None
     if args.loss == "nll":
         # q-free: prior is supervised directly on log p(y_std | g, C_X) (z≈y).
         loss_fn = make_nll_loss(
             N=N, batch_size=batch_size,
-            weights=jnp.asarray(w_np),
-            nda=(jnp.asarray(nda) if use_nda_weight else None),
-            nda_clip_percentile=nda_clip,
+            weights=sampling_weights,
             log_scale_range=log_scale_range, e_max=e_max,
             n_sx_train=n_sx_train, use_sx=(log_scale_range is not None),
             raw2standard=raw2standard,
@@ -278,9 +270,7 @@ def main() -> int:
     else:
         loss_fn = make_elbo_loss(
             N=N, batch_size=batch_size, num_samples=num_samples,
-            weights=jnp.asarray(w_np),
-            nda=(jnp.asarray(nda) if use_nda_weight else None),
-            nda_clip_percentile=nda_clip,
+            weights=sampling_weights,
             log_scale_range=log_scale_range, e_max=e_max,
             n_sx_train=n_sx_train, use_sx=(log_scale_range is not None),
             raw2standard=raw2standard, mean_log_diag=mean_log_diag,
