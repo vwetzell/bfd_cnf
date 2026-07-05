@@ -527,11 +527,11 @@ def make_elbo_loss(
         Number of Monte Carlo samples drawn from q per batch element.
         Default is 8.
     weights : array-like or None, optional
-        Batch-sampling proposal ∝ the BFD template weight ``nda`` (= sky_density·da,
-        HT-corrected for the subsample; see ``_finalize_dataset``).  Sampling ∝ nda
-        makes the proposal match the objective's static part, so the only residual
-        per-copy weight is the centroid marginalisation ``L(X|C_X)``.  ``None`` ⇒
-        uniform sampling.
+        Batch-sampling proposal ∝ the BFD per-copy prior weight ``nda·detj`` (nda =
+        sky_density·da, HT-corrected; detj = ¼(Mr²−M1²−M2²) is the |dX/dx| Jacobian from
+        BFD's kernel; see ``_finalize_dataset``).  Sampling ∝ nda·detj makes the proposal
+        match the objective's static part, so the only residual per-copy weight is the
+        centroid marginalisation ``L(X|C_X)``.  ``None`` ⇒ uniform sampling.
     log_scale_range : tuple of float or None, optional
         Range of ``0.5 * log det(Σ_X)`` for Σ_X marginalisation.  Pass
         ``None`` (default) to disable Σ_X conditioning.
@@ -556,7 +556,7 @@ def make_elbo_loss(
     _use_sx = use_sx and (log_scale_range is not None)
 
     # ``weights`` is the batch-sampling proposal = nda (BFD template weight, HT-corrected;
-    # see _finalize_dataset).  Sampling ∝ nda ⇒ residual per-copy weight is L(X|C_X) only.
+    # see _finalize_dataset).  Sampling ∝ nda·detj ⇒ residual per-copy weight is L(X|C_X) only.
     if weights is not None:
         weights = jnp.asarray(weights)
         # Guard against float32 underflow when most raw weights are near zero:
@@ -602,7 +602,7 @@ def make_elbo_loss(
     def plain_loss(model_tuple, data_y, data_Sigma, data_dg, data_d2g, data_X, key):
         prior_flow, q_flow = model_tuple
 
-        # ── sample batch indices ∝ nda (proposal == objective's static part) ──
+        # ── sample batch indices ∝ nda·detj (proposal == objective's static part) ──
         key, subkey = jr.split(key)
         if weights_cdf is not None:
             u = jr.uniform(subkey, shape=(batch_size,))
@@ -707,9 +707,9 @@ def make_elbo_loss(
                 )(z_SBG).reshape(S, batch_size, G)  # (S, B, G)
                 elbo = log_p_y_minus_sel + log_pz - log_q  # (S, B, G)
                 lse = logsumexp(elbo, axis=0) - jnp.log(S)  # (B, G)
-                # Batch drawn ∝ nda ⇒ the ONLY residual per-copy weight is the BFD
+                # Batch drawn ∝ nda·detj ⇒ the ONLY residual per-copy weight is the BFD
                 # centroid marginalisation L(X(g)|C_X), self-normalised per g ⇒ the
-                # nda·L X-marginal for this C_X.  No detj, no is_corr.
+                # nda·detj·L X-marginal for this C_X.  detj is in the proposal, not here.
                 logL_bg = _batch_log_L_X(X_bg_flat, sx_cond).reshape(batch_size, G)
                 w_bg = jax.nn.softmax(logL_bg, axis=0)  # (B, G) per-g, cols sum to 1
                 return -jnp.mean(jnp.sum(w_bg * lse, axis=0))  # mean over g
@@ -730,7 +730,7 @@ def make_elbo_loss(
 
             elbo = log_p_y_minus_sel + log_p_z - log_q
             lse = logsumexp(elbo, axis=0) - jnp.log(S)  # (B, G)
-            # No C_X ⇒ no L; batch is already ∝ nda ⇒ plain mean ELBO over the batch.
+            # No C_X ⇒ no L; batch is already ∝ nda·detj ⇒ plain mean ELBO over the batch.
             loss = -jnp.mean(lse)
 
         return loss
@@ -761,12 +761,13 @@ def make_nll_loss(
     involved — the prior is supervised directly on log p(y_std | g, C_X), averaged
     over the shear g-grid and n_sx_train C_X draws, weighted by L(X|C_X).
 
-    The only per-copy weight required is the BFD centroid marginalisation L(X|C_X)
-    (probabilities_jax.py:198).  The BFD template weight nda (= sky-density·da,
-    momentcalc.py:556; HT-corrected for our subsample) enters ONLY as the batch
-    SAMPLING proposal (``weights`` ∝ nda), so sampling ∝ nda makes the proposal match
-    the objective's static part and the residual per-copy weight is L alone.  No
-    per-copy detj (not a BFD prior weight) and no is_corr (proposal == objective).
+    The BFD per-copy prior weight is nda·detj·L(X|C_X): the template weight nda
+    (= sky-density·da, momentcalc.py:556; HT-corrected for our subsample), the |dX/dx|
+    Jacobian detj = ¼(Mr²−M1²−M2²) carried in BFD's kernel (probabilities_jax.py:200),
+    and the centroid marginalisation L (probabilities_jax.py:198).  nda·detj enters ONLY
+    as the batch SAMPLING proposal (``weights`` ∝ nda·detj), so sampling ∝ nda·detj makes
+    the proposal match the objective's static part and the residual per-copy weight in the
+    softmax is L alone.  No is_corr (proposal == objective's static part).
 
     Returned signature:
         (prior_flow, data_y, data_Sigma, data_dg, data_d2g, data_X, key) -> scalar
@@ -774,7 +775,7 @@ def make_nll_loss(
     _use_sx = use_sx and (log_scale_range is not None)
 
     # ``weights`` is the batch-sampling proposal = nda (BFD template weight, HT-corrected;
-    # see _finalize_dataset).  Sampling ∝ nda ⇒ residual per-copy weight is L(X|C_X) only.
+    # see _finalize_dataset).  Sampling ∝ nda·detj ⇒ residual per-copy weight is L(X|C_X) only.
     if weights is not None:
         weights = jnp.asarray(weights)
         weights = weights / jnp.maximum(jnp.mean(weights), jnp.finfo(jnp.float32).tiny)
@@ -797,7 +798,7 @@ def make_nll_loss(
     g2d = g.reshape(G, -1)  # (G, 2)
 
     def nll_loss(prior_flow, data_y, data_Sigma, data_dg, data_d2g, data_X, key):
-        # ── batch sampling ∝ nda (proposal == objective's static part) ────
+        # ── batch sampling ∝ nda·detj (proposal == objective's static part) ────
         key, subkey = jr.split(key)
         if weights_cdf is not None:
             u = jr.uniform(subkey, shape=(batch_size,))
@@ -839,17 +840,17 @@ def make_nll_loss(
                     batch_size, G
                 )  # (B, G)
                 logL_bg = _batch_log_L_X(X_bg_flat, sx_cond).reshape(batch_size, G)
-                # Batch drawn ∝ nda ⇒ the ONLY residual per-copy weight is the BFD
+                # Batch drawn ∝ nda·detj ⇒ the ONLY residual per-copy weight is the BFD
                 # centroid marginalisation L(X(g)|C_X), self-normalised per g ⇒ the
-                # nda·L X-marginal for this C_X.  No detj (not a BFD prior weight), no
-                # is_corr (proposal == nda == objective's static part).
+                # nda·detj·L X-marginal for this C_X.  detj is in the proposal, not here;
+                # no is_corr (proposal == nda·detj == objective's static part).
                 w_bg = jax.nn.softmax(logL_bg, axis=0)  # (B, G) per-g, cols sum to 1
                 return -jnp.mean(jnp.sum(w_bg * log_p, axis=0))  # mean over g
 
             losses_sx = jax.lax.map(jax.checkpoint(_loss_for_sx), sx_conds)
             return jnp.mean(losses_sx)
         else:
-            # No C_X ⇒ no L; batch is already ∝ nda ⇒ plain mean NLL over the batch.
+            # No C_X ⇒ no L; batch is already ∝ nda·detj ⇒ plain mean NLL over the batch.
             cond_p = jnp.concatenate(
                 [g_flat_batch, jnp.zeros((BG, 3), dtype=g_flat_batch.dtype)], axis=-1
             )

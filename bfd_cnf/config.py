@@ -55,7 +55,7 @@ q_flow_layers = 4
 min_scale = 1e-2
 max_scale = 100.0
 
-batch_size = 2048
+batch_size = 512
 num_samples = 8
 
 # Number of gradient steps fused into a single ``jax.lax.scan`` dispatch during

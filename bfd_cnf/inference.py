@@ -10,6 +10,25 @@ Flow-based PQR inference utilities:
   - rqmc_pqr_grid()               — batched RQMC PQR integration over a grid
   - rqmc_integrate_pqr_jax()      — single-object RQMC PQR integrator
   - Template loading and per-object PQR assembly
+
+Notation convention — P, Q, R are derivatives of the PROBABILITY P, NOT of log P:
+
+    P(g) = ∫ p_flow(x|g, C_X) · N(x; M, Σ) dx     marginal probability   (scalar)
+    Q    = ∇_g P     (gradient, 2-vec)            "BFD Q"
+    R    = ∇²_g P    (Hessian, 2×2)               "BFD R"
+
+  stored as ``pqr = [P, Q1, Q2, R11, R22, R12]``.  Q and R can be negative /
+  indefinite, so there is no "log Q" / "log R".
+
+  The FLOW supplies LOG-density derivatives at each quadrature point x — the
+  ``lp_`` vars: ``lp_flow = log p_flow``, ``dlp_dg = ∇_g log p_flow``,
+  ``d2lp = ∇²_g log p_flow``.  P/Q/R are assembled via ``p = exp(lp)``:
+      Q = ⟨w·p·∇log p⟩ = ⟨w·∇p⟩ ,   R = ⟨w·p·(∇²log p + ∇log p ∇log pᵀ)⟩ = ⟨w·∇²p⟩.
+  Note ``∇_g log p_flow`` (per-point) is NOT ``∇_g log P`` (the marginal Q_tot).
+
+  The shear-relevant LOG-MARGINAL quantities — Q_tot ≡ ∇_g log P = Q/P and
+  R_tot ≡ −∇²_g log P = (Q⊗Q)/P² − R/P, with ĝ = R_tot⁻¹ Q_tot — are formed in
+  ``statistics.pqr2g`` (see there).
 """
 
 from __future__ import annotations

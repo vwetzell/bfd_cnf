@@ -5,10 +5,9 @@ One pipeline, two template sources (``--source``), both from
 ``load_training_dataset`` — the exact set the flow trains on:
 
   train    the EXACT training population (quality + derivative cuts, selection box),
-           nda·N(X|C_X) weighted — NO per-copy detj, matching the nll Σ_X loss the
-           flow was trained on.
-  draw     1M templates drawn EXACTLY as training selects batches (``ds["weights"]``),
-           optionally × nda. Data-only by default (the distribution the loss sees).
+           nda·detj·N(X|C_X) weighted, matching the nll Σ_X loss the flow was trained on.
+  draw     1M templates drawn EXACTLY as training selects batches (``ds["weights"]``,
+           ∝ nda·detj). Data-only — the batch-sampling proposal, not the objective.
 
 Shared across sources: g=0, e=0 flow sampling at ``--log-scale``; the
 [log10 Mf, Mr/Mf, M1/Mr, M2/Mr] coordinates; count equalisation; and the
@@ -72,26 +71,28 @@ def resample(m, w, n, label):
 def load_train(args):
     # Blue = the EXACT training population via load_training_dataset (same quality +
     # derivative cuts the flow saw), weighted by the per-copy objective weight
-    # nda·N(X|C_X) — the ONLY weights the loss uses (BFD template weight nda, already
-    # HT-corrected; and the centroid marginalisation L).  No per-copy detj, no box;
-    # C_X isotropic at var_xy = exp(args._log_scale) (e=0), matching flows._log_L_X.
+    # nda·detj·N(X|C_X): the BFD template weight nda (HT-corrected), the |dX/dx| Jacobian
+    # detj=¼(Mr²−M1²−M2²) carried in BFD's kernel (probabilities_jax.py:200), and the
+    # centroid marginalisation L.  No box; C_X isotropic at var_xy = exp(args._log_scale)
+    # (e=0), matching flows._log_L_X.
     from bfd_cnf.data import load_training_dataset
     ds = load_training_dataset()
     m = np.asarray(ds["moments_jnp"], dtype=np.float64)                  # (N,4) post cuts
     X = np.asarray(ds["centroid_moments_jnp"], dtype=np.float64)[:, :2]  # [MX,MY] at g=0
     nda = np.asarray(ds["nda"], dtype=np.float64)                        # BFD template weight (HT)
+    detj = np.clip(0.25 * (m[:, 1] ** 2 - m[:, 2] ** 2 - m[:, 3] ** 2), 0.0, None)
     var_xy = float(np.exp(args._log_scale))
     L_X = np.exp(-0.5 * (X[:, 0] ** 2 + X[:, 1] ** 2) / var_xy)
-    return m, nda * L_X, "Templates (training cuts, nda·N(X|C_X))"
+    return m, nda * detj * L_X, "Templates (training cuts, nda·detj·N(X|C_X))"
 
 
 def load_draw(args):
-    # ds["weights"] is now the batch-sampling proposal ∝ nda (the loss samples ∝ this).
+    # ds["weights"] is the batch-sampling proposal ∝ nda·detj (the loss samples ∝ this).
     from bfd_cnf.data import load_training_dataset
     ds = load_training_dataset()
     m = np.asarray(ds["moments_jnp"], dtype=np.float64)
-    w = np.asarray(ds["weights"], dtype=np.float64)  # ∝ nda (batch-sampling proposal)
-    return m, w, "training draw (∝ nda)"
+    w = np.asarray(ds["weights"], dtype=np.float64)  # ∝ nda·detj (batch-sampling proposal)
+    return m, w, "training draw (∝ nda·detj)"
 
 
 LOADERS = {"train": load_train, "draw": load_draw}

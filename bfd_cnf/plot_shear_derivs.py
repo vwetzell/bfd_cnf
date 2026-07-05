@@ -93,6 +93,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Output PNG path (default: auto-named from the slice parameters).",
     )
+    p.add_argument("--prior", default=None,
+                   help="Prior-flow .eqx to evaluate (default: config canonical).")
+    p.add_argument("--q", default=None,
+                   help="Q-flow .eqx (default: config canonical).")
+    p.add_argument("--stats", default=None,
+                   help="raw2standard_stats npz (mean,std) the flow was trained with "
+                        "(default: the flow's own sidecar).")
     return p.parse_args()
 
 
@@ -108,26 +115,25 @@ def main() -> None:
     r = args.m_range
 
     # ── Load data (for the standardisation) and the trained prior flow ──────────
+    prior_path = args.prior or PRIOR_FLOW_PATH
+    q_path = args.q or Q_FLOW_PATH
     print("Loading standardiser from the flow's sidecar...")
     from bfd_cnf.models.bijections import load_stats
-    _r2s = load_stats(PRIOR_FLOW_PATH)
+    _r2s = load_stats(prior_path, override=args.stats)
     key = jax.random.key(0)
     data_mean = np.array(_r2s.mean)
     data_std = np.array(_r2s.std)
 
     print("Loading flow...")
-    if not (os.path.exists(PRIOR_FLOW_PATH) and os.path.exists(Q_FLOW_PATH)):
+    if not (os.path.exists(prior_path) and os.path.exists(q_path)):
         raise FileNotFoundError(
             "Trained flow weights not found:\n"
-            f"  {PRIOR_FLOW_PATH}\n  {Q_FLOW_PATH}\n"
+            f"  {prior_path}\n  {q_path}\n"
             "Train the flows first (e.g. `python -m bfd_cnf.train_from_scratch`). "
             "This script only loads and evaluates the prior flow."
         )
-    from bfd_cnf.models.bijections import load_stats
-    prior_flow, q_flow = build_flows(
-        key, latent_dim=4, cond_dim=16, raw2standard=load_stats(PRIOR_FLOW_PATH)
-    )
-    prior_trained, _ = load_models(prior_flow, q_flow, PRIOR_FLOW_PATH, Q_FLOW_PATH)
+    prior_flow, q_flow = build_flows(key, latent_dim=4, cond_dim=16, raw2standard=_r2s)
+    prior_trained, _ = load_models(prior_flow, q_flow, prior_path, q_path)
 
     # ── Build the M1/Mr – M2/Mr grid at fixed (log10 Mf, Mr/Mf) ─────────────────
     # Transformed moment coordinates are [log10(Mf), Mr/Mf, M1/Mr, M2/Mr].

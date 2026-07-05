@@ -7,6 +7,15 @@ Pure math / statistics helpers for BFD shear estimation:
   - pqr2multbias()             — compute multiplicative bias from ± PQR
   - clipR()                    — eigenvalue-clip the R matrix
   - bootstrap_total_mult_bias() — bootstrap uncertainty on multiplicative bias
+
+Notation — the per-object ``pqr`` array is PROBABILITY-space ``[P, Q1, Q2, R11,
+R22, R12]`` where Q = ∇_g P and R = ∇²_g P (derivatives of P, NOT of log P).
+The estimators here form the LOG-MARGINAL quantities
+    Q_tot ≡ ∇_g log P     = Q / P
+    R_tot ≡ −∇²_g log P   = (Q⊗Q)/P² − R/P
+and the ML shear ĝ = (Σ R_tot)⁻¹ (Σ Q_tot) (per-object P-normalised, summed with
+EQUAL target weight).  Consequence: any per-object constant factor on [P,Q,R]
+(e.g. the BFD target-detj prefactor) cancels in Q_tot/R_tot ⇒ no effect on ĝ.
 """
 
 from __future__ import annotations

@@ -327,18 +327,23 @@ def _finalize_dataset(
     ).T[resampled_idx]
 
     # -------------------------------------------------------------------
-    # Batch-sampling proposal = the BFD template weight nda.
+    # Batch-sampling proposal = the BFD per-copy prior weight  nda·detj.
     # -------------------------------------------------------------------
-    # The FITS `nda` column is already the Horvitz-Thompson weight nda_orig/p for our
-    # importance subsample (momentcalc.py:556 sets nda=sky_density·da; dev/subsample.py
-    # stores nda_orig/p).  Sampling the training batch ∝ nda makes the proposal match
-    # the loss objective's static part, so the ONLY residual per-copy weight in the loss
-    # is the BFD centroid marginalisation L(X|C_X) (see make_nll_loss / make_elbo_loss).
-    # No density-flattening 1/p̂ proposal, no per-copy detj, no clip: those were
-    # unrequired variance machinery whose 1/p̂ proposal anti-correlated with the nda·L
-    # objective (<1% per-batch ESS) and biased the finite-batch SNIS toward high flux.
-    nda_f = jnp.asarray(nda_jnp)
-    weights = nda_f / jnp.maximum(jnp.mean(nda_f), jnp.finfo(jnp.float32).tiny)
+    # The BFD template contribution is nda·detj·kernel: nda=sky_density·da is the copy's
+    # shift-grid weight (momentcalc.py:556; the FITS column is already the Horvitz-Thompson
+    # weight nda_orig/p for our subsample, dev/subsample.py), and detj=¼(Mr²−M1²−M2²) is the
+    # |dX/dx| Jacobian carried in BFD's likelihood kernel (probabilities_jax.py:200,
+    # detj_target).  Our flow inference kernel has NO detj, so it must live in the prior:
+    # per-copy weight = nda·detj·L(X|C_X), giving Σ_copies ∝ base per galaxy (without detj the
+    # prior collapses ∝ base/detj ∝ 1/Mf², starving high flux).  Sampling ∝ nda·detj makes the
+    # proposal match the objective's static part ⇒ residual per-copy weight is L alone
+    # (see make_nll_loss / make_elbo_loss).  No 1/p̂ flattening, no clip.
+    detj = jnp.clip(
+        0.25 * (moments_jnp[:, 1] ** 2 - moments_jnp[:, 2] ** 2 - moments_jnp[:, 3] ** 2),
+        0.0, None,
+    )
+    w = jnp.asarray(nda_jnp) * detj
+    weights = w / jnp.maximum(jnp.mean(w), jnp.finfo(jnp.float32).tiny)
 
     # Population bounds kept only as optional viz overlay hints (no longer gate training).
     x_lo, x_hi = float(jnp.log10(template_flux_min)), float(jnp.log10(500000))  # log10 Mf
