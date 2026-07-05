@@ -2,11 +2,11 @@
 
 **Conditional normalizing-flow priors for BFD weak-lensing shear estimation.**
 
-`bfd_cnf` replaces the analytic moment-space priors in the **BFD** (Bayesian
+`bfd_cnf` replaces the template summing in the **BFD** (Bayesian
 Fourier Domain; Bernstein & Armstrong 2014, [arXiv:1304.1843](https://arxiv.org/abs/1304.1843);
 Bernstein et al. 2016, [arXiv:1508.05655](https://arxiv.org/abs/1508.05655)) weak-lensing
 shear estimator with two **trained conditional normalizing flows** (JAX / Equinox / FlowJax),
-enabling more flexible galaxy-population modeling and improved multiplicative-bias performance.
+enabling more robust galaxy-population modeling and improved multiplicative-bias performance.
 
 For the full architecture, math, data formats, and script-by-script reference, see the
 **[project wiki](../../wiki)**. This README covers orientation and quick start only.
@@ -17,15 +17,16 @@ For the full architecture, math, data formats, and script-by-script reference, s
 
 BFD never forward-models pixels. It works entirely in Fourier-domain **galaxy moment space**
 — flux, size, and ellipticity moments `[Mf, Mr, M1, M2]` — and estimates shear by marginalizing
-over the intrinsic (unsheared) galaxy population, using Taylor-expanded shear derivatives to
-propagate the effect of a small shear `g` through that population.
+over the intrinsic (unsheared) galaxy population using Taylor-expanded shear derivatives to
+propagate the effect of a small shear `g` through that population. The unsheared galaxy
+population is derived from high signal to noise template galaxies measured in deep fields.
 
 Two flows are trained jointly:
 
-| Flow | Conditions on | Role |
-|------|----------------|------|
-| **Prior** `p_θ(z \| g, Σ_X)` | shear `g`, PSF centroid-noise covariance `Σ_X` | Learned replacement for the analytic BFD moment-space prior |
-| **Q flow** `q_φ(z \| y, Σ_y, g)` | noisy measurement `y`, its covariance `Σ_y`, shear `g` | Variational posterior, used only during training (for the IWAE-style ELBO) |
+| Flow                             | Conditions on                                                   | Role                                                                       |
+| -------------------------------- | --------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| **Prior** `p_θ(z \| g, Σ_X)`     | shear `g`, centroid-noise covariance `Σ_X`                      | Learned replacement for discrete template summation in BFD                 |
+| **Q flow** `q_φ(z \| y, Σ_y, g)` | noisy template measurement `y`, its covariance `Σ_y`, shear `g` | Variational posterior, used only during training (for the IWAE-style ELBO) |
 
 At inference time, only the trained **prior** flow is needed. For each target galaxy it is
 integrated (via RQMC + a Laplace-mode proposal) against the target's Gaussian measurement
@@ -35,8 +36,12 @@ kernel to produce per-object **PQR** statistics:
 - **Q** — first shear derivative, `∂P/∂g`
 - **R** — second shear derivative, `∂²P/∂g²`
 
-Summed over a catalogue, the maximum-likelihood shear is `ĝ = R⁻¹·Q`, and multiplicative bias
-is measured from `±g` simulation pairs as `m = (ĝ₊ − ĝ₋)/Δg − 1`.
+`P`/`Q`/`R` are derivatives of the probability `P`, **not** of `log P` — Q and R can be
+negative/indefinite, so there is no "log Q" or "log R". Per catalogue object these are
+converted to the log-marginal quantities that actually drive shear, `Q_tot = Q/P` and
+`R_tot = (Q⊗Q)/P² − R/P`, and summed over the catalogue; the maximum-likelihood shear is
+then `ĝ = R_tot⁻¹·Q_tot`. Multiplicative bias is measured from `±g` simulation pairs as
+`m = (ĝ₊ − ĝ₋)/Δg − 1`. See `statistics.pqr2g` for the implementation.
 
 See the wiki's **[Architecture](../../wiki/Architecture)** and
 **[Inference and Shear Estimation](../../wiki/Inference-and-Shear-Estimation)** pages for the
@@ -84,7 +89,7 @@ Run package scripts from the **repo root** so the package import resolves, e.g.
 No `requirements.txt`/`pyproject.toml` yet — install directly:
 
 ```bash
-pip install jax jaxlib equinox flowjax optax paramax jaxopt jaxopt fitsio astropy numpy matplotlib corner
+pip install jax jaxlib equinox flowjax optax paramax jaxopt fitsio astropy numpy matplotlib corner
 ```
 
 > **`bfd`** (the underlying BFD moments/PQR library — `TemplateTable`, `MomentCovariance`,
