@@ -91,16 +91,10 @@ template_flux_min: float = 800.0
 # learned C_X-response.  Set False to reproduce the pre-change (unweighted) loss
 # exactly (control arm for A/B comparison).
 use_nda_weight: bool = True
-# Optional top-tail percentile clip on nda to bound per-batch gradient variance
-# (nda spans ~282x p5→p95 with rare >p99 outliers).  None = no clip; 99.9 trims
-# only the extreme tail with negligible effect on the bulk weighting.
-nda_clip_percentile: float | None = 99.9
 
 # ---------------------------------------------------------------------------
 # Σ_X conditioning / training parameters
 # ---------------------------------------------------------------------------
-# Number of Σ_X conditions sampled per gradient step; losses are averaged.
-n_sx_train: int = 5
 # Range of log_scale = 0.5*log det(C_X) (centroid noise) sampled uniformly each step.
 # Derived from the grid TARGETS' per-object centroid covariance C_X — the odd-moment
 # covariance built from each target's even cov via models.flows.even_cov_to_CX (NOT the
@@ -135,9 +129,9 @@ DATA_DIR = os.path.join(_REPO_ROOT, "data")
 # External input data (not in the repo). Override the directory on a new
 # machine (e.g. HPC) with BFD_DATA_DIR; falls back to the local workstation path.
 _EXT_DIR = os.environ.get("BFD_DATA_DIR", "/home/vwetzell/Documents/BFD_cNF")
-# New template set, pre-joined into one lean training table by
-# bfd_cnf.build_training_table (columns already in trainer-native shapes:
-# moments(4), cov(4,4), dm_dg(4,2), d2m_dg2(4,2,2), centroid(2), nda, id).
+# Training table built by dev/make_template_file.py -> dev/subsample.py, already
+# in trainer-native shapes: moments(4), cov(4,4), dm_dg(4,2), d2m_dg2(4,2,2),
+# centroid(2), nda, id.
 TRAIN_FITS_PATH = os.environ.get(
     "BFD_TRAIN_FITS", os.path.join(DATA_DIR, "templates_train.fits")
 )

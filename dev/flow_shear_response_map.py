@@ -5,8 +5,8 @@ g-modulation.
 Facts this rests on (from the code, verified — not from other dev/ scripts):
   * g conditions ONLY ExplicitPolyLast; the early layers are unconditional.
   * data->base order: early -> ExplicitPolyLast(g) -> SigmaX(Sigma_X) -> base.
-    SigmaX maps ellipticity (z2,z3) -> (1/kappa)[(I+cE)(z2,z3)+D e], kappa=exp(g_s).
-    ExplicitPolyLast injects the shear shift shared_c*g on (z2,z3); SigmaX then
+    SigmaX maps ellipticity (m2,m3) -> (1/kappa)[(I+cE)(m2,m3)+D e], kappa=exp(g_s).
+    ExplicitPolyLast injects the shear shift shared_c*g on (m2,m3); SigmaX then
     divides it by kappa, so the base score d/dg1 log p picks up ~1/kappa^2.
     => the effective shear response is modulated by a flux/Sigma_X-dependent factor
        even though SigmaX ignores g in its coefficients.

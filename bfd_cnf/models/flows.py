@@ -265,14 +265,14 @@ def _moment_jacobian_det(m_raw: jax.Array) -> jax.Array:
 
 
 def _sample_sx_conds(
-    key: jax.Array, log_scale_range: tuple[float, float], e_max: float, n_sx: int
+    key: jax.Array, log_scale_range: tuple[float, float], e_max: float
 ) -> jax.Array:
-    """Build PSF noise covariance condition vectors on a fixed e-stencil.
+    """Build centering-bias (Σ_X) condition vectors on a fixed e-stencil.
 
     Each condition vector is ``[log_scale, e1, e2]`` where
 
     * ``log_scale = 0.5 * log det(Σ_X)`` (spin-0 noise level) — **random**,
-    * ``(e1, e2)`` (spin-2 PSF ellipticity) — a **fixed stencil**: one centre
+    * ``(e1, e2)`` (spin-2 centering-bias ellipticity) — a **fixed stencil**: one centre
       ``e=0`` plus two 8-direction rings at ``|e| = e_max/2`` and ``|e| = e_max``
       (17 points total).
 
@@ -294,10 +294,7 @@ def _sample_sx_conds(
     log_scale_range : tuple of float
         ``(min, max)`` for the uniform distribution over ``log_scale``.
     e_max : float
-        PSF ellipticity magnitude of the outer stencil ring (inner ring = e_max/2).
-    n_sx : int
-        Retained for call-site compatibility but no longer sets the e-count: the
-        stencil is a fixed 1 + 8 + 8 = 17 points.
+        Centering-bias ellipticity magnitude of the outer stencil ring (inner ring = e_max/2).
 
     Returns
     -------
@@ -488,6 +485,23 @@ def _normalised_importance_weights(log_w: jax.Array) -> jax.Array:
 
 
 # ---------------------------------------------------------------------------
+# Flux-selection correction (shared by make_elbo_loss and make_nll_loss)
+# ---------------------------------------------------------------------------
+# Floor on log P_sel so the selection correction -log P_sel stays bounded.
+# σ_f = sqrt(var_mf) is tiny for high-SNR templates, so a sample drawn below
+# the flux threshold makes logsf((threshold-mf)/σ_f) astronomically negative and
+# -log P_sel explode (seen as a -2.9e9 loss spike at init).  The floor only
+# engages for such pathological samples; legitimate near-threshold corrections
+# are O(1-10) and unaffected.  P_sel >= exp(-30) ≈ 9e-14.
+_LOG_PSEL_FLOOR = -30.0
+
+
+def _log_p_select_given_x_raw(mf_true, var_mf, threshold):
+    sigma = jnp.sqrt(jnp.maximum(var_mf, 0.0) + 1e-12)
+    return jnp.maximum(jstats.norm.logsf((threshold - mf_true) / sigma), _LOG_PSEL_FLOOR)
+
+
+# ---------------------------------------------------------------------------
 # ELBO loss factory
 # ---------------------------------------------------------------------------
 
@@ -500,7 +514,6 @@ def make_elbo_loss(
     weights: jax.Array | None = None,
     log_scale_range: tuple[float, float] | None = None,
     e_max: float = 0.0,
-    n_sx_train: int = 8,
     use_sx: bool = True,
     raw2standard: Any = None,
     mean_log_diag: jax.Array | None = None,
@@ -536,10 +549,7 @@ def make_elbo_loss(
         Range of ``0.5 * log det(Σ_X)`` for Σ_X marginalisation.  Pass
         ``None`` (default) to disable Σ_X conditioning.
     e_max : float, optional
-        Maximum PSF ellipticity magnitude.  Default is 0.
-    n_sx_train : int, optional
-        Number of Σ_X conditions sampled per gradient step when
-        ``log_scale_range`` is not ``None``.  Default is 1.
+        Maximum centering-bias ellipticity magnitude.  Default is 0.
     use_sx : bool, optional
         Whether to use Σ_X marginalisation.  Must be consistent with
         ``log_scale_range``.  Default is ``True``.
@@ -583,18 +593,6 @@ def make_elbo_loss(
     g = jnp.concatenate([g0, 0.01 * g_grid, 0.02 * g_grid], axis=1)  # (1, G, 2) centre + 2 rings
     G = g.shape[1]
     g2d = g.reshape(G, -1)  # (G, 2)
-
-    # Floor on log P_sel so the selection correction -log P_sel stays bounded.
-    # σ_f = sqrt(var_mf) is tiny for high-SNR templates, so a q sample drawn below
-    # the flux threshold makes logsf((threshold-mf)/σ_f) astronomically negative and
-    # -log P_sel explode (seen as a -2.9e9 loss spike at init).  The floor only
-    # engages for such pathological samples; legitimate near-threshold corrections
-    # are O(1-10) and unaffected.  P_sel >= exp(-30) ≈ 9e-14.
-    _LOG_PSEL_FLOOR = -30.0
-
-    def _log_p_select_given_x_raw(mf_true, var_mf, threshold):
-        sigma = jnp.sqrt(jnp.maximum(var_mf, 0.0) + 1e-12)
-        return jnp.maximum(jstats.norm.logsf((threshold - mf_true) / sigma), _LOG_PSEL_FLOOR)
 
     # Import here to avoid circular at module level
     from ..data import transform_dataset_to_standard
@@ -646,22 +644,22 @@ def make_elbo_loss(
             g_scale=g_scale,
         )  # (BG, cond_dim), (BG, D, D)
 
-        # ── sample z ~ q(z | cond) ────────────────────────────────────
+        # ── sample m ~ q(m | cond) ────────────────────────────────────
         key, subkey = jr.split(key)
-        z, log_q = q_flow.sample_and_log_prob(
+        m, log_q = q_flow.sample_and_log_prob(
             subkey,
             sample_shape=(S,),
             condition=cond,
-        )  # z: (S, BG, D),  log_q: (S, BG)
+        )  # m: (S, BG, D),  log_q: (S, BG)
         log_q = log_q.reshape(S, batch_size, G)
 
         # ── likelihood + selection correction (independent of Σ_X) ──────────
-        log_p_y = log_gaussian_full(y_std, z.reshape(S, BG, -1), L).reshape(
+        log_p_y = log_gaussian_full(y_std, m.reshape(S, BG, -1), L).reshape(
             S, batch_size, G
         )
 
-        z0_0 = z.reshape(S * BG, -1)[:, 0] * raw2standard.std[0] + raw2standard.mean[0]
-        mf_true = jnp.power(10.0, z0_0).reshape(S, BG)
+        log10mf_destd = m.reshape(S * BG, -1)[:, 0] * raw2standard.std[0] + raw2standard.mean[0]
+        mf_true = jnp.power(10.0, log10mf_destd).reshape(S, BG)
         # var_mf uses the template's own flux variance (S_b[:, 0, 0]) rather than a
         # fixed target noise. This makes the selection correction per-template: bright
         # low-noise templates get P_sel ≈ 1 (negligible correction); templates near
@@ -677,7 +675,7 @@ def make_elbo_loss(
         log_p_y_minus_sel = log_p_y - log_p_sel  # (S, B, G)
 
         # ── Σ_X marginalisation: learn the X-marginal per drawn C_X ──────────
-        # For each randomly drawn centroid covariance C_X, the prior p(z|g,C_X) is
+        # For each randomly drawn centroid covariance C_X, the prior p(m|g,C_X) is
         # trained to be the template distribution *marginalised over the centroid
         # offset* X, weighting each copy by L(X|C_X)=N(X;0,C_X) computed from the TRUE
         # 1st-order centroid moments X=[MX,MY].  (Copies with large |X| have lower M0
@@ -688,23 +686,21 @@ def make_elbo_loss(
         # C_X draws are then averaged.
         if _use_sx:
             key, k_sx = jr.split(key)
-            sx_conds = _sample_sx_conds(
-                k_sx, log_scale_range, e_max, n_sx_train
-            )  # (n_sx, 3)
+            sx_conds = _sample_sx_conds(k_sx, log_scale_range, e_max)  # (17, 3)
             X_b = data_X[idx]  # (B, 2)  true centroid moments [MX, MY] at g=0
             # Shear the centroid by its own derivatives [4:6] so L(X(g)|C_X) tracks
             # the BFD centroid shear response (was held at g=0).  See make_nll_loss.
             X_bg = shear(X_b, g, dg_b[:, 4:6], d2g_b[:, 4:6])  # (B, G, 2)
             X_bg_flat = X_bg.reshape(BG, 2)
-            z_SBG = z.reshape(S, BG, -1)  # (S, BG, D)
+            m_SBG = m.reshape(S, BG, -1)  # (S, BG, D)
 
             def _loss_for_sx(sx_cond):
                 # ELBO of every copy under the prior conditioned on this C_X.
                 sx_tiled = jnp.broadcast_to(sx_cond[None, :], (BG, 3))
                 cond_p = jnp.concatenate([g_flat_batch, sx_tiled], axis=-1)  # (BG, 5)
                 log_pz = jax.vmap(
-                    lambda z_s: prior_flow.log_prob(z_s, condition=cond_p)
-                )(z_SBG).reshape(S, batch_size, G)  # (S, B, G)
+                    lambda m_s: prior_flow.log_prob(m_s, condition=cond_p)
+                )(m_SBG).reshape(S, batch_size, G)  # (S, B, G)
                 elbo = log_p_y_minus_sel + log_pz - log_q  # (S, B, G)
                 lse = logsumexp(elbo, axis=0) - jnp.log(S)  # (B, G)
                 # Batch drawn ∝ nda·detj ⇒ the ONLY residual per-copy weight is the BFD
@@ -722,8 +718,8 @@ def make_elbo_loss(
             cond_p = jnp.concatenate(
                 [g_flat_batch, jnp.zeros((BG, 3), dtype=g_flat_batch.dtype)], axis=-1
             )  # (BG, 5)
-            log_p_z = jax.vmap(lambda z_s: prior_flow.log_prob(z_s, condition=cond_p))(
-                z.reshape(S, BG, -1)
+            log_p_z = jax.vmap(lambda m_s: prior_flow.log_prob(m_s, condition=cond_p))(
+                m.reshape(S, BG, -1)
             ).reshape(
                 S, batch_size, G
             )  # (S, B, G)
@@ -739,7 +735,7 @@ def make_elbo_loss(
 
 
 # ---------------------------------------------------------------------------
-# NLL loss factory (prior pre-training, z ≈ y)
+# NLL loss factory (prior pre-training, m ≈ y)
 # ---------------------------------------------------------------------------
 
 
@@ -750,16 +746,18 @@ def make_nll_loss(
     weights: jax.Array | None = None,
     log_scale_range: tuple[float, float] | None = None,
     e_max: float = 0.0,
-    n_sx_train: int = 8,
     use_sx: bool = True,
     raw2standard: Any = None,
 ) -> Callable:
-    """Direct NLL loss for prior-only pre-training (z ≈ y approximation).
+    """Direct NLL loss for prior-only pre-training (m ≈ y approximation).
 
-    Treats each template's moments y as a direct sample from the prior p(z|g,C_X),
+    Treats each template's moments y as a direct sample from the prior p(m|g,C_X),
     valid when templates have high SNR.  Unlike make_elbo_loss, no Q flow is
     involved — the prior is supervised directly on log p(y_std | g, C_X), averaged
-    over the shear g-grid and n_sx_train C_X draws, weighted by L(X|C_X).
+    over the shear g-grid and the 17-point C_X stencil, weighted by L(X|C_X), with
+    the same flux-selection correction ``-log P_sel(mf)`` make_elbo_loss applies
+    (here evaluated at the template's own sheared flux and its own flux variance,
+    since m ≈ y stands in for a q-sample).
 
     The BFD per-copy prior weight is nda·detj·L(X|C_X): the template weight nda
     (= sky-density·da, momentcalc.py:556; HT-corrected for our subsample), the |dX/dx|
@@ -807,12 +805,13 @@ def make_nll_loss(
             idx = jr.choice(subkey, N, shape=(batch_size,), replace=True)
 
         y_b = data_y[idx]     # (B, 4)
+        S_b = data_Sigma[idx] # (B, 4, 4)
         dg_b = data_dg[idx]   # (B, 6, 2)    [Mf,Mr,M1,M2,MX,MY] derivs
         d2g_b = data_d2g[idx] # (B, 6, 2, 2)
 
         BG = batch_size * G
 
-        # ── shear EVEN copies + standardise (z ≈ y) ──────────────────────
+        # ── shear EVEN copies + standardise (m ≈ y) ──────────────────────
         y_sheared = shear(y_b, g, dg_b[:, :4], d2g_b[:, :4])  # (B, G, 4)
         # detj is held at g=0 ON PURPOSE: BFD's detj is the TARGET's (g-constant),
         # not the copy's — shearing it tripled the grid m-bias (+0.13→+0.32, 28σ,
@@ -823,10 +822,18 @@ def make_nll_loss(
         transform_and_logdet = raw2standard.transform_and_log_det
         y_std = jax.vmap(transform_and_logdet)(y_flat)[0]  # (BG, 4)
 
+        # ── flux-selection correction (mirrors make_elbo_loss; m ≈ y ⇒ mf_true is
+        # the template's own sheared raw flux, var_mf its own flux variance) ──────
+        mf_true = y_flat[:, 0]  # (BG,) raw flux, already sheared
+        var_mf = jnp.broadcast_to(S_b[:, 0, 0][:, None], (batch_size, G)).reshape(BG)
+        log_p_sel = _log_p_select_given_x_raw(mf_true, var_mf, target_flux_min).reshape(
+            batch_size, G
+        )
+
         # ── Σ_X marginalisation ───────────────────────────────────────────
         if _use_sx:
             key, k_sx = jr.split(key)
-            sx_conds = _sample_sx_conds(k_sx, log_scale_range, e_max, n_sx_train)
+            sx_conds = _sample_sx_conds(k_sx, log_scale_range, e_max)  # (17, 3)
             X_b = data_X[idx]  # (B, 2)  centroid at g=0
             # Shear the centroid by its own derivatives [4:6] so the weight
             # L(X(g)|C_X) tracks the BFD centroid shear response (was held at g=0).
@@ -839,13 +846,14 @@ def make_nll_loss(
                 log_p = prior_flow.log_prob(y_std, condition=cond_p).reshape(
                     batch_size, G
                 )  # (B, G)
+                log_p_minus_sel = log_p - log_p_sel
                 logL_bg = _batch_log_L_X(X_bg_flat, sx_cond).reshape(batch_size, G)
                 # Batch drawn ∝ nda·detj ⇒ the ONLY residual per-copy weight is the BFD
                 # centroid marginalisation L(X(g)|C_X), self-normalised per g ⇒ the
                 # nda·detj·L X-marginal for this C_X.  detj is in the proposal, not here;
                 # no is_corr (proposal == nda·detj == objective's static part).
                 w_bg = jax.nn.softmax(logL_bg, axis=0)  # (B, G) per-g, cols sum to 1
-                return -jnp.mean(jnp.sum(w_bg * log_p, axis=0))  # mean over g
+                return -jnp.mean(jnp.sum(w_bg * log_p_minus_sel, axis=0))  # mean over g
 
             losses_sx = jax.lax.map(jax.checkpoint(_loss_for_sx), sx_conds)
             return jnp.mean(losses_sx)
@@ -855,7 +863,7 @@ def make_nll_loss(
                 [g_flat_batch, jnp.zeros((BG, 3), dtype=g_flat_batch.dtype)], axis=-1
             )
             log_p = prior_flow.log_prob(y_std, condition=cond_p).reshape(batch_size, G)
-            return -jnp.mean(log_p)
+            return -jnp.mean(log_p - log_p_sel)
 
     return nll_loss
 
@@ -951,7 +959,7 @@ def build_flows(
     Returns
     -------
     prior : Transformed
-        Prior normalizing flow conditioned on shear and PSF parameters.
+        Prior normalizing flow conditioned on shear and centering-bias (Σ_X) parameters.
     q_flow : Transformed
         Variational q flow conditioned on the moment + covariance features.
     """

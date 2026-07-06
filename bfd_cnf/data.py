@@ -287,17 +287,9 @@ def _finalize_dataset(
     d2m_dg2_jnp: jax.Array,
     nda_jnp: jax.Array,
     key: jax.Array,
-    weight_clip_percentile: float = 99.0,
 ) -> dict[str, Any]:
     """Shared tail of the data loaders: flat-coverage importance weighting,
     resampling, and the standardisation bijection.
-
-    ``weight_clip_percentile`` caps the per-template sampling weight (``1/p_hat``)
-    at this top percentile to control gradient variance.  Because the batch loss
-    applies an exact SNIS correction (``is_corr = 1/weights``), the clip changes
-    only the *variance* of the (nda-weighted) gradient estimate, not the
-    objective — raising it (e.g. 99.99) or setting ``>= 100`` (no clip) gives the
-    sparse/bright tail more samples per batch for faster convergence there.
 
     Takes the already-filtered (quality- and derivative-cut) training arrays —
     identical in meaning regardless of which template file they came from — and
@@ -392,7 +384,6 @@ def load_training_table(
     fits_path: str = TRAIN_FITS_PATH,
     key: jax.Array | None = None,
     subsample: int = 1,
-    weight_clip_percentile: float = 99.0,
 ) -> dict[str, Any]:
     """Load the pre-joined training table and run the full pipeline.
 
@@ -521,7 +512,6 @@ def load_training_table(
         d2m_dg2_jnp,
         nda_jnp,
         key,
-        weight_clip_percentile=weight_clip_percentile,
     )
     ds["nda_is_ht"] = nda_is_ht
     return ds
@@ -530,7 +520,6 @@ def load_training_table(
 def load_training_dataset(
     key: jax.Array | None = None,
     subsample: int = 1,
-    weight_clip_percentile: float = 99.0,
 ) -> dict[str, Any]:
     """Load the training template set (``TRAIN_FITS_PATH`` via :func:`load_training_table`).
 
@@ -538,7 +527,4 @@ def load_training_dataset(
     (``train_from_scratch``, ``converge_train``, ``pretrain_prior``, ``run``).
     """
     print(f"Training set: {TRAIN_FITS_PATH}")
-    return load_training_table(
-        key=key, subsample=subsample,
-        weight_clip_percentile=weight_clip_percentile,
-    )
+    return load_training_table(key=key, subsample=subsample)

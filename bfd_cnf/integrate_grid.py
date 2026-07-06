@@ -11,6 +11,12 @@ centroid condition Σ_X is built from each target's odd-moment covariance ``C_X`
 (:func:`bfd_cnf.models.flows.even_cov_to_CX`, from the even cov's flux row), then
 mapped to ``[log_scale, e1, e2]`` via :func:`bfd_cnf.models.flows.cx_to_sx_cond`.
 
+The +/- catalogues are independent injection realisations over the same
+footprint (only ~0.8% are genuine ring pairs at matching sky positions), so
+each side is integrated separately, selected on its own moments
+(:func:`bfd_cnf.inference.integrate_catalog_pqr`), and compared via the
+aggregate sum-PQR shears — see :func:`bfd_cnf.statistics.bootstrap_independent_mult_bias`.
+
 Usage
 -----
     python -m bfd_cnf.integrate_grid [--n-targets N] [--n-points 1024]
@@ -41,15 +47,10 @@ from .config import (
     key as _base_key,
     target_flux_min,
 )
-from .inference import integrate_catalog_pqr, integrate_grid_pqr, load_grid_data
+from .inference import integrate_catalog_pqr
 from .models.bijections import RawMomentStandardize, load_stats
 from .models.flows import build_flows
-from .statistics import (
-    bootstrap_independent_mult_bias,
-    bootstrap_total_mult_bias,
-    pqr2g,
-    pqr2multbias,
-)
+from .statistics import bootstrap_independent_mult_bias, pqr2g
 from .training import load_models
 
 DEFAULT_STATS_FILE = os.path.join(DATA_DIR, "raw2standard_stats.npz")
@@ -112,16 +113,8 @@ def load_prior_flow(key, prior_path: str = PRIOR_FLOW_PATH, q_path: str = Q_FLOW
     return prior_trained
 
 
-def _run_independent(args, key, raw2standard, prior_flow) -> None:
-    """Integrate the +/- catalogues independently and report the ensemble m-bias.
-
-    The two grid catalogues are independent injection realisations over the same
-    footprint (only ~0.8% are genuine ring pairs), so the unbiased way to use all
-    the data is to integrate each side separately — each selected on its own
-    moments — and compare the aggregate sum-PQR shears.
-    """
-    print("INDEPENDENT-ENSEMBLE mode: integrating +/- catalogues separately "
-          "(no ring-pair matching).")
+def _run(args, key, raw2standard, prior_flow) -> None:
+    """Integrate the +/- catalogues independently and report the ensemble m-bias."""
     cat_p = np.load(GRID_P_PATH)
     cat_m = np.load(GRID_M_PATH)
 
@@ -165,8 +158,6 @@ def _run_independent(args, key, raw2standard, prior_flow) -> None:
     )
 
     out = args.out
-    if out == os.path.join(DATA_DIR, "pqr_grid.npz"):
-        out = os.path.join(DATA_DIR, "pqr_grid_independent.npz")
     np.savez(
         out,
         ids_p=np.asarray(res_p["ids"]), ids_m=np.asarray(res_m["ids"]),
@@ -234,19 +225,7 @@ def main() -> None:
                          "Pair with the matching --stats-file for the new-template flow.")
     ap.add_argument("--q", type=str, default=None,
                     help="Q-flow .eqx (needed by load_models; default: config canonical).")
-    ap.add_argument(
-        "--independent", action="store_true",
-        help="Independent-ensemble mode: integrate the +/- catalogues SEPARATELY, "
-             "each selected on its own moments (no ring-pair matching), and report "
-             "the aggregate m from sum-PQR shears.  Use this to exploit the full "
-             "catalogues; the default (paired) mode uses only the ~40k position-"
-             "matched ring pairs.",
-    )
     args = ap.parse_args()
-
-    fixed_sx_cond = None
-    if args.fixed_log_scale is not None:
-        fixed_sx_cond = (args.fixed_log_scale, args.fixed_e1, args.fixed_e2)
 
     key = _base_key
 
@@ -263,69 +242,7 @@ def main() -> None:
         k_flow, prior_path, args.q or Q_FLOW_PATH
     )
 
-    if args.independent:
-        _run_independent(args, key, raw2standard, prior_flow)
-        return
-
-    print("Loading galaxy grid data...")
-    joined_grid = load_grid_data(GRID_P_PATH, GRID_M_PATH)
-
-    key, k_int = jr.split(key)
-    res = integrate_grid_pqr(
-        joined_grid,
-        raw2standard,
-        prior_flow,
-        key=k_int,
-        n_targets=args.n_targets,
-        flux_min=args.flux_min,
-        flux_max=args.flux_max,
-        n_points=args.n_points,
-        n_replicates=args.n_replicates,
-        batch_size=args.batch_size,
-        hessian_scale=args.hessian_scale,
-        fixed_sx_cond=fixed_sx_cond,
-    )
-
-    pqr_p, pqr_m = res["pqr_p"], res["pqr_m"]
-
-    # Flow vs analytic-BFD shear recovery on the same targets.
-    g_p, g_m = pqr2g(pqr_p), pqr2g(pqr_m)
-    m_flow = pqr2multbias(jnp.concatenate([pqr_p, pqr_m], axis=-1))
-
-    g_p_sim, g_m_sim = pqr2g(res["pqr_sim_p"]), pqr2g(res["pqr_sim_m"])
-    m_sim = pqr2multbias(jnp.concatenate([res["pqr_sim_p"], res["pqr_sim_m"]], axis=-1))
-
-    print("\n=== Shear recovery (expect g(+) ~ +0.02, g(-) ~ -0.02) ===")
-    print(f"flow  g(+) = {np.asarray(g_p)}   g(-) = {np.asarray(g_m)}")
-    print(f"BFD   g(+) = {np.asarray(g_p_sim)}   g(-) = {np.asarray(g_m_sim)}")
-    print(f"flow  multiplicative bias m = {float(m_flow):+.4f}")
-    print(f"BFD   multiplicative bias m = {float(m_sim):+.4f}")
-
-    stats = bootstrap_total_mult_bias(
-        pqr_p, pqr_m, n_boot=5000, delta_g=0.04, key=jr.PRNGKey(42)
-    )
-    print("\n=== Bootstrap multiplicative bias (flow) ===")
-    print(
-        f"m point={float(stats['m_point']):+.4f}  mean={float(stats['m_mean']):+.4f}  "
-        f"std={float(stats['m_std']):.4f}  "
-        f"16-84%=[{float(stats['m_p16']):+.4f}, {float(stats['m_p84']):+.4f}]  "
-        f"n={stats['n_used']}"
-    )
-
-    np.savez(
-        args.out,
-        ids=np.asarray(res["ids"]),
-        pqr_p=np.asarray(pqr_p),
-        pqr_m=np.asarray(pqr_m),
-        pqr_sim_p=np.asarray(res["pqr_sim_p"]),
-        pqr_sim_m=np.asarray(res["pqr_sim_m"]),
-        sx_conds_p=np.asarray(res["sx_conds_p"]),
-        sx_conds_m=np.asarray(res["sx_conds_m"]),
-        targets_p=np.asarray(res["targets_p"]),
-        targets_m=np.asarray(res["targets_m"]),
-    )
-    print(f"\nSaved PQR results to {args.out}  "
-          "(columns [P, Q1, Q2, R11, R22, R12]).")
+    _run(args, key, raw2standard, prior_flow)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 plot_mbias_vs_logscale.py
 ==========================
 Multiplicative bias ``m`` binned by an ``sx_conds`` component (``log_scale``,
-``e1``, or ``e2`` -- the PSF/centroid noise condition ``[log_scale, e1, e2]``),
+``e1``, or ``e2`` -- the centering-bias noise condition ``[log_scale, e1, e2]``),
 Flow vs Fiducial, from an independent-ensemble PQR npz (e.g.
 ``data/pqr_indep_xy_elbo_1M.npz``). The +/- arms are different targets, so
 each arm is binned by its own ``sx_conds`` value and ``m`` is formed from the

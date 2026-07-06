@@ -63,7 +63,6 @@ from .config import (
     e_max,
     key as _base_key,
     log_scale_range,
-    n_sx_train,
     num_samples,
     prior_sigmax_log_scale_mean,
     train_chunk_size,
@@ -173,7 +172,7 @@ def main() -> int:
     p.add_argument("--q-in", type=str, default=Q_FLOW_PATH)
     p.add_argument("--loss", choices=["elbo", "nll"], default="elbo",
                    help="Training objective. 'elbo' (default) jointly trains prior+q. "
-                        "'nll' trains the prior alone on direct template NLL (z≈y, no q flow) "
+                        "'nll' trains the prior alone on direct template NLL (m≈y, no q flow) "
                         "with the same per-stage convergence gates — for isolating ELBO/q issues.")
     p.add_argument("--from-scratch", action="store_true",
                    help="Initialise fresh flows (skip load_models) and train from random init "
@@ -191,8 +190,7 @@ def main() -> int:
         args.start_steps = 0 if args.from_scratch else 50_000
 
     print(f"devices: {jax.devices()}")
-    print(f"Σ_X conditioning: log_scale_range={log_scale_range} e_max={e_max} "
-          f"n_sx_train={n_sx_train}")
+    print(f"Σ_X conditioning: log_scale_range={log_scale_range} e_max={e_max}")
     print(f"blocks: {args.block_steps} steps each, max {args.max_blocks}; "
           f"thresholds τ_param={args.tau_param} τ_func={args.tau_func} τ_loss={args.tau_loss}")
 
@@ -239,11 +237,11 @@ def main() -> int:
         print(f"  validation cut: {cand.size}/{N} templates pass log10(Mf)/Mr/Mf limits")
     n_val = min(args.n_val, cand.size)
     val_idx = cand[jr.choice(k_val, cand.size, shape=(n_val,), replace=False)]
-    z_val, _ = transform_dataset_to_standard(
+    m_val, _ = transform_dataset_to_standard(
         raw2standard, moments_jnp[val_idx], cov_jnp[val_idx]
     )
-    z_val = jnp.asarray(z_val)
-    bins = make_moment_space_bins(z_val)
+    m_val = jnp.asarray(m_val)
+    bins = make_moment_space_bins(m_val)
     c_ref = jnp.array([0.0, 0.0, float(prior_sigmax_log_scale_mean), 0.0, 0.0])
     print(f"  validation set: {n_val} pts, {bins.nx}×{bins.ny} moment-space bins "
           f"({int(bins.valid_mask.sum())} valid)")
@@ -258,12 +256,12 @@ def main() -> int:
     w_np = w_np / w_np.sum()
     sampling_weights = jnp.asarray(w_np) if use_nda_weight else None
     if args.loss == "nll":
-        # q-free: prior is supervised directly on log p(y_std | g, C_X) (z≈y).
+        # q-free: prior is supervised directly on log p(y_std | g, C_X) (m≈y).
         loss_fn = make_nll_loss(
             N=N, batch_size=batch_size,
             weights=sampling_weights,
             log_scale_range=log_scale_range, e_max=e_max,
-            n_sx_train=n_sx_train, use_sx=(log_scale_range is not None),
+            use_sx=(log_scale_range is not None),
             raw2standard=raw2standard,
         )
         print("Loss: NLL (q-free, prior-only direct template NLL)")
@@ -272,7 +270,7 @@ def main() -> int:
             N=N, batch_size=batch_size, num_samples=num_samples,
             weights=sampling_weights,
             log_scale_range=log_scale_range, e_max=e_max,
-            n_sx_train=n_sx_train, use_sx=(log_scale_range is not None),
+            use_sx=(log_scale_range is not None),
             raw2standard=raw2standard, mean_log_diag=mean_log_diag,
             std_log_diag=std_log_diag, mean_off=mean_off, std_off=std_off,
         )
@@ -328,7 +326,7 @@ def main() -> int:
 
     # ------------------------------------------------ baseline (block 0) metrics
     prev_params = collect_stage_params(prior)
-    prev_fields = compute_functional_fields(prior, z_val, bins, c_ref)
+    prev_fields = compute_functional_fields(prior, m_val, bins, c_ref)
     param_m0 = param_plateau_metrics(prev_params, None)
     func_m0 = functional_plateau_metrics(prev_fields, None, bins)
     print("\nBaseline (resume point) functional magnitudes:")
@@ -412,7 +410,7 @@ def main() -> int:
 
         # metrics
         cur_params = collect_stage_params(prior)
-        cur_fields = compute_functional_fields(prior, z_val, bins, c_ref)
+        cur_fields = compute_functional_fields(prior, m_val, bins, c_ref)
         param_m = param_plateau_metrics(cur_params, prev_params)
         func_m = functional_plateau_metrics(cur_fields, prev_fields_for_delta, bins)
         conv = stage_converged(param_m, func_m, args.tau_param, args.tau_func)
@@ -555,7 +553,7 @@ def _make_plots(history, final_fields, bins, tag) -> None:
     # ---- final across-moment-space field maps ----
     extent = [bins.x_edges[0], bins.x_edges[-1], bins.y_edges[0], bins.y_edges[-1]]
     titles = {
-        STAGE_ORDER[0]: "base shape:  log p(z | ref)",
+        STAGE_ORDER[0]: "base shape:  log p(m | ref)",
         STAGE_ORDER[1]: "shear resp:  |∂logp/∂g|",
         STAGE_ORDER[2]: "C_X resp:  |∂logp/∂(logS,e1,e2)|",
     }
@@ -571,7 +569,7 @@ def _make_plots(history, final_fields, bins, tag) -> None:
         m = _field_mag(name).T
         im = ax2[k].imshow(m, origin="lower", extent=extent, aspect="auto", cmap="viridis")
         ax2[k].set_title(f"{short[name]}\n{titles[name]}", fontsize=10)
-        ax2[k].set_xlabel("std flux z0"); ax2[k].set_ylabel("std size z1")
+        ax2[k].set_xlabel("std flux m0"); ax2[k].set_ylabel("std size m1")
         fig2.colorbar(im, ax=ax2[k], fraction=0.046)
     fig2.suptitle(f"Final per-stage signatures across moment space "
                   f"(total steps = {blocks[-1]['total_steps']})", fontsize=13)

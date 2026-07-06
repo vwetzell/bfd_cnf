@@ -35,9 +35,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from .config import GRID_M_PATH, GRID_P_PATH, PLOTS_DIR, key as _base_key
-from .inference import integrate_grid_pqr, load_grid_data
+from .inference import integrate_catalog_pqr
 from .integrate_grid import load_prior_flow, load_raw2standard
-from .statistics import pqr2g, pqr2multbias
+from .statistics import pqr2g
 
 
 def main() -> None:
@@ -70,9 +70,10 @@ def main() -> None:
     raw2standard = load_raw2standard()
     key, k_flow = jr.split(_base_key)
     prior_flow = load_prior_flow(k_flow)
-    print("Loading grid...")
-    joined_grid = load_grid_data(GRID_P_PATH, GRID_M_PATH)
-    key, k_int = jr.split(key)          # same k_int for every config => same targets
+    print("Loading grid catalogues...")
+    cat_p = np.load(GRID_P_PATH)
+    cat_m = np.load(GRID_M_PATH)
+    key, kp, km = jr.split(key, 3)       # same kp/km for every config => same targets
 
     rows = []
     print(f"\nproposal convergence: n_targets={args.n_targets}\n")
@@ -83,18 +84,18 @@ def main() -> None:
     print(hdr)
     print("-" * len(hdr))
     for npts, nrep, hs, bs in configs:
-        res = integrate_grid_pqr(
-            joined_grid, raw2standard, prior_flow, key=k_int,
-            n_targets=args.n_targets, n_points=npts,
-            n_replicates=nrep, batch_size=bs,
-            hessian_scale=hs, return_ess=True, verbose=False,
+        common = dict(
+            n_targets=args.n_targets, n_points=npts, n_replicates=nrep,
+            batch_size=bs, hessian_scale=hs, return_ess=True, verbose=False,
         )
-        pqr_p, pqr_m = res["pqr_p"], res["pqr_m"]
+        res_p = integrate_catalog_pqr(cat_p, raw2standard, prior_flow, key=kp, **common)
+        res_m = integrate_catalog_pqr(cat_m, raw2standard, prior_flow, key=km, **common)
+        pqr_p, pqr_m = res_p["pqr"], res_m["pqr"]
         gp = np.asarray(pqr2g(jnp.asarray(pqr_p)))
         gm = np.asarray(pqr2g(jnp.asarray(pqr_m)))
-        m = float(pqr2multbias(jnp.concatenate([pqr_p, pqr_m], axis=-1)))
-        ess = np.concatenate([np.asarray(res["ess_p"]), np.asarray(res["ess_m"])])
-        maxw = np.concatenate([np.asarray(res["maxw_p"]), np.asarray(res["maxw_m"])])
+        m = float((gp[0] - gm[0]) / 0.04 - 1.0)
+        ess = np.concatenate([np.asarray(res_p["ess"]), np.asarray(res_m["ess"])])
+        maxw = np.concatenate([np.asarray(res_p["maxw"]), np.asarray(res_m["maxw"])])
         ess = ess[np.isfinite(ess)]; maxw = maxw[np.isfinite(maxw)]
         medess = float(np.median(ess))
         # effective samples/target combining points across replicates:

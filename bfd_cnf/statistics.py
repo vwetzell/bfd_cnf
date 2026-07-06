@@ -6,7 +6,8 @@ Pure math / statistics helpers for BFD shear estimation:
   - pqr2g()                    — estimate shear vector from PQR array
   - pqr2multbias()             — compute multiplicative bias from ± PQR
   - clipR()                    — eigenvalue-clip the R matrix
-  - bootstrap_total_mult_bias() — bootstrap uncertainty on multiplicative bias
+  - bootstrap_independent_mult_bias() — bootstrap uncertainty on multiplicative
+    bias from two independent (unpaired, possibly unequal-length) PQR ensembles
 
 Notation — the per-object ``pqr`` array is PROBABILITY-space ``[P, Q1, Q2, R11,
 R22, R12]`` where Q = ∇_g P and R = ∇²_g P (derivatives of P, NOT of log P).
@@ -147,11 +148,11 @@ def clipR(pqr: np.ndarray, lower: float = -100, upper: float = 100) -> np.ndarra
 
 
 # ---------------------------------------------------------------------------
-# bootstrap_total_mult_bias
+# bootstrap_independent_mult_bias
 # ---------------------------------------------------------------------------
 
 
-def bootstrap_total_mult_bias(
+def bootstrap_independent_mult_bias(
     pqr_arr_p: jax.Array,
     pqr_arr_m: jax.Array,
     n_boot: int = 2000,
@@ -160,15 +161,18 @@ def bootstrap_total_mult_bias(
     key: jax.Array = jr.PRNGKey(0),
     return_samples: bool = False,
 ) -> dict[str, Any]:
-    """Bootstrap the multiplicative bias and its uncertainty from per-object PQR arrays.
+    """Bootstrap the multiplicative bias from two *independent* PQR ensembles.
+
+    The +shear and -shear grid catalogues are independent injection realisations
+    over the same footprint — different objects, possibly different lengths, with
+    only a small fraction landing at coincident sky positions — so each arm is
+    resampled independently rather than jointly.  The shear of each arm is the
+    aggregate sum-PQR estimate and ``m = (g1_p - g1_m) / delta_g - 1``.
 
     Parameters
     ----------
-    pqr_arr_p : array-like, shape (N, 6)
-        PQR array for the +shear catalogue with columns
-        ``[P, Q1, Q2, R11, R22, R12]``.
-    pqr_arr_m : array-like, shape (N, 6)
-        PQR array for the -shear catalogue (same layout as ``pqr_arr_p``).
+    pqr_arr_p, pqr_arr_m : array-like, shape (Np, 6) / (Nm, 6)
+        Per-object PQR for the + and - catalogues; the two lengths may differ.
     n_boot : int, optional
         Number of bootstrap resamples.  Default is 2000.
     delta_g : float, optional
@@ -185,153 +189,10 @@ def bootstrap_total_mult_bias(
     Returns
     -------
     dict
-        Dictionary with the following keys:
-
-        m_point : jax.Array, scalar
-            Full-sample point estimate of the multiplicative bias.
-        m_mean : jax.Array, scalar
-            Bootstrap mean of the multiplicative bias.
-        m_std : jax.Array, scalar
-            Bootstrap 1-σ uncertainty (``ddof=1``).
-        m_p16, m_p84 : jax.Array, scalar
-            16th and 84th bootstrap percentiles.
-        n_used : int
-            Number of objects after filtering.
-        m_boot : jax.Array, shape (n_boot,)
-            Bootstrap samples (only present when ``return_samples=True``).
-    """
-
-    pqr_arr_p = jnp.asarray(pqr_arr_p)
-    pqr_arr_m = jnp.asarray(pqr_arr_m)
-
-    if pqr_arr_p.shape != pqr_arr_m.shape:
-        raise ValueError("pqr_arr_p and pqr_arr_m must have the same shape")
-    if pqr_arr_p.ndim != 2 or pqr_arr_p.shape[1] != 6:
-        raise ValueError("Each PQR array must have shape (N, 6)")
-
-    # SHARED validity mask applied to BOTH arms up front, so the + and - catalogues
-    # keep exactly the same matched objects (a proper *paired* bootstrap).
-    #
-    # The previous version applied the P>=1e-10 cut to each arm separately *inside*
-    # pqr_to_qr_totals and never actually applied a shared mask (the `[finite_mask]`
-    # slice was commented out), with n_obj left at the unmasked N.  When the two arms
-    # dropped different objects (common — thousands of targets have tiny P in only one
-    # arm) this (a) misaligned Qp[i] vs Qm[i] so the resample paired *different*
-    # galaxies across ±, and (b) indexed [0, N) into the shorter masked arrays, which
-    # JAX silently clamps.  Both corrupt the bootstrap (its mean became input-order /
-    # pre-filter dependent and biased low).  Masking both arms together fixes it.
-    keep = (
-        jnp.all(jnp.isfinite(pqr_arr_p), axis=1)
-        & jnp.all(jnp.isfinite(pqr_arr_m), axis=1)
-        & (pqr_arr_p[:, 0] >= 1e-10)
-        & (pqr_arr_m[:, 0] >= 1e-10)
-    )
-    p = pqr_arr_p[keep]
-    m = pqr_arr_m[keep]
-    n_obj = p.shape[0]
-
-    if n_obj < 2:
-        raise ValueError("Not enough valid objects after filtering")
-
-    def pqr_to_qr_totals(pqr):
-        # No per-arm masking here: the shared `keep` mask above already guarantees
-        # P>=1e-10 and keeps the two arms paired (same rows, same length = n_obj).
-        P = pqr[:, 0]
-        Q = pqr[:, 1:3]
-        R = jnp.stack(
-            [
-                jnp.stack([pqr[:, 3], pqr[:, 5]], axis=-1),
-                jnp.stack([pqr[:, 5], pqr[:, 4]], axis=-1),
-            ],
-            axis=-2,
-        )  # (N, 2, 2)
-
-        Q_tot = Q / P[:, None]
-        R_tot = (
-            jnp.einsum("ni,nj->nij", Q, Q) / P[:, None, None] ** 2
-            - R / P[:, None, None]
-        )
-        return Q_tot, R_tot
-
-    Qp, Rp = pqr_to_qr_totals(p)
-    Qm, Rm = pqr_to_qr_totals(m)
-
-    eye2 = jnp.eye(2)
-
-    def g_from_totals(Q_tot, R_tot):
-        Q_sum = jnp.nansum(Q_tot, axis=0)
-        R_sum = jnp.nansum(R_tot, axis=0) + ridge * eye2
-        return jnp.linalg.solve(R_sum, Q_sum)
-
-    # Full-sample point estimate
-    g_p_point = g_from_totals(Qp, Rp)
-    g_m_point = g_from_totals(Qm, Rm)
-    m_point = (g_p_point[0] - g_m_point[0]) / delta_g - 1.0
-
-    # Bootstrap using per-iteration keys (no giant idx matrix)
-    key, sub = jr.split(key)
-    keys = jr.split(sub, n_boot)
-
-    def one_boot(k):
-        ii = jr.randint(k, shape=(n_obj,), minval=0, maxval=n_obj)
-        g_p = g_from_totals(Qp[ii], Rp[ii])
-        g_m = g_from_totals(Qm[ii], Rm[ii])
-        return (g_p[0] - g_m[0]) / delta_g - 1.0
-
-    m_boot = jax.lax.map(one_boot, keys)
-
-    out = {
-        "m_point": m_point,
-        "m_mean": jnp.nanmean(m_boot),
-        "m_std": jnp.nanstd(m_boot, ddof=1),
-        "m_p16": jnp.nanpercentile(m_boot, 16.0),
-        "m_p84": jnp.nanpercentile(m_boot, 84.0),
-        "n_used": n_obj,
-    }
-    if return_samples:
-        out["m_boot"] = m_boot
-    return out
-
-
-# ---------------------------------------------------------------------------
-# bootstrap_independent_mult_bias
-# ---------------------------------------------------------------------------
-
-
-def bootstrap_independent_mult_bias(
-    pqr_arr_p: jax.Array,
-    pqr_arr_m: jax.Array,
-    n_boot: int = 2000,
-    delta_g: float = 0.04,
-    ridge: float = 1e-10,
-    key: jax.Array = jr.PRNGKey(0),
-    return_samples: bool = False,
-) -> dict[str, Any]:
-    """Bootstrap the multiplicative bias from two *independent* PQR ensembles.
-
-    Unlike :func:`bootstrap_total_mult_bias` (which assumes ``pqr_arr_p`` and
-    ``pqr_arr_m`` are the SAME galaxies row-paired, and resamples them jointly for
-    shape-noise cancellation), this treats the +shear and -shear catalogues as
-    independent samples — different objects, possibly different lengths — and
-    resamples each arm independently.  This is the correct estimator when the two
-    catalogues are independent injection realisations rather than ring pairs (see
-    :func:`bfd_cnf.inference.load_grid_data`).
-
-    The shear of each arm is the aggregate sum-PQR estimate and
-    ``m = (g1_p - g1_m) / delta_g - 1``.
-
-    Parameters
-    ----------
-    pqr_arr_p, pqr_arr_m : array-like, shape (Np, 6) / (Nm, 6)
-        Per-object PQR for the + and - catalogues; the two lengths may differ.
-    n_boot, delta_g, ridge, key, return_samples
-        As in :func:`bootstrap_total_mult_bias`.
-
-    Returns
-    -------
-    dict
-        Same keys as :func:`bootstrap_total_mult_bias`, with ``n_used`` replaced
-        by ``n_used_p`` / ``n_used_m``.
+        ``m_point``, ``m_mean``, ``m_std``, ``m_p16``, ``m_p84`` (as in
+        :func:`pqr2multbias`'s bootstrap), plus ``n_used_p`` / ``n_used_m``
+        (object counts after filtering, one per arm), and ``m_boot`` when
+        ``return_samples=True``.
     """
     pqr_arr_p = jnp.asarray(pqr_arr_p)
     pqr_arr_m = jnp.asarray(pqr_arr_m)

@@ -43,7 +43,6 @@ from .config import (
     e_max,
     key as _base_key,
     log_scale_range,
-    n_sx_train,
     train_chunk_size,
 )
 from .data import load_training_dataset
@@ -106,19 +105,12 @@ def main() -> int:
             data["weights"],
             data["raw2standard"],
             nda=data["nda"],
-            # The importance-subsampled template_train.fits stores Horvitz-Thompson
-            # weights (nda/p); its heavy top tail IS the correction for the
-            # down-weighted far-MX/MY copies, so it must NOT be clipped (the config
-            # default 99.9 would truncate it and reintroduce the MX/MY bias).
-            # See dev/subsample.py. Drop this override if training the raw (non-subsampled) table.
-            nda_clip_percentile=None,
             steps=args.steps,
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
             grad_clip=args.grad_clip,
             log_scale_range=log_scale_range,
             e_max=e_max,
-            n_sx_train=n_sx_train,
             # NaNs cannot be localised inside a lax.scan, so debug runs use the
             # eager per-step loop; normal runs use the fast fused-scan loop.
             chunk_size=1 if args.debug_nans else train_chunk_size,

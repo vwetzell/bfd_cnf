@@ -24,7 +24,7 @@ weights = nda / jnp.mean(nda)                         # proposal ∝ nda
 r2s = load_stats("flows/prior_flow_xy_nll.eqx")       # realistic standardiser
 prior, q = build_flows(jr.key(0), 4, 16, raw2standard=r2s)
 
-common = dict(N=N, batch_size=B, weights=weights, e_max=0.05, n_sx_train=4,
+common = dict(N=N, batch_size=B, weights=weights, e_max=0.05,
               raw2standard=r2s)
 for lsr, tag in [((10.5, 13.0), "Σ_X on"), (None, "Σ_X off")]:
     nll = make_nll_loss(log_scale_range=lsr, use_sx=lsr is not None, **common)
@@ -38,7 +38,7 @@ for lsr, tag in [((10.5, 13.0), "Σ_X on"), (None, "Σ_X off")]:
 # ELBO needs the whitening stats; pass zeros (cond features tolerate it for smoke).
 z = jnp.zeros(4)
 elbo = make_elbo_loss(N=N, batch_size=B, num_samples=4, weights=weights,
-                      log_scale_range=(10.5, 13.0), e_max=0.05, n_sx_train=4,
+                      log_scale_range=(10.5, 13.0), e_max=0.05,
                       raw2standard=r2s, mean_log_diag=z, std_log_diag=z + 1,
                       mean_off=jnp.zeros(6), std_off=jnp.ones(6))
 v, g = eqx.filter_value_and_grad(

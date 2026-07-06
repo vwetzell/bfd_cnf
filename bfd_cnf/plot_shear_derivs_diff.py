@@ -1,7 +1,7 @@
 """
 plot_shear_derivs_diff.py
 =========================
-Plot the **difference** of the shear-derivative panels between two PSF/centroid
+Plot the **difference** of the shear-derivative panels between two centering-bias
 ellipticity slices, e.g. ``e2=0.2`` minus ``e2=0.0``:
 
     Δ(field) = field(e2=b) − field(e2=a)   for field in

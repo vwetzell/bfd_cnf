@@ -26,7 +26,6 @@ from .config import (
     Sigma0,
     e_max,
     log_scale_range,
-    n_sx_train,
     prior_flow_layers,
     q_flow_layers,
 )
@@ -40,9 +39,7 @@ from .config import (
 from .data import load_training_dataset, transform_dataset_to_standard
 from .inference import (
     _halton_sequence,
-    assemble_pqr_from_flow,
-    integrate_grid_pqr,
-    load_grid_data,
+    integrate_catalog_pqr,
     make_flow_prob_and_derivs,
     prob_template,
     rqmc_integrate_pqr_jax,
@@ -51,10 +48,8 @@ from .inference import (
 )
 from .models.flows import batch_cholesky_of_sym, build_flows, cov2corr, cx_to_sx_cond
 from .statistics import (
-    bootstrap_total_mult_bias,
-    clipR,
+    bootstrap_independent_mult_bias,
     pqr2g,
-    pqr2multbias,
 )
 from .training import (
     compute_std_stats,
@@ -65,7 +60,6 @@ from .training import (
 from .viz import (
     plot_flow_vs_obs_corner,
     plot_g_distributions,
-    plot_mult_bias_hexbin,
     plot_Q_distributions,
     plot_R_distributions,
     plot_snr_histograms,
@@ -81,9 +75,10 @@ def main() -> None:
     2. Load or train the prior and q normalizing flows.
     3. Build flow-based PQR inference functions.
     4. Run a single-object RQMC PQR sanity check.
-    5. Load galaxy grid data and compute flow-based RQMC PQR for ±shear grids.
-    6. Assemble per-object PQR arrays and estimate the shear vector.
-    7. Bootstrap the multiplicative bias uncertainty.
+    5. Integrate the +/- shear grid catalogues independently (each selected on
+       its own moments — see :func:`bfd_cnf.inference.integrate_catalog_pqr`).
+    6. Estimate the per-object shear vector on each side.
+    7. Bootstrap the multiplicative bias uncertainty (independent-ensemble).
     8. Produce diagnostic visualisations.
     """
     key = _base_key
@@ -117,7 +112,6 @@ def main() -> None:
         grad_clip=0.5,
         log_scale_range=log_scale_range,
         e_max=e_max,
-        n_sx_train=n_sx_train,
     )
 
     if _os.path.exists(PRIOR_FLOW_PATH) and _os.path.exists(Q_FLOW_PATH):
@@ -211,87 +205,63 @@ def main() -> None:
     print(f"R12(near): {R12_est_near:.4e} +/- {R12_se_near:.4e}")
 
     # -----------------------------------------------------------------------
-    # 5. Grid PQR on galaxy grid
+    # 5. Grid PQR — +/- catalogues integrated independently
     # -----------------------------------------------------------------------
-    print("Loading galaxy grid data...")
-    joined_grid = load_grid_data(GRID_P_PATH, GRID_M_PATH)
+    # The two catalogues are independent injection realisations over the same
+    # footprint (only ~0.8% are genuine +/- ring pairs at the same sky position),
+    # so each side is selected and integrated on its own moments rather than
+    # matched into pairs — see integrate_catalog_pqr.
+    print("Loading galaxy grid catalogues...")
+    cat_p = np.load(GRID_P_PATH)
+    cat_m = np.load(GRID_M_PATH)
 
     jax.config.update("jax_debug_nans", False)
 
-    # Per-target Σ_X is built from each target's even-moment covariance via
-    # even_cov_to_CX (the exact odd-cov identity) → cx_to_sx_cond; it is NOT the
-    # [M1, M2] ellipticity sub-block.  See inference.integrate_grid_pqr.
-    print("Running flow-based RQMC PQR on grid (+/- shear)...")
-    key, k_int = jr.split(key)
-    grid_res = integrate_grid_pqr(
-        joined_grid,
-        raw2standard,
-        prior_trained,
-        key=k_int,
-        n_targets=100_000,
-        n_points=2**10,
-        n_replicates=16,
-        batch_size=512,
+    print("Running flow-based RQMC PQR on grid (+/- shear, independent ensembles)...")
+    key, kp, km = jr.split(key, 3)
+    common = dict(
+        n_targets=100_000, n_points=2**10, n_replicates=16, batch_size=512,
     )
-
-    (
-        P_p, P_se_p, Q1_p, Q1_se_p, Q2_p, Q2_se_p,
-        R11_p, R11_se_p, R22_p, R22_se_p, R12_p, R12_se_p,
-    ) = grid_res["components_p"]
-    (
-        P_m, P_se_m, Q1_m, Q1_se_m, Q2_m, Q2_se_m,
-        R11_m, R11_se_m, R22_m, R22_se_m, R12_m, R12_se_m,
-    ) = grid_res["components_m"]
-
-    targets_p_10k = grid_res["targets_p"]
+    res_p = integrate_catalog_pqr(cat_p, raw2standard, prior_trained, key=kp, **common)
+    res_m = integrate_catalog_pqr(cat_m, raw2standard, prior_trained, key=km, **common)
 
     # -----------------------------------------------------------------------
-    # 6. Assemble PQR and compute shear
+    # 6. Per-object shear estimate on each side
     # -----------------------------------------------------------------------
-    pqr_arr_p, pqr_arr_m = grid_res["pqr_p"], grid_res["pqr_m"]
+    pqr_p, pqr_m = res_p["pqr"], res_m["pqr"]
 
-    Q_p_vec = jnp.stack([Q1_p, Q2_p], axis=-1)
-    R_p_mat = jnp.stack(
-        [
-            jnp.stack([R11_p, R12_p], axis=-1),
-            jnp.stack([R12_p, R22_p], axis=-1),
-        ],
-        axis=-2,
-    )
-    Q_tot_p = Q_p_vec / P_p[:, None]
-    R_tot_p = (
-        jnp.einsum("...i,...j->...ij", Q_p_vec, Q_p_vec) / P_p[:, None, None] ** 2
-        - R_p_mat / P_p[:, None, None]
-    )
-    g_est_p = jnp.einsum("...ij,...j->...i", jnp.linalg.inv(R_tot_p), Q_tot_p)
+    def _q_r_g(pqr):
+        Q_vec = pqr[:, 1:3]
+        R_mat = jnp.stack(
+            [
+                jnp.stack([pqr[:, 3], pqr[:, 5]], axis=-1),
+                jnp.stack([pqr[:, 5], pqr[:, 4]], axis=-1),
+            ],
+            axis=-2,
+        )
+        Q_tot = Q_vec / pqr[:, 0:1]
+        R_tot = (
+            jnp.einsum("...i,...j->...ij", Q_vec, Q_vec) / pqr[:, 0, None, None] ** 2
+            - R_mat / pqr[:, 0, None, None]
+        )
+        g_est = jnp.einsum("...ij,...j->...i", jnp.linalg.inv(R_tot), Q_tot)
+        return Q_tot, R_tot, g_est
 
-    Q_m_vec = jnp.stack([Q1_m, Q2_m], axis=-1)
-    R_m_mat = jnp.stack(
-        [
-            jnp.stack([R11_m, R12_m], axis=-1),
-            jnp.stack([R12_m, R22_m], axis=-1),
-        ],
-        axis=-2,
-    )
-    Q_tot_m = Q_m_vec / P_m[:, None]
-    R_tot_m = (
-        jnp.einsum("...i,...j->...ij", Q_m_vec, Q_m_vec) / P_m[:, None, None] ** 2
-        - R_m_mat / P_m[:, None, None]
-    )
-    g_est_m = jnp.einsum("...ij,...j->...i", jnp.linalg.inv(R_tot_m), Q_tot_m)
+    Q_tot_p, R_tot_p, g_est_p = _q_r_g(pqr_p)
+    Q_tot_m, R_tot_m, g_est_m = _q_r_g(pqr_m)
 
-    print(f"Estimated g (flow +0.02): {pqr2g(pqr_arr_p)}")
-    print(f"Estimated g (flow -0.02): {pqr2g(pqr_arr_m)}")
-
-    pqr_arr = jnp.concatenate([pqr_arr_p, pqr_arr_m], axis=-1)
-    print(f"Multiplicative bias: {pqr2multbias(pqr_arr):.3f}")
+    g_p_pt, g_m_pt = pqr2g(pqr_p), pqr2g(pqr_m)
+    print(f"Estimated g (flow +0.02): {g_p_pt}")
+    print(f"Estimated g (flow -0.02): {g_m_pt}")
+    m_flow = float((g_p_pt[0] - g_m_pt[0]) / 0.04 - 1.0)
+    print(f"Multiplicative bias: {m_flow:.3f}")
 
     # -----------------------------------------------------------------------
-    # 7. Bootstrap uncertainty
+    # 7. Bootstrap uncertainty (independent ensembles, unequal lengths allowed)
     # -----------------------------------------------------------------------
     print("Bootstrapping multiplicative bias uncertainty...")
-    stats = bootstrap_total_mult_bias(
-        pqr_arr_p, pqr_arr_m, n_boot=5000, delta_g=0.04, key=jr.PRNGKey(42)
+    stats = bootstrap_independent_mult_bias(
+        pqr_p, pqr_m, n_boot=5000, delta_g=0.04, key=jr.PRNGKey(42)
     )
     print(f"m (point): {float(stats['m_point']):0.3f}")
     print(f"m (bootstrap mean): {float(stats['m_mean']):0.3f}")
@@ -304,7 +274,6 @@ def main() -> None:
     plot_g_distributions(g_est_p, g_est_m)
     plot_Q_distributions(Q_tot_p, Q_tot_m)
     plot_R_distributions(R_tot_p, R_tot_m)
-    plot_mult_bias_hexbin(targets_p_10k, pqr_arr, pqr2multbias)
 
 
 if __name__ == "__main__":

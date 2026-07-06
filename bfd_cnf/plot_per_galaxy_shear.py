@@ -1,9 +1,9 @@
 """
 plot_per_galaxy_shear.py
 ========================
-Distribution of *individual-galaxy* shear estimates from a saved PQR grid
-integration, with the per-galaxy **median** and the **sum-PQR** estimate
-overlaid.
+Distribution of *individual-galaxy* shear estimates from a saved independent-
+ensemble PQR grid integration, with the per-galaxy **median** and the
+**sum-PQR** estimate overlaid.
 
 For galaxy i the single-object shear is the per-object version of ``pqr2g``:
 
@@ -18,11 +18,15 @@ actually used for the shear measurement.  Comparing the per-galaxy median to the
 sum-PQR value shows whether the optimal weighting pulls the estimate away from
 the robust unweighted centre.
 
+The +shear and -shear arms are independent injection realisations (different
+objects, generally different lengths) — everything here is computed per arm
+with no cross-arm indexing, so this works directly on that schema.
+
 Panels: 2×2 = {+shear, −shear} × {g1, g2}.
 
 Run::
 
-    python -m bfd_cnf.plot_per_galaxy_shear --in data/pqr_grid_100k_mf3000_90000_plateau310k.npz
+    python -m bfd_cnf.plot_per_galaxy_shear --in data/pqr_grid.npz
 """
 
 from __future__ import annotations
@@ -63,8 +67,7 @@ def per_object_g(pqr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--in", dest="inp",
-                    default="data/pqr_grid_FULL_mf3000_90000_adapt240k.npz")
+    ap.add_argument("--in", dest="inp", default="data/pqr_grid.npz")
     ap.add_argument("--out", default=None)
     ap.add_argument("--range", type=float, default=0.5,
                     help="Half-width of the g axis for the histograms (default 0.5).")

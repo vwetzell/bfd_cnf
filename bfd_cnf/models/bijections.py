@@ -113,9 +113,9 @@ def _raw2std_jacobian_single_jax(
     """Compute the Jacobian matrix of the raw-to-standardised coordinate transform.
 
     The transform is
-    ``z = [(log10 Mf - mean[0])/s[0],  (Mr/Mf - mean[1])/s[1],
+    ``m = [(log10 Mf - mean[0])/s[0],  (Mr/Mf - mean[1])/s[1],
            (M1/Mr - mean[2])/s[2],      (M2/Mr - mean[3])/s[3]]``
-    and this function returns ``J = diag(1/s) @ dz0/dx``.
+    and this function returns ``J = diag(1/s) @ dt/dx``.
 
     Parameters
     ----------
@@ -127,7 +127,7 @@ def _raw2std_jacobian_single_jax(
     Returns
     -------
     jax.Array, shape (4, 4)
-        Jacobian ``dz/dx`` incorporating the standardisation scaling.
+        Jacobian ``dm/dx`` incorporating the standardisation scaling.
     """
     Mf = raw_moments[0]
     Mr = raw_moments[1]
@@ -240,8 +240,8 @@ def propagate_cov_to_std_jax(
 class RawMomentStandardize(AbstractBijection):
     """
     Raw x = [Mf, Mr, M1, M2]
-    Transformed z0 = [log10(Mf), Mr/Mf, M1/Mr, M2/Mr]
-    Then standardized: z = (z0 - mean) / std
+    Transformed t = [log10(Mf), Mr/Mf, M1/Mr, M2/Mr]
+    Then standardized: m = (t - mean) / std
     """
 
     mean: jax.Array
@@ -287,45 +287,45 @@ class RawMomentStandardize(AbstractBijection):
 
         Returns
         -------
-        z : jax.Array, shape (..., 4)
+        m : jax.Array, shape (..., 4)
             Standardised coordinates.
-        z0 : jax.Array, shape (..., 4)
+        t : jax.Array, shape (..., 4)
             Intermediate un-standardised transformed coordinates.
         """
         Mf, Mr, M1, M2 = x[..., 0], x[..., 1], x[..., 2], x[..., 3]
 
-        z0_0 = jnp.log10(Mf)
-        z0_1 = Mr / Mf
-        z0_2 = M1 / Mr
-        z0_3 = M2 / Mr
+        t0 = jnp.log10(Mf)
+        t1 = Mr / Mf
+        t2 = M1 / Mr
+        t3 = M2 / Mr
 
-        z0 = jnp.stack([z0_0, z0_1, z0_2, z0_3], axis=-1)
-        z = (z0 - self.mean) / self.std
-        return z, z0
+        t = jnp.stack([t0, t1, t2, t3], axis=-1)
+        m = (t - self.mean) / self.std
+        return m, t
 
-    def _inverse_transform(self, z):
+    def _inverse_transform(self, m):
         """Invert the standardised-to-raw coordinate change.
 
         Parameters
         ----------
-        z : jax.Array, shape (..., 4)
+        m : jax.Array, shape (..., 4)
             Standardised coordinates.
 
         Returns
         -------
         x : jax.Array, shape (..., 4)
             Raw moments ``[Mf, Mr, M1, M2]``.
-        z0 : jax.Array, shape (..., 4)
+        t : jax.Array, shape (..., 4)
             Intermediate un-standardised coordinates.
         """
-        z0 = z * self.std + self.mean
-        log10_const = jnp.log(jnp.array(10.0, dtype=z0.dtype))
-        Mf = jnp.exp(z0[..., 0] * log10_const)
-        Mr = z0[..., 1] * Mf
-        M1 = z0[..., 2] * Mr
-        M2 = z0[..., 3] * Mr
-        x = jnp.stack([Mf, Mr, M1, M2], axis=-1).astype(z0.dtype)
-        return x, z0
+        t = m * self.std + self.mean
+        log10_const = jnp.log(jnp.array(10.0, dtype=t.dtype))
+        Mf = jnp.exp(t[..., 0] * log10_const)
+        Mr = t[..., 1] * Mf
+        M1 = t[..., 2] * Mr
+        M2 = t[..., 3] * Mr
+        x = jnp.stack([Mf, Mr, M1, M2], axis=-1).astype(t.dtype)
+        return x, t
 
     def transform_and_log_det(self, x, condition=None):
         """Transform raw moments to standardised coordinates and compute the log-abs-det.
@@ -338,18 +338,18 @@ class RawMomentStandardize(AbstractBijection):
 
         Returns
         -------
-        z : jax.Array, shape (..., 4)
+        m : jax.Array, shape (..., 4)
             Standardised output.
         log_abs_det : jax.Array, scalar
             Log absolute determinant of the Jacobian.
         """
-        z, _ = self._forward_transform(x)
+        m, _ = self._forward_transform(x)
         Mf = x[..., 0]
         Mr = x[..., 1]
         ln10 = jnp.log(jnp.array(10.0, dtype=Mf.dtype))
         lad_geom = -(2.0 * jnp.log(Mf) + 2.0 * jnp.log(Mr) + jnp.log(ln10))
         lad_std = -jnp.sum(jnp.log(self.std))
-        return z, lad_geom + lad_std
+        return m, lad_geom + lad_std
 
     def inverse_and_log_det(self, y, condition=None):
         """Invert the standardisation and return the log-abs-det of the inverse.
@@ -578,8 +578,8 @@ class Spin0AutoregressiveLayer(AbstractBijection):
     Transforms components 0 and 1 of the input vector with an affine
     autoregressive map:
 
-    * ``z[0] = x[0] * exp(-s0)`` — unconditional scale.
-    * ``z[1] = (x[1] - loc1(z[0])) * exp(-s1(z[0]))`` — conditioned on z[0].
+    * ``y[0] = x[0] * exp(-s0)`` — unconditional scale.
+    * ``y[1] = (x[1] - loc1(y[0])) * exp(-s1(y[0]))`` — conditioned on y[0].
 
     Leaves components 2 and 3 unchanged.
 
@@ -613,23 +613,23 @@ class Spin0AutoregressiveLayer(AbstractBijection):
 
     def _spin0_fwd(self, x):
         ls0 = _bounded_log_scale(self.log_scale0)
-        z0_t = x[0] * jnp.exp(-ls0)
-        out1 = self.net_ls1(jnp.array([z0_t]))
+        y0_t = x[0] * jnp.exp(-ls0)
+        out1 = self.net_ls1(jnp.array([y0_t]))
         loc1 = out1[0]
         ls1 = _bounded_log_scale(out1[1])
-        z1_t = (x[1] - loc1) * jnp.exp(-ls1)
-        return z0_t, z1_t, loc1, ls0, ls1
+        y1_t = (x[1] - loc1) * jnp.exp(-ls1)
+        return y0_t, y1_t, loc1, ls0, ls1
 
     def transform_and_log_det(self, x, condition=None):
-        z0_t, z1_t, _, ls0, ls1 = self._spin0_fwd(x)
-        y = x.at[0].set(z0_t).at[1].set(z1_t)
+        y0_t, y1_t, _, ls0, ls1 = self._spin0_fwd(x)
+        y = x.at[0].set(y0_t).at[1].set(y1_t)
         return y, -(ls0 + ls1)
 
     def inverse_and_log_det(self, y, condition=None):
         ls0 = _bounded_log_scale(self.log_scale0)
         x0 = y[0] * jnp.exp(ls0)
-        z0_t = y[0]
-        out1 = self.net_ls1(jnp.array([z0_t]))
+        y0_t = y[0]
+        out1 = self.net_ls1(jnp.array([y0_t]))
         loc1 = out1[0]
         ls1 = _bounded_log_scale(out1[1])
         x1 = y[1] * jnp.exp(ls1) + loc1
@@ -675,8 +675,8 @@ class Spin2CouplingLayer(AbstractBijection):
     def cond_shape(self):
         return None
 
-    def _log_scale_each(self, z0_t, z1_t):
-        out = self.net(jnp.array([z0_t, z1_t]))
+    def _log_scale_each(self, y0_t, y1_t):
+        out = self.net(jnp.array([y0_t, y1_t]))
         s2 = _bounded_log_scale(out[0])
         return -s2  # log alpha_2 = -s2, the per-component log scale
 
@@ -901,11 +901,11 @@ class SigmaXCouplingLayer(AbstractBijection):
     the centroid marginalisation produces to leading order (analogous to
     :class:`ExplicitPolyLast` for shear, but a different effect):
 
-    * **Flux** ``z0`` → translation ``z0 + s0`` (the C_X-dependent flux-mean tilt).
-    * **Size** ``z1`` → *locked* scaling ``κ·z1 + c1·(κ−1)``, ``κ = exp(g_s)``,
+    * **Flux** ``m0`` → translation ``m0 + s0`` (the C_X-dependent flux-mean tilt).
+    * **Size** ``m1`` → *locked* scaling ``κ·m1 + c1·(κ−1)``, ``κ = exp(g_s)``,
       ``c1 = μ1/σ1``.  This equals ``κ × (Mr/Mf)`` on the un-centred ratio, so the
       multiplicative knob produces the physical size *mean* shift.
-    * **Ellipticity** ``(z2, z3)`` → ``(1/κ)·[(I + c·E)·(z2, z3) + D·(e1, e2)]``:
+    * **Ellipticity** ``(m2, m3)`` → ``(1/κ)·[(I + c·E)·(m2, m3) + D·(e1, e2)]``:
       the **same** ``κ`` (reciprocal lock — size inflation shrinks the ellipticity
       ratio), an additive **dipole** ``D·(e1, e2)`` (leading O(e) centring bias),
       and an anisotropic-broadening **quadrupole** ``c·E``,
@@ -913,7 +913,7 @@ class SigmaXCouplingLayer(AbstractBijection):
 
     Conditioning: the locked scale ``g_s`` depends on flux + C_X only (preserving a
     closed-form inverse); the directional terms ``D, c`` additionally depend on
-    size ``z1`` (where the small size-dependent corrections live).  Nets are
+    size ``m1`` (where the small size-dependent corrections live).  Nets are
     zero-initialised, so the layer starts at the identity (a small perturbation).
 
     Analytic C_X scaling: the leading marginalisation response is known in closed
@@ -948,9 +948,9 @@ class SigmaXCouplingLayer(AbstractBijection):
     """
 
     net_flux: CoeffNet  # (log_scale_n, ehat2)           → (1,)  s0  flux shift
-    net_size: CoeffNet  # (z0, log_scale_n, ehat2)       → (1,)  g_s size log-scale
-    net_dip: CoeffNet   # (z0, z1, log_scale_n, ehat2)   → (1,)  D   dipole amplitude
-    net_quad: CoeffNet  # (z0, z1, log_scale_n, ehat2)   → (1,)  c   quadrupole (pre-tanh)
+    net_size: CoeffNet  # (m0, log_scale_n, ehat2)       → (1,)  g_s size log-scale
+    net_dip: CoeffNet   # (m0, m1, log_scale_n, ehat2)   → (1,)  D   dipole amplitude
+    net_quad: CoeffNet  # (m0, m1, log_scale_n, ehat2)   → (1,)  c   quadrupole (pre-tanh)
     _cond_dim: int = eqx.field(static=True)
     _log_scale_mean: float = eqx.field(static=True)
     _log_scale_std: float = eqx.field(static=True)
@@ -1036,7 +1036,7 @@ class SigmaXCouplingLayer(AbstractBijection):
         # flux: translation;  size: locked scale + loc-shift (= κ × Mr/Mf)
         y0 = x[0] + s0
         y1 = kappa * x[1] + c1 * (kappa - 1.0)
-        # ellipticity: (1/κ)[(I + c·E)(z2,z3) + D·(e1,e2)],  E=[[e1,e2],[e2,-e1]]
+        # ellipticity: (1/κ)[(I + c·E)(x2,x3) + D·(e1,e2)],  E=[[e1,e2],[e2,-e1]]
         m2 = (1.0 + c * e1) * x[2] + c * e2 * x[3] + D * e1
         m3 = c * e2 * x[2] + (1.0 - c * e1) * x[3] + D * e2
         y2 = m2 / kappa
@@ -1050,7 +1050,7 @@ class SigmaXCouplingLayer(AbstractBijection):
         log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n = self._unpack(condition)
 
         # Same analytic T-scaling as the forward pass (see _coeffs).
-        # s0, g_s depend only on the recoverable z0 (and z1 for D, c) ⇒ closed form.
+        # s0, g_s depend only on the recoverable x0 (and x1 for D, c) ⇒ closed form.
         s0 = T_n * self.net_flux(jnp.array([log_scale_n, e_mag_sq_n]))[0]
         x0 = y[0] - s0
         g_s = self._g_s_max * jnn.tanh(
@@ -1064,8 +1064,8 @@ class SigmaXCouplingLayer(AbstractBijection):
         D = T_n * self.net_dip(dq_in)[0]
         c = jnn.tanh(T_n**2 * self.net_quad(dq_in)[0])
 
-        # invert (y2,y3) = (1/κ)[(I+cE)(z2,z3) + D·e]  ⇒
-        #   (z2,z3) = (I+cE)^{-1}[κ(y2,y3) − D·e],  (I+cE)^{-1} = (I−cE)/(1−c²|e|²)
+        # invert (y2,y3) = (1/κ)[(I+cE)(x2,x3) + D·e]  ⇒
+        #   (x2,x3) = (I+cE)^{-1}[κ(y2,y3) − D·e],  (I+cE)^{-1} = (I−cE)/(1−c²|e|²)
         r2 = kappa * y[2] - D * e1
         r3 = kappa * y[3] - D * e2
         det_e = 1.0 - c**2 * e_mag_sq

@@ -36,7 +36,6 @@ from .config import (
     e_max,
     key as _base_key,
     log_scale_range,
-    n_sx_train,
 )
 from .data import load_training_dataset
 from .models.flows import build_flows
@@ -69,10 +68,7 @@ def main() -> int:
         jax.config.update("jax_debug_nans", True)
 
     print(f"devices: {jax.devices()}")
-    print(
-        f"Sigma_X conditioning: log_scale_range={log_scale_range}  "
-        f"e_max={e_max}  n_sx_train={n_sx_train}"
-    )
+    print(f"Sigma_X conditioning: log_scale_range={log_scale_range}  e_max={e_max}")
 
     key = _base_key
 
@@ -109,7 +105,6 @@ def main() -> int:
         grad_clip=args.grad_clip,
         log_scale_range=log_scale_range,
         e_max=e_max,
-        n_sx_train=n_sx_train,
     )
 
     losses_arr = np.asarray(losses)

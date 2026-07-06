@@ -2,15 +2,19 @@
 plot_per_galaxy_shear_analytic.py
 =================================
 Bare-bones histogram of the **analytic-BFD** per-galaxy shear estimates from a
-saved PQR grid (``pqr_sim_{p,m}``), restricted to ``2000 < Mf < 4000``.
+saved independent-ensemble PQR grid (``pqr_sim_{p,m}``), restricted to
+``2000 < Mf < 4000``.
 
 Every selected measurement is plotted with equal weight (plain counts, no
-inverse-variance / nda weighting); the +shear and -shear groups are pooled.
+inverse-variance / nda weighting). The +shear and -shear catalogues are
+independent injection realisations rather than ring pairs, so each arm's flux
+cut is applied using that arm's *own* ``targets_{p,m}`` — not a single cut
+built from one arm and reused on the other, which would misalign the two
+(generally different-length) arrays.
 
 Run::
 
-    python -m bfd_cnf.plot_per_galaxy_shear_analytic \
-        --in data/pqr_grid_100k_mf2000_4000_nda510k.npz
+    python -m bfd_cnf.plot_per_galaxy_shear_analytic --in data/pqr_grid.npz
 """
 
 from __future__ import annotations
@@ -30,8 +34,7 @@ from .plot_per_galaxy_shear import per_object_g
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--in", dest="inp",
-                    default="data/pqr_grid_100k_mf2000_4000_nda510k.npz")
+    ap.add_argument("--in", dest="inp", default="data/pqr_grid.npz")
     ap.add_argument("--out", default=None)
     ap.add_argument("--mf-lo", type=float, default=2000.0)
     ap.add_argument("--mf-hi", type=float, default=4000.0)
@@ -40,15 +43,14 @@ def main() -> None:
 
     d = np.load(args.inp)
 
-    # Single shared selection on the +shear Mf (= targets col 0); the +/- groups
-    # are row-aligned matched galaxies, so the same cut keeps every matched pair
-    # and uses the BFD selection variable (defined on the +shear catalogue).
-    mf = d["targets_p"][:, 0]
-    cut = (mf > args.mf_lo) & (mf < args.mf_hi)
-
-    # Keep the +/- shear groups separate.
+    # Each arm's flux cut uses that arm's OWN targets — the +/- catalogues are
+    # independent injection realisations of different (and differently-ordered)
+    # galaxies, not row-aligned ring pairs, so a cut built from one arm cannot be
+    # reused on the other.
     g = {}
     for grp in ("p", "m"):
+        mf = d[f"targets_{grp}"][:, 0]
+        cut = (mf > args.mf_lo) & (mf < args.mf_hi)
         a1, a2 = per_object_g(d[f"pqr_sim_{grp}"][cut].astype(np.float64))
         g[grp] = (a1[np.isfinite(a1)], a2[np.isfinite(a2)])
 

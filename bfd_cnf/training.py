@@ -29,7 +29,6 @@ from .config import (
     g_scale,
     max_scale,
     min_scale,
-    nda_clip_percentile,
     num_samples,
     prior_early_nn_depth,
     prior_early_nn_width,
@@ -53,9 +52,6 @@ from .config import (
 )
 from .config import (
     log_scale_range as _log_scale_range,
-)
-from .config import (
-    n_sx_train as _n_sx_train,
 )
 from .data import transform_dataset_to_standard
 from .models.flows import (
@@ -287,11 +283,9 @@ def train_model(
     grad_clip: float = 0.5,
     log_scale_range: tuple[float, float] = _log_scale_range,
     e_max: float = _e_max,
-    n_sx_train: int = _n_sx_train,
     chunk_size: int = train_chunk_size,
     nda: jax.Array | None = None,
     use_nda_weight: bool = use_nda_weight,
-    nda_clip_percentile: float | None = nda_clip_percentile,
 ) -> tuple[Any, Any, list[float]]:
     """Build flows, construct the ELBO loss, and run training.
 
@@ -326,12 +320,7 @@ def train_model(
     log_scale_range : tuple of float, optional
         ``(min, max)`` of ``0.5 * log det(Σ_X)`` for Σ_X conditioning.
     e_max : float, optional
-        Maximum PSF ellipticity magnitude for Σ_X conditioning.
-    n_sx_train : int, optional
-        Number of Σ_X conditions sampled per gradient step.  The ELBO is
-        evaluated at each and the losses are averaged, reducing gradient
-        variance from the single-PSF estimate.  Default is 1 (original
-        behaviour); try 4–8 to widen the learned marginal distribution.
+        Maximum ellipticity magnitude for Σ_X conditioning.
     chunk_size : int, optional
         Number of gradient steps fused into one ``jax.lax.scan`` dispatch
         (≈1.7x faster, identical math).  Default from ``config.train_chunk_size``.
@@ -345,9 +334,6 @@ def train_model(
     use_nda_weight : bool, optional
         Master switch for the ``nda`` weighting.  Defaults to
         ``config.use_nda_weight``.
-    nda_clip_percentile : float or None, optional
-        Optional top-tail percentile clip on ``nda`` for gradient-variance
-        control.  Defaults to ``config.nda_clip_percentile``.
 
     Returns
     -------
@@ -398,7 +384,6 @@ def train_model(
         weights=(jnp.asarray(weights_np) if use_nda_weight else None),
         log_scale_range=log_scale_range,
         e_max=e_max,
-        n_sx_train=n_sx_train,
         use_sx=(log_scale_range is not None),
         raw2standard=raw2standard,
         mean_log_diag=mean_log_diag,
@@ -448,11 +433,9 @@ def continue_training(
     grad_clip: float = 0.3,
     log_scale_range: tuple[float, float] = _log_scale_range,
     e_max: float = _e_max,
-    n_sx_train: int = _n_sx_train,
     chunk_size: int = train_chunk_size,
     nda: jax.Array | None = None,
     use_nda_weight: bool = use_nda_weight,
-    nda_clip_percentile: float | None = nda_clip_percentile,
 ) -> tuple[Any, Any, list[float]]:
     """Continue training from saved model weights.
 
@@ -495,11 +478,7 @@ def continue_training(
     log_scale_range : tuple of float, optional
         ``(min, max)`` of ``0.5 * log det(Σ_X)`` for Σ_X conditioning.
     e_max : float, optional
-        Maximum PSF ellipticity magnitude for Σ_X conditioning.
-    n_sx_train : int, optional
-        Number of Σ_X conditions sampled per gradient step.  Losses are
-        averaged over all conditions.  Default is 1 (original behaviour);
-        try 4–8 to widen the learned marginal distribution.
+        Maximum ellipticity magnitude for Σ_X conditioning.
     chunk_size : int, optional
         Number of gradient steps fused into one ``jax.lax.scan`` dispatch
         (≈1.7x faster, identical math).  Default from ``config.train_chunk_size``.
@@ -513,9 +492,6 @@ def continue_training(
     use_nda_weight : bool, optional
         Master switch for the ``nda`` weighting.  Defaults to
         ``config.use_nda_weight``.
-    nda_clip_percentile : float or None, optional
-        Optional top-tail percentile clip on ``nda`` for gradient-variance
-        control.  Defaults to ``config.nda_clip_percentile``.
 
     Returns
     -------
@@ -540,7 +516,6 @@ def continue_training(
         weights=(jnp.asarray(weights_np) if use_nda_weight else None),
         log_scale_range=log_scale_range,
         e_max=e_max,
-        n_sx_train=n_sx_train,
         use_sx=(log_scale_range is not None),
         raw2standard=raw2standard,
         mean_log_diag=mean_log_diag,
@@ -592,13 +567,11 @@ def pretrain_prior(
     grad_clip: float = 0.5,
     log_scale_range: tuple[float, float] = _log_scale_range,
     e_max: float = _e_max,
-    n_sx_train: int = _n_sx_train,
     chunk_size: int = train_chunk_size,
     nda: jax.Array | None = None,
     use_nda_weight: bool = use_nda_weight,
-    nda_clip_percentile: float | None = nda_clip_percentile,
 ) -> tuple[Any, list[float]]:
-    """Pre-train only the prior flow using direct NLL on template moments (z ≈ y).
+    """Pre-train only the prior flow using direct NLL on template moments (m ≈ y).
 
     Gives all three prior stages — base shape, shear response, C_X response —
     a clean gradient signal without Q-sampling noise.  Run this before
@@ -616,7 +589,6 @@ def pretrain_prior(
         weights=(jnp.asarray(weights_np) if use_nda_weight else None),
         log_scale_range=log_scale_range,
         e_max=e_max,
-        n_sx_train=n_sx_train,
         use_sx=(log_scale_range is not None),
         raw2standard=raw2standard,
     )

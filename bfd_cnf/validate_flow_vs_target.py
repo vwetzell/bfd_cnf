@@ -64,8 +64,8 @@ def main() -> None:
     ls = float(prior_sigmax_log_scale_mean)
     cond = jnp.array([0.0, 0.0, ls, 0.0, 0.0])
     key, sub = jr.split(key)
-    z = prior.sample(sub, sample_shape=(N,), condition=cond)
-    raw, _ = jax.vmap(raw2standard.inverse_and_log_det)(z)
+    m = prior.sample(sub, sample_shape=(N,), condition=cond)
+    raw, _ = jax.vmap(raw2standard.inverse_and_log_det)(m)
     raw = np.asarray(raw)
     flow = _marg_raw(raw)
     flow = flow[np.all(np.isfinite(flow), axis=1)]

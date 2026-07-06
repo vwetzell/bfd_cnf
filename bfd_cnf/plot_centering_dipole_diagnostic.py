@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
                    help="log10 of the flux moment Mf at which to slice.")
     p.add_argument("--mrmf", type=float, default=3.3, help="Size ratio Mr/Mf.")
     p.add_argument("--log-scale", type=float, default=13.3,
-                   help="PSF/centroid log-noise-scale 0.5*log det(C_X).")
+                   help="Centering-bias log-noise-scale 0.5*log det(C_X).")
     p.add_argument("--n", type=int, default=101, help="Grid resolution per axis.")
     p.add_argument("--m-range", type=float, default=0.5,
                    help="Half-width of the M1/Mr, M2/Mr axes.")

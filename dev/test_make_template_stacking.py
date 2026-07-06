@@ -3,8 +3,8 @@
 in-order concatenation with HDF5 and FITS rows still aligned by id.
 
 This is the contract make_template_file.py relies on after switching to per-batch
-chunks (build_training_table.py validates HDF5/summary id alignment). Runs without
-the multi-GB pscratch inputs by feeding the real stackers synthetic chunks.
+chunks. Runs without the multi-GB pscratch inputs by feeding the real stackers
+synthetic chunks.
 
     python dev/test_make_template_stacking.py
 """

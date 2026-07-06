@@ -2,7 +2,8 @@
 plot_flow_vs_analytic_qr.py
 ===========================
 Per-cell comparison of the **flow** PQR vs the **analytic BFD** PQR
-(``pqr_sim_*``) from a saved grid integration, in the (log10 Mf, Mr/Mf) plane.
+(``pqr_sim_*``) from a saved independent-ensemble grid integration, in the
+(log10 Mf, Mr/Mf) plane.
 
 The flow and the analytic estimator run on the *same* targets with the *same*
 noise — only the prior differs — so any difference in the recovered shear (and
@@ -16,11 +17,19 @@ To first order with a diagonal response,
 flow−analytic difference in ``Q1`` and ``R11`` (on the +shear arm) attributes
 the residual ``m`` to a **signal (Q)** vs a **normalisation (R)** error.
 
-Panels: m(flow), m(analytic), Δm=flow−analytic; ΔQ1/Q1, ΔR11/R11, counts.
+The +shear and -shear catalogues are independent injection realisations, not
+ring pairs, so the ``m``/``Δm`` panels bin both arms onto one shared hex grid
+and split each cell's carried indices back out by arm (mirroring
+``plot_mbias_hexbin_independent.py``); a cell needs at least
+``--mincnt-per-arm`` targets from *each* arm to be coloured. The Q/R
+attribution panels are a +shear-arm-only diagnostic and only need that arm's
+own per-cell count.
+
+Panels: m(flow), m(analytic), Δm=flow−analytic; ΔQ1/Q1, ΔR11/R11 (+arm only), counts.
 
 Run::
 
-    python -m bfd_cnf.plot_flow_vs_analytic_qr --in data/pqr_grid_FULL_mf3000_90000_adapt240k.npz
+    python -m bfd_cnf.plot_flow_vs_analytic_qr --in data/pqr_grid.npz
 """
 
 from __future__ import annotations
@@ -64,59 +73,108 @@ def _g1(pqr):
         return np.nan
 
 
+def _arm_coords(pqr: np.ndarray, sim: np.ndarray, targets: np.ndarray):
+    """Return (x=log10 Mf, y=Mr/Mf, pqr, sim) keeping only finite, P>0 targets in both."""
+    mf = np.abs(targets[:, 0])
+    x = np.log10(mf)
+    y = targets[:, 1] / mf
+    valid = (
+        np.all(np.isfinite(pqr), axis=1) & np.all(np.isfinite(sim), axis=1)
+        & (pqr[:, 0] > 0) & (sim[:, 0] > 0) & np.isfinite(x) & np.isfinite(y)
+    )
+    return x[valid], y[valid], pqr[valid], sim[valid]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--in", dest="inp",
-                    default="data/pqr_grid_FULL_mf3000_90000_adapt240k.npz")
+    ap.add_argument("--in", dest="inp", default="data/pqr_grid.npz")
     ap.add_argument("--out", default=None)
     ap.add_argument("--gridsize", type=int, default=12)
-    ap.add_argument("--mincnt", type=int, default=3000)
+    ap.add_argument("--mincnt-per-arm", type=int, default=1500,
+                     help="Min targets PER ARM in a cell for a stable m (default 1500).")
     ap.add_argument("--mclim", type=float, default=0.3, help="m / Δm colour limit.")
     ap.add_argument("--qrclim", type=float, default=0.3, help="ΔQ1/Q1, ΔR11/R11 colour limit.")
     args = ap.parse_args()
 
     d = np.load(args.inp)
-    pqr_p = d["pqr_p"].astype(np.float64); pqr_m = d["pqr_m"].astype(np.float64)
-    sim_p = d["pqr_sim_p"].astype(np.float64); sim_m = d["pqr_sim_m"].astype(np.float64)
-    tp = d["targets_p"]; mf = np.abs(tp[:, 0])
-    x = np.log10(mf); y = tp[:, 1] / mf
-
-    valid = (
-        np.all(np.isfinite(pqr_p), axis=1) & np.all(np.isfinite(pqr_m), axis=1)
-        & np.all(np.isfinite(sim_p), axis=1) & np.all(np.isfinite(sim_m), axis=1)
-        & (pqr_p[:, 0] > 0) & (pqr_m[:, 0] > 0) & (sim_p[:, 0] > 0) & (sim_m[:, 0] > 0)
-        & np.isfinite(x) & np.isfinite(y)
+    xp, yp, pqr_p, sim_p = _arm_coords(
+        d["pqr_p"].astype(np.float64), d["pqr_sim_p"].astype(np.float64), d["targets_p"]
     )
-    x, y = x[valid], y[valid]
-    pqr_p, pqr_m, sim_p, sim_m = pqr_p[valid], pqr_m[valid], sim_p[valid], sim_m[valid]
-    n = x.shape[0]
-    print(f"{n} valid targets")
+    xm, ym, pqr_m, sim_m = _arm_coords(
+        d["pqr_m"].astype(np.float64), d["pqr_sim_m"].astype(np.float64), d["targets_m"]
+    )
+    n_p, n_m = xp.shape[0], xm.shape[0]
+    print(f"+arm {n_p:,} valid targets, -arm {n_m:,} valid targets")
+
+    # Concatenate both arms onto ONE hex grid; carried index < n_p => +arm.
+    x_all = np.concatenate([xp, xm])
+    y_all = np.concatenate([yp, ym])
+    min_arm = args.mincnt_per_arm
+
+    def _split(c):
+        """Split a cell's carried indices by arm; None if either arm is under-populated.
+
+        matplotlib's hexbin *drops* a cell outright (from get_array() and
+        get_offsets() alike) whenever reduce_C_function returns NaN, rather than
+        masking it in place — so every reduce function below must return NaN on
+        exactly the same condition, or the panels' returned arrays end up
+        different lengths and silently misaligned with each other. All six
+        panels therefore share this one both-arms-populated gate, even the
+        +arm-only Q/R attribution panels.
+        """
+        idx = np.asarray(c, np.int64)
+        ip, im = idx[idx < n_p], idx[idx >= n_p] - n_p
+        if ip.size < min_arm or im.size < min_arm:
+            return None, None
+        return ip, im
 
     def reduce_m_flow(c):
-        i = np.asarray(c, np.int64); return (_g1(pqr_p[i]) - _g1(pqr_m[i])) / DELTA_G - 1.0
+        ip, im = _split(c)
+        if ip is None:
+            return np.nan
+        return (_g1(pqr_p[ip]) - _g1(pqr_m[im])) / DELTA_G - 1.0
 
     def reduce_m_sim(c):
-        i = np.asarray(c, np.int64); return (_g1(sim_p[i]) - _g1(sim_m[i])) / DELTA_G - 1.0
+        ip, im = _split(c)
+        if ip is None:
+            return np.nan
+        return (_g1(sim_p[ip]) - _g1(sim_m[im])) / DELTA_G - 1.0
 
     def reduce_dm(c):
-        return reduce_m_flow(c) - reduce_m_sim(c)
+        ip, im = _split(c)
+        if ip is None:
+            return np.nan
+        m_flow = (_g1(pqr_p[ip]) - _g1(pqr_m[im])) / DELTA_G - 1.0
+        m_sim = (_g1(sim_p[ip]) - _g1(sim_m[im])) / DELTA_G - 1.0
+        return m_flow - m_sim
 
     def reduce_dQ1(c):
-        i = np.asarray(c, np.int64)
-        qf, _ = _qr_tot(pqr_p[i]); qs, _ = _qr_tot(sim_p[i])
+        ip, _ = _split(c)
+        if ip is None:
+            return np.nan
+        qf, _r = _qr_tot(pqr_p[ip]); qs, _rs = _qr_tot(sim_p[ip])
         return (qf[0] - qs[0]) / (np.abs(qs[0]) + _TINY)
 
     def reduce_dR11(c):
-        i = np.asarray(c, np.int64)
-        _, rf = _qr_tot(pqr_p[i]); _, rs = _qr_tot(sim_p[i])
+        ip, _ = _split(c)
+        if ip is None:
+            return np.nan
+        _q, rf = _qr_tot(pqr_p[ip]); _qs, rs = _qr_tot(sim_p[ip])
         return (rf[0, 0] - rs[0, 0]) / (np.abs(rs[0, 0]) + _TINY)
 
     def reduce_imbalance(c):
         # d(ln Q1) - d(ln R11) ≈ d(ln g1):  >0 => flow over-responds => m up
-        return reduce_dQ1(c) - reduce_dR11(c)
+        ip, _ = _split(c)
+        if ip is None:
+            return np.nan
+        qf, rf = _qr_tot(pqr_p[ip]); qs, rs = _qr_tot(sim_p[ip])
+        dq = (qf[0] - qs[0]) / (np.abs(qs[0]) + _TINY)
+        dr = (rf[0, 0] - rs[0, 0]) / (np.abs(rs[0, 0]) + _TINY)
+        return dq - dr
 
-    extent = (x.min(), x.max(), max(y.min(), 1.5), min(y.max(), 5.0))
-    hexkw = dict(gridsize=args.gridsize, mincnt=args.mincnt, extent=extent, C=np.arange(n))
+    extent = (x_all.min(), x_all.max(), max(y_all.min(), 1.5), min(y_all.max(), 5.0))
+    hexkw = dict(gridsize=args.gridsize, mincnt=2 * min_arm, extent=extent,
+                 C=np.arange(n_p + n_m))
 
     fig, ax = plt.subplots(2, 3, figsize=(19, 10))
     mc = args.mclim
@@ -134,7 +192,7 @@ def main() -> None:
     ]
     arrays = {}
     for a, fn, cmap, vmin, vmax, title in panels:
-        hb = a.hexbin(x, y, reduce_C_function=fn, cmap=cmap, **hexkw)
+        hb = a.hexbin(x_all, y_all, reduce_C_function=fn, cmap=cmap, **hexkw)
         hb.set_clim(vmin, vmax)
         arrays[title] = np.ma.filled(hb.get_array().astype(float), np.nan)
         fig.colorbar(hb, ax=a)

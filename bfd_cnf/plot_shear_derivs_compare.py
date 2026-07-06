@@ -1,7 +1,7 @@
 """
 plot_shear_derivs_compare.py
 ============================
-Recreate the :mod:`bfd_cnf.plot_shear_derivs` diagnostic for *several* PSF
+Recreate the :mod:`bfd_cnf.plot_shear_derivs` diagnostic for *several* Σ_X
 ellipticity slices using a **shared color scale** across all of them, so the
 panels can be compared by eye.
 
@@ -61,10 +61,10 @@ def parse_args() -> argparse.Namespace:
                     help="Flux moment Mf in raw units (overrides --log10mf).")
     p.add_argument("--mrmf", type=float, default=3.3, help="Size ratio Mr/Mf.")
     p.add_argument("--log-scale", type=float, default=13.3,
-                   help="PSF log-noise-scale 0.5*log det(Sigma_X).")
-    p.add_argument("--e1", type=float, default=0.0, help="PSF ellipticity e1.")
+                   help="Σ_X log-noise-scale 0.5*log det(Sigma_X).")
+    p.add_argument("--e1", type=float, default=0.0, help="Σ_X ellipticity e1.")
     p.add_argument("--e2", type=float, nargs="+", default=[0.0, 0.2],
-                   help="One or more PSF e2 values; one PNG per value, shared scale.")
+                   help="One or more Σ_X e2 values; one PNG per value, shared scale.")
     p.add_argument("--g1", type=float, default=0.0, help="Shear g1 for derivatives.")
     p.add_argument("--g2", type=float, default=0.0, help="Shear g2 for derivatives.")
     p.add_argument("--n", type=int, default=101, help="Grid resolution per axis.")

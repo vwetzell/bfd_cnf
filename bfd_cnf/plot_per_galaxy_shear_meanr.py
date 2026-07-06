@@ -26,15 +26,22 @@ Annotated mean shear (proper, sum the PQRs over the *entire* population,
 independent of --batch-size):
     ĝ = (Σ R_tot,i)⁻¹ Σ Q_tot,i,   ± bootstrap error.
 
+The four groups (flow+, flow-, sim+, sim-) are each built from a saved
+independent-ensemble PQR grid: the +shear and -shear catalogues are
+independent injection realisations (different objects, generally different
+lengths), so every quantity here — selection, sum-PQR, and the bootstrap
+error — is computed per arm with no cross-arm indexing, and ``_boot_mc``
+resamples each arm's indices independently.
+
 Two panels (g1, g2); flow = solid, analytic-BFD (sim) = dotted;
 +shear arm = blue, −shear arm = red.
 
 Run::
 
     python -m bfd_cnf.plot_per_galaxy_shear_meanr \
-        --in data/pqr_grid_newtmpl_detj_1M_1p5k90k.npz --mf-range 1500 90000
+        --in data/pqr_grid.npz --mf-range 1500 90000
     python -m bfd_cnf.plot_per_galaxy_shear_meanr \
-        --in data/pqr_grid_newtmpl_detj_1M_1p5k90k.npz --batch-size 100 --range 0.2
+        --in data/pqr_grid.npz --batch-size 100 --range 0.2
 """
 
 from __future__ import annotations
@@ -149,7 +156,7 @@ def _boot_mc(Qp, Rp, Qm, Rm, gi, nboot, rng):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--in", dest="inp", default="data/pqr_grid_newtmpl_detj_1M_1p5k90k.npz")
+    ap.add_argument("--in", dest="inp", default="data/pqr_grid.npz")
     ap.add_argument("--out", default=None)
     ap.add_argument("--mf-range", type=float, nargs=2, default=(1500.0, 90000.0),
                     help="flux selection Mf_lo Mf_hi (default full 1500 90000).")

@@ -12,7 +12,7 @@ second derivatives with respect to the applied shear ``(g1, g2)``:
     P,  ∂P/∂g1,  ∂P/∂g2,  ∂²P/∂g1²,  ∂²P/∂g2²,  ∂²P/∂g1∂g2
 
 The derivatives are taken at ``g = (g1, g2)`` (default ``g = 0``) for a provided
-PSF log-noise-scale and ellipticity ``(e1, e2)``, exactly the condition vector
+Σ_X log-noise-scale and ellipticity ``(e1, e2)``, exactly the condition vector
 ``[g1, g2, log_scale, e1, e2]`` the prior flow was trained on.
 
 Run from the repo root so the package import resolves::
@@ -68,10 +68,10 @@ def parse_args() -> argparse.Namespace:
         "--log-scale",
         type=float,
         default=12.0,
-        help="PSF log-noise-scale  log_scale = 0.5 * log det(Sigma_X).",
+        help="Σ_X log-noise-scale  log_scale = 0.5 * log det(Sigma_X).",
     )
-    p.add_argument("--e1", type=float, default=0.0, help="PSF ellipticity component e1.")
-    p.add_argument("--e2", type=float, default=0.0, help="PSF ellipticity component e2.")
+    p.add_argument("--e1", type=float, default=0.0, help="Σ_X ellipticity component e1.")
+    p.add_argument("--e2", type=float, default=0.0, help="Σ_X ellipticity component e2.")
     p.add_argument(
         "--g1", type=float, default=0.0, help="Shear g1 at which derivatives are taken."
     )

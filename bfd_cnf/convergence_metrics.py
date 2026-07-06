@@ -7,7 +7,7 @@ The prior flow is a composition of three trainable stages, each carrying a
 *disjoint* slice of the model's behaviour:
 
   1. ``EquivariantAutoregressiveLayer``  (×9, unconditional) — the base galaxy
-     moment *shape* ``p(z)`` at the reference condition.
+     moment *shape* ``p(m)`` at the reference condition.
   2. ``ExplicitPolyLast``                (conditional on ``[g1, g2]``) — the
      entire **shear** response of the prior.
   3. ``SigmaXCouplingLayer``             (conditional on ``[log_scale, e1, e2]``)
@@ -17,7 +17,7 @@ The prior flow is a composition of three trainable stages, each carrying a
 Because the prior's conditioning vector ``[g1, g2, log_scale, e1, e2]`` is read
 by exactly one conditional stage per slot (``g`` → ExplicitPolyLast,
 ``log_scale/e`` → SigmaXCouplingLayer) and the early layers are unconditional,
-the gradient ``∇_cond log p(z | cond)`` evaluated at a fixed reference condition
+the gradient ``∇_cond log p(m | cond)`` evaluated at a fixed reference condition
 *cleanly partitions* into a per-stage functional signature:
 
   * ``∂ log p / ∂[g1, g2]``           → ExplicitPolyLast signature.
@@ -30,8 +30,8 @@ This module provides two complementary convergence views per stage:
     trainable parameter vector between consecutive checkpoints.  This is the
     cleanly *isolated* "have the parameters stopped moving" signal.
   * **Functional plateau** — relative change of the stage's functional
-    signature, binned across moment space (the standardised flux ``z0`` and
-    size ``z1`` axes).  This captures whether the stage's *behaviour* has
+    signature, binned across moment space (the standardised flux ``m0`` and
+    size ``m1`` axes).  This captures whether the stage's *behaviour* has
     stopped moving, which can plateau before/after the raw parameters do.
 
 A stage is considered converged when *both* its parameter and functional
@@ -165,14 +165,14 @@ def param_plateau_metrics(
 # ---------------------------------------------------------------------------
 
 
-def _logprob_and_cond_grad(prior: Any, z: jax.Array, cond: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _logprob_and_cond_grad(prior: Any, m: jax.Array, cond: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Per-point ``log p`` and its gradient w.r.t. the conditioning vector.
 
     Parameters
     ----------
     prior : Transformed
         The prior flow.
-    z : jax.Array, shape (4,)
+    m : jax.Array, shape (4,)
         A single standardised moment vector.
     cond : jax.Array, shape (5,)
         Conditioning vector ``[g1, g2, log_scale, e1, e2]``.
@@ -183,7 +183,7 @@ def _logprob_and_cond_grad(prior: Any, z: jax.Array, cond: jax.Array) -> tuple[j
     grad_cond : jax.Array, shape (5,)
     """
     def lp(c: jax.Array) -> jax.Array:
-        return prior.log_prob(z, condition=c)
+        return prior.log_prob(m, condition=c)
 
     logp, grad_cond = jax.value_and_grad(lp)(cond)
     return logp, grad_cond
@@ -191,7 +191,7 @@ def _logprob_and_cond_grad(prior: Any, z: jax.Array, cond: jax.Array) -> tuple[j
 
 def functional_signatures(
     prior: Any,
-    z_val: jax.Array,
+    m_val: jax.Array,
     c_ref: jax.Array,
     chunk: int = 4096,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -201,7 +201,7 @@ def functional_signatures(
     ----------
     prior : Transformed
         The prior flow.
-    z_val : jax.Array, shape (Nval, 4)
+    m_val : jax.Array, shape (Nval, 4)
         Fixed validation set of standardised moments.
     c_ref : jax.Array, shape (5,)
         Reference conditioning vector ``[0, 0, log_scale_ref, 0, 0]``.
@@ -218,14 +218,14 @@ def functional_signatures(
         signature.
     """
     f = eqx.filter_jit(
-        jax.vmap(lambda z, c: _logprob_and_cond_grad(prior, z, c), in_axes=(0, 0))
+        jax.vmap(lambda m, c: _logprob_and_cond_grad(prior, m, c), in_axes=(0, 0))
     )
-    n = z_val.shape[0]
+    n = m_val.shape[0]
     cond_full = jnp.broadcast_to(c_ref[None, :], (n, c_ref.shape[0]))
     logps, grads = [], []
     for start in range(0, n, chunk):
         end = min(start + chunk, n)
-        lp, gc = f(z_val[start:end], cond_full[start:end])
+        lp, gc = f(m_val[start:end], cond_full[start:end])
         logps.append(np.asarray(lp))
         grads.append(np.asarray(gc))
     return np.concatenate(logps, axis=0), np.concatenate(grads, axis=0)
@@ -238,7 +238,7 @@ def functional_signatures(
 
 @dataclasses.dataclass
 class MomentSpaceBins:
-    """Fixed 2-D binning of moment space by standardised flux (z0) and size (z1)."""
+    """Fixed 2-D binning of moment space by standardised flux (m0) and size (m1)."""
 
     bin_idx: np.ndarray          # (Nval,) flattened bin index in [0, nbins)
     counts: np.ndarray           # (nbins,) points per bin
@@ -258,13 +258,13 @@ class MomentSpaceBins:
 
 
 def make_moment_space_bins(
-    z_val: jax.Array, nx: int = 8, ny: int = 8, q_lo: float = 1.0, q_hi: float = 99.0
+    m_val: jax.Array, nx: int = 8, ny: int = 8, q_lo: float = 1.0, q_hi: float = 99.0
 ) -> MomentSpaceBins:
-    """Build a fixed (z0, z1) 2-D binning from the validation set quantiles.
+    """Build a fixed (m0, m1) 2-D binning from the validation set quantiles.
 
     Parameters
     ----------
-    z_val : jax.Array, shape (Nval, 4)
+    m_val : jax.Array, shape (Nval, 4)
         Validation standardised moments.
     nx, ny : int, optional
         Number of flux / size bins.  Default 8 each.
@@ -275,8 +275,8 @@ def make_moment_space_bins(
     -------
     MomentSpaceBins
     """
-    z = np.asarray(z_val)
-    x, y = z[:, 0], z[:, 1]
+    m = np.asarray(m_val)
+    x, y = m[:, 0], m[:, 1]
     x_edges = np.linspace(*np.percentile(x, [q_lo, q_hi]), nx + 1)
     y_edges = np.linspace(*np.percentile(y, [q_lo, q_hi]), ny + 1)
     ix = np.clip(np.digitize(x, x_edges[1:-1]), 0, nx - 1)
@@ -339,7 +339,7 @@ def _field_rel_delta(cur: np.ndarray, prev: np.ndarray, mask: np.ndarray) -> tup
 
 
 def compute_functional_fields(
-    prior: Any, z_val: jax.Array, bins: MomentSpaceBins, c_ref: jax.Array, chunk: int = 4096
+    prior: Any, m_val: jax.Array, bins: MomentSpaceBins, c_ref: jax.Array, chunk: int = 4096
 ) -> dict[str, Any]:
     """Compute the three per-stage functional fields + scalar summaries.
 
@@ -349,7 +349,7 @@ def compute_functional_fields(
     Stage 1 (base shape) uses ``log p``; stages 2/3 use the relevant gradient
     slice (``|·|`` taken over channels for the magnitude summary).
     """
-    logp, grad_cond = functional_signatures(prior, z_val, c_ref, chunk=chunk)
+    logp, grad_cond = functional_signatures(prior, m_val, c_ref, chunk=chunk)
 
     g_sig = grad_cond[:, list(_POLY_COND_COLS)]      # (Nval, 2)
     cx_sig = grad_cond[:, list(_SIGMAX_COND_COLS)]   # (Nval, 3)

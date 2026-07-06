@@ -1,7 +1,7 @@
 """
 pretrain_prior.py
 =================
-Pre-train only the prior flow using direct NLL on template moments (z ≈ y).
+Pre-train only the prior flow using direct NLL on template moments (m ≈ y).
 
 This warmup phase gives all three prior stages a clean, Q-free gradient signal
 before joint ELBO fine-tuning with converge_train.py.  The prior learns the base
@@ -47,8 +47,6 @@ from .config import (
     e_max,
     key as _base_key,
     log_scale_range,
-    n_sx_train,
-    nda_clip_percentile,
     train_chunk_size,
     use_nda_weight,
 )
@@ -97,8 +95,7 @@ def main() -> int:
     print(f"devices: {jax.devices()}")
     print(f"NLL prior pre-training: {args.steps} steps, LR={args.learning_rate:.1e}, "
           f"schedule={args.lr_schedule}")
-    print(f"Σ_X conditioning: log_scale_range={log_scale_range}  e_max={e_max}  "
-          f"n_sx_train={n_sx_train}")
+    print(f"Σ_X conditioning: log_scale_range={log_scale_range}  e_max={e_max}")
 
     key = _base_key
 
@@ -148,7 +145,6 @@ def main() -> int:
         weights=(jnp.asarray(weights_np) if use_nda_weight else None),
         log_scale_range=log_scale_range,
         e_max=e_max,
-        n_sx_train=n_sx_train,
         use_sx=(log_scale_range is not None),
         raw2standard=raw2standard,
     )
