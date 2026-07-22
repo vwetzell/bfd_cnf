@@ -40,6 +40,26 @@ prior_sigmax_nn_width = 32
 prior_sigmax_nn_depth = 4
 prior_flow_layers = 10
 
+# Shear-conditioning layer kind:
+#   "poly"   -> ExplicitPolyLast: free polynomial-in-g affine coupling (the current
+#              w128 .eqx flows were trained with this).
+#   "taylor" -> ShearTaylorLast: the structural alternative — an additive Taylor-in-g
+#              displacement, identity at g=0, whose 1st/2nd-order coefficients ARE the
+#              moments' shear response (readable via .shear_derivs, cleanly Sobolev-
+#              supervisable).
+# The kind is a STATIC part of the flow structure, so a saved flow only deserialises
+# with the kind it was trained with (like prior_last_nn_width above): switching this
+# requires retraining and pointing PRIOR_FLOW_PATH at a matching .eqx.
+shear_layer_kind = "poly"
+
+# Sobolev shear-derivative training weights (0 = off, the default; no behaviour
+# change). When >0, the loss adds lambda * MSE between the flow's own moment
+# shear-response (d m / d g and d^2 m / d g^2 of the decode map, by autodiff) and the
+# template truth (a quadratic fit of the sheared moments over the g-grid). Works with
+# either shear_layer_kind and in both the NLL and ELBO paths.
+sobolev_g1_weight = 0.0   # first-order  d m / d g   matching
+sobolev_g2_weight = 0.0   # second-order d^2 m / d g^2 matching
+
 import math as _math
 
 # log_scale = 0.5 * log det(C_X) for the *centroid* noise covariance C_X = σ_xy² · I.

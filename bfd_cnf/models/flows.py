@@ -49,6 +49,9 @@ from ..config import (
     g_scale,
     target_flux_min,
     e_max,
+    shear_layer_kind as _shear_layer_kind,
+    sobolev_g1_weight as _sobolev_g1_weight,
+    sobolev_g2_weight as _sobolev_g2_weight,
 )
 
 # ---------------------------------------------------------------------------
@@ -502,6 +505,104 @@ def _log_p_select_given_x_raw(mf_true, var_mf, threshold):
 
 
 # ---------------------------------------------------------------------------
+# Sobolev shear-derivative term (shared by make_elbo_loss and make_nll_loss)
+# ---------------------------------------------------------------------------
+# "Sobolev training" = supervise the flow's DERIVATIVES w.r.t. a condition, not just
+# its density.  Here we match the flow's moment shear-response (d m / d g and
+# d^2 m / d g^2 at g=0) to the template truth.  The truth is a quadratic fit of the
+# sheared-standardised template moments over the g-grid; the flow's response is the
+# g-derivative of its decode map at fixed latent (autodiff, coordinate-agnostic — so
+# it works for either shear layer kind).  Both are in standardised moment space and
+# evaluated at the same unsheared template moments, so the match is pointwise.
+
+
+def _sobolev_pinv(g2d: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Least-squares pseudo-inverse for a g-grid quadratic fit, and the fit scale.
+
+    Fits ``f(g) = c0 + c1 u1 + c2 u2 + c3 u1^2 + c4 u2^2 + c5 u1 u2`` in the RESCALED
+    shear ``u = g / s`` (``s`` = outer g-grid radius).  The rescale is essential: the
+    raw grid has ``|g| ~ 1e-2``, so the ``g^2`` design columns are ``~1e-4`` against a
+    unit constant column — a condition number that makes the un-scaled ``pinv`` lose
+    all precision.  In ``u`` the columns are O(1) and the fit is exact for a quadratic.
+
+    Returns ``(pinv, s)`` with ``pinv`` shape ``(6, G)``.  Fixed (depends only on the
+    grid), so computed once in the loss factory.
+    """
+    s = jnp.sqrt(jnp.max(jnp.sum(g2d**2, axis=1)))  # outer ring radius
+    u1, u2 = g2d[:, 0] / s, g2d[:, 1] / s
+    Phi = jnp.stack(
+        [jnp.ones_like(u1), u1, u2, u1**2, u2**2, u1 * u2], axis=1
+    )  # (G, 6)
+    return jnp.linalg.pinv(Phi), s  # (6, G), scalar
+
+
+def _sobolev_target(y_std_grid: jax.Array, pinv: jax.Array, scale: jax.Array):
+    """Template moment shear-response from a quadratic fit over the g-grid.
+
+    ``y_std_grid`` : (B, G, D) sheared-standardised moments; ``pinv, scale`` from
+    :func:`_sobolev_pinv`.  Coefficients are fit in ``u = g / scale`` then converted
+    back to ``g`` derivatives: ``d/dg = (1/s) d/du``, ``d^2/dg^2 = (1/s^2) d^2/du^2``.
+    Returns ``A`` (B, D, 2) = ``d m / d g`` and ``B`` (B, D, 2, 2) = ``d^2 m / d g^2``.
+
+    The g=0 baseline is subtracted before the fit so we fit the O(g) *displacement*,
+    not the moment plus its O(1) baseline: in float32 the g^2 curvature (~1e-4·B) would
+    otherwise be swamped by that baseline and the second-order target come out as noise.
+    """
+    dy = y_std_grid - y_std_grid[:, 0:1, :]  # displacement from g=0 (float32-robust)
+    coeffs = jnp.einsum("cg,bgd->bdc", pinv, dy)  # (B, D, 6) in u-space
+    A = coeffs[..., 1:3] / scale  # (B, D, 2)
+    s2 = scale**2
+    c3, c4, c5 = coeffs[..., 3], coeffs[..., 4], coeffs[..., 5]
+    B = jnp.stack(
+        [
+            jnp.stack([2.0 * c3, c5], axis=-1),
+            jnp.stack([c5, 2.0 * c4], axis=-1),
+        ],
+        axis=-2,
+    ) / s2  # (B, D, 2, 2)
+    return A, B
+
+
+def _flow_shear_derivs(prior_flow, m0_std: jax.Array, sx_ref: jax.Array):
+    """Flow's own moment shear-response at each unsheared std moment, by autodiff.
+
+    For each moment ``m0`` (at g=0): encode to the latent at ``[g=0, sx_ref]``, then
+    differentiate the decode map w.r.t. ``g`` at fixed latent.  Since the encode uses
+    g=0, ``decode(latent, g=0) == m0``, so ``A = d(decode)/dg`` and
+    ``B = d^2(decode)/dg^2`` are the moment shear-response at ``m0``.  Coordinate-
+    agnostic: it uses only the flow's decode/encode, not any layer internals.
+
+    ``m0_std`` : (B, D).  ``sx_ref`` : (3,) reference ``[log_scale, e1, e2]``.
+    Returns ``A`` (B, D, 2), ``B`` (B, D, 2, 2).
+    """
+    bij = prior_flow.bijection
+    g0 = jnp.zeros(2)
+
+    def per_example(m0):
+        cond0 = jnp.concatenate([g0, sx_ref])
+        z = bij.inverse(m0, cond0)  # encode data -> latent at g=0
+
+        def decode(g):
+            return bij.transform(z, jnp.concatenate([g, sx_ref]))  # latent -> data
+
+        A = jax.jacfwd(decode)(g0)  # (D, 2)
+        B = jax.jacfwd(jax.jacfwd(decode))(g0)  # (D, 2, 2)
+        return A, B
+
+    return jax.vmap(per_example)(m0_std)
+
+
+def _sobolev_loss(prior_flow, y_std_grid, sob1_w, sob2_w, pinv, scale, sx_ref):
+    """Sobolev penalty: MSE of (flow − template) 1st/2nd moment shear-response."""
+    A_tgt, B_tgt = _sobolev_target(y_std_grid, pinv, scale)  # (B,D,2), (B,D,2,2)
+    m0 = y_std_grid[:, 0, :]  # (B, D) unsheared (g=0 is grid index 0)
+    A_flow, B_flow = _flow_shear_derivs(prior_flow, m0, sx_ref)
+    l1 = jnp.mean((A_flow - A_tgt) ** 2)
+    l2 = jnp.mean((B_flow - B_tgt) ** 2)
+    return sob1_w * l1 + sob2_w * l2
+
+
+# ---------------------------------------------------------------------------
 # ELBO loss factory
 # ---------------------------------------------------------------------------
 
@@ -520,6 +621,8 @@ def make_elbo_loss(
     std_log_diag: jax.Array | None = None,
     mean_off: jax.Array | None = None,
     std_off: jax.Array | None = None,
+    sobolev_g1_weight: float = _sobolev_g1_weight,
+    sobolev_g2_weight: float = _sobolev_g2_weight,
 ) -> Callable:
     """Build the ELBO loss function for training the (prior_flow, q_flow) pair.
 
@@ -557,6 +660,11 @@ def make_elbo_loss(
         Bijection from raw to standardised moment coordinates.
     mean_log_diag, std_log_diag, mean_off, std_off : jax.Array or None
         Whitening statistics for Cholesky conditioning features.
+    sobolev_g1_weight, sobolev_g2_weight : float, optional
+        Weights for the Sobolev shear-derivative term (0 = off).  When either is
+        > 0 the loss adds ``λ · MSE`` between the prior flow's own moment shear-
+        response (1st / 2nd ``d m / d g`` of its decode map, by autodiff) and the
+        template truth (a quadratic fit of the sheared moments over the g-grid).
 
     Returns
     -------
@@ -564,6 +672,7 @@ def make_elbo_loss(
         ``(model_tuple, data_y, data_Sigma, data_dg, data_d2g, data_X, key) -> scalar``
     """
     _use_sx = use_sx and (log_scale_range is not None)
+    _sob_on = (sobolev_g1_weight > 0.0) or (sobolev_g2_weight > 0.0)
 
     # ``weights`` is the batch-sampling proposal = nda (BFD template weight, HT-corrected;
     # see _finalize_dataset).  Sampling ∝ nda·detj ⇒ residual per-copy weight is L(X|C_X) only.
@@ -593,6 +702,12 @@ def make_elbo_loss(
     g = jnp.concatenate([g0, 0.01 * g_grid, 0.02 * g_grid], axis=1)  # (1, G, 2) centre + 2 rings
     G = g.shape[1]
     g2d = g.reshape(G, -1)  # (G, 2)
+
+    # Sobolev term precompute (fixed g-grid quadratic-fit pinv + reference C_X).
+    if _sob_on:
+        _sob_pinv, _sob_scale = _sobolev_pinv(g2d)
+        _ls_ref = 0.5 * (log_scale_range[0] + log_scale_range[1]) if _use_sx else 0.0
+        _sob_sx_ref = jnp.array([_ls_ref, 0.0, 0.0])  # shear response ≈ C_X-independent
 
     # Import here to avoid circular at module level
     from ..data import transform_dataset_to_standard
@@ -729,6 +844,17 @@ def make_elbo_loss(
             # No C_X ⇒ no L; batch is already ∝ nda·detj ⇒ plain mean ELBO over the batch.
             loss = -jnp.mean(lse)
 
+        if _sob_on:
+            loss = loss + _sobolev_loss(
+                prior_flow,
+                y_std.reshape(batch_size, G, -1),
+                sobolev_g1_weight,
+                sobolev_g2_weight,
+                _sob_pinv,
+                _sob_scale,
+                _sob_sx_ref,
+            )
+
         return loss
 
     return plain_loss
@@ -748,6 +874,8 @@ def make_nll_loss(
     e_max: float = 0.0,
     use_sx: bool = True,
     raw2standard: Any = None,
+    sobolev_g1_weight: float = _sobolev_g1_weight,
+    sobolev_g2_weight: float = _sobolev_g2_weight,
 ) -> Callable:
     """Direct NLL loss for prior-only pre-training (m ≈ y approximation).
 
@@ -767,10 +895,15 @@ def make_nll_loss(
     the proposal match the objective's static part and the residual per-copy weight in the
     softmax is L alone.  No is_corr (proposal == objective's static part).
 
+    ``sobolev_g1_weight`` / ``sobolev_g2_weight`` add the same Sobolev shear-derivative
+    term as :func:`make_elbo_loss` (0 = off): ``λ · MSE`` between the prior flow's own
+    moment shear-response and the template quadratic-fit truth.
+
     Returned signature:
         (prior_flow, data_y, data_Sigma, data_dg, data_d2g, data_X, key) -> scalar
     """
     _use_sx = use_sx and (log_scale_range is not None)
+    _sob_on = (sobolev_g1_weight > 0.0) or (sobolev_g2_weight > 0.0)
 
     # ``weights`` is the batch-sampling proposal = nda (BFD template weight, HT-corrected;
     # see _finalize_dataset).  Sampling ∝ nda·detj ⇒ residual per-copy weight is L(X|C_X) only.
@@ -794,6 +927,12 @@ def make_nll_loss(
     g = jnp.concatenate([g0, 0.01 * g_grid, 0.02 * g_grid], axis=1)  # (1, G, 2) centre + 2 rings
     G = g.shape[1]
     g2d = g.reshape(G, -1)  # (G, 2)
+
+    # Sobolev term precompute (fixed g-grid quadratic-fit pinv + reference C_X).
+    if _sob_on:
+        _sob_pinv, _sob_scale = _sobolev_pinv(g2d)
+        _ls_ref = 0.5 * (log_scale_range[0] + log_scale_range[1]) if _use_sx else 0.0
+        _sob_sx_ref = jnp.array([_ls_ref, 0.0, 0.0])  # shear response ≈ C_X-independent
 
     def nll_loss(prior_flow, data_y, data_Sigma, data_dg, data_d2g, data_X, key):
         # ── batch sampling ∝ nda·detj (proposal == objective's static part) ────
@@ -856,14 +995,27 @@ def make_nll_loss(
                 return -jnp.mean(jnp.sum(w_bg * log_p_minus_sel, axis=0))  # mean over g
 
             losses_sx = jax.lax.map(jax.checkpoint(_loss_for_sx), sx_conds)
-            return jnp.mean(losses_sx)
+            loss = jnp.mean(losses_sx)
         else:
             # No C_X ⇒ no L; batch is already ∝ nda·detj ⇒ plain mean NLL over the batch.
             cond_p = jnp.concatenate(
                 [g_flat_batch, jnp.zeros((BG, 3), dtype=g_flat_batch.dtype)], axis=-1
             )
             log_p = prior_flow.log_prob(y_std, condition=cond_p).reshape(batch_size, G)
-            return -jnp.mean(log_p - log_p_sel)
+            loss = -jnp.mean(log_p - log_p_sel)
+
+        if _sob_on:
+            loss = loss + _sobolev_loss(
+                prior_flow,
+                y_std.reshape(batch_size, G, -1),
+                sobolev_g1_weight,
+                sobolev_g2_weight,
+                _sob_pinv,
+                _sob_scale,
+                _sob_sx_ref,
+            )
+
+        return loss
 
     return nll_loss
 
@@ -894,6 +1046,7 @@ def build_flows(
     q_nn_depth: int = q_nn_depth,
     min_scale: float = min_scale,
     max_scale: float = max_scale,
+    shear_layer_kind: str = _shear_layer_kind,
 ) -> tuple[Any, Any]:
     """Construct the prior and variational (q) normalizing flows.
 
@@ -999,6 +1152,7 @@ def build_flows(
         sigmax_log_scale_std=prior_sigmax_log_scale_std,
         sigmax_e_max=prior_e_max,
         sigmax_size_loc=prior_size_loc_c1,
+        shear_layer_kind=shear_layer_kind,
     )
 
     q_flow = masked_autoregressive_flow(

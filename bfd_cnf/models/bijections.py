@@ -6,7 +6,7 @@ Custom flowjax bijection classes used in the bfd_cnf normalizing-flow model:
   - RawMomentStandardize   — transforms raw moments to standardized coordinates
   - BoundedAffine          — affine bijection with bounded scale parameter
   - Spin0AutoregressiveLayer / Spin2CouplingLayer / EquivariantAutoregressiveLayer
-  - ExplicitPolyLast / SigmaXCouplingLayer / EarlyChain
+  - ExplicitPolyLast / ShearTaylorLast / SigmaXCouplingLayer / EarlyChain
   - new_masked_autoregressive_flow
 
 Helper functions: _bounded_log_scale, _bounded_scale, _inv_bounded_scale,
@@ -1083,6 +1083,160 @@ class SigmaXCouplingLayer(AbstractBijection):
 
 
 # ---------------------------------------------------------------------------
+# ShearTaylorLast
+# ---------------------------------------------------------------------------
+
+
+class ShearTaylorLast(AbstractBijection):
+    """Structural shear layer: an additive Taylor-in-g moment displacement.
+
+    The final conditional shear layer — the structural alternative to
+    :class:`ExplicitPolyLast`.  Instead of folding ``g`` into affine scale/shift
+    coefficients (which mixes the shear orders), it applies an *explicit*
+    second-order Taylor displacement in the shear ``g = (g1, g2)``::
+
+        y[i] = x[i] + A[i]·g + 1/2 g^T B[i] g
+
+    so the first- and second-order shear responses are read straight off the named
+    coefficient fields ``A`` (``dy/dg`` at ``g=0``) and ``B`` (``d^2y/dg^2`` at
+    ``g=0``) — the moments' shear response, exposed via :meth:`shear_derivs` for
+    diagnostics and Sobolev supervision.
+
+    Structure / equivariance:
+
+    * The shift depends on ``g`` and on the *preceding* components only (masked-
+      autoregressive), so ``dy/dx`` is unit lower-triangular and ``log|det J| = 0``:
+      a valid, closed-form-invertible layer in both directions.
+    * Spin-0 components (flux ``x0``, size ``x1``) get NO linear term (``A=0``): a
+      spin-0 moment has no first-order response to the spin-2 shear.  Only the even
+      ``|g|^2`` second-order term acts on them.
+    * Spin-2 components (ellipticity ``x2, x3``) carry the dipole ``A·g`` (leading
+      shear response) plus the second-order term.
+    * Zero-initialised coeff nets ⇒ the layer is the **identity at init, and at
+      ``g=0`` always**.  So the ``g=0`` prior shape comes entirely from the earlier
+      (unconditional) layers and this layer only imprints the shear displacement on
+      top.  That clean separation is what lets :meth:`shear_derivs(x)` be evaluated
+      at a data moment directly (at ``g=0`` the layer's input *is* the data moment).
+
+    ``g1, g2`` are read from ``condition[:2]``; extra dims (the Σ_X
+    ``[log_scale, e1, e2]``) are ignored — Σ_X is handled by
+    :class:`SigmaXCouplingLayer`, chained after this one.
+
+    ponytail: the spin-2 dipole coefficient depends on the preceding components
+    (flux, size, and — for M2 — M1) but not on a component's own value, so a single
+    layer cannot make the first-order response depend on the galaxy's own |e|.  The
+    Sobolev supervision (which uses the whole flow's response) carries the own-|e|
+    dependence; add an own-|e| term here only if that proves insufficient.
+
+    Parameters
+    ----------
+    key : jax.Array
+        JAX PRNG key (split for the four coefficient nets).
+    dim : int
+        Input dimensionality (must be 4 for galaxy moments).
+    raw_cond_dim : int
+        Conditioning dimensionality (>= 2 for ``[g1, g2]``; extra dims ignored).
+    last_width, last_depth : int
+        Hidden width / depth of the coefficient nets.
+    activation : callable
+        Activation function.
+    """
+
+    dim: int = eqx.field(static=True)
+    raw_cond_dim: int = eqx.field(static=True)
+    net_flux: CoeffNet  # ()          -> (3,)  B0 (spin-0, even only)
+    net_size: CoeffNet  # (x0,)       -> (3,)  B1 (spin-0, even only)
+    net_m1: CoeffNet  # (x0,x1)       -> (5,)  A2 (2) + B2 (3)
+    net_m2: CoeffNet  # (x0,x1,x2)    -> (5,)  A3 (2) + B3 (3)
+
+    def __init__(self, key, dim, raw_cond_dim, last_width, last_depth, activation):
+        if dim != 4:
+            raise ValueError(
+                "ShearTaylorLast is defined for the 4 galaxy moments (dim=4)."
+            )
+        self.dim = dim
+        self.raw_cond_dim = raw_cond_dim
+        k0, k1, k2, k3 = jr.split(key, 4)
+        nets = [
+            CoeffNet(k0, 0, 3, last_width, last_depth, activation),  # net_flux
+            CoeffNet(k1, 1, 3, last_width, last_depth, activation),  # net_size
+            CoeffNet(k2, 2, 5, last_width, last_depth, activation),  # net_m1
+            CoeffNet(k3, 3, 5, last_width, last_depth, activation),  # net_m2
+        ]
+        # Zero each net's final layer -> all coefficients start at 0, so the layer is
+        # the identity at init (a small perturbation of the g=0 base shape).
+        nets = [_zero_last_layer(n) for n in nets]
+        self.net_flux, self.net_size, self.net_m1, self.net_m2 = nets
+
+    @property
+    def shape(self):
+        return (self.dim,)
+
+    @property
+    def cond_shape(self):
+        return (self.raw_cond_dim,)
+
+    @staticmethod
+    def _shift(A, B, g1, g2):
+        # A: (2,) linear coeffs; B: (3,) = (B11, B22, B12) second-order coeffs.
+        # y - x = A0 g1 + A1 g2 + 1/2 B11 g1^2 + 1/2 B22 g2^2 + B12 g1 g2.
+        return (
+            A[0] * g1
+            + A[1] * g2
+            + 0.5 * B[0] * g1**2
+            + 0.5 * B[1] * g2**2
+            + B[2] * g1 * g2
+        )
+
+    def _coeffs(self, x0, x1, x2):
+        """Per-component (A, B) coefficient tuples at the given preceding components."""
+        B0 = self.net_flux(jnp.zeros(0))  # (3,)
+        B1 = self.net_size(jnp.array([x0]))  # (3,)
+        o2 = self.net_m1(jnp.array([x0, x1]))  # (5,)
+        o3 = self.net_m2(jnp.array([x0, x1, x2]))  # (5,)
+        zeroA = jnp.zeros(2)
+        A = (zeroA, zeroA, o2[:2], o3[:2])
+        B = (B0, B1, o2[2:], o3[2:])
+        return A, B
+
+    def transform_and_log_det(self, x, condition=None):
+        g1, g2 = condition[0], condition[1]
+        A, B = self._coeffs(x[0], x[1], x[2])
+        shifts = jnp.stack([self._shift(A[i], B[i], g1, g2) for i in range(4)])
+        return x + shifts, jnp.zeros(())
+
+    def inverse_and_log_det(self, y, condition=None):
+        g1, g2 = condition[0], condition[1]
+        # Sequential: shift[i] depends only on the already-recovered x[<i].
+        B0 = self.net_flux(jnp.zeros(0))
+        x0 = y[0] - self._shift(jnp.zeros(2), B0, g1, g2)
+        B1 = self.net_size(jnp.array([x0]))
+        x1 = y[1] - self._shift(jnp.zeros(2), B1, g1, g2)
+        o2 = self.net_m1(jnp.array([x0, x1]))
+        x2 = y[2] - self._shift(o2[:2], o2[2:], g1, g2)
+        o3 = self.net_m2(jnp.array([x0, x1, x2]))
+        x3 = y[3] - self._shift(o3[:2], o3[2:], g1, g2)
+        return jnp.stack([x0, x1, x2, x3]), jnp.zeros(())
+
+    def shear_derivs(self, x):
+        """First/second moment shear-response at ``x`` (a std moment at ``g=0``).
+
+        Returns ``(A, B)`` with ``A`` shape ``(4, 2)`` = ``dy/dg`` and ``B`` shape
+        ``(4, 2, 2)`` = ``d^2y/dg^2`` at ``g=0``.  Because the layer is the identity
+        at ``g=0``, its input there IS the data moment, so ``x`` may be passed as a
+        data moment directly.
+        """
+        A, B = self._coeffs(x[0], x[1], x[2])
+        A_mat = jnp.stack(A)  # (4, 2)
+
+        def _Bmat(b):
+            return jnp.array([[b[0], b[2]], [b[2], b[1]]])  # (B11,B22,B12) -> 2x2
+
+        B_mat = jnp.stack([_Bmat(B[i]) for i in range(4)])  # (4, 2, 2)
+        return A_mat, B_mat
+
+
+# ---------------------------------------------------------------------------
 # EarlyChain
 # ---------------------------------------------------------------------------
 
@@ -1203,6 +1357,7 @@ def new_masked_autoregressive_flow(
     sigmax_log_scale_std: float = 1.0,
     sigmax_e_max: float = 0.2,
     sigmax_size_loc: float = 0.0,
+    shear_layer_kind: str = "poly",
 ) -> Transformed:
     """Construct a masked autoregressive normalizing flow for BFD galaxy moments.
 
@@ -1280,22 +1435,40 @@ def new_masked_autoregressive_flow(
     ]
 
     k_last = keys[-2] if use_sigmax else keys[-1]
-    k_perm, k_poly = jr.split(k_last)
+    k_perm, k_shear = jr.split(k_last)
 
-    explicit = ExplicitPolyLast(
-        k_poly,
-        dim,
-        last_layer_cond_dim,
-        quadratic_last,
-        _last_width,
-        _last_depth,
-        nn_activation,
-    )
-    explicit_with_perm = (
-        Chain([_add_equivariant_permute(explicit, k_perm)]).merge_chains()
-        if dim > 1
-        else explicit
-    )
+    if shear_layer_kind == "taylor":
+        shear = ShearTaylorLast(
+            k_shear,
+            dim,
+            last_layer_cond_dim,
+            _last_width,
+            _last_depth,
+            nn_activation,
+        )
+        # No equivariant permute for the Taylor layer: it relies on the fixed
+        # spin-0/spin-2 component order (0,1 spin-0; 2,3 spin-2), which a 2<->3 swap
+        # would scramble.
+        shear_with_perm = shear
+    elif shear_layer_kind == "poly":
+        shear = ExplicitPolyLast(
+            k_shear,
+            dim,
+            last_layer_cond_dim,
+            quadratic_last,
+            _last_width,
+            _last_depth,
+            nn_activation,
+        )
+        shear_with_perm = (
+            Chain([_add_equivariant_permute(shear, k_perm)]).merge_chains()
+            if dim > 1
+            else shear
+        )
+    else:
+        raise ValueError(
+            f"unknown shear_layer_kind {shear_layer_kind!r} (want 'poly' or 'taylor')"
+        )
 
     if use_sigmax:
         sigmax = SigmaXCouplingLayer(
@@ -1315,10 +1488,10 @@ def new_masked_autoregressive_flow(
         # inputs must stay aligned with (M1, M2).  _add_equivariant_permute swaps
         # 2↔3, which rotates the e-coupling 90° (off-diagonal response: e1→M2,
         # e2→M1) and makes the dipole/quadrupole terms unable to match the diagonal
-        # target — the directional terms then never train.  Use `explicit` directly.
-        last = Chain([explicit, sigmax]).merge_chains()
+        # target — the directional terms then never train.  Use `shear` directly.
+        last = Chain([shear, sigmax]).merge_chains()
     else:
-        last = explicit_with_perm
+        last = shear_with_perm
 
     bijection = EarlyChain(early_layers, last)
 
