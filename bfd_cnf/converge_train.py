@@ -65,6 +65,9 @@ from .config import (
     log_scale_range,
     num_samples,
     prior_sigmax_log_scale_mean,
+    shear_layer_kind as _shear_layer_kind,
+    sobolev_g1_weight as _sobolev_g1_weight,
+    sobolev_g2_weight as _sobolev_g2_weight,
     train_chunk_size,
     use_nda_weight,
 )
@@ -174,6 +177,17 @@ def main() -> int:
                    help="Training objective. 'elbo' (default) jointly trains prior+q. "
                         "'nll' trains the prior alone on direct template NLL (m≈y, no q flow) "
                         "with the same per-stage convergence gates — for isolating ELBO/q issues.")
+    p.add_argument("--shear-layer", choices=["poly", "taylor"], default=_shear_layer_kind,
+                   help="Shear conditioning layer (default from config.shear_layer_kind). "
+                        "'taylor' = structural ShearTaylorLast (Taylor-in-g displacement, "
+                        "Sobolev-supervisable); needs --from-scratch and a fresh --prior-out "
+                        "(a poly checkpoint won't deserialise into a taylor structure).")
+    p.add_argument("--sobolev-g1", type=float, default=_sobolev_g1_weight,
+                   help="Sobolev 1st-order (dm/dg) weight, added to the loss (0=off). "
+                        "Default from config.sobolev_g1_weight.")
+    p.add_argument("--sobolev-g2", type=float, default=_sobolev_g2_weight,
+                   help="Sobolev 2nd-order (d2m/dg2) weight, added to the loss (0=off). "
+                        "Default from config.sobolev_g2_weight.")
     p.add_argument("--from-scratch", action="store_true",
                    help="Initialise fresh flows (skip load_models) and train from random init "
                         "rather than resuming from a checkpoint.")
@@ -212,7 +226,11 @@ def main() -> int:
 
     # ------------------------------------------------ build / load flows
     key, k_build = jr.split(key)
-    prior_flow, q_flow = build_flows(k_build, latent_dim=4, cond_dim=16, raw2standard=raw2standard)
+    prior_flow, q_flow = build_flows(k_build, latent_dim=4, cond_dim=16, raw2standard=raw2standard,
+                                     shear_layer_kind=args.shear_layer)
+    print(f"Shear layer: {args.shear_layer}"
+          + (f"   Sobolev g1={args.sobolev_g1} g2={args.sobolev_g2}"
+             if (args.sobolev_g1 > 0 or args.sobolev_g2 > 0) else "   Sobolev off"))
     if args.from_scratch:
         print("Initialising FRESH flows from scratch (random init, no checkpoint load).")
         prior, q = prior_flow, q_flow  # build_flows pulls arch from config → canonical structure
@@ -263,6 +281,7 @@ def main() -> int:
             log_scale_range=log_scale_range, e_max=e_max,
             use_sx=(log_scale_range is not None),
             raw2standard=raw2standard,
+            sobolev_g1_weight=args.sobolev_g1, sobolev_g2_weight=args.sobolev_g2,
         )
         print("Loss: NLL (q-free, prior-only direct template NLL)")
     else:
@@ -273,6 +292,7 @@ def main() -> int:
             use_sx=(log_scale_range is not None),
             raw2standard=raw2standard, mean_log_diag=mean_log_diag,
             std_log_diag=std_log_diag, mean_off=mean_off, std_off=std_off,
+            sobolev_g1_weight=args.sobolev_g1, sobolev_g2_weight=args.sobolev_g2,
         )
         print("Loss: ELBO (joint prior+q)")
     def make_opt(lr):
@@ -512,7 +532,7 @@ def _make_plots(history, final_fields, bins, tag) -> None:
     steps = [h["total_steps"] for h in blocks]
     colors = {STAGE_ORDER[0]: "C0", STAGE_ORDER[1]: "C1", STAGE_ORDER[2]: "C2"}
     short = {STAGE_ORDER[0]: "Equiv (base shape)",
-             STAGE_ORDER[1]: "PolyLast (shear)",
+             STAGE_ORDER[1]: "Shear layer (g)",
              STAGE_ORDER[2]: "SigmaX (C_X)"}
 
     # ---- dashboard ----

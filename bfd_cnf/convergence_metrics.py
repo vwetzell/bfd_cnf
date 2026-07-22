@@ -8,8 +8,9 @@ The prior flow is a composition of three trainable stages, each carrying a
 
   1. ``EquivariantAutoregressiveLayer``  (×9, unconditional) — the base galaxy
      moment *shape* ``p(m)`` at the reference condition.
-  2. ``ExplicitPolyLast``                (conditional on ``[g1, g2]``) — the
-     entire **shear** response of the prior.
+  2. the **shear layer** (``ExplicitPolyLast`` OR ``ShearTaylorLast``, whichever
+     the flow was built with; conditional on ``[g1, g2]``) — the entire **shear**
+     response of the prior.
   3. ``SigmaXCouplingLayer``             (conditional on ``[log_scale, e1, e2]``)
      — the entire **centroid-covariance** ``C_X`` response (flux/size monopole
      + ellipticity dipole/quadrupole).
@@ -51,19 +52,23 @@ import numpy as np
 from .models.bijections import (
     EquivariantAutoregressiveLayer,
     ExplicitPolyLast,
+    ShearTaylorLast,
     SigmaXCouplingLayer,
 )
 
 # Stage identifiers (order = report order).
 STAGE_EQUIV = "EquivariantAutoregressiveLayer"
-STAGE_POLY = "ExplicitPolyLast"
+STAGE_POLY = "ShearLayer"
 STAGE_SIGMAX = "SigmaXCouplingLayer"
 STAGE_ORDER = (STAGE_EQUIV, STAGE_POLY, STAGE_SIGMAX)
 
-_STAGE_TYPES = {
-    STAGE_EQUIV: EquivariantAutoregressiveLayer,
-    STAGE_POLY: ExplicitPolyLast,
-    STAGE_SIGMAX: SigmaXCouplingLayer,
+# Each stage matches one OR MORE bijection types (the shear stage is either the
+# ExplicitPolyLast or the structural ShearTaylorLast layer, whichever the flow was
+# built with — so the param-plateau walk tracks the shear layer under both).
+_STAGE_TYPES: dict[str, tuple[type, ...]] = {
+    STAGE_EQUIV: (EquivariantAutoregressiveLayer,),
+    STAGE_POLY: (ExplicitPolyLast, ShearTaylorLast),
+    STAGE_SIGMAX: (SigmaXCouplingLayer,),
 }
 
 # Condition-vector layout: [g1, g2, log_scale, e1, e2].  Which columns each
@@ -95,9 +100,11 @@ def collect_stage_params(prior: Any) -> dict[str, jax.Array]:
     dict[str, jax.Array]
         Mapping ``stage_name -> flat_param_vector`` for the three stages.
     """
-    types = tuple(_STAGE_TYPES.values())
     buckets: dict[str, list[jax.Array]] = {name: [] for name in STAGE_ORDER}
-    name_of = {t: name for name, t in _STAGE_TYPES.items()}
+    # Flatten {stage: (types...)} to {type: stage} so isinstance can match any of a
+    # stage's types (e.g. the shear stage's ExplicitPolyLast OR ShearTaylorLast).
+    name_of = {t: name for name, ts in _STAGE_TYPES.items() for t in ts}
+    types = tuple(name_of)
 
     def rec(o: Any) -> None:
         for t in types:

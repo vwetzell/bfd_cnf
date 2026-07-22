@@ -37,7 +37,7 @@ from .convergence_metrics import STAGE_ORDER
 
 _SHORT = {
     STAGE_ORDER[0]: "Equiv (base shape)",
-    STAGE_ORDER[1]: "PolyLast (shear)",
+    STAGE_ORDER[1]: "Shear layer (g)",
     STAGE_ORDER[2]: "SigmaX (C_X)",
 }
 _COLORS = {STAGE_ORDER[0]: "C0", STAGE_ORDER[1]: "C1", STAGE_ORDER[2]: "C2"}
