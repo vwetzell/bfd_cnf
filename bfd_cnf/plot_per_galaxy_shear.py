@@ -43,25 +43,20 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 from .config import PLOTS_DIR
-from .statistics import pqr2g
+from .statistics import pqr2g, qr_log_totals
 
 
 def per_object_g(pqr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Per-galaxy shear g_i = R_tot,i⁻¹ Q_tot,i (analytic 2×2 inverse)."""
     keep = pqr[:, 0] >= 1e-10
-    pqr = pqr[keep]
-    P = pqr[:, 0]
-    Q1, Q2 = pqr[:, 1], pqr[:, 2]
-    R11, R22, R12 = pqr[:, 3], pqr[:, 4], pqr[:, 5]
-    qt1, qt2 = Q1 / P, Q2 / P
-    a = Q1 * Q1 / P**2 - R11 / P          # R_tot[0,0]
-    c = Q2 * Q2 / P**2 - R22 / P          # R_tot[1,1]
-    b = Q1 * Q2 / P**2 - R12 / P          # R_tot[0,1]
+    qt, Rtot = qr_log_totals(pqr[keep])  # Q_tot (N,2), R_tot (N,2,2)
+    a = Rtot[:, 0, 0]
+    c = Rtot[:, 1, 1]
+    b = Rtot[:, 0, 1]
     det = a * c - b * b
-    bad = np.abs(det) < 1e-30
-    det = np.where(bad, np.nan, det)
-    g1 = (c * qt1 - b * qt2) / det
-    g2 = (-b * qt1 + a * qt2) / det
+    det = np.where(np.abs(det) < 1e-30, np.nan, det)  # per-object R is often singular
+    g1 = (c * qt[:, 0] - b * qt[:, 1]) / det
+    g2 = (-b * qt[:, 0] + a * qt[:, 1]) / det
     return g1, g2
 
 

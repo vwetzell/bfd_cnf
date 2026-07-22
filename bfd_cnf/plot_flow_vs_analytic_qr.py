@@ -44,6 +44,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from .config import PLOTS_DIR
+from .statistics import qr_log_totals
 
 DELTA_G = 0.04
 _TINY = 1e-30
@@ -55,14 +56,8 @@ def _qr_tot(pqr: np.ndarray):
     pqr = pqr[keep]
     if pqr.shape[0] < 3:
         return np.full(2, np.nan), np.full((2, 2), np.nan)
-    P = pqr[:, 0]
-    Q = pqr[:, 1:3]
-    R = np.empty((pqr.shape[0], 2, 2))
-    R[:, 0, 0] = pqr[:, 3]; R[:, 1, 1] = pqr[:, 4]; R[:, 0, 1] = R[:, 1, 0] = pqr[:, 5]
-    Q_tot = np.nansum(Q / P[:, None], axis=0)
-    R_tot = np.nansum(np.einsum("ni,nj->nij", Q, Q) / P[:, None, None] ** 2
-                      - R / P[:, None, None], axis=0)
-    return Q_tot, R_tot
+    qt, Rtot = qr_log_totals(pqr)
+    return np.nansum(qt, axis=0), np.nansum(Rtot, axis=0)
 
 
 def _g1(pqr):

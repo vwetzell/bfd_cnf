@@ -37,6 +37,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 from .config import PLOTS_DIR
+from .statistics import qr_log_totals
 
 DELTA_G = 0.04
 BOX_MF = (1500.0, 90000.0)  # green selection box flux bounds
@@ -61,24 +62,14 @@ CORNER_ASPECT = (np.log10(200000.0) - np.log10(500.0)) / (5.5 - 1.2)
 
 
 def _g_from_pqr(pqr: np.ndarray) -> np.ndarray:
-    """Maximum-likelihood shear from a summed PQR block (numpy port of pqr2g)."""
+    """Maximum-likelihood shear from a summed PQR block (pqr2g accumulation)."""
     keep = pqr[:, 0] >= 1e-10
     pqr = pqr[keep]
     if pqr.shape[0] < 3:
         return np.array([np.nan, np.nan])
-    P = pqr[:, 0]
-    Q = pqr[:, 1:3]
-    R = np.empty((pqr.shape[0], 2, 2), dtype=np.float64)
-    R[:, 0, 0] = pqr[:, 3]
-    R[:, 1, 1] = pqr[:, 4]
-    R[:, 0, 1] = R[:, 1, 0] = pqr[:, 5]
-    Q_tot = np.nansum(Q / P[:, None], axis=0)
-    R_tot = np.nansum(
-        np.einsum("ni,nj->nij", Q, Q) / P[:, None, None] ** 2 - R / P[:, None, None],
-        axis=0,
-    )
+    qt, Rtot = qr_log_totals(pqr)
     try:
-        return np.linalg.solve(R_tot, Q_tot)
+        return np.linalg.solve(np.nansum(Rtot, axis=0), np.nansum(qt, axis=0))
     except np.linalg.LinAlgError:
         return np.array([np.nan, np.nan])
 

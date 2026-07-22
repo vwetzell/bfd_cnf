@@ -30,15 +30,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from .config import PLOTS_DIR
+from .statistics import qr_log_totals
 
 
 def _accum(pqr: np.ndarray):
     """pqr2g per-target accumulation terms q (N,2) and r (N,2) (diagonal R)."""
-    P = pqr[:, 0]
-    Q = pqr[:, 1:3]
-    Rdiag = pqr[:, 3:5]  # R11, R22
-    q = Q / P[:, None]
-    r = Q ** 2 / P[:, None] ** 2 - Rdiag / P[:, None]
+    q, Rtot = qr_log_totals(pqr)
+    r = np.stack([Rtot[:, 0, 0], Rtot[:, 1, 1]], axis=1)  # diagonal R_tot
     return q, r
 
 
