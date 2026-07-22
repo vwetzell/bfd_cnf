@@ -38,6 +38,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from functools import partial
 from typing import Any
+import time
 
 import numpy as np
 import jax
@@ -128,6 +129,115 @@ def make_flow_prob_and_derivs(
         return jax.vmap(_single)(x_batch)
 
     return log_prob_and_derivs
+
+
+# ---------------------------------------------------------------------------
+# Flux-limit selection PQR (BFD-2016 selection correction)
+# ---------------------------------------------------------------------------
+
+
+def selection_pqr(
+    prior_flow: Any,
+    r2s: Any,
+    f_min: float,
+    f_max: float,
+    sigma_f: float,
+    *,
+    sx_cond: jax.Array | None = None,
+    n_samples: int = 2**17,
+    key: jax.Array,
+) -> jax.Array:
+    """Selection PQR for a flux band ``[f_min, f_max]`` at one flux-moment noise.
+
+    Returns flow-order ``[P_sel, Q1, Q2, R11, R22, R12]`` (probability-space, at g=0):
+
+        P_sel(g) = E_{x~p_theta(·|g)} [ Φ((f_max-Mf)/σ_f) - Φ((f_min-Mf)/σ_f) ]
+
+    the BFD-2016 flux-only selection probability (selection acts on the *measured*
+    flux moment, so the noise convolves the band into a Gaussian-CDF box).  ``Mf`` is
+    the raw flux moment of a prior draw: dim-0 of the standardised moment vector
+    inverted through the flow's standardiser ``r2s`` (``10**(x0*std0 + mean0)``).
+
+    Estimated by reparameterisation — fixed base draws ``z~N(0,I)``,
+    ``x = transform(z, [g, sx])`` (base→data, standardised moments), and autodiff of
+    the g-dependence (``g`` enters *only* via the forward map, ``z`` fixed).  The
+    integrand ``s̄∈[0,1]`` is bounded and smooth, so no importance weighting / k-hat
+    machinery is needed — a plain MC mean over prior draws suffices.
+    """
+    if sx_cond is None:
+        sx_cond = jnp.array([prior_sigmax_log_scale_mean, 0.0, 0.0])
+    mean0 = jnp.asarray(r2s.mean)[0]
+    std0 = jnp.asarray(r2s.std)[0]
+    z = jr.normal(key, (n_samples, 4))
+
+    def P_sel(g):
+        cond = jnp.concatenate([g, sx_cond])
+        x = jax.vmap(lambda zi: prior_flow.bijection.transform(zi, condition=cond))(z)
+        mf = 10.0 ** (x[:, 0] * std0 + mean0)
+        s = ndtr((f_max - mf) / sigma_f) - ndtr((f_min - mf) / sigma_f)
+        return jnp.mean(s)
+
+    g0 = jnp.zeros(2)
+    P = P_sel(g0)
+    Q = jax.grad(P_sel)(g0)          # (2,)
+    R = jax.hessian(P_sel)(g0)       # (2,2)
+    return jnp.array([P, Q[0], Q[1], R[0, 0], R[1, 1], R[0, 1]])
+
+
+def selection_pqr_binned(
+    prior_flow: Any,
+    r2s: Any,
+    f_min: float,
+    f_max: float,
+    sigma_f_bins: Any,
+    counts: Any,
+    *,
+    sx_cond: jax.Array | None = None,
+    n_samples: int = 2**17,
+    key: jax.Array,
+) -> dict:
+    """Sweep :func:`selection_pqr` over ``sigma_f_bins`` and aggregate.
+
+    ``sigma_f_bins`` (n_bins,) is a representative flux-moment noise per bin and
+    ``counts`` (n_bins,) the number of targets in each bin (histogram the catalogue's
+    ``σ_f,i = sqrt(Σ_i[0,0])``).  ``σ_f`` enters only the CDF weight, so every bin
+    shares the same base draws (common random numbers → smooth across the sweep).
+
+    Returns a dict with per-bin PQR ``pqr_bins`` (n_bins, 6), per-bin log-totals
+    ``q_tot_b`` (n_bins, 2) / ``r_tot_b`` (n_bins, 2, 2) (via ``qr_log_totals`` — the
+    P-normalised ``Q/P``, ``(Q⊗Q)/P²−R/P``), and the count-weighted total selection
+    log-totals ``q_tot_sel`` / ``r_tot_sel``.  The per-bin ``q_tot_b``/``r_tot_b`` are
+    what the per-object path (``statistics.apply_selection`` / the bootstrap) gathers.
+
+    ponytail: recomputes the flow pushforward per σ_f bin (O(n_bins) flow evals); fine
+    for an offline one-shot with ≲ tens of bins.  If the sweep is slow, hoist the
+    g-Jacobian/Hessian of ``Mf(z,g)`` out of the loop (σ_f only enters the CDF weight)
+    and apply the chain rule per bin — O(1) flow evals in the bin count.
+    """
+    from .statistics import qr_log_totals
+
+    sigma_f_bins = np.asarray(sigma_f_bins, dtype=np.float64)
+    counts = np.asarray(counts, dtype=np.float64)
+    pqr_bins = np.stack([
+        np.asarray(selection_pqr(
+            prior_flow, r2s, f_min, f_max, float(s),
+            sx_cond=sx_cond, n_samples=n_samples, key=key,
+        ))
+        for s in sigma_f_bins
+    ])  # (n_bins, 6), shared base draws (same key)
+
+    q_tot_b, r_tot_b = qr_log_totals(pqr_bins)          # (n_bins,2), (n_bins,2,2)
+    q_tot_sel = (counts[:, None] * q_tot_b).sum(0)       # (2,)
+    r_tot_sel = (counts[:, None, None] * r_tot_b).sum(0)  # (2,2)
+    return dict(
+        pqr_bins=pqr_bins,
+        sigma_f_bins=sigma_f_bins,
+        counts=counts,
+        q_tot_b=q_tot_b,
+        r_tot_b=r_tot_b,
+        q_tot_sel=q_tot_sel,
+        r_tot_sel=r_tot_sel,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -775,24 +885,35 @@ def rqmc_pqr_grid(
     prior_flow,
     hessian_scale=3.0,
     return_ess=False,
-    bruteforce=False,
+    bruteforce=True,
     augment=False,
+    eps_all_override=None,
+    key=None,
+    progress_every=0,
 ):
-    """Compute RQMC PQR for a grid of galaxy templates in batches.
+    """Compute PQR for a grid of galaxy templates in batches.
 
-    If ``bruteforce`` is True, bypass the entire importance-sampling scheme
-    (mode-find, Laplace Gaussian proposal, scrambled-Halton ±5.6σ clip) and
-    instead estimate each integral by plain Monte Carlo: draw ``n_points``
-    samples directly from the (augmented) Gaussian noise kernel with ordinary
-    pseudo-random normals (no proposal, no low-discrepancy points, no clip) and
-    average the SAME integrand (same noise augmentation, same BFD Jacobian
-    correction, same flow evaluation).  This shares zero machinery with the
-    production estimator's proposal/sampler, so agreement between the two proves
-    the integration scheme — not the flow — is unbiased.  Use a large
-    ``n_points`` (brute MC has no variance reduction).
+    ``bruteforce=True`` is now the DEFAULT.  It draws ``n_points`` samples directly
+    from the (augmented) Gaussian noise kernel with ordinary normals and averages
+    the integrand (flow × BFD-Jacobian correction) — no proposal, no low-discrepancy
+    points.  This was measured (2026-07-13) to strictly dominate the old Laplace-
+    proposal RQMC at *every* S/N: the Gaussian Laplace proposal ran at ESS ≈ 5% of
+    the budget (light tails + a ×3 inflated covariance), so kernel sampling has 2–15×
+    more effective samples per flow-eval and 2.3× lower c2 seed-variance overall.
+    Total flow-evals per target = ``n_points × n_replicates``; the replicate split
+    only provides the SE (brute MC has no variance reduction, so 16×1024 ≡ 1×16384).
 
-    Halton points are generated once and shared across all templates for
-    efficiency.  Noise augmentation and Σ_X conditioning are applied per object.
+    Set ``bruteforce=False`` to use the retired Laplace-proposal path (mode-find +
+    finite-difference Hessian Gaussian proposal, scrambled-Halton points) — kept for
+    A/B comparison and as the seat for a future heavy-tailed (Student-t) proposal,
+    which is the only thing expected to beat kernel sampling in the faint tail.
+
+    Quadrature points are drawn independently per target AND per replicate: each
+    target folds ``key`` (default ``jr.key(42)``) with its global index and splits
+    into per-replicate subkeys.  Sharing one fixed set across all targets (the old
+    behaviour, still available via ``eps_all_override``) correlates their MC errors
+    into a coherent, non-averaging angular ripple in ``(Q1, Q2)``.  Noise
+    augmentation and Σ_X conditioning are applied per object.
 
     Parameters
     ----------
@@ -863,21 +984,31 @@ def rqmc_pqr_grid(
     CM_raw_b = CM_raw_pad.reshape(n_batches, batch_size, dim, dim)
     sx_conds_b = sx_conds_pad.reshape(n_batches, batch_size, 3)
 
-    # ── Generate ALL Halton points once, outside lax.map ──────────────────────
-    # Shape: (n_replicates, n_points, dim)
-    # Each replicate gets its own scrambling key, same as before —
-    # but now this happens once for the entire grid rather than N_grid times.
-    rqmc_keys = jr.split(jr.key(42), n_replicates)
-    if bruteforce:
-        # Plain pseudo-random standard normals: no low-discrepancy, no clip.
-        eps_all = jax.vmap(lambda k: jr.normal(k, (n_points, dim)))(rqmc_keys)
-    else:
-        u_all = jax.vmap(lambda k: _halton_sequence(k, n_points, dim))(rqmc_keys)
-        u_all = jnp.clip(u_all, 1e-8, 1.0 - 1e-8)  # clip once here too
-        eps_all = jax.scipy.stats.norm.ppf(u_all)
+    # Per-target global index, so each target can fold the base key with its own id
+    # and get an independent quadrature cloud (padded rows reuse id 0, then dropped).
+    idx_b = pad_front(jnp.arange(N, dtype=jnp.uint32)).reshape(n_batches, batch_size)
+
+    # ── Quadrature points: per-target AND per-replicate ───────────────────────
+    # Each target folds the base key with its own index, then splits into
+    # n_replicates subkeys, so no two targets (and no two replicates) draw the same
+    # cloud (generated lazily per replicate inside _single -- see _gen_eps).  The old
+    # code reused ONE fixed (jr.key(42)) set for every target "once for the whole
+    # grid"; sharing correlates every target's MC error into a coherent, non-averaging
+    # angular ripple in (Q1,Q2) (physical ellipticity is isotropic; the artifact is
+    # purely the shared draw).  eps_all_override still supplies a single shared set for
+    # A/B / seed-controlled diagnostics, in which case that fixed set is used for all.
+    base_key = jr.key(42) if key is None else key
+    eps_all = None if eps_all_override is None else jnp.asarray(eps_all_override)
+
+    def _gen_eps(rep_key):
+        """(n_points, dim) standard normals for one replicate from its own subkey."""
+        if bruteforce:
+            return jr.normal(rep_key, (n_points, dim))  # plain normals, no low-discrepancy
+        u = jnp.clip(_halton_sequence(rep_key, n_points, dim), 1e-8, 1.0 - 1e-8)
+        return jax.scipy.stats.norm.ppf(u)  # randomized (per-key scrambled) Halton
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _single(prior_flow, mu_std, cov_std, mu_raw, CM_raw, sx_cond):
+    def _single(prior_flow, mu_std, cov_std, mu_raw, CM_raw, sx_cond, target_idx):
 
         # jax.debug.print(60 * "=")
 
@@ -1107,7 +1238,14 @@ def rqmc_pqr_grid(
         # Process replicates sequentially with lax.map to avoid materialising
         # a (batch_size, n_replicates, n_points, dim) tensor through the flow.
         # Each map step allocates (batch_size, n_points, dim) intermediates instead.
-        stacked = jax.lax.map(single_replicate, eps_all)
+        if eps_all is not None:
+            # Diagnostic override: one shared point set for every target/replicate.
+            stacked = jax.lax.map(single_replicate, eps_all)
+        else:
+            # Independent draw per target (fold_in) and per replicate (split), so
+            # MC errors are uncorrelated across targets -- no shared-quadrature ripple.
+            rep_keys = jr.split(jr.fold_in(base_key, target_idx), n_replicates)
+            stacked = jax.lax.map(lambda rk: single_replicate(_gen_eps(rk)), rep_keys)
         (P_ests, Q1_ests, Q2_ests, R11_ests, R22_ests, R12_ests,
          ess_reps, maxw_reps, skew_reps) = stacked
 
@@ -1135,17 +1273,35 @@ def rqmc_pqr_grid(
     # eqx.filter_jit handles the non-array leaves in prior_flow (e.g. triangular.fn)
     # by treating them as static cache keys rather than traced arrays.
     _single_batch = eqx.filter_jit(
-        eqx.filter_vmap(_single, in_axes=(None, 0, 0, 0, 0, 0))
+        eqx.filter_vmap(_single, in_axes=(None, 0, 0, 0, 0, 0, 0))
     )
 
+    # progress_every>0 prints a live line every ~progress_every targets.  We
+    # block_until_ready on the reported batch so the count/rate/ETA reflect work
+    # actually finished (JAX dispatch is async), and flush so it shows immediately.
+    t0 = time.time()
+    next_report = progress_every
     results = []
     for i in range(n_batches):
         result = _single_batch(
             prior_flow,
-            mu_std_b[i], cov_std_b[i], mu_raw_b[i], CM_raw_b[i], sx_conds_b[i],
+            mu_std_b[i], cov_std_b[i], mu_raw_b[i], CM_raw_b[i], sx_conds_b[i], idx_b[i],
         )
         results.append(result)
+        if progress_every:
+            done = min((i + 1) * batch_size, N)
+            if done >= next_report:
+                jax.block_until_ready(result)
+                el = time.time() - t0
+                rate = done / el if el > 0 else 0.0
+                eta = (N - done) / rate / 60.0 if rate > 0 else 0.0
+                print(f"[integrate] {done:,}/{N:,} targets  "
+                      f"({el:.0f}s, {rate:.0f}/s, ETA {eta:.1f} min)", flush=True)
+                while next_report <= done:
+                    next_report += progress_every
     batched = jax.tree.map(lambda *xs: jnp.stack(xs), *results)
+    if progress_every:
+        print(f"[integrate] done: {N:,} targets in {time.time() - t0:.0f}s", flush=True)
 
     # Flatten batches and remove padding
     # Flatten the (n_batches, batch_size, ...) leaves to (N, ...), preserving any
@@ -1259,8 +1415,10 @@ def integrate_catalog_pqr(
     return_ess: bool = False,
     fixed_sx_cond: tuple[float, float, float] | None = None,
     verbose: bool = True,
-    bruteforce: bool = False,
+    bruteforce: bool = True,
     augment: bool = False,
+    eps_all_override=None,
+    progress_every: int = 1000,
 ) -> dict[str, Any]:
     """Flow-based RQMC PQR over a SINGLE shear catalogue, selected on its own moments.
 
@@ -1325,7 +1483,8 @@ def integrate_catalog_pqr(
         n_points=n_points, n_replicates=n_replicates, batch_size=batch_size,
         raw2standard=raw2standard, prior_flow=prior_flow,
         hessian_scale=hessian_scale, return_ess=return_ess, bruteforce=bruteforce,
-        augment=augment,
+        augment=augment, eps_all_override=eps_all_override, key=key,
+        progress_every=(progress_every if verbose else 0),
     )
 
     ess = maxw = skew = None

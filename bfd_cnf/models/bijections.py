@@ -17,19 +17,19 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import ClassVar
 
-import numpy as np
-import jax
-import jax.numpy as jnp
-import jax.nn as jnn
-import jax.random as jr
 import equinox as eqx
+import jax
+import jax.nn as jnn
+import jax.numpy as jnp
+import jax.random as jr
+import numpy as np
 from flowjax.bijections import AbstractBijection, Chain, Invert, Permute
 from flowjax.distributions import AbstractDistribution, Transformed
 from flowjax.utils import arraylike_to_array
-from jaxtyping import Array, ArrayLike, Shaped
-from paramax import Parameterize, AbstractUnwrappable
+from jaxtyping import Array, ArrayLike
+from paramax import AbstractUnwrappable, Parameterize
 
 # ---------------------------------------------------------------------------
 # Bounded-scale helpers
@@ -410,14 +410,18 @@ def load_stats(
         o = np.load(override)
         if have_side:
             s = np.load(side)
-            if not (np.allclose(o["mean"], s["mean"], rtol=rtol)
-                    and np.allclose(o["std"], s["std"], rtol=rtol)):
+            if not (
+                np.allclose(o["mean"], s["mean"], rtol=rtol)
+                and np.allclose(o["std"], s["std"], rtol=rtol)
+            ):
                 raise ValueError(
                     f"--stats {override} disagrees with the flow's sidecar "
                     f"{side}; they encode different standardisers, so the flow "
                     "would be evaluated in the wrong coordinates."
                 )
-        return RawMomentStandardize(mean=jnp.asarray(o["mean"]), std=jnp.asarray(o["std"]))
+        return RawMomentStandardize(
+            mean=jnp.asarray(o["mean"]), std=jnp.asarray(o["std"])
+        )
     if not have_side:
         raise FileNotFoundError(
             f"No standardiser sidecar {side} and no --stats override. "
@@ -949,8 +953,10 @@ class SigmaXCouplingLayer(AbstractBijection):
 
     net_flux: CoeffNet  # (log_scale_n, ehat2)           → (1,)  s0  flux shift
     net_size: CoeffNet  # (m0, log_scale_n, ehat2)       → (1,)  g_s size log-scale
-    net_dip: CoeffNet   # (m0, m1, log_scale_n, ehat2)   → (1,)  D   dipole amplitude
-    net_quad: CoeffNet  # (m0, m1, log_scale_n, ehat2)   → (1,)  c   quadrupole (pre-tanh)
+    net_dip: CoeffNet  # (m0, m1, log_scale_n, ehat2)   → (1,)  D   dipole amplitude
+    net_quad: (
+        CoeffNet  # (m0, m1, log_scale_n, ehat2)   → (1,)  c   quadrupole (pre-tanh)
+    )
     _cond_dim: int = eqx.field(static=True)
     _log_scale_mean: float = eqx.field(static=True)
     _log_scale_std: float = eqx.field(static=True)
@@ -1003,14 +1009,14 @@ class SigmaXCouplingLayer(AbstractBijection):
         e1 = condition[3]
         e2 = condition[4]
         e_mag_sq = e1**2 + e2**2
-        log_scale_n = (log_scale - self._log_scale_mean) / (self._log_scale_std + 1e-8)
+        log_scale_n = log_scale - self._log_scale_mean
         e_mag_sq_n = e_mag_sq / (self._e_mag_sq_scale + 1e-8)
         # T_n ∝ tr(C_X) = exp(log_scale)/exp(mean) (=1 at the reference log_scale_n=0).
         # Leading C_X response is analytic: mean shifts (s0, g_s, D) are O(T), the
         # anisotropic broadening (c) is O(T²).  Factoring these powers of T out of the
         # coeff nets leaves them learning only the (flux,size) form factor.
         # ponytail: dropped the 1/√(1−|e|²) factor in T (≤1.001 at e_max=0.05).
-        T_n = jnp.exp(self._log_scale_std * log_scale_n)
+        T_n = jnp.exp(log_scale_n)
         return log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n
 
     def _coeffs(self, x0, x1, log_scale_n, e_mag_sq_n, T_n):

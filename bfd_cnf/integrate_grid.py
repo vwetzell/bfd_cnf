@@ -99,15 +99,22 @@ def load_raw2standard(
     return r2s
 
 
-def load_prior_flow(key, prior_path: str = PRIOR_FLOW_PATH, q_path: str = Q_FLOW_PATH):
+def load_prior_flow(key, prior_path: str = PRIOR_FLOW_PATH, q_path: str = Q_FLOW_PATH,
+                    raw2standard=None):
     """Build the flow architecture (config defaults) and load trained weights.
 
     Only the prior flow is needed for PQR integration; the q flow is built and
     deserialised because :func:`bfd_cnf.training.load_models` expects both
     template pytrees, but it is otherwise unused here.
+
+    ``raw2standard`` overrides the standardiser (default: the prior's own sidecar
+    ``load_stats(prior_path)``).  Useful for checkpoint backups that lack a
+    ``.stats.npz`` sidecar but share the canonical (data-derived) standardiser.
     """
+    if raw2standard is None:
+        raw2standard = load_stats(prior_path)
     prior_flow, q_flow = build_flows(
-        key, latent_dim=4, cond_dim=16, raw2standard=load_stats(prior_path)
+        key, latent_dim=4, cond_dim=16, raw2standard=raw2standard
     )
     prior_trained, _ = load_models(prior_flow, q_flow, prior_path, q_path)
     return prior_trained

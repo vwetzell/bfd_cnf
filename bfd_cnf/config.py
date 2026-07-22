@@ -34,7 +34,7 @@ key = jr.key(18061998)
 # ---------------------------------------------------------------------------
 prior_early_nn_width = 32
 prior_early_nn_depth = 2
-prior_last_nn_width = 32
+prior_last_nn_width = 128  # shear conditioner (ExplicitPolyLast); was 32, widened 2026-07-11
 prior_last_nn_depth = 4
 prior_sigmax_nn_width = 32
 prior_sigmax_nn_depth = 4
@@ -138,9 +138,11 @@ TRAIN_FITS_PATH = os.environ.get(
 GRID_P_PATH = os.path.join(_EXT_DIR, "merged_masked_bfd_grid_p.npy")
 GRID_M_PATH = os.path.join(_EXT_DIR, "merged_masked_bfd_grid_m.npy")
 
-# Saved flow weights live in the repo's flows/ directory.
-PRIOR_FLOW_PATH = os.path.join(FLOWS_DIR, "prior_flow_xy.eqx")
-Q_FLOW_PATH = os.path.join(FLOWS_DIR, "q_flow_xy.eqx")
+# Saved flow weights live in the repo's flows/ directory.  Defaults track the
+# current w128 architecture (prior_last_nn_width=128); the older width-32
+# prior_flow_xy.eqx no longer matches build_flows and fails to deserialise.
+PRIOR_FLOW_PATH = os.path.join(FLOWS_DIR, "prior_flow_xy_w128.eqx")
+Q_FLOW_PATH = os.path.join(FLOWS_DIR, "q_flow_xy_w128.eqx")
 
 # ---------------------------------------------------------------------------
 # Fixed matrices

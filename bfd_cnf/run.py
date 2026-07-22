@@ -231,6 +231,9 @@ def main() -> None:
     pqr_p, pqr_m = res_p["pqr"], res_m["pqr"]
 
     def _q_r_g(pqr):
+        # jax mirror of statistics.qr_log_totals (kept in jax: batched inv here
+        # tolerates singular per-object R without raising, unlike numpy/bfd).
+        # flow order [P,Q1,Q2,R11,R22,R12] -> R=[[R11,R12],[R12,R22]] (see to_bfd).
         Q_vec = pqr[:, 1:3]
         R_mat = jnp.stack(
             [

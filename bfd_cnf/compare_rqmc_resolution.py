@@ -75,7 +75,7 @@ def main() -> None:
     for col, (axi, name) in enumerate([(ax[0], "g_1"), (ax[1], "g_2")]):
         for grp, color in [("p", "red"), ("m", "blue")]:
             pqr_b, pqr_h, common = _align(
-                db[f"pqr_{grp}"], dh[f"pqr_{grp}"], db["ids"], dh["ids"])
+                db[f"pqr_{grp}"], dh[f"pqr_{grp}"], db[f"ids_{grp}"], dh[f"ids_{grp}"])
             gb = per_object_g(pqr_b.astype(np.float64))[col]
             gh = per_object_g(pqr_h.astype(np.float64))[col]
             sb, sh = _dist_stats(gb), _dist_stats(gh)
