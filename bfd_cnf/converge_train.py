@@ -21,15 +21,35 @@ For each stage and each block we record:
     signature binned across moment space (flux × size), so we can see *where*
     in moment space each stage is still moving.
 
-A stage is "converged" for a block when both rel-deltas are below their
-thresholds.  Training stops when all three stages are converged AND the block
-loss has stopped improving, for ``--patience`` consecutive blocks (or at
-``--max-blocks``).
+A stage is "converged" for a block once its trailing ``--plateau-window``
+blocks show no more net drift than a random walk of the same per-block jitter
+would produce (see ``convergence_metrics.drift_diffusion_ratio`` — this
+replaces a fixed relative-delta threshold, which breaks down for a stage
+whose signature is legitimately tiny, e.g. ``SigmaXCouplingLayer``). Training
+stops when all three stages are converged AND the block loss has stopped
+improving, for ``--patience`` consecutive blocks (or at ``--max-blocks``).
 
 Unlike :func:`bfd_cnf.training.continue_training`, the optimizer (Adam) state is
 carried across blocks, so blocks are just checkpoint/measure boundaries on one
 continuous run — no per-block Adam warm-up transient to contaminate the
 plateau signal.
+
+Two more things keep the convergence read honest instead of ad hoc thresholds:
+
+* **Polyak/EMA averaging** (``--ema-decay``) — Adam trains to a noise ball
+  around the optimum whose radius scales with the learning rate, so raw
+  per-block snapshots keep jittering even once training has genuinely
+  settled (worst for a stage like ``SigmaXCouplingLayer`` whose signature is
+  a small perturbation to begin with). Convergence metrics and checkpoints
+  are computed from an exponential moving average of the trained weights
+  (Polyak et al. 1991), which converges to the true optimum even while the
+  raw iterate keeps oscillating — not from a magnitude floor that just
+  stops asking the noisy question.
+* **Smooth plateau LR drops** — the ``plateau`` LR schedule no longer jumps
+  the learning rate discretely between blocks. A drop is realised as a
+  one-block ``optax.cosine_decay_schedule`` ramp from the old LR to the new
+  one (held flat at the new value afterwards), so the optimizer never sees a
+  step-function change in step size.
 
 Usage
 -----
@@ -47,6 +67,7 @@ import datetime as _dt
 import json
 import os
 import shutil
+from collections import deque
 
 import equinox as eqx
 import jax
@@ -66,8 +87,12 @@ from .config import (
     num_samples,
     prior_sigmax_log_scale_mean,
     shear_layer_kind as _shear_layer_kind,
+    prior_shear_own_e as _prior_shear_own_e,
+    prior_shear_split_ab as _prior_shear_split_ab,
+    prior_shear_spin2_owne as _prior_shear_spin2_owne,
     sobolev_g1_weight as _sobolev_g1_weight,
     sobolev_g2_weight as _sobolev_g2_weight,
+    shear_coeff_ood_weight as _shear_coeff_ood_weight,
     train_chunk_size,
     use_nda_weight,
 )
@@ -75,6 +100,8 @@ from .convergence_metrics import (
     STAGE_ORDER,
     collect_stage_params,
     compute_functional_fields,
+    drift_diffusion_ratio,
+    flatten_valid_field,
     functional_plateau_metrics,
     make_moment_space_bins,
     param_plateau_metrics,
@@ -82,7 +109,10 @@ from .convergence_metrics import (
 )
 from .data import load_training_dataset, transform_dataset_to_standard
 from .models.bijections import save_stats
-from .models.flows import build_flows, make_elbo_loss, make_nll_loss
+from .models.flows import (
+    build_flows, make_elbo_loss, make_nll_loss,
+    warmstart_prior_A, warmstart_prior_AB, warmstart_prior_B,
+)
 from .training import _run_training_loop, compute_std_stats, load_models
 
 _LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
@@ -101,21 +131,35 @@ def _fmt(v: float) -> str:
     return "   nan " if not np.isfinite(v) else f"{v:8.5f}"
 
 
-def _print_block_table(block: int, total_steps: int, param_m, func_m, conv, loss_stats) -> None:
+def _ema_update(new, old, decay):
+    """Polyak/EMA update restricted to inexact-array leaves.
+
+    Flows carry non-array leaves (e.g. bare activation functions inside
+    ``CoeffNet.layers``) that ``optax.incremental_update`` can't do arithmetic
+    on; partition them out and pass them through unchanged.
+    """
+    new_params, static = eqx.partition(new, eqx.is_inexact_array)
+    old_params, _ = eqx.partition(old, eqx.is_inexact_array)
+    avg_params = optax.incremental_update(new_params, old_params, step_size=1.0 - decay)
+    return eqx.combine(avg_params, static)
+
+
+def _print_block_table(block: int, total_steps: int, param_m, func_m, drift, conv, loss_stats) -> None:
     print(
         f"\n┌─ block {block}  (total steps = {total_steps})  "
         f"loss median={loss_stats['median']:.4f} "
         f"mean={loss_stats['mean']:.4f} last={loss_stats['last']:.4f} "
         f"Δloss_rel={_fmt(loss_stats['rel_improve'])}"
     )
-    print(f"│ {'stage':32s} {'param|θ|':>10s} {'paramΔrel':>10s} "
-          f"{'funcMag':>10s} {'funcΔrel':>10s}  conv")
+    print(f"│ {'stage':32s} {'param|θ|':>10s} {'funcMag':>10s} "
+          f"{'paramDrift':>10s} {'funcDrift':>10s}  conv")
     for name in STAGE_ORDER:
         pm = param_m[name]
         fm = func_m[name]
+        dr = drift[name]
         print(
-            f"│ {name:32s} {pm['param_norm']:10.4f} {_fmt(pm['rel_delta']):>10s} "
-            f"{fm['mean_mag']:10.4f} {_fmt(fm['rel_delta']):>10s}  "
+            f"│ {name:32s} {pm['param_norm']:10.4f} {fm['mean_mag']:10.4f} "
+            f"{_fmt(dr['param']):>10s} {_fmt(dr['func']):>10s}  "
             f"{'YES' if conv[name] else 'no '}"
         )
     print("└" + "─" * 78)
@@ -123,22 +167,22 @@ def _print_block_table(block: int, total_steps: int, param_m, func_m, conv, loss
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--block-steps", type=int, default=10_000, help="Gradient steps per block.")
-    p.add_argument("--max-blocks", type=int, default=10, help="Hard cap on number of blocks.")
-    p.add_argument("--min-blocks", type=int, default=2, help="Always run at least this many blocks.")
+    p.add_argument("--block-steps", type=int, default=5_000, help="Gradient steps per block.")
+    p.add_argument("--max-blocks", type=int, default=6, help="Hard cap on number of blocks.")
+    p.add_argument("--min-blocks", type=int, default=6, help="Always run at least this many blocks.")
     p.add_argument("--start-steps", type=int, default=None,
                    help="Step count already trained (for labelling/backups only). "
                         "Default: 0 with --from-scratch, else 50000.")
-    p.add_argument("--learning-rate", type=float, default=1e-4)
+    p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--grad-clip", type=float, default=0.5)
-    p.add_argument("--lr-schedule", choices=["constant", "cosine", "plateau"], default="constant",
-                   help="LR schedule. 'cosine' decays learning_rate -> lr_final over "
+    p.add_argument("--lr-schedule", choices=["constant", "cosine", "plateau"], default="cosine",
+                   help="LR schedule. 'cosine' (default) decays learning_rate -> lr_final over "
                         "lr_decay_steps.  'plateau' = reduce-LR-on-plateau: hold LR until the "
                         "loss flattens, then drop by lr_gamma; terminate at lr_min + gates "
                         "(adaptive — ensures convergence without guessing a horizon).")
-    p.add_argument("--lr-final", type=float, default=None,
-                   help="Final LR for the cosine schedule (default = learning_rate).")
+    p.add_argument("--lr-final", type=float, default=1e-5,
+                   help="Final LR for the cosine schedule.")
     p.add_argument("--lr-decay-steps", type=int, default=None,
                    help="Steps over which cosine decay runs (default = block_steps*max_blocks).")
     p.add_argument("--lr-gamma", type=float, default=0.3,
@@ -158,39 +202,114 @@ def main() -> int:
     p.add_argument("--val-logmf-max", type=float, default=np.log10(90000), help="Max log10(Mf) for validation sample.")
     p.add_argument("--val-mrmf-min", type=float, default=2.2, help="Min Mr/Mf for validation sample.")
     p.add_argument("--val-mrmf-max", type=float, default=3.5, help="Max Mr/Mf for validation sample.")
-    p.add_argument("--tau-param", type=float, default=0.03,
-                   help="Param rel-delta below this = stage params plateaued.")
-    p.add_argument("--tau-func", type=float, default=0.05,
-                   help="Functional rel-delta below this = stage behaviour plateaued.")
-    p.add_argument("--tau-loss", type=float, default=0.003,
+    p.add_argument("--plateau-window", type=int, default=6,
+                   help="Trailing blocks over which each stage's param/functional drift-"
+                        "diffusion ratio is computed (see convergence_metrics.stage_converged). "
+                        "A stage needs this many completed blocks of history before it can be "
+                        "marked converged.")
+    p.add_argument("--plateau-k", type=float, default=2.5,
+                   help="Drift-diffusion ratio threshold: a stage's trailing-window net "
+                        "displacement must be below k times the random-walk noise floor implied "
+                        "by its own per-block jitter to count as plateaued (both param and "
+                        "functional trajectories). Scale-free, so one k applies to every stage "
+                        "regardless of signature magnitude.")
+    p.add_argument("--ema-decay", type=float, default=0.7,
+                   help="Polyak/EMA decay applied to the trained weights once per block "
+                        "(ema = decay*ema + (1-decay)*raw; effective window ~1/(1-decay) "
+                        "blocks). Convergence metrics + checkpoints use this smoothed "
+                        "trajectory instead of the raw noisy per-block iterate, since Adam "
+                        "trains to a noise ball around the optimum rather than a point. "
+                        "0 disables (ema == raw).")
+    p.add_argument("--tau-loss", type=float, default=0.0015,
                    help="Relative loss-improvement margin. plateau: a block counts as progress "
                         "only if it beats the running-best block loss by this fraction; "
                         "constant/cosine: consecutive-block rel-improvement below this = plateaued.")
-    p.add_argument("--patience", type=int, default=2,
+    p.add_argument("--patience", type=int, default=3,
                    help="Consecutive plateaued blocks required to stop.")
     p.add_argument("--tag", type=str, default="converge", help="Backup/label tag.")
     p.add_argument("--prior-out", type=str, default=PRIOR_FLOW_PATH)
     p.add_argument("--q-out", type=str, default=Q_FLOW_PATH)
     p.add_argument("--prior-in", type=str, default=PRIOR_FLOW_PATH)
     p.add_argument("--q-in", type=str, default=Q_FLOW_PATH)
-    p.add_argument("--loss", choices=["elbo", "nll"], default="elbo",
-                   help="Training objective. 'elbo' (default) jointly trains prior+q. "
-                        "'nll' trains the prior alone on direct template NLL (m≈y, no q flow) "
-                        "with the same per-stage convergence gates — for isolating ELBO/q issues.")
+    p.add_argument("--loss", choices=["elbo", "nll"], default="nll",
+                   help="Training objective. 'nll' (default) trains the prior alone on direct "
+                        "template NLL (m≈y, no q flow). 'elbo' jointly trains prior+q — same "
+                        "loss terms, but denoises via q-sampling instead of the m≈y shortcut.")
     p.add_argument("--shear-layer", choices=["poly", "taylor"], default=_shear_layer_kind,
                    help="Shear conditioning layer (default from config.shear_layer_kind). "
                         "'taylor' = structural ShearTaylorLast (Taylor-in-g displacement, "
                         "Sobolev-supervisable); needs --from-scratch and a fresh --prior-out "
                         "(a poly checkpoint won't deserialise into a taylor structure).")
+    p.add_argument("--shear-own-e", action="store_true", default=_prior_shear_own_e,
+                   help="taylor only: give the M1 shear response an own-|e| dependence "
+                        "(ShearTaylorLast second-stage M1 correction) to fix the high-|e| "
+                        "tail under-response. STATIC structure; needs --from-scratch + fresh "
+                        "--prior-out. Default from config.prior_shear_own_e.")
+    p.add_argument("--shear-split-ab", action=argparse.BooleanOptionalAction,
+                   default=_prior_shear_split_ab,
+                   help="taylor only: give the spin-2 2nd-order coeff B its own coeff net "
+                        "instead of sharing the A trunk (so sob2 can train B — a shared "
+                        "trunk is captured by the 1st-order gradient and pins B at ~0). "
+                        "STATIC structure; needs --from-scratch + fresh --prior-out. "
+                        "Default from config.prior_shear_split_ab (now True); "
+                        "pass --no-shear-split-ab for the legacy shared-trunk layer.")
+    p.add_argument("--shear-spin2-owne", action=argparse.BooleanOptionalAction,
+                   default=_prior_shear_spin2_owne,
+                   help="taylor only: condition the spin-2 (M1,M2) shear coeffs on the "
+                        "invariant |e|^2 so the 2nd-order response can depend on the "
+                        "galaxy's own ellipticity (the ONLY way to represent M1's 2nd "
+                        "derivative). Joint block w/ real log-det + iterative inverse. "
+                        "STATIC; needs --from-scratch. Default from config.")
+    p.add_argument("--warmstart-b-steps", type=int, default=300,
+                   help="For a from-scratch split-A/B taylor flow, regress its 2nd-order "
+                        "shear response B onto the template truth for this many steps before "
+                        "the main loop, so B starts near-correct instead of at its zero init. "
+                        "0 disables. Ignored for non-split / non-taylor / resumed runs.")
+    p.add_argument("--warmstart-a-steps", type=int, default=300,
+                   help="Regress the taylor flow's 1st-order shear response A onto the "
+                        "template truth for this many steps before the main loop/resumed "
+                        "fine-tune. Unlike --warmstart-b-steps (from-scratch only, relies "
+                        "on A=0 at init), A_gen=-A is independent of B/bulk params "
+                        "unconditionally, so this runs on EITHER a fresh (--from-scratch) "
+                        "OR a resumed (--prior-in) flow — e.g. to correct an already-"
+                        "trained checkpoint's A before a short fine-tune. 0 disables. "
+                        "Ignored for non-taylor shear layers.")
+    p.add_argument("--warmstart-ab-steps", type=int, default=300,
+                   help="Jointly regress BOTH A and B onto the template truth in one "
+                        "pass (uses --sobolev-g1/-g2 as the two term weights), instead "
+                        "of --warmstart-a-steps/--warmstart-b-steps run separately. "
+                        "Prefer this over sequential A/B warmstarts on an existing "
+                        "(resumed, --prior-in) flow: B_gen depends on A once A != 0, so "
+                        "a sob2-only step can nudge A away from A_tgt again right after "
+                        "an A-only step set it (or vice versa) — the joint loss has no "
+                        "such cross-coupling issue, since A_tgt/B_tgt both constrain the "
+                        "same optimisation simultaneously. Safe for --from-scratch too, "
+                        "and DEFAULT (300) since this is what the validated spin2_owne "
+                        "recipe uses (2026-07-31: --warmstart-a/-b-steps run separately "
+                        "was never validated for spin2_owne, only this joint form). "
+                        "0 disables. Ignored for non-taylor shear layers; if set >0, "
+                        "runs INSTEAD of (not in addition to) the separate A/B "
+                        "warmstarts below (pass --warmstart-ab-steps 0 to fall back to "
+                        "those instead).")
     p.add_argument("--sobolev-g1", type=float, default=_sobolev_g1_weight,
                    help="Sobolev 1st-order (dm/dg) weight, added to the loss (0=off). "
                         "Default from config.sobolev_g1_weight.")
     p.add_argument("--sobolev-g2", type=float, default=_sobolev_g2_weight,
                    help="Sobolev 2nd-order (d2m/dg2) weight, added to the loss (0=off). "
                         "Default from config.sobolev_g2_weight.")
+    p.add_argument("--coeff-ood-weight", type=float, default=_shear_coeff_ood_weight,
+                   help="Shear-coeff off-template penalty weight (0=off): trains "
+                        "ShearTaylorLast's coefficient nets toward zero on synthetic "
+                        "(flux, size, |e|) probes beyond where real templates live. "
+                        "Default from config.shear_coeff_ood_weight.")
     p.add_argument("--from-scratch", action="store_true",
                    help="Initialise fresh flows (skip load_models) and train from random init "
                         "rather than resuming from a checkpoint.")
+    p.add_argument("--q-from-scratch", action="store_true",
+                   help="Resume the prior from --prior-in but initialise q fresh (random "
+                        "init) instead of loading --q-in. For switching a q-free NLL run "
+                        "(which never wrote a q checkpoint) over to --loss elbo. Ignored "
+                        "if --from-scratch is set.")
     p.add_argument("--no-backup", action="store_true", help="Do not write per-block .bak copies.")
     p.add_argument("--subsample", type=int, default=1,
                    help="Keep roughly 1/subsample of the training templates (sampled before cuts). "
@@ -206,7 +325,8 @@ def main() -> int:
     print(f"devices: {jax.devices()}")
     print(f"Σ_X conditioning: log_scale_range={log_scale_range} e_max={e_max}")
     print(f"blocks: {args.block_steps} steps each, max {args.max_blocks}; "
-          f"thresholds τ_param={args.tau_param} τ_func={args.tau_func} τ_loss={args.tau_loss}")
+          f"plateau: window={args.plateau_window} k={args.plateau_k} τ_loss={args.tau_loss}; "
+          f"EMA decay={args.ema_decay}")
 
     key = _base_key
 
@@ -227,16 +347,51 @@ def main() -> int:
     # ------------------------------------------------ build / load flows
     key, k_build = jr.split(key)
     prior_flow, q_flow = build_flows(k_build, latent_dim=4, cond_dim=16, raw2standard=raw2standard,
-                                     shear_layer_kind=args.shear_layer)
+                                     shear_layer_kind=args.shear_layer,
+                                     prior_shear_own_e=args.shear_own_e,
+                                     prior_shear_split_ab=args.shear_split_ab,
+                                     prior_shear_spin2_owne=args.shear_spin2_owne)
     print(f"Shear layer: {args.shear_layer}"
+          + (f" (split A/B)" if args.shear_split_ab else "")
           + (f"   Sobolev g1={args.sobolev_g1} g2={args.sobolev_g2}"
-             if (args.sobolev_g1 > 0 or args.sobolev_g2 > 0) else "   Sobolev off"))
+             if (args.sobolev_g1 > 0 or args.sobolev_g2 > 0) else "   Sobolev off")
+          + (f"   coeff-ood-weight={args.coeff_ood_weight}"
+             if args.coeff_ood_weight > 0 else "   coeff-ood off"))
     if args.from_scratch:
         print("Initialising FRESH flows from scratch (random init, no checkpoint load).")
         prior, q = prior_flow, q_flow  # build_flows pulls arch from config → canonical structure
+        # B's isolated-regression property relies on A=0 at init (the sob2 gradient
+        # w.r.t. A/bulk vanishes only then — see warmstart_prior_B) — from-scratch only.
+        # Skipped when --warmstart-ab-steps runs the joint A+B warmstart instead below.
+        if (args.warmstart_ab_steps == 0 and args.warmstart_b_steps > 0
+                and args.shear_layer == "taylor" and args.shear_split_ab):
+            prior = warmstart_prior_B(prior, raw2standard, moments_jnp, cov_jnp,
+                                      dm_dg_jnp, d2m_dg2_jnp, steps=args.warmstart_b_steps)
+    elif args.q_from_scratch:
+        print("Resuming prior from checkpoint; initialising FRESH q flow (random init).")
+        prior = eqx.tree_deserialise_leaves(args.prior_in, prior_flow)
+        q = q_flow
     else:
         print("Building architecture and loading checkpoints...")
         prior, q = load_models(prior_flow, q_flow, args.prior_in, args.q_in)
+
+    # A's isolated-regression property (A_gen=-A, independent of B/bulk) is an
+    # unconditional algebraic identity — not an at-init argument like B's — so this is
+    # safe to run against an already-trained (resumed) prior too, not just --from-scratch.
+    if args.warmstart_ab_steps > 0 and args.shear_layer == "taylor":
+        prior = warmstart_prior_AB(prior, raw2standard, moments_jnp, cov_jnp,
+                                   dm_dg_jnp, d2m_dg2_jnp,
+                                   sob1_w=args.sobolev_g1, sob2_w=args.sobolev_g2,
+                                   steps=args.warmstart_ab_steps)
+    elif args.warmstart_a_steps > 0 and args.shear_layer == "taylor":
+        prior = warmstart_prior_A(prior, raw2standard, moments_jnp, cov_jnp,
+                                  dm_dg_jnp, d2m_dg2_jnp, steps=args.warmstart_a_steps)
+
+    # Polyak/EMA-averaged copy: starts equal to the resume point, updated once per
+    # block below. This (not the raw per-block iterate) is what convergence is
+    # measured against and what gets checkpointed to disk.
+    ema_prior = prior
+    ema_q = q if args.loss == "elbo" else None
 
     # ------------------------------------------------ validation set
     key, k_val = jr.split(key)
@@ -282,6 +437,7 @@ def main() -> int:
             use_sx=(log_scale_range is not None),
             raw2standard=raw2standard,
             sobolev_g1_weight=args.sobolev_g1, sobolev_g2_weight=args.sobolev_g2,
+            coeff_ood_weight=args.coeff_ood_weight,
         )
         print("Loss: NLL (q-free, prior-only direct template NLL)")
     else:
@@ -293,17 +449,35 @@ def main() -> int:
             raw2standard=raw2standard, mean_log_diag=mean_log_diag,
             std_log_diag=std_log_diag, mean_off=mean_off, std_off=std_off,
             sobolev_g1_weight=args.sobolev_g1, sobolev_g2_weight=args.sobolev_g2,
+            coeff_ood_weight=args.coeff_ood_weight,
         )
         print("Loss: ELBO (joint prior+q)")
     def make_opt(lr):
-        # A scalar LR is applied at update time (not stored in Adam's state), so the
-        # opt_state structure is identical for any scalar lr — letting the 'plateau'
-        # mode rebuild the optimizer with a new LR each drop while REUSING opt_state
-        # (Adam moments stay warm).
+        # `lr` is either a scalar or an optax schedule (callable of the cumulative
+        # step count). A given call site must stick to ONE kind for the life of the
+        # run: switching kinds changes the opt_state pytree shape (a scalar LR is
+        # stateless — EmptyState — while any schedule callable carries its own step
+        # counter — ScaleByScheduleState), which would break reusing `opt_state`
+        # across a 'plateau'-mode rebuild. 'plateau' below always passes a schedule
+        # (constant or ramping) for exactly this reason.
         return optax.chain(
             optax.clip_by_global_norm(args.grad_clip),
             optax.adamw(learning_rate=lr, weight_decay=args.weight_decay),
         )
+
+    def _plateau_schedule(step0, lr_from, lr_to, ramp_steps):
+        """Flat at `lr_to`, or — if `lr_from` differs — a one-block cosine ramp
+        `lr_from` -> `lr_to` starting at cumulative step `step0`, held flat at
+        `lr_to` afterwards (cosine_decay_schedule clamps once count >= ramp_steps).
+        Always a schedule callable (never a bare float) so 'plateau' mode's
+        opt_state shape never changes across a drop — see `make_opt`.
+        """
+        if lr_from is None or lr_from == lr_to:
+            return optax.constant_schedule(lr_to)
+        cos = optax.cosine_decay_schedule(
+            init_value=lr_from, decay_steps=ramp_steps, alpha=lr_to / lr_from
+        )
+        return lambda count: cos(count - step0)
 
     current_lr = args.learning_rate          # mutated by the 'plateau' schedule
     # Reduce-LR-on-plateau state (noise-robust, ReduceLROnPlateau semantics): track the
@@ -323,18 +497,18 @@ def main() -> int:
         )
         print(f"LR schedule: cosine {args.learning_rate:.1e} -> {lr_final:.1e} over {decay_steps} steps")
     elif args.lr_schedule == "plateau":
-        base_lr = None
+        base_lr = _plateau_schedule(args.start_steps, None, current_lr, args.block_steps)
         print(f"LR schedule: plateau — start {args.learning_rate:.1e}, ×{args.lr_gamma} after "
               f"{args.lr_patience} blocks not beating best by {args.tau_loss} "
-              f"(cooldown {args.lr_cooldown}), floor {args.lr_min:.1e}")
+              f"(cooldown {args.lr_cooldown}), floor {args.lr_min:.1e}; "
+              f"drops are a 1-block cosine ramp, not a discrete jump")
     else:
         base_lr = args.learning_rate
         print(f"LR schedule: constant {args.learning_rate:.1e}")
 
     # The optimised model is the (prior, q) pair for ELBO, or the prior alone for NLL.
     model_tuple = (prior, q) if args.loss == "elbo" else prior
-    _init_lr = base_lr if args.lr_schedule == "cosine" else args.learning_rate
-    opt_state = make_opt(_init_lr).init(eqx.filter(model_tuple, eqx.is_inexact_array))
+    opt_state = make_opt(base_lr).init(eqx.filter(model_tuple, eqx.is_inexact_array))
 
     # ------------------------------------------------ pristine backup of the resume point
     if not args.no_backup:
@@ -345,14 +519,27 @@ def main() -> int:
         print(f"  backed up resume checkpoint with tag '{tag0}'")
 
     # ------------------------------------------------ baseline (block 0) metrics
-    prev_params = collect_stage_params(prior)
-    prev_fields = compute_functional_fields(prior, m_val, bins, c_ref)
+    # ema_prior == prior at this point (no blocks trained yet).
+    prev_params = collect_stage_params(ema_prior)
+    prev_fields = compute_functional_fields(ema_prior, m_val, bins, c_ref)
     param_m0 = param_plateau_metrics(prev_params, None)
     func_m0 = functional_plateau_metrics(prev_fields, None, bins)
     print("\nBaseline (resume point) functional magnitudes:")
     for name in STAGE_ORDER:
         print(f"  {name:32s} |θ|={param_m0[name]['param_norm']:.4f} "
               f"funcMag={func_m0[name]['mean_mag']:.4f}")
+
+    # Rolling per-stage snapshot history for the drift-diffusion plateau test (see
+    # convergence_metrics.stage_converged) — a stage needs plateau_window+1 blocks of
+    # history before it can be judged converged.
+    mask = bins.valid_mask
+    param_hist: dict[str, deque] = {
+        n: deque([np.asarray(prev_params[n])], maxlen=args.plateau_window + 1) for n in STAGE_ORDER
+    }
+    func_hist: dict[str, deque] = {
+        n: deque([flatten_valid_field(prev_fields[n]["field"], mask)], maxlen=args.plateau_window + 1)
+        for n in STAGE_ORDER
+    }
 
     history: list[dict] = [{
         "block": 0, "total_steps": args.start_steps,
@@ -377,13 +564,16 @@ def main() -> int:
     # that is never freed -> GPU OOM after ~10 blocks.  For 'plateau' the optimizer
     # is rebuilt ONLY when the LR actually drops, and the runner cache is cleared
     # then (the runner closes over the optimizer) with the stale executable freed.
-    optimizer = make_opt(current_lr if args.lr_schedule == "plateau" else base_lr)
+    optimizer = make_opt(base_lr)
     last_opt_lr = current_lr
     runners: dict = {}
 
     for block in range(1, args.max_blocks + 1):
         if args.lr_schedule == "plateau" and current_lr != last_opt_lr:
-            optimizer = make_opt(current_lr)   # reuses opt_state — Adam moments warm
+            # Ramp smoothly from the old LR to the new one over this block (not an
+            # instant jump), then hold flat until the next drop.
+            ramp = _plateau_schedule(total_steps, last_opt_lr, current_lr, args.block_steps)
+            optimizer = make_opt(ramp)         # reuses opt_state — Adam moments warm
             runners.clear()
             jax.clear_caches()                 # free the stale compiled runner
             last_opt_lr = current_lr
@@ -397,6 +587,11 @@ def main() -> int:
         if args.loss == "elbo":
             q = model_tuple[1]
         total_steps += args.block_steps
+
+        # Polyak/EMA update (raw iterate -> smoothed checkpoint), see module docstring.
+        ema_prior = _ema_update(prior, ema_prior, args.ema_decay)
+        if args.loss == "elbo":
+            ema_q = _ema_update(q, ema_q, args.ema_decay)
 
         losses_arr = np.asarray(losses)
         finite = losses_arr[np.isfinite(losses_arr)]
@@ -412,12 +607,13 @@ def main() -> int:
             "n_nonfinite": int(np.sum(~np.isfinite(losses_arr))),
         }
 
-        # checkpoint (only overwrite canonical paths if the block stayed finite)
+        # checkpoint the EMA'd weights (only if the block stayed finite) — the raw
+        # `prior`/`q` keep training in `model_tuple`/`opt_state` regardless.
         if loss_stats["n_nonfinite"] == 0:
-            eqx.tree_serialise_leaves(args.prior_out, prior)
+            eqx.tree_serialise_leaves(args.prior_out, ema_prior)
             save_stats(args.prior_out, raw2standard)
             if args.loss == "elbo":
-                eqx.tree_serialise_leaves(args.q_out, q)
+                eqx.tree_serialise_leaves(args.q_out, ema_q)
                 save_stats(args.q_out, raw2standard)
             if not args.no_backup:
                 tag = f"{args.tag}{total_steps // 1000}k-{_ts()}"
@@ -428,20 +624,34 @@ def main() -> int:
             print(f"  WARNING: {loss_stats['n_nonfinite']} non-finite losses in block "
                   f"{block}; NOT overwriting canonical checkpoint.")
 
-        # metrics
-        cur_params = collect_stage_params(prior)
-        cur_fields = compute_functional_fields(prior, m_val, bins, c_ref)
+        # metrics (against the EMA'd weights — see module docstring). param_m/func_m
+        # (single-consecutive-block rel-delta) are kept only for the dashboard plots —
+        # convergence itself is gated by the windowed drift-diffusion ratio below, which
+        # doesn't break down for a low-magnitude stage like SigmaXCouplingLayer.
+        cur_params = collect_stage_params(ema_prior)
+        cur_fields = compute_functional_fields(ema_prior, m_val, bins, c_ref)
         param_m = param_plateau_metrics(cur_params, prev_params)
         func_m = functional_plateau_metrics(cur_fields, prev_fields_for_delta, bins)
-        conv = stage_converged(param_m, func_m, args.tau_param, args.tau_func)
 
-        _print_block_table(block, total_steps, param_m, func_m, conv, loss_stats)
+        for name in STAGE_ORDER:
+            param_hist[name].append(np.asarray(cur_params[name]))
+            func_hist[name].append(flatten_valid_field(cur_fields[name]["field"], mask))
+        conv = stage_converged(param_hist, func_hist, args.plateau_window, args.plateau_k)
+        drift = {
+            n: {
+                "param": drift_diffusion_ratio(list(param_hist[n])),
+                "func": drift_diffusion_ratio(list(func_hist[n])),
+            }
+            for n in STAGE_ORDER
+        }
+
+        _print_block_table(block, total_steps, param_m, func_m, drift, conv, loss_stats)
 
         history.append({
             "block": block, "total_steps": total_steps, "loss": loss_stats,
             "lr": float(current_lr),
-            "param": {n: param_m[n] for n in STAGE_ORDER},
-            "func": {n: {k: v for k, v in func_m[n].items()} for n in STAGE_ORDER},
+            "param": {n: {**param_m[n], "drift_ratio": drift[n]["param"]} for n in STAGE_ORDER},
+            "func": {n: {**func_m[n], "drift_ratio": drift[n]["func"]} for n in STAGE_ORDER},
             "converged": {n: bool(conv[n]) for n in STAGE_ORDER},
             "fields": {n: np.asarray(cur_fields[n]["field"]).tolist() for n in STAGE_ORDER},
         })
