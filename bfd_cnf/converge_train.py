@@ -90,6 +90,7 @@ from .config import (
     prior_shear_own_e as _prior_shear_own_e,
     prior_shear_split_ab as _prior_shear_split_ab,
     prior_shear_spin2_owne as _prior_shear_spin2_owne,
+    prior_shear_flux_size_owne as _prior_shear_flux_size_owne,
     sobolev_g1_weight as _sobolev_g1_weight,
     sobolev_g2_weight as _sobolev_g2_weight,
     shear_coeff_ood_weight as _shear_coeff_ood_weight,
@@ -260,6 +261,15 @@ def main() -> int:
                         "galaxy's own ellipticity (the ONLY way to represent M1's 2nd "
                         "derivative). Joint block w/ real log-det + iterative inverse. "
                         "STATIC; needs --from-scratch. Default from config.")
+    p.add_argument("--shear-flux-size-owne", action=argparse.BooleanOptionalAction,
+                   default=_prior_shear_flux_size_owne,
+                   help="taylor only: condition the SPIN-0 (flux,size) shear coeffs on the "
+                        "invariant |e|^2 too, so their g1*g2 cross-term and |g|^2 curvature "
+                        "can depend on the galaxy's own ellipticity/size instead of a "
+                        "flux-only (net_size) or fully global (net_flux) compromise. Fixes "
+                        "a whole-(flux,size)-plane m gradient diagnosed 2026-08-01. Log-det "
+                        "unchanged (deferred correction on already-fixed downstream M1,M2). "
+                        "STATIC structure; needs --from-scratch. Default from config.")
     p.add_argument("--warmstart-b-steps", type=int, default=300,
                    help="For a from-scratch split-A/B taylor flow, regress its 2nd-order "
                         "shear response B onto the template truth for this many steps before "
@@ -350,9 +360,11 @@ def main() -> int:
                                      shear_layer_kind=args.shear_layer,
                                      prior_shear_own_e=args.shear_own_e,
                                      prior_shear_split_ab=args.shear_split_ab,
-                                     prior_shear_spin2_owne=args.shear_spin2_owne)
+                                     prior_shear_spin2_owne=args.shear_spin2_owne,
+                                     prior_shear_flux_size_owne=args.shear_flux_size_owne)
     print(f"Shear layer: {args.shear_layer}"
           + (f" (split A/B)" if args.shear_split_ab else "")
+          + (f" (flux/size own-e)" if args.shear_flux_size_owne else "")
           + (f"   Sobolev g1={args.sobolev_g1} g2={args.sobolev_g2}"
              if (args.sobolev_g1 > 0 or args.sobolev_g2 > 0) else "   Sobolev off")
           + (f"   coeff-ood-weight={args.coeff_ood_weight}"

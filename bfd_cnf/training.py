@@ -136,6 +136,40 @@ def compute_std_stats(
 # ---------------------------------------------------------------------------
 
 
+def _skip_if_nonfinite(is_finite: jax.Array, new_tree: Any, old_tree: Any) -> Any:
+    """Reject an update tree-wide when ``is_finite`` is False, else keep it.
+
+    A single non-finite loss (occasionally seen from an out-of-distribution
+    training sample) makes the gradient tree NaN; optax's global-norm clip
+    (``grad_clip``) then propagates that NaN into EVERY parameter in one step
+    with no protection, permanently corrupting the model for the rest of the
+    run (checkpointing is separately guarded downstream, but the in-memory
+    model/opt_state never recovers). Falling back to the pre-step tree turns a
+    bad step into a no-op retry instead of a permanent corruption.
+    """
+    return jax.tree_util.tree_map(
+        lambda new, old: jnp.where(is_finite, new, old) if eqx.is_array(new) else new,
+        new_tree, old_tree,
+    )
+
+
+def _tree_all_finite(tree: Any) -> jax.Array:
+    """Whether every inexact-array leaf of ``tree`` is finite.
+
+    Checking ``isfinite(loss)`` alone is NOT enough: a function's forward value
+    can be perfectly finite while its *gradient* is NaN (e.g. a branch with a
+    singularity that isn't taken but still poisons the backward pass — the same
+    failure mode already documented in ShearTaylorLast's inverse). A gradient
+    tree with one NaN leaf is exactly what optax's global-norm grad_clip needs
+    to propagate NaN into every parameter, so the gradient itself must be
+    checked, not just the scalar loss it came from.
+    """
+    leaves = jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_inexact_array))
+    if not leaves:
+        return jnp.array(True)
+    return jnp.stack([jnp.all(jnp.isfinite(leaf)) for leaf in leaves]).all()
+
+
 def _make_train_step(elbo: Any, optimizer: Any) -> Any:
     """Build the eager single-step update used by the per-step fallback loop."""
 
@@ -149,7 +183,11 @@ def _make_train_step(elbo: Any, optimizer: Any) -> Any:
         updates, new_opt_state = optimizer.update(
             grads, opt_state, eqx.filter(model, eqx.is_inexact_array)
         )
-        return eqx.apply_updates(model, updates), new_opt_state, loss_val
+        new_model = eqx.apply_updates(model, updates)
+        is_finite = jnp.isfinite(loss_val) & _tree_all_finite(grads)
+        model = _skip_if_nonfinite(is_finite, new_model, model)
+        opt_state = _skip_if_nonfinite(is_finite, new_opt_state, opt_state)
+        return model, opt_state, loss_val
 
     return train_step
 
@@ -183,11 +221,19 @@ def _make_chunk_runner(elbo: Any, optimizer: Any, chunk_len: int) -> Any:
             loss_val, grads = eqx.filter_value_and_grad(
                 lambda m: elbo(m, data_y, data_Sigma, data_dg, data_d2g, data_X, subkey)
             )(model)
-            updates, opt_state = optimizer.update(
+            updates, new_opt_state = optimizer.update(
                 grads, opt_state, eqx.filter(model, eqx.is_inexact_array)
             )
-            model = eqx.apply_updates(model, updates)
-            model_arrays, _ = eqx.partition(model, eqx.is_array)
+            new_model = eqx.apply_updates(model, updates)
+            new_model_arrays, _ = eqx.partition(new_model, eqx.is_array)
+            # See _skip_if_nonfinite / _tree_all_finite: reject the whole step
+            # (params + optimizer moments) rather than let one bad step's NaN
+            # gradient permanently corrupt the model via optax's global-norm
+            # grad_clip. Must check the GRADIENT, not just the loss value — a
+            # finite loss can still have a NaN gradient.
+            is_finite = jnp.isfinite(loss_val) & _tree_all_finite(grads)
+            model_arrays = _skip_if_nonfinite(is_finite, new_model_arrays, model_arrays)
+            opt_state = _skip_if_nonfinite(is_finite, new_opt_state, opt_state)
             return (model_arrays, opt_state, key), loss_val
 
         (model_arrays, opt_state, key), losses = jax.lax.scan(

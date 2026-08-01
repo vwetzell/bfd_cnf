@@ -55,6 +55,7 @@ from ..config import (
     prior_shear_own_e as _prior_shear_own_e,
     prior_shear_split_ab as _prior_shear_split_ab,
     prior_shear_spin2_owne as _prior_shear_spin2_owne,
+    prior_shear_flux_size_owne as _prior_shear_flux_size_owne,
     sobolev_g1_weight as _sobolev_g1_weight,
     sobolev_g2_weight as _sobolev_g2_weight,
     shear_coeff_ood_weight as _shear_coeff_ood_weight,
@@ -1437,6 +1438,7 @@ def build_flows(
     prior_shear_own_e: bool = _prior_shear_own_e,
     prior_shear_split_ab: bool = _prior_shear_split_ab,
     prior_shear_spin2_owne: bool = _prior_shear_spin2_owne,
+    prior_shear_flux_size_owne: bool = _prior_shear_flux_size_owne,
 ) -> tuple[Any, Any]:
     """Construct the prior and variational (q) normalizing flows.
 
@@ -1547,6 +1549,7 @@ def build_flows(
         shear_own_e=prior_shear_own_e,
         shear_split_ab=prior_shear_split_ab,
         shear_spin2_owne=prior_shear_spin2_owne,
+        shear_flux_size_owne=prior_shear_flux_size_owne,
     )
 
     q_flow = masked_autoregressive_flow(

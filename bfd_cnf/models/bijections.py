@@ -1169,6 +1169,7 @@ class ShearTaylorLast(AbstractBijection):
     own_e: bool = eqx.field(static=True)
     split_ab: bool = eqx.field(static=True)
     spin2_owne: bool = eqx.field(static=True)
+    flux_size_owne: bool = eqx.field(static=True)
     net_flux: CoeffNet  # ()          -> (3,)  B0 (spin-0, even only)
     net_size: CoeffNet  # (x0,)       -> (3,)  B1 (spin-0, even only)
     net_m1: CoeffNet  # (x0,x1)       -> (5,) A2+B2, or (2,) A2 only when split_ab
@@ -1176,9 +1177,11 @@ class ShearTaylorLast(AbstractBijection):
     net_m1_B: Any  # (x0,x1)          -> (3,)  B2, or None (only when split_ab)
     net_m2_B: Any  # (x0,x1,x2)       -> (3,)  B3, or None (only when split_ab)
     net_m1_e: Any  # (x0,x1,m2_final) -> (5,)  own-|e| M1 correction, or None
+    net_flux_e: Any  # (log1p|e_final|^2,)        -> (2,)  invariant (c0,c1); flux B0 correction, or None
+    net_size_e: Any  # (x0,log1p|e_final|^2,)     -> (2,)  invariant (c0,c1); size B1 correction, or None
 
     def __init__(self, key, dim, raw_cond_dim, last_width, last_depth, activation,
-                 own_e=False, split_ab=False, spin2_owne=False):
+                 own_e=False, split_ab=False, spin2_owne=False, flux_size_owne=False):
         if dim != 4:
             raise ValueError(
                 "ShearTaylorLast is defined for the 4 galaxy moments (dim=4)."
@@ -1198,7 +1201,38 @@ class ShearTaylorLast(AbstractBijection):
         # coupling with a real (non-unit) log-det and an iterative inverse — the price for
         # own-|e| while keeping spin-2 equivariance (|e|^2 is a spin-0 invariant).
         self.spin2_owne = bool(spin2_owne)
-        k0, k1, k2, k3, k4, k5, k6 = jr.split(key, 7)
+        # flux_size_owne: give the SPIN-0 (flux, size) shear coefficients the same
+        # own-|e| treatment spin2_owne/own_e already give M1,M2 -- net_flux/net_size
+        # are otherwise structurally blind to the galaxy's own ellipticity (masked
+        # order [flux,size,M1,M2] puts M1,M2 strictly AFTER), which forces their
+        # g1*g2 cross-term to ~0 and their |g|^2 curvature to a single flux-only (or
+        # even fully global, for net_flux) compromise value -- see memory
+        # shear-taylor-flux-size-blind-to-orientation. The correction is deferred
+        # until the FINAL (already-shifted) M1,M2 are known -- exactly the own_e
+        # pattern -- which keeps log|det J| EXACTLY UNCHANGED (block-triangular
+        # composition: the correction only reads already-fixed downstream outputs,
+        # never an unknown its own inverse needs, so it contributes a zero
+        # bottom-left block / identity bottom-right block either way). net_flux_e
+        # takes ONLY log1p(|e_final|^2) (no x0, no x1) and net_size_e takes
+        # (x0, log1p(|e_final|^2)) (no x1) -- deliberately excluding x1 keeps the
+        # 2x2 (flux,size) sub-Jacobian lower-triangular so det stays exactly 1.
+        #
+        # net_flux_e/net_size_e output TWO invariant scalars (c0, c1), functions only
+        # of |e|^2 -- NOT the (B11,B22,B12) triple directly. An unconstrained net fed
+        # only the rotation-INVARIANT log1p(|e|^2) cannot legally produce anisotropic
+        # (B11!=B22, B12!=0) output: with no orientation input, gradient descent
+        # correctly (not just typically) drives B12 -> 0, since any nonzero constant
+        # is wrong for half the isotropically-oriented population (this was the
+        # original 2026-08-01 bug -- see memory shear-taylor-flux-size-blind-to-
+        # orientation's R12 follow-up). The fix mirrors _spin2_shift's pattern:
+        # combine invariant-scalar coefficients with the UNIQUE quadratic-in-g,
+        # rotation-equivariant tensor built from own-e, (e.g1+e.g2)^2 = e1^2 g1^2 +
+        # 2 e1 e2 g1 g2 + e2^2 g2^2 (the only other spin-0 invariant quadratic in g,
+        # besides the isotropic |g|^2 already in the base B0/B1) --
+        #   B11 = 2 c0 + 2 c1 e1^2,  B22 = 2 c0 + 2 c1 e2^2,  B12 = 2 c1 e1 e2
+        # See _flux_owne_B/_size_owne_B.
+        self.flux_size_owne = bool(flux_size_owne)
+        k0, k1, k2, k3, k4, k5, k6, k7, k8 = jr.split(key, 9)
         if self.spin2_owne:
             # Equivariant spin-2 block: the (M1,M2) shift is built from equivariant tensors
             # of e=(M1,M2) and g, with complex INVARIANT-scalar coefficients (functions of
@@ -1239,6 +1273,63 @@ class ShearTaylorLast(AbstractBijection):
             )
         else:
             self.net_m1_e = None
+        if self.flux_size_owne:
+            self.net_flux_e = _zero_last_layer(
+                CoeffNet(k7, 1, 2, last_width, last_depth, activation)  # (Lval,)->(c0,c1)
+            )
+            self.net_size_e = _zero_last_layer(
+                CoeffNet(k8, 2, 2, last_width, last_depth, activation)  # (x0,Lval)->(c0,c1)
+            )
+        else:
+            self.net_flux_e = None
+            self.net_size_e = None
+
+    @staticmethod
+    def _owne_B_from_invariants(c0, c1, e1_final, e2_final):
+        """Build the equivariant (B11,B22,B12) triple from invariant coeffs (c0,c1).
+
+        The shift these B's feed into (``_shift``) is
+        ``0.5 B11 g1^2 + 0.5 B22 g2^2 + B12 g1 g2`` -- a spin-0 (rotation-invariant)
+        SCALAR by construction (flux/size have no orientation). Under a rotation
+        that carries both e and g together, the only quadratic-in-g invariants
+        are ``|g|^2`` (already in the e-independent base B0/B1) and
+        ``(e1 g1 + e2 g2)^2 = e1^2 g1^2 + 2 e1 e2 g1 g2 + e2^2 g2^2`` -- the
+        unique other one, linear in the invariant e1^2,e2^2,e1e2. Matching
+        coefficients of g1^2, g2^2, g1g2 against ``c0*|g|^2 + c1*(e.g)^2`` gives
+        this map. Letting a net emit (B11,B22,B12) directly from an
+        ORIENTATION-BLIND input (as the pre-fix code did) cannot represent this:
+        with no e1,e2 in hand, training can only find the isotropic point
+        B11=B22, B12=0 -- see memory shear-taylor-flux-size-blind-to-orientation.
+        """
+        return jnp.array([
+            2.0 * c0 + 2.0 * c1 * e1_final * e1_final,
+            2.0 * c0 + 2.0 * c1 * e2_final * e2_final,
+            2.0 * c1 * e1_final * e2_final,
+        ])
+
+    def _flux_owne_B(self, e1_final, e2_final):
+        """Own-|e| correction (B11,B22,B12) for the flux channel's shift.
+
+        `e1_final`/`e2_final` MUST be the already-fixed M1,M2 the flux/size
+        correction is deferred until (see __init__ docstring note): at g=0
+        these equal x[2],x[3] exactly (the layer is the identity at g=0); at
+        general g they are the FINAL layer output y[2],y[3] (transform) or the
+        given y[2],y[3] (inverse — trivially already known, no reconstruction
+        needed). Never pass the layer's own unknown here.
+        """
+        Lval = jnp.log1p(e1_final * e1_final + e2_final * e2_final)
+        c0, c1 = self.net_flux_e(jnp.array([Lval]))
+        return self._owne_B_from_invariants(c0, c1, e1_final, e2_final)
+
+    def _size_owne_B(self, x0, e1_final, e2_final):
+        """Own-|e| correction (B11,B22,B12) for the size channel's shift.
+
+        Deliberately excludes x1 (the size channel's own value) -- keeps the
+        (flux,size) 2x2 sub-Jacobian lower-triangular, see __init__ note.
+        """
+        Lval = jnp.log1p(e1_final * e1_final + e2_final * e2_final)
+        c0, c1 = self.net_size_e(jnp.array([_bound_coeff_input(x0), Lval]))
+        return self._owne_B_from_invariants(c0, c1, e1_final, e2_final)
 
     @property
     def shape(self):
@@ -1416,6 +1507,14 @@ class ShearTaylorLast(AbstractBijection):
             y1 = x[1] + self._shift(jnp.zeros(2), B1, g1, g2)
             # spin-2 (2,3): equivariant joint coupling with a real 2x2 log-det.
             y2, y3, log_det = self._spin2_transform(x, g1, g2)
+            if self.flux_size_owne:
+                # Stage 2: extra flux/size shift conditioned on the FINAL M1,M2
+                # (y2,y3, already fixed above) -- det UNCHANGED (block-triangular:
+                # this stage's Jacobian is [[1,0],[*,1]] over (x0,x1) with a zero
+                # bottom-left block over (y2,y3), so det(stage2)=1 exactly; total
+                # det = det(stage1) * 1 = the same log_det _spin2_transform returned).
+                y0 = y0 + self._shift(jnp.zeros(2), self._flux_owne_B(y2, y3), g1, g2)
+                y1 = y1 + self._shift(jnp.zeros(2), self._size_owne_B(x[0], y2, y3), g1, g2)
             return jnp.stack([y0, y1, y2, y3]), log_det
         A, B = self._coeffs(x[0], x[1], x[2])
         shifts = jnp.stack([self._shift(A[i], B[i], g1, g2) for i in range(4)])
@@ -1427,6 +1526,13 @@ class ShearTaylorLast(AbstractBijection):
                 _bound_coeff_input(x[0]), _bound_coeff_input(x[1]), _bound_coeff_input(y[3]),
             ]))  # (5,) = A2e + B2e
             y = y.at[2].add(self._shift(oe[:2], oe[2:], g1, g2))
+        if self.flux_size_owne:
+            # Stage 3: extra flux/size shift conditioned on the FINAL M1,M2 (y[2],y[3],
+            # already fixed above, own_e included). det stays 1, same argument as above.
+            y = y.at[0].add(self._shift(jnp.zeros(2), self._flux_owne_B(y[2], y[3]), g1, g2))
+            y = y.at[1].add(
+                self._shift(jnp.zeros(2), self._size_owne_B(x[0], y[2], y[3]), g1, g2)
+            )
         return y, jnp.zeros(())
 
     def inverse_and_log_det(self, y, condition=None):
@@ -1434,8 +1540,14 @@ class ShearTaylorLast(AbstractBijection):
         if self.spin2_owne:
             B0 = self.net_flux(jnp.zeros(0))
             x0 = y[0] - self._shift(jnp.zeros(2), B0, g1, g2)
+            if self.flux_size_owne:
+                # y[2],y[3] are the FINAL M1,M2 -- already given as part of y, no
+                # reconstruction needed (unlike x0,x1 which we're solving for here).
+                x0 = x0 - self._shift(jnp.zeros(2), self._flux_owne_B(y[2], y[3]), g1, g2)
             B1 = self.net_size(jnp.array([_bound_coeff_input(x0)]))
             x1 = y[1] - self._shift(jnp.zeros(2), B1, g1, g2)
+            if self.flux_size_owne:
+                x1 = x1 - self._shift(jnp.zeros(2), self._size_owne_B(x0, y[2], y[3]), g1, g2)
             # spin-2 inverse: closed-form substitution inverse — NOT a Newton solve,
             # and NOT routed through shear_derivs_generative's extra derivative layer
             # either (that needed d(A)/dx via a further jacfwd on top of the jacfwd/
@@ -1462,8 +1574,13 @@ class ShearTaylorLast(AbstractBijection):
         # own-|e| M1 correction, on the FINAL M2 = y[3], which is given).
         B0 = self.net_flux(jnp.zeros(0))
         x0 = y[0] - self._shift(jnp.zeros(2), B0, g1, g2)
+        if self.flux_size_owne:
+            # y[2],y[3] (final M1,M2) already given -- same as the spin2_owne branch.
+            x0 = x0 - self._shift(jnp.zeros(2), self._flux_owne_B(y[2], y[3]), g1, g2)
         B1 = self.net_size(jnp.array([_bound_coeff_input(x0)]))
         x1 = y[1] - self._shift(jnp.zeros(2), B1, g1, g2)
+        if self.flux_size_owne:
+            x1 = x1 - self._shift(jnp.zeros(2), self._size_owne_B(x0, y[2], y[3]), g1, g2)
         x01 = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1)])
         if self.split_ab:
             A2, B2 = self.net_m1(x01), self.net_m1_B(x01)
@@ -1508,6 +1625,12 @@ class ShearTaylorLast(AbstractBijection):
         if self.spin2_owne:
             B0 = self.net_flux(jnp.zeros(0))
             B1 = self.net_size(jnp.array([x[0]]))
+            if self.flux_size_owne:
+                # At g=0 the layer is the identity, so the "final" M1,M2 the flux/size
+                # correction is deferred until (see __init__ note) equal x[2],x[3]
+                # exactly here -- no need to reconstruct a post-shear value.
+                B0 = B0 + self._flux_owne_B(x[2], x[3])
+                B1 = B1 + self._size_owne_B(x[0], x[2], x[3])
             # spin-2 A,B by autodiff of the equivariant shift w.r.t. g at g=0.
             def sh(gv):
                 return jnp.stack(self._spin2_shift(x[0], x[1], x[2], x[3], gv[0], gv[1]))
@@ -1528,6 +1651,13 @@ class ShearTaylorLast(AbstractBijection):
             ]))  # (5,) = A2e + B2e
             A = (A[0], A[1], A[2] + oe[:2], A[3])
             B = (B[0], B[1], B[2] + oe[2:], B[3])
+        if self.flux_size_owne:
+            # At g=0, x[2],x[3] ARE the final M1,M2 (identity at g=0) -- same as the
+            # spin2_owne branch above. Does NOT touch A -- shear_derivs_generative's
+            # -A/-B+corr formula only differentiates A, and A[0],A[1] stay exactly
+            # zero, so this correction needs no own_e_stop_grad-style treatment.
+            B = (B[0] + self._flux_owne_B(x[2], x[3]),
+                 B[1] + self._size_owne_B(x[0], x[2], x[3]), B[2], B[3])
         A_mat = jnp.stack(A)  # (4, 2)
 
         def _Bmat(b):
@@ -1603,15 +1733,23 @@ class ShearTaylorLast(AbstractBijection):
                 B1 = self.net_size(jnp.array([x0i]))
                 inv = jnp.array([x0i, x1i, jnp.log1p(e1i * e1i + e2i * e2i)])
                 a, b = self.net_m1(inv), self.net_m2(inv)
-                return jnp.sum(B1**2) + jnp.sum(a**2) + jnp.sum(b**2)
+                pen = jnp.sum(B1**2) + jnp.sum(a**2) + jnp.sum(b**2)
+                if self.flux_size_owne:
+                    pen = pen + jnp.sum(self._flux_owne_B(e1i, e2i) ** 2)
+                    pen = pen + jnp.sum(self._size_owne_B(x0i, e1i, e2i) ** 2)
+                return pen
 
             return jnp.mean(jax.vmap(_sq)(x0, x1, e1, e2))
 
-        def _sq(x0i, x1i, e1i):
+        def _sq(x0i, x1i, e1i, e2i):
             A, B = self._coeffs(x0i, x1i, e1i)  # e1i doubles as the M1 "x2" probe
-            return sum(jnp.sum(a**2) for a in A) + sum(jnp.sum(b**2) for b in B)
+            pen = sum(jnp.sum(a**2) for a in A) + sum(jnp.sum(b**2) for b in B)
+            if self.flux_size_owne:
+                pen = pen + jnp.sum(self._flux_owne_B(e1i, e2i) ** 2)
+                pen = pen + jnp.sum(self._size_owne_B(x0i, e1i, e2i) ** 2)
+            return pen
 
-        return jnp.mean(jax.vmap(_sq)(x0, x1, e1))
+        return jnp.mean(jax.vmap(_sq)(x0, x1, e1, e2))
 
 
 # ---------------------------------------------------------------------------
@@ -1766,6 +1904,7 @@ def new_masked_autoregressive_flow(
     shear_own_e: bool = False,
     shear_split_ab: bool = False,
     shear_spin2_owne: bool = False,
+    shear_flux_size_owne: bool = False,
 ) -> Transformed:
     """Construct a masked autoregressive normalizing flow for BFD galaxy moments.
 
@@ -1856,6 +1995,7 @@ def new_masked_autoregressive_flow(
             own_e=shear_own_e,
             split_ab=shear_split_ab,
             spin2_owne=shear_spin2_owne,
+            flux_size_owne=shear_flux_size_owne,
         )
         # No equivariant permute for the Taylor layer: it relies on the fixed
         # spin-0/spin-2 component order (0,1 spin-0; 2,3 spin-2), which a 2<->3 swap

@@ -26,7 +26,7 @@ def _layer(key, zero_init=True):
         return lay
     # de-zero the last layers so coeffs are non-trivial (random small weights)
     nets = []
-    for i, n in enumerate(("net_flux", "net_size", "net_dip", "net_quad")):
+    for i, n in enumerate(("net_flux", "net_size", "net_dipquad")):
         sub = getattr(lay, n)
         last = sub.layers[-1]
         k = jr.fold_in(key, i)
@@ -34,7 +34,7 @@ def _layer(key, zero_init=True):
         sub = eqx.tree_at(lambda m: m.layers[-1].weight, sub, w)
         nets.append(sub)
     lay = eqx.tree_at(
-        lambda m: (m.net_flux, m.net_size, m.net_dip, m.net_quad), lay, tuple(nets)
+        lambda m: (m.net_flux, m.net_size, m.net_dipquad), lay, tuple(nets)
     )
     return lay
 

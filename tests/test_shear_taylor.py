@@ -28,6 +28,8 @@ from bfd_cnf.models.flows import (
     make_nll_loss,
     _sobolev_pinv,
     _sobolev_target,
+    _sobolev_row_weights,
+    _batch_log_L_X,
 )
 
 
@@ -151,6 +153,125 @@ def test_losses_run_with_taylor_and_sobolev():
     leaves2 = [a for a in jax.tree_util.tree_leaves(grads2) if eqx.is_inexact_array(a)]
     assert leaves2 and all(jnp.all(jnp.isfinite(a)) for a in leaves2), "ELBO+Sobolev grad must be finite"
 
+    # Σ_X on: exercises the new _sobolev_row_weights(X_b, sx_conds) path (row_w != None).
+    nll_sx = make_nll_loss(N, batch_size=16, use_sx=True, log_scale_range=(-1.0, 1.0),
+                           raw2standard=r2s, sobolev_g1_weight=1.0, sobolev_g2_weight=0.5)
+    grads3 = eqx.filter_grad(lambda p: nll_sx(p, y, cov, dg, d2g, X, jr.key(9)))(prior)
+    leaves3 = [a for a in jax.tree_util.tree_leaves(grads3) if eqx.is_inexact_array(a)]
+    assert leaves3 and all(jnp.all(jnp.isfinite(a)) for a in leaves3), \
+        "NLL+Sobolev+use_sx grad must be finite"
+
+    elbo_sx = make_elbo_loss(N, batch_size=16, num_samples=2, use_sx=True,
+                             log_scale_range=(-1.0, 1.0), raw2standard=r2s,
+                             sobolev_g1_weight=1.0, sobolev_g2_weight=0.5)
+    grads4 = eqx.filter_grad(lambda mt: elbo_sx(mt, y, cov, dg, d2g, X, jr.key(10)))((prior, q))
+    leaves4 = [a for a in jax.tree_util.tree_leaves(grads4) if eqx.is_inexact_array(a)]
+    assert leaves4 and all(jnp.all(jnp.isfinite(a)) for a in leaves4), \
+        "ELBO+Sobolev+use_sx grad must be finite"
+
+
+def _fsowne_layer():
+    lay = ShearTaylorLast(
+        jr.key(20), dim=4, raw_cond_dim=5, last_width=8, last_depth=1,
+        activation=jax.nn.silu, split_ab=True, spin2_owne=True, flux_size_owne=True,
+    )
+    return jax.tree_util.tree_map(
+        lambda a: a + 0.3 * jr.normal(jr.key(21), a.shape) if eqx_is_arr(a) else a,
+        lay,
+    )
+
+
+def test_flux_size_owne_bijection_roundtrip():
+    """flux_size_owne (combined with spin2_owne, the trained-flow config) must
+    still be a valid bijection and an identity at g=0. Unlike the plain (non-
+    spin2_owne) layer, log|det| here is the real spin-2 value (not 0), and the
+    spin-2 inverse is only exact to O(g^2) by construction (see
+    inverse_and_log_det's spin2_owne branch docstring) -- flux_size_owne's own
+    stage is exact (block-triangular, see __init__ note), so the roundtrip
+    residual should stay at that same O(g^2) floor, not blow up."""
+    lay = _fsowne_layer()
+    x = jnp.array([0.3, -0.7, 0.2, -0.4])
+    cond = jnp.array([0.03, -0.02, 12.0, 0.0, 0.0])
+
+    y, lad = lay.transform_and_log_det(x, cond)
+    assert jnp.all(jnp.isfinite(lad))
+    x_rt, lad_inv = lay.inverse_and_log_det(y, cond)
+    assert jnp.allclose(x, x_rt, atol=2e-3), "flux_size_owne forward∘inverse must match to O(g^2)"
+    assert jnp.allclose(lad + lad_inv, 0.0, atol=2e-3), "fwd/inv log|det| must cancel to O(g^2)"
+
+    cond0 = cond.at[:2].set(0.0)
+    y0, _ = lay.transform_and_log_det(x, cond0)
+    assert jnp.allclose(y0, x, atol=1e-9), "flux_size_owne layer must be identity at g=0"
+
+
+def test_flux_size_owne_B12_nonzero_and_equivariant():
+    """The bug this fixes: net_flux_e/net_size_e used to emit (B11,B22,B12) directly
+    from an orientation-blind input, which can only ever represent B11==B22, B12==0
+    (see memory shear-taylor-flux-size-blind-to-orientation). The fix builds B from
+    two invariant scalars (c0,c1) combined with the equivariant tensor
+    (e1^2,e2^2,e1e2) — this checks (1) B12 is now generically NONZERO, and (2) the
+    resulting shift is exactly invariant under a rotation applied jointly to
+    (e1,e2) and (g1,g2), the defining property a spin-0 (flux/size) shift must have."""
+    lay = _fsowne_layer()
+    e1, e2 = 0.18, -0.09
+    g1, g2 = 0.02, -0.015
+
+    B_flux = lay._flux_owne_B(e1, e2)
+    B_size = lay._size_owne_B(0.4, e1, e2)
+    assert abs(float(B_flux[2])) > 1e-8, "flux B12 must be able to be nonzero"
+    assert abs(float(B_size[2])) > 1e-8, "size B12 must be able to be nonzero"
+
+    def shift_scalar(e1v, e2v, g1v, g2v):
+        Bf = lay._flux_owne_B(e1v, e2v)
+        Bs = lay._size_owne_B(0.4, e1v, e2v)
+        zeroA = jnp.zeros(2)
+        return lay._shift(zeroA, Bf, g1v, g2v), lay._shift(zeroA, Bs, g1v, g2v)
+
+    theta = 0.7
+    c, s = jnp.cos(theta), jnp.sin(theta)
+    e1r, e2r = c * e1 - s * e2, s * e1 + c * e2
+    g1r, g2r = c * g1 - s * g2, s * g1 + c * g2
+
+    sf0, ss0 = shift_scalar(e1, e2, g1, g2)
+    sf1, ss1 = shift_scalar(e1r, e2r, g1r, g2r)
+    assert jnp.allclose(sf0, sf1, atol=1e-9), "flux shift must be rotation-invariant"
+    assert jnp.allclose(ss0, ss1, atol=1e-9), "size shift must be rotation-invariant"
+
+
+def test_sobolev_row_weights_match_density_softmax_mean():
+    """_sobolev_row_weights caps each stencil point's softmax at max_weight_mult/B
+    before renormalising (see docstring: an uncapped self-normalised softmax can
+    collapse onto one outlier row and caused a real training NaN divergence,
+    2026-07-30). This checks the capped-then-renormalised result matches a manual
+    reimplementation, and that a wide-open cap recovers the uncapped
+    mean-of-softmax identity."""
+    rng = np.random.default_rng(3)
+    X = jnp.asarray(rng.normal(0, 50.0, (12, 2)))
+    sx_conds = jnp.asarray(
+        np.stack([rng.uniform(-1, 1, 5), rng.uniform(-0.3, 0.3, 5),
+                  rng.uniform(-0.3, 0.3, 5)], axis=-1)
+    )
+    B = X.shape[0]
+
+    def _manual(cap_mult):
+        w_c = jnp.stack([jax.nn.softmax(_batch_log_L_X(X, c)) for c in sx_conds], axis=0)
+        w_c = jnp.minimum(w_c, cap_mult / B)
+        w_c = w_c / jnp.sum(w_c, axis=1, keepdims=True)
+        return jnp.mean(w_c, axis=0)
+
+    w = _sobolev_row_weights(X, sx_conds)  # default cap = 20
+    assert jnp.allclose(jnp.sum(w), 1.0, atol=1e-6), "row weights must sum to 1"
+    assert jnp.allclose(w, _manual(20.0), atol=1e-10), "must match manual capped mean-of-softmax"
+    assert jnp.max(w) <= 20.0 / B + 1e-9, "no row may exceed the cap"
+
+    # A wide-open cap (never binds) must recover the uncapped identity.
+    w_uncapped = _sobolev_row_weights(X, sx_conds, max_weight_mult=1e6)
+    expected_uncapped = jnp.mean(
+        jnp.stack([jax.nn.softmax(_batch_log_L_X(X, c)) for c in sx_conds], axis=0), axis=0
+    )
+    assert jnp.allclose(w_uncapped, expected_uncapped, atol=1e-9), \
+        "an effectively-infinite cap must recover the uncapped mean-of-softmax"
+
 
 def eqx_is_arr(a):
     return isinstance(a, (jnp.ndarray, np.ndarray)) and jnp.issubdtype(
@@ -162,5 +283,8 @@ if __name__ == "__main__":
     test_bijection_roundtrip_and_identity_at_g0()
     test_shear_derivs_match_autodiff()
     test_sobolev_target_recovers_known_quadratic()
+    test_flux_size_owne_bijection_roundtrip()
+    test_flux_size_owne_B12_nonzero_and_equivariant()
+    test_sobolev_row_weights_match_density_softmax_mean()
     test_losses_run_with_taylor_and_sobolev()
     print("OK: ShearTaylorLast + Sobolev term self-checks passed")

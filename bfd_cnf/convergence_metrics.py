@@ -36,7 +36,17 @@ This module provides two complementary convergence views per stage:
     stopped moving, which can plateau before/after the raw parameters do.
 
 A stage is considered converged when *both* its parameter and functional
-relative deltas fall below their thresholds.
+trajectories have stopped **drifting** — see :func:`drift_diffusion_ratio`.
+A single-consecutive-block relative delta (``‖Δx‖/‖x_prev‖``) breaks down for
+a stage whose signature is legitimately tiny (``SigmaXCouplingLayer``'s C_X
+response is a documented "small perturbation" — its reference-condition
+gradient magnitude is ~1000x smaller than the other two stages'): the same
+residual Polyak/EMA weight noise that both other stages absorb comfortably
+turns into a huge *relative* swing purely because the denominator is close to
+zero, so that stage can never satisfy a fixed relative threshold no matter
+how well trained it is. Comparing a trailing window's net displacement to
+the random-walk noise floor implied by its own per-step jitter (both in the
+same absolute units) sidesteps the scale mismatch entirely.
 """
 
 from __future__ import annotations
@@ -398,18 +408,77 @@ def functional_plateau_metrics(
     return out
 
 
+def flatten_valid_field(field: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Flatten a (possibly multi-channel) binned field to its valid-bin entries.
+
+    Same masking ``_field_rel_delta`` uses, factored out so callers can build a
+    per-block flat vector for :func:`drift_diffusion_ratio`.
+    """
+    arr = np.asarray(field)
+    m = mask if arr.ndim == 1 else mask[:, None] * np.ones((1, arr.shape[1]), dtype=bool)
+    v = arr[m]
+    return v[np.isfinite(v)]
+
+
+def drift_diffusion_ratio(history: list[np.ndarray]) -> float:
+    """Net-displacement-to-random-walk-noise ratio over a window of snapshots.
+
+    ``history`` is a list of ``>= 2`` flattened vectors (oldest -> newest) of
+    the SAME quantity — a stage's trainable-parameter vector, or its binned
+    functional signature — sampled once per block.
+
+    If the quantity has stopped systematically moving (only Polyak/EMA noise
+    left), consecutive per-block steps are close to independent jitter, so the
+    net displacement over ``n`` steps grows like ``sqrt(n) * (typical step
+    size)`` (a random walk). If it is still genuinely converging, displacement
+    instead accumulates roughly linearly, ``n * (typical step size)``. The
+    ratio
+
+        ratio = ‖x[-1] - x[0]‖ / (sqrt(n) * rms(‖x[i] - x[i-1]‖))
+
+    is O(1) under the noise-only null *regardless of the quantity's absolute
+    scale* (numerator and denominator carry the same units), which is what
+    makes one fixed threshold usable across stages whose signal magnitude
+    varies by orders of magnitude — unlike a relative-delta-to-threshold test.
+
+    Returns ``inf`` if ``history`` has fewer than 2 entries (not enough data
+    to judge — never counts as converged).
+    """
+    n = len(history) - 1
+    if n < 1:
+        return float("inf")
+    diffs = np.array(
+        [np.linalg.norm(history[i] - history[i - 1]) for i in range(1, len(history))]
+    )
+    rms_step = float(np.sqrt(np.mean(diffs ** 2)))
+    if rms_step < 1e-12:
+        return 0.0  # literally frozen
+    net = float(np.linalg.norm(history[-1] - history[0]))
+    return net / (np.sqrt(n) * rms_step)
+
+
 def stage_converged(
-    param_m: dict[str, dict[str, float]],
-    func_m: dict[str, dict[str, float]],
-    tau_param: float,
-    tau_func: float,
+    param_hist: dict[str, list[np.ndarray]],
+    func_hist: dict[str, list[np.ndarray]],
+    window: int,
+    k: float,
 ) -> dict[str, bool]:
-    """Per-stage boolean: both param and functional rel-deltas below threshold."""
+    """Per-stage boolean: both trajectories are drift-free over the trailing window.
+
+    ``param_hist``/``func_hist`` map each stage to its list of per-block flat
+    vectors (params from a Polyak/EMA-averaged checkpoint — see
+    ``converge_train.py``'s ``--ema-decay`` — and the masked functional field
+    from :func:`flatten_valid_field`). A stage counts as converged once at
+    least ``window + 1`` blocks are available and both drift-diffusion ratios
+    (see :func:`drift_diffusion_ratio`) fall below ``k``.
+    """
     out: dict[str, bool] = {}
     for name in STAGE_ORDER:
-        pr = param_m[name]["rel_delta"]
-        fr = func_m[name]["rel_delta"]
-        out[name] = (
-            np.isfinite(pr) and np.isfinite(fr) and pr < tau_param and fr < tau_func
-        )
+        ph, fh = param_hist[name], func_hist[name]
+        if len(ph) <= window or len(fh) <= window:
+            out[name] = False
+            continue
+        pr = drift_diffusion_ratio(list(ph)[-(window + 1):])
+        fr = drift_diffusion_ratio(list(fh)[-(window + 1):])
+        out[name] = np.isfinite(pr) and np.isfinite(fr) and pr < k and fr < k
     return out

@@ -90,6 +90,9 @@ def main() -> None:
                     help="Paired bootstrap resamples per cell (default 50).")
     ap.add_argument("--mf-lim", type=float, nargs=2, default=_MF_LIM_PAD)
     ap.add_argument("--y-lim", type=float, nargs=2, default=_Y_LIM_PAD)
+    ap.add_argument("--bin-arm", choices=["plus", "minus"], default="plus",
+                    help="Which arm's own noisy (Mf, Mr) decides cell membership "
+                         "(diagnostic: compare plus vs minus to test noise-selection artifacts).")
     args = ap.parse_args()
 
     d = np.load(args.inp)
@@ -97,9 +100,8 @@ def main() -> None:
     n = len(kp)
     print(f"Matched {n:,} pairs by id (arms had {len(d['ids_p']):,} / {len(d['ids_m']):,} rows).")
 
-    xp, yp = _xy(np.asarray(d["targets_p"], dtype=np.float64)[kp], args.yaxis)
-    xm, ym = _xy(np.asarray(d["targets_m"], dtype=np.float64)[km], args.yaxis)
-    x, y = (xp + xm) / 2.0, (yp + ym) / 2.0  # bin on the pair's mean flux/size
+    bin_key, bin_idx = ("targets_p", kp) if args.bin_arm == "plus" else ("targets_m", km)
+    x, y = _xy(np.asarray(d[bin_key], dtype=np.float64)[bin_idx], args.yaxis)
     valid = np.isfinite(x) & np.isfinite(y)
     x, y, pqr_p, pqr_m = x[valid], y[valid], pqr_p[valid], pqr_m[valid]
     n = len(x)
@@ -229,6 +231,8 @@ def main() -> None:
         a.set_ylim(extent[2], extent[3])
 
     tag = os.path.basename(args.inp).replace(".npz", "") + f"_{args.yaxis}"
+    if args.bin_arm != "plus":
+        tag += f"_bin{args.bin_arm}"
     out = args.out or os.path.join(PLOTS_DIR, f"mbias_hexbin_paired_{tag}.png")
     os.makedirs(PLOTS_DIR, exist_ok=True)
     fig.savefig(out, dpi=140, bbox_inches="tight")

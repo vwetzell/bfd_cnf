@@ -63,9 +63,9 @@ def _zero_last(net):
 
 def _neuter(sx):
     return eqx.tree_at(
-        lambda L: (L.net_flux, L.net_size, L.net_dip, L.net_quad),
+        lambda L: (L.net_flux, L.net_size, L.net_dipquad),
         sx,
-        tuple(_zero_last(n) for n in (sx.net_flux, sx.net_size, sx.net_dip, sx.net_quad)),
+        tuple(_zero_last(n) for n in (sx.net_flux, sx.net_size, sx.net_dipquad)),
     )
 
 

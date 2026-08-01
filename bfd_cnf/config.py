@@ -34,7 +34,7 @@ key = jr.key(18061998)
 # ---------------------------------------------------------------------------
 prior_early_nn_width = 32
 prior_early_nn_depth = 2
-prior_last_nn_width = 128  # shear conditioner (ExplicitPolyLast); was 32, widened 2026-07-11
+prior_last_nn_width = 32  # shear conditioner (ExplicitPolyLast); was widened to 128 on 2026-07-11, reverted 2026-07-30
 prior_last_nn_depth = 4
 prior_sigmax_nn_width = 32
 prior_sigmax_nn_depth = 4
@@ -50,15 +50,88 @@ prior_flow_layers = 10
 # The kind is a STATIC part of the flow structure, so a saved flow only deserialises
 # with the kind it was trained with (like prior_last_nn_width above): switching this
 # requires retraining and pointing PRIOR_FLOW_PATH at a matching .eqx.
-shear_layer_kind = "poly"
+# DEFAULT (matches the best-performing run, tag nll_taylor_spin2_4Msub32): a poly
+# checkpoint at the default PRIOR_FLOW_PATH will fail to deserialise under this default
+# (self-guarding — different param shapes) until PRIOR_FLOW_PATH points at a taylor .eqx;
+# pass --shear-layer poly (+ --from-scratch or a matching poly checkpoint) for the old kind.
+shear_layer_kind = "taylor"
 
-# Sobolev shear-derivative training weights (0 = off, the default; no behaviour
-# change). When >0, the loss adds lambda * MSE between the flow's own moment
-# shear-response (d m / d g and d^2 m / d g^2 of the decode map, by autodiff) and the
-# template truth (a quadratic fit of the sheared moments over the g-grid). Works with
-# either shear_layer_kind and in both the NLL and ELBO paths.
-sobolev_g1_weight = 0.0   # first-order  d m / d g   matching
-sobolev_g2_weight = 0.0   # second-order d^2 m / d g^2 matching
+# Where the conditional shear + Σ_X layers sit in the prior flow.
+#   False -> base-adjacent (historical order the w128 .eqx flows were trained with):
+#            the unconditional bulk is data-adjacent, so the data-space shear response
+#            is the shear layer's coefficient threaded through the bulk decode Jacobian.
+#   True  -> data-adjacent (default): generative stack base -> bulk -> Σ_X -> shear -> data,
+#            so the shear layer's A IS the data-space dM/dg directly (cleanly Sobolev-
+#            supervisable, decoupled from the bulk tail Jacobian). See EarlyChain.
+# DANGER: this only reorders composition — it does NOT change the leaf set, so a flow
+# trained with the other value deserialises WITHOUT error but silently mismatches (wrong
+# order applied to the trained weights). It is NOT self-guarding like shear_layer_kind
+# (which changes param shapes and fails loudly). Load a pre-flip .eqx with
+# load_prior_flow(conditional_first=False) until a data-adjacent flow is retrained.
+prior_conditional_first = True
+
+# Own-|e| conditioning for the taylor shear layer (ShearTaylorLast). False (default) =
+# the masked M1 dipole sees only (flux, size); True adds a second-stage M1 correction
+# conditioned on the final M2, giving the shear response an own-ellipticity dependence
+# (closed-form invertible, det=1) to fix the high-|e| tail under-response. STATIC flow
+# structure (adds net_m1_e); a saved flow only deserialises with the value it trained with.
+# Only meaningful with shear_layer_kind="taylor".
+prior_shear_own_e = False
+
+# Give the spin-2 SECOND-order shear coeff B its own coeff net instead of sharing the
+# A trunk. A shared trunk is captured by the first-order NLL+sob1 gradient and starves
+# the sob2 (2nd-order) supervision, pinning B at ~0; a dedicated B trunk lets sob2 train
+# it. STATIC flow structure (adds net_m1_B/net_m2_B); a saved flow only deserialises with
+# the value it trained with. Only meaningful with shear_layer_kind="taylor".
+# NOW THE DEFAULT: pre-split-flip taylor .eqx must be loaded with shear_split_ab=False.
+prior_shear_split_ab = True
+
+# Condition the SPIN-2 (M1,M2) shear coefficients on the rotation-invariant |e|^2 =
+# M1^2+M2^2, so the shift depends on the galaxy's OWN ellipticity — the ONLY way to
+# represent the M1 second-order shear response (which is ~100% own-|e|: R^2=0 from
+# flux,size, the masked layer's legal inputs). Turns the (M1,M2) block into a joint
+# coupling with a real (non-unit) log-det + iterative inverse; equivariance kept because
+# |e|^2 is a spin-0 invariant. STATIC structure. Only meaningful with taylor.
+# DEFAULT (needed for 2nd-order fidelity); old taylor .eqx load with shear_spin2_owne=False.
+prior_shear_spin2_owne = True
+
+# Give the SPIN-0 (flux, size) shear coefficients the same own-|e| treatment
+# spin2_owne/own_e already give M1,M2. net_flux/net_size are otherwise structurally
+# blind to the galaxy's own ellipticity (masked order [flux,size,M1,M2] puts M1,M2
+# strictly AFTER) -- this forces their g1*g2 cross-term to ~0 and their |g|^2
+# curvature to a flux-only (or, for net_flux, fully global) compromise value,
+# independent of how well-trained the flow is. Diagnosed 2026-08-01 on
+# prior_flow_4Msub32sig0p3_w32_spin2default_narrowsx_elbo_ft.eqx: this structural
+# gap produced a smooth +0.19-to--0.06 `m` gradient across the whole (flux,size)
+# plane (see memory shear-taylor-flux-size-blind-to-orientation). STATIC flow
+# structure (adds net_flux_e/net_size_e); a saved flow only deserialises with the
+# value it trained with. Only meaningful with shear_layer_kind="taylor".
+# DEFAULT (fixes the above); pre-fix taylor .eqx must be loaded with
+# shear_flux_size_owne=False.
+# 2026-08-01 (R12 follow-up): net_flux_e/net_size_e's own-|e| correction was
+# initially built from an orientation-blind input (log1p|e|^2 only), which STILL
+# cannot represent a nonzero B12 -- see the _owne_B_from_invariants docstring in
+# bijections.py for the equivariant construction that replaced it. Any .eqx
+# trained before this fix (including prior_flow_4Msub32sig0p3_w32_fsowne_narrowsx_
+# elbo_ft.eqx) has net_flux_e/net_size_e with the OLD (3,)-output shape and needs
+# a from-scratch retrain -- it will not deserialise into the new (2,)-output
+# structure.
+prior_shear_flux_size_owne = True
+
+# Sobolev shear-derivative training weights (0 = off). When >0, the loss adds
+# lambda * MSE between the flow's own moment shear-response (d m / d g and
+# d^2 m / d g^2 of the decode map, by autodiff) and the template truth (a quadratic fit
+# of the sheared moments over the g-grid). Works with either shear_layer_kind and in
+# both the NLL and ELBO paths. DEFAULT (matches nll_taylor_spin2_4Msub32); pass
+# --sobolev-g1 0 --sobolev-g2 0 to disable.
+sobolev_g1_weight = 1.0   # first-order  d m / d g   matching
+sobolev_g2_weight = 1.0   # second-order d^2 m / d g^2 matching
+
+# Weight for the shear-coeff off-template penalty (0 = off): trains
+# ShearTaylorLast's coefficient nets toward zero output on synthetic
+# (flux, size, |e|) probes beyond where real templates live, instead of leaving
+# their off-manifold extrapolation arbitrary. See ShearTaylorLast.coeff_ood_penalty.
+shear_coeff_ood_weight = 0.01
 
 import math as _math
 
@@ -116,24 +189,22 @@ use_nda_weight: bool = True
 # Σ_X conditioning / training parameters
 # ---------------------------------------------------------------------------
 # Range of log_scale = 0.5*log det(C_X) (centroid noise) sampled uniformly each step.
-# Derived from the grid TARGETS' per-object centroid covariance C_X — the odd-moment
-# covariance built from each target's even cov via models.flows.even_cov_to_CX (NOT the
-# [M+, Mx] ellipticity sub-block, a different spin-2 quantity).  Across both ±shear grids
-# the corrected C_X gives log_scale p0.1/p50/p99.5 ≈ 10.83/11.37/12.67, so (10.5, 13.0)
-# covers ~99.7% of targets with margin AND contains the isotropic per-tier SIG_XY
-# corner reference (≈11.94).  Normalisation (prior_sigmax_log_scale_mean/std = 11.98/2.0)
-# is kept so log_scale_n=0 sits at the SIG_XY corner reference; the new range maps to
-# log_scale_n ≈ [-0.74, +0.51].
-# (Was (11,15): tuned to the WRONG [M+,Mx]-block C_X — median ≈13.27 — which left the
-# true target bulk near 10.9-11 below the trained range and wasted capacity on 13-15.)
-log_scale_range: tuple[float, float] = (10.5, 13.0)
+# 2026-07-30: measured directly off imsims's data/targets_plus_4M_fix.fits (unpacking
+# the stored covariance via bfd.moment.MomentCovariance) — EVERY target has the exact
+# same, isotropic C_X: log_scale = 12.04249382, e1 = e2 = 0.0 (imsims uses one fixed
+# global target-noise sigma, not per-object depth variation, unlike the grid-catalog
+# calibration this range/e_max used to be tuned to). Compressed to +/-0.1 around that
+# single point so training capacity concentrates where inference actually lands, while
+# KEEPING the stencil/marginalisation structure (not collapsing to a point) so the
+# Σ_X-conditioned layer still generalises to future target populations with genuine
+# per-object log_scale/e spread. Widen back out before training on such a population.
+log_scale_range: tuple[float, float] = (11.94249382, 12.14249382)
 # Maximum centroid-covariance ellipticity magnitude |e| sampled for Σ_X conditioning.
-# Sized to the bulk of the real target C_X anisotropy (|e| median ≈0.012, p99 ≈0.041
-# across both ±grids via even_cov_to_CX) rather than the full tail, so training capacity
-# concentrates near the dipole magnitude targets actually have.  NOTE: ~1% of targets
-# exceed this (rare max ≈0.27) and their e1,e2 conditioning mildly extrapolates at
-# inference; widen if those high-|e| targets show miscalibration.
-e_max: float = 0.05
+# 2026-07-30: compressed alongside log_scale_range for the same reason — imsims targets
+# are exactly isotropic (e1=e2=0) today, so 0.05 was pure extrapolation padding for this
+# dataset. 0.005 keeps a small nonzero ring (structure preserved for future non-isotropic
+# populations) without diluting training signal onto e-directions never seen at inference.
+e_max: float = 0.005
 
 # ---------------------------------------------------------------------------
 # File path constants
