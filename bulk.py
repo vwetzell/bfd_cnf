@@ -43,6 +43,7 @@ from flowjax.distributions import MultivariateNormal, Transformed
 from paramax import non_trainable
 
 from models.bijections import EquivariantAutoregressiveLayer, RawMomentStandardize
+from models.shear import ShearResponse
 
 LAYERS = 8
 NN_WIDTH = 64
@@ -69,11 +70,18 @@ def to_coords(m):
                      m[:, 2] / m[:, 1], m[:, 3] / m[:, 1]], axis=-1)
 
 
-def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH):
-    """Bulk-only flow, standardised against `m_train`."""
+def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH,
+               shear=False):
+    """Bulk flow standardised against `m_train`; with `shear`, conditioned on g.
+
+    The generative stack is ``base -> bulk -> shear(g) -> data``, so the shear
+    layer is data-adjacent and acts in raw moment space -- which is where shear
+    physically acts, and where its coefficients are comparable to bfd's dm/dg.
+    """
     t = to_coords(m_train)
     raw2standard = RawMomentStandardize(mean=t.mean(0), std=t.std(0))
 
+    key, k_shear = jr.split(key)
     keys = jr.split(key, layers)
     bulk = []
     for i, k in enumerate(keys):
@@ -83,8 +91,9 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
         bulk.append(Permute(jnp.array([1, 0, 2, 3] if i % 2 else [0, 1, 2, 3])))
 
     # Chain.transform runs in list order and maps data -> base, so the
-    # standardiser (data-adjacent) comes first; Invert flips it for sampling.
-    bijection = Invert(Chain([raw2standard, *bulk]).merge_chains())
+    # data-adjacent layers come first; Invert flips it for sampling.
+    head = [ShearResponse(k_shear)] if shear else []
+    bijection = Invert(Chain([*head, raw2standard, *bulk]).merge_chains())
     base = non_trainable(MultivariateNormal(jnp.zeros(4), jnp.eye(4)))
     return Transformed(base, bijection)
 

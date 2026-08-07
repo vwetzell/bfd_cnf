@@ -34,11 +34,41 @@ python bulk.py corner --data ../bfd_cnf_imsims/data/moments.fits
 coordinates, with the point-source (`Mr/Mf = 3.976`) reference marked — above
 that line a source is unresolved and carries no shape information.
 
+## Phase 2 — shear conditioning (here now)
+
+`models/shear.py` adds the `ShearResponse` layer, derived from scratch against
+the paper's appendix C and checked against `bfd`.  Its functional form is fixed
+by three symmetries rather than chosen:
+
+* **spin** — `Mf`, `Mr` are spin 0 and `e = (M1 + iM2)/Mr` is spin 2, as is `g`,
+  which leaves exactly three spin-0 and five spin-2 structures through order
+  `g^2`;
+* **parity** — every coefficient is real;
+* **flux** — moments are linear in the image, so the eleven coefficients depend
+  only on `Mr/Mf` and `|e|^2`.  Verified exact to six digits over a 1000x flux
+  range, which is why the coefficient network has two inputs.
+
+`shear.py` trains it on the density, not on a fitted response map: templates are
+lensed by their own exact `Q`, `R` and the flow maximises `log P(m(g)|g)`.  The
+analytic derivatives also enter as a low-variance estimator of the same
+transport velocity — see that module's docstring for why that costs no
+generality at first order, and where it does at second.
+
+```
+python shear.py train  --data ../bfd_cnf_imsims/data/moments.fits
+python shear.py derivs --data ../bfd_cnf_imsims/data/moments.fits
+```
+
+`plots/shear_derivs.png` shows `P` and its first and second shear derivatives
+over the `(M1/Mr, M2/Mr)` plane at fixed flux and size.
+
 ## Layout
 
 ```
 bulk.py               phase-1 build / train / corner plot
-models/bijections.py  the flow layers, incl. the g and Sigma_X layers phases 2-3 need
+shear.py              phase-2 train / check / shear-derivative plot
+models/shear.py       the ShearResponse layer
+models/bijections.py  the bulk layers, and the Sigma_X layer phase 3 needs
 ```
 
 ## Notes
