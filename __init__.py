@@ -1,10 +1,8 @@
 """
 bfd_cnf
 =======
-Bayesian Forward-modelling of galaxy shapes with Conditional Normalizing Flows.
-
-Use ``python -m bfd_cnf.run`` to run the end-to-end workflow, or import
-individual sub-modules as needed.
+A conditional normalizing flow for the BFD prior P(m | g, Sigma_X)
+(Bernstein et al. 2016, MNRAS 459, 4467).  See README.md.
 """
 
 from __future__ import annotations

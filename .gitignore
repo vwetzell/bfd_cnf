@@ -1,0 +1,13 @@
+# Generated (large, reproducible)
+data/
+flows/
+plots/
+logs/
+*.eqx
+*.npz
+*.fits
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
