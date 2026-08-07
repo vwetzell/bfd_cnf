@@ -2,7 +2,8 @@
 bulk.py
 =======
 Phase 1: learn p(m) for the imsims Gaussian-galaxy population, using only the
-*bulk* (unconditional) layers of the bfd_cnf flow.
+*bulk* (unconditional) layers of the bfd_cnf flow.  m is the five even moments
+[Mf, Mr, M1, M2, Mc].
 
 The end goal is P(m | g, Sigma_X) of Bernstein et al. 2016 (MNRAS 459, 4467),
 where m = [Mf, Mr, M1, M2] are the four even moments, g the shear and Sigma_X the
@@ -45,13 +46,18 @@ from paramax import non_trainable
 from models.bijections import EquivariantAutoregressiveLayer, RawMomentStandardize
 from models.shear import ShearResponse
 
+# All six permutations of the three spin-0 slots, cycled between bulk layers.
+_SPIN0_PERMS = [[0, 1, 2], [1, 2, 0], [2, 0, 1], [0, 2, 1], [2, 1, 0], [1, 0, 2]]
+
 LAYERS = 8
 NN_WIDTH = 64
 NN_DEPTH = 2
 
-# The flow works in t = [log10(Mf), Mr/Mf, M1/Mr, M2/Mr] (RawMomentStandardize),
-# standardised by the training set's own mean/std.  Label the corner plot in it.
-COORD_LABELS = [r"$\log_{10}M_f$", r"$M_r / M_f$", r"$M_1 / M_r$", r"$M_2 / M_r$"]
+# The flow works in t = [log10(Mf), Mr/Mf, Mc/Mr, M1/Mr, M2/Mr]
+# (RawMomentStandardize), standardised by the training set's own mean/std --
+# spin-0 first, spin-2 last.  Label the corner plot in it.
+COORD_LABELS = [r"$\log_{10}M_f$", r"$M_r / M_f$", r"$M_c / M_r$",
+                r"$M_1 / M_r$", r"$M_2 / M_r$"]
 LABEL_FONTSIZE, TICK_LABELSIZE = 34, 24
 # Mr/Mf ceiling: a point source, i.e. the PSF itself.  Anything at or above it is
 # unresolved and carries no shape information -- the old repo drew it as the
@@ -60,13 +66,13 @@ POINT_SOURCE = 3.976167
 
 
 def load_moments(path):
-    """Read the four even moments [Mf, Mr, M1, M2] from an imsims catalog."""
-    return np.asarray(fitsio.read(path)["moments"][:, :4], dtype=np.float64)
+    """Read the five even moments [Mf, Mr, M1, M2, Mc] from an imsims catalog."""
+    return np.asarray(fitsio.read(path)["moments"], dtype=np.float64)
 
 
 def to_coords(m):
     """Raw moments -> the flow's transformed coordinates t (for plotting)."""
-    return np.stack([np.log10(m[:, 0]), m[:, 1] / m[:, 0],
+    return np.stack([np.log10(m[:, 0]), m[:, 1] / m[:, 0], m[:, 4] / m[:, 1],
                      m[:, 2] / m[:, 1], m[:, 3] / m[:, 1]], axis=-1)
 
 
@@ -86,15 +92,18 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
     bulk = []
     for i, k in enumerate(keys):
         bulk.append(EquivariantAutoregressiveLayer(k, nn_width, nn_depth, jax.nn.silu))
-        # Alternate the spin-0 (flux/size) order so both directions get conditioned;
-        # spin-2 is left alone -- swapping M1/M2 would break the equivariance.
-        bulk.append(Permute(jnp.array([1, 0, 2, 3] if i % 2 else [0, 1, 2, 3])))
+        # Cycle through all six orderings of the three SPIN-0 coordinates, so no
+        # one of them is permanently the unconditional head of the autoregression
+        # and every pairwise dependence gets modelled in both directions.  The
+        # spin-2 pair (3, 4) is never touched: swapping M1/M2 would rotate the
+        # shape by 45 degrees and destroy the equivariance.
+        bulk.append(Permute(jnp.array(_SPIN0_PERMS[i % len(_SPIN0_PERMS)] + [3, 4])))
 
     # Chain.transform runs in list order and maps data -> base, so the
     # data-adjacent layers come first; Invert flips it for sampling.
     head = [ShearResponse(k_shear)] if shear else []
     bijection = Invert(Chain([*head, raw2standard, *bulk]).merge_chains())
-    base = non_trainable(MultivariateNormal(jnp.zeros(4), jnp.eye(4)))
+    base = non_trainable(MultivariateNormal(jnp.zeros(5), jnp.eye(5)))
     return Transformed(base, bijection)
 
 
@@ -163,11 +172,11 @@ def main():
 
     # Percentile ranges from the DATA so both sets share axes even if the flow
     # puts mass somewhere the data has none -- that mismatch is the thing to see.
-    plot_range = [np.percentile(d[:, i], [0.05, 99.95]) for i in range(4)]
-    # Zoom out on flux and size: both are bounded by the population's own cuts, so
-    # padding puts the point-source line and the empty margin beyond each edge in
-    # frame -- that is where a flow leaking mass off the support would show up.
-    for i in (0, 1):
+    plot_range = [np.percentile(d[:, i], [0.05, 99.95]) for i in range(5)]
+    # Zoom out on the three spin-0 axes: all are bounded by the population's own
+    # cuts, so padding puts the point-source line and the empty margin beyond each
+    # edge in frame -- that is where a flow leaking mass off the support shows up.
+    for i in (0, 1, 2):
         plot_range[i] += 0.25 * np.ptp(plot_range[i]) * np.array([-1.0, 1.0])
     plot_range = [tuple(r) for r in plot_range]
     style = dict(labels=COORD_LABELS, bins=500, range=plot_range, smooth=5.0,
@@ -180,16 +189,27 @@ def main():
     corner.corner(s, fig=fig, color="tab:orange", plot_datapoints=False,
                   hist_kwargs={"label": "Prior flow"}, **style)
 
+    # corner lays the panels out row-major in an N x N grid, so panel (i, j)
+    # is axes[i*N + j] and only j <= i exists.  Derive the reference-line
+    # positions from that rather than hard-coding indices for one N.
+    n_c = len(COORD_LABELS)
     axs = fig.axes
-    axs[5].axvline(POINT_SOURCE, lw=1, color="tab:red", label="Point source")
-    axs[4].axhline(POINT_SOURCE, lw=1, color="tab:red")
-    for i in (9, 13):
-        axs[i].axvline(POINT_SOURCE, lw=1, color="tab:red", zorder=500)
-    for i in (8, 12, 14):
-        axs[i].axhline(0.0, lw=1, color="tab:red", zorder=500)
-    for i in (10, 14, 15):
-        axs[i].axvline(0.0, lw=1, color="tab:red", zorder=500)
-    axs[5].legend(bbox_to_anchor=(0.0, 1.0), loc="lower left", fontsize=16)
+
+    def mark(coord, value, **kw):
+        """Draw `value` on every panel where `coord` is an axis."""
+        for row in range(n_c):
+            for col in range(row + 1):
+                ax = axs[row * n_c + col]
+                if col == coord:
+                    ax.axvline(value, lw=1, color="tab:red", zorder=500, **kw)
+                    kw = {}          # label once
+                elif row == coord and row != col:
+                    ax.axhline(value, lw=1, color="tab:red", zorder=500)
+
+    mark(1, POINT_SOURCE, label="Point source")   # Mr/Mf unresolved ceiling
+    mark(3, 0.0)                                  # M1/Mr
+    mark(4, 0.0)                                  # M2/Mr
+    axs[n_c + 1].legend(bbox_to_anchor=(0.0, 1.0), loc="lower left", fontsize=16)
     for ax in axs:
         ax.tick_params(axis="both", which="major", labelsize=TICK_LABELSIZE)
 

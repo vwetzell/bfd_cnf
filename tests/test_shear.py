@@ -16,7 +16,7 @@ from models.shear import ShearResponse, dm_dg
 jax.config.update("jax_enable_x64", True)
 
 LAYER = ShearResponse(jr.key(0))
-M = jnp.array([5.0e3, 1.8e4, 900.0, -400.0])
+M = jnp.array([5.0e3, 1.8e4, 900.0, -400.0, 1.1e5])
 G = jnp.array([0.04, -0.025])
 
 
@@ -24,7 +24,8 @@ def _rot(m, g, phi):
     """Rotate the frame by phi: the spin-2 pairs (M1,M2) and g turn by 2*phi."""
     z = jax.lax.complex(m[2], m[3]) * jnp.exp(2j * phi)
     w = jax.lax.complex(g[0], g[1]) * jnp.exp(2j * phi)
-    return jnp.stack([m[0], m[1], z.real, z.imag]), jnp.stack([w.real, w.imag])
+    return (jnp.stack([m[0], m[1], z.real, z.imag, m[4]]),
+            jnp.stack([w.real, w.imag]))
 
 
 def test_rotation_equivariance():
@@ -36,9 +37,11 @@ def test_rotation_equivariance():
 
 
 def test_parity_equivariance():
-    flip = lambda v: v.at[-1].set(-v[-1])       # M2 -> -M2, g2 -> -g2
-    lhs = LAYER.unshear(flip(M), flip(G))
-    rhs = flip(LAYER.unshear(M, G))
+    # y -> -y flips M2 and g2; Mf, Mr, M1 and Mc are all parity even.
+    flip_m = lambda v: v.at[3].set(-v[3])
+    flip_g = lambda v: v.at[1].set(-v[1])
+    lhs = LAYER.unshear(flip_m(M), flip_g(G))
+    rhs = flip_m(LAYER.unshear(M, G))
     assert jnp.max(jnp.abs(lhs - rhs) / jnp.abs(rhs)) < 1e-12
 
 

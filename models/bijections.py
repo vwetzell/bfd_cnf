@@ -280,9 +280,14 @@ def propagate_cov_to_std_jax(
 
 class RawMomentStandardize(AbstractBijection):
     """
-    Raw x = [Mf, Mr, M1, M2]
-    Transformed z0 = [log10(Mf), Mr/Mf, M1/Mr, M2/Mr]
+    Raw x = [Mf, Mr, M1, M2, Mc]   (bfd's even-moment order)
+    Transformed z0 = [log10(Mf), Mr/Mf, Mc/Mr, M1/Mr, M2/Mr]
     Then standardized: z = (z0 - mean) / std
+
+    The transformed order groups the three SPIN-0 coordinates first (0, 1, 2)
+    and the spin-2 pair last (3, 4); the equivariant layers and the
+    permutations between them rely on that split.  Mc/Mr carries the same units
+    as Mr/Mf (both are k^2), so the two size-like coordinates share a scale.
     """
 
     mean: jax.Array
@@ -300,18 +305,18 @@ class RawMomentStandardize(AbstractBijection):
             ones.
         """
         if mean is None:
-            self.mean = jnp.zeros(4)
+            self.mean = jnp.zeros(5)
         else:
             self.mean = jnp.asarray(mean)
         if std is None:
-            self.std = jnp.ones(4)
+            self.std = jnp.ones(5)
         else:
             self.std = jnp.asarray(std)
 
     @property
     def shape(self):  # type: ignore[override]
-        """Shape of the bijection input/output: ``(4,)``."""
-        return (4,)
+        """Shape of the bijection input/output: ``(5,)``."""
+        return (5,)
 
     @property
     def cond_shape(self):  # type: ignore[override]
@@ -323,8 +328,8 @@ class RawMomentStandardize(AbstractBijection):
 
         Parameters
         ----------
-        x : jax.Array, shape (..., 4)
-            Raw moments ``[Mf, Mr, M1, M2]``.
+        x : jax.Array, shape (..., 5)
+            Raw moments ``[Mf, Mr, M1, M2, Mc]``.
 
         Returns
         -------
@@ -333,14 +338,16 @@ class RawMomentStandardize(AbstractBijection):
         z0 : jax.Array, shape (..., 4)
             Intermediate un-standardised transformed coordinates.
         """
-        Mf, Mr, M1, M2 = x[..., 0], x[..., 1], x[..., 2], x[..., 3]
+        Mf, Mr, M1, M2, Mc = (x[..., 0], x[..., 1], x[..., 2],
+                              x[..., 3], x[..., 4])
 
         z0_0 = jnp.log10(Mf)
         z0_1 = Mr / Mf
-        z0_2 = M1 / Mr
-        z0_3 = M2 / Mr
+        z0_2 = Mc / Mr
+        z0_3 = M1 / Mr
+        z0_4 = M2 / Mr
 
-        z0 = jnp.stack([z0_0, z0_1, z0_2, z0_3], axis=-1)
+        z0 = jnp.stack([z0_0, z0_1, z0_2, z0_3, z0_4], axis=-1)
         z = (z0 - self.mean) / self.std
         return z, z0
 
@@ -354,8 +361,8 @@ class RawMomentStandardize(AbstractBijection):
 
         Returns
         -------
-        x : jax.Array, shape (..., 4)
-            Raw moments ``[Mf, Mr, M1, M2]``.
+        x : jax.Array, shape (..., 5)
+            Raw moments ``[Mf, Mr, M1, M2, Mc]``.
         z0 : jax.Array, shape (..., 4)
             Intermediate un-standardised coordinates.
         """
@@ -363,9 +370,10 @@ class RawMomentStandardize(AbstractBijection):
         log10_const = jnp.log(jnp.array(10.0, dtype=z0.dtype))
         Mf = jnp.exp(z0[..., 0] * log10_const)
         Mr = z0[..., 1] * Mf
-        M1 = z0[..., 2] * Mr
-        M2 = z0[..., 3] * Mr
-        x = jnp.stack([Mf, Mr, M1, M2], axis=-1).astype(z0.dtype)
+        Mc = z0[..., 2] * Mr
+        M1 = z0[..., 3] * Mr
+        M2 = z0[..., 4] * Mr
+        x = jnp.stack([Mf, Mr, M1, M2, Mc], axis=-1).astype(z0.dtype)
         return x, z0
 
     def transform_and_log_det(self, x, condition=None):
@@ -388,7 +396,7 @@ class RawMomentStandardize(AbstractBijection):
         Mf = x[..., 0]
         Mr = x[..., 1]
         ln10 = jnp.log(jnp.array(10.0, dtype=Mf.dtype))
-        lad_geom = -(2.0 * jnp.log(Mf) + 2.0 * jnp.log(Mr) + jnp.log(ln10))
+        lad_geom = -(2.0 * jnp.log(Mf) + 3.0 * jnp.log(Mr) + jnp.log(ln10))
         lad_std = -jnp.sum(jnp.log(self.std))
         return z, lad_geom + lad_std
 
@@ -559,15 +567,19 @@ class CoeffNet(eqx.Module):
 
 
 class Spin0AutoregressiveLayer(AbstractBijection):
-    """Autoregressive bijection on the spin-0 (flux/size) components.
+    """Autoregressive bijection on the three spin-0 components
+    (flux, size, concentration).
 
-    Transforms components 0 and 1 of the input vector with an affine
+    Transforms components 0, 1, 2 of the input vector with an affine
     autoregressive map:
 
     * ``z[0] = x[0] * exp(-s0)`` — unconditional scale.
     * ``z[1] = (x[1] - loc1(z[0])) * exp(-s1(z[0]))`` — conditioned on z[0].
+    * ``z[2] = (x[2] - loc2(z[0], z[1])) * exp(-s2(z[0], z[1]))``.
 
-    Leaves components 2 and 3 unchanged.
+    Leaves the spin-2 components 3 and 4 unchanged.  Which physical quantity
+    sits in which slot is set by the permutation between layers, so each spin-0
+    coordinate takes a turn as the unconditional one.
 
     Parameters
     ----------
@@ -583,44 +595,45 @@ class Spin0AutoregressiveLayer(AbstractBijection):
 
     log_scale0: jax.Array
     net_ls1: CoeffNet
+    net_ls2: CoeffNet
 
     def __init__(self, key, nn_width, nn_depth, activation):
-        (k1,) = jr.split(key, 1)
+        k1, k2 = jr.split(key, 2)
         self.log_scale0 = jnp.zeros(())
         self.net_ls1 = CoeffNet(k1, 1, 2, nn_width, nn_depth, activation)
+        self.net_ls2 = CoeffNet(k2, 2, 2, nn_width, nn_depth, activation)
 
     @property
     def shape(self):
-        return (4,)
+        return (5,)
 
     @property
     def cond_shape(self):
         return None
 
-    def _spin0_fwd(self, x):
-        ls0 = _bounded_log_scale(self.log_scale0)
-        z0_t = x[0] * jnp.exp(-ls0)
-        out1 = self.net_ls1(jnp.array([z0_t]))
-        loc1 = out1[0]
-        ls1 = _bounded_log_scale(out1[1])
-        z1_t = (x[1] - loc1) * jnp.exp(-ls1)
-        return z0_t, z1_t, loc1, ls0, ls1
+    def _loc_scale(self, net, inputs):
+        out = net(jnp.array(inputs))
+        return out[0], _bounded_log_scale(out[1])
 
     def transform_and_log_det(self, x, condition=None):
-        z0_t, z1_t, _, ls0, ls1 = self._spin0_fwd(x)
-        y = x.at[0].set(z0_t).at[1].set(z1_t)
-        return y, -(ls0 + ls1)
+        ls0 = _bounded_log_scale(self.log_scale0)
+        z0 = x[0] * jnp.exp(-ls0)
+        loc1, ls1 = self._loc_scale(self.net_ls1, [z0])
+        z1 = (x[1] - loc1) * jnp.exp(-ls1)
+        loc2, ls2 = self._loc_scale(self.net_ls2, [z0, z1])
+        z2 = (x[2] - loc2) * jnp.exp(-ls2)
+        y = x.at[0].set(z0).at[1].set(z1).at[2].set(z2)
+        return y, -(ls0 + ls1 + ls2)
 
     def inverse_and_log_det(self, y, condition=None):
         ls0 = _bounded_log_scale(self.log_scale0)
         x0 = y[0] * jnp.exp(ls0)
-        z0_t = y[0]
-        out1 = self.net_ls1(jnp.array([z0_t]))
-        loc1 = out1[0]
-        ls1 = _bounded_log_scale(out1[1])
+        loc1, ls1 = self._loc_scale(self.net_ls1, [y[0]])
         x1 = y[1] * jnp.exp(ls1) + loc1
-        x = y.at[0].set(x0).at[1].set(x1)
-        return x, ls0 + ls1
+        loc2, ls2 = self._loc_scale(self.net_ls2, [y[0], y[1]])
+        x2 = y[2] * jnp.exp(ls2) + loc2
+        x = y.at[0].set(x0).at[1].set(x1).at[2].set(x2)
+        return x, ls0 + ls1 + ls2
 
 
 # ---------------------------------------------------------------------------
@@ -631,9 +644,10 @@ class Spin0AutoregressiveLayer(AbstractBijection):
 class Spin2CouplingLayer(AbstractBijection):
     """Coupling bijection on the spin-2 (shape) components conditioned on spin-0.
 
-    Transforms components 2 and 3 with a shared affine scale conditioned
-    on the already-transformed spin-0 components (0, 1).  The coupling
-    preserves the spin-2 equivariance of the distribution.
+    Transforms components 3 and 4 with a shared affine scale conditioned
+    on the already-transformed spin-0 components (0, 1, 2).  The single shared
+    scale is what preserves spin-2 equivariance: anything treating the two
+    components differently would pick out a direction on the sky.
 
     Parameters
     ----------
@@ -650,37 +664,37 @@ class Spin2CouplingLayer(AbstractBijection):
     net: CoeffNet
 
     def __init__(self, key, nn_width, nn_depth, activation):
-        self.net = CoeffNet(key, 2, 2, nn_width, nn_depth, activation)
+        self.net = CoeffNet(key, 3, 2, nn_width, nn_depth, activation)
 
     @property
     def shape(self):
-        return (4,)
+        return (5,)
 
     @property
     def cond_shape(self):
         return None
 
-    def _coeffs(self, z0_t, z1_t):
-        out = self.net(jnp.array([z0_t, z1_t]))
+    def _coeffs(self, z0_t, z1_t, z2_t):
+        out = self.net(jnp.array([z0_t, z1_t, z2_t]))
         log_scale = _bounded_log_scale(out[0])
         c = 0.9 * jnn.tanh(out[1])
         log_one_minus_c = jnp.log1p(-c)
         return log_scale, c, log_one_minus_c
 
     def transform_and_log_det(self, x, condition=None):
-        log_scale, c, log_one_minus_c = self._coeffs(x[0], x[1])
+        log_scale, c, log_one_minus_c = self._coeffs(x[0], x[1], x[2])
         log_det_each = log_one_minus_c - log_scale
-        y2 = x[2] * jnp.exp(log_det_each)
         y3 = x[3] * jnp.exp(log_det_each)
-        y = x.at[2].set(y2).at[3].set(y3)
+        y4 = x[4] * jnp.exp(log_det_each)
+        y = x.at[3].set(y3).at[4].set(y4)
         return y, log_det_each + log_det_each
 
     def inverse_and_log_det(self, y, condition=None):
-        log_scale, c, log_one_minus_c = self._coeffs(y[0], y[1])
+        log_scale, c, log_one_minus_c = self._coeffs(y[0], y[1], y[2])
         log_det_each = log_one_minus_c - log_scale
-        x2 = y[2] * jnp.exp(-log_det_each)
         x3 = y[3] * jnp.exp(-log_det_each)
-        x = y.at[2].set(x2).at[3].set(x3)
+        x4 = y[4] * jnp.exp(-log_det_each)
+        x = y.at[3].set(x3).at[4].set(x4)
         return x, -(log_det_each + log_det_each)
 
 
@@ -692,8 +706,8 @@ class Spin2CouplingLayer(AbstractBijection):
 class EquivariantAutoregressiveLayer(AbstractBijection):
     """Composed bijection combining :class:`Spin0AutoregressiveLayer` and :class:`Spin2CouplingLayer`.
 
-    The spin-0 layer transforms components 0–1 autoregressively and the
-    spin-2 layer then transforms components 2–3 conditioned on the spin-0
+    The spin-0 layer transforms components 0–2 autoregressively and the
+    spin-2 layer then transforms components 3–4 conditioned on the spin-0
     output.  Together they implement a fully equivariant normalizing-flow
     layer for galaxy moments.
 
@@ -719,7 +733,7 @@ class EquivariantAutoregressiveLayer(AbstractBijection):
 
     @property
     def shape(self):
-        return (4,)
+        return (5,)
 
     @property
     def cond_shape(self):

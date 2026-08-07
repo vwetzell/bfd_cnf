@@ -42,10 +42,14 @@ is trying to find, and adding it costs no generality at first order.
 
 At second order they do differ: the g^2 term of the density feels both E[R|m]
 and the *spread* Var[Q|m], and a deterministic transport can only supply the
-first.  That gap is real for populations whose response scatters at fixed m
-(it vanishes on this Gaussian test bed, where the response is a function of the
-invariants to a few percent).  Closing it needs a stochastic layer; keeping the
-likelihood term in the loss is what will expose it when the sims get richer.
+first.  The resulting multiplicative bias is ~Var[Q|m]/E[Q|m]^2, and note that
+it does NOT shrink with the shear -- the missing term and the term it competes
+with in R are both O(g^2), so the ratio is the same at g = 0.02 as at 0.1.
+Measured on a bulge+disc population, the spin-2 response scatter at fixed
+[Mr/Mf, |e|^2] is 8.1% (m ~ 7e-3, well over the 1e-3 target); adding Mc to the
+moment vector drops it to 2.0% (m ~ 4e-4).  That is why Mc is modelled.  What
+is left would need a stochastic layer; keeping the likelihood term in the loss
+is what will expose it when the sims get richer.
 
 Usage:
     python shear.py train  --data ../bfd_cnf_imsims/data/moments.fits
@@ -77,7 +81,7 @@ def load(path):
     """Moments and their exact shear derivatives, as float64 arrays."""
     t = fitsio.read(path)
     f64 = lambda a: np.asarray(a, dtype=np.float64)
-    return f64(t["moments"][:, :4]), f64(t["dm_dg"]), f64(t["d2m_dg2"])
+    return f64(t["moments"]), f64(t["dm_dg"]), f64(t["d2m_dg2"])
 
 
 def lens(m, q, r, g):
@@ -110,18 +114,25 @@ def _trainable(flow, bulk_frozen):
         replace=jax.tree.map(eqx.is_inexact_array, _shear_layer(flow)))
 
 
+def _scale(m):
+    """Per-moment normalisation [Mf, Mr, Mr, Mr, Mc].  Each moment is divided by
+    its own magnitude, so the residuals are fractional and flux-blind -- except
+    the spin-2 pair, which is divided by Mr because M1 and M2 pass through zero."""
+    return jnp.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1], m[:, 4]], axis=-1)
+
+
 def _velocity_mse(layer, m, q_true, r_true):
     """L2 distance between the layer's transport velocity and the templates'
-    own shear derivatives, normalised by [Mf, Mr, Mr, Mr] so it is
+    own shear derivatives, normalised by `_scale` so it is
     dimensionless, flux-blind, and weighs every galaxy equally.  Its minimiser
     is E[dm/dg | m] -- see the module docstring."""
     q, r = jax.vmap(dm_dg, in_axes=(None, 0))(layer, m)
-    s = jnp.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1]], axis=-1)[:, None, :]
+    s = _scale(m)[:, None, :]
     return jnp.mean(((q - q_true) / s) ** 2) + jnp.mean(((r - r_true) / s) ** 2)
 
 
 def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
-          deriv_weight=1e3):
+          deriv_weight=1e4):
     m, q, r = (jnp.asarray(a) for a in data)
     opt = optax.chain(optax.clip_by_global_norm(1.0),
                       optax.adam(optax.cosine_decay_schedule(lr, steps)))
@@ -179,9 +190,10 @@ def check(flow, data, n=4000):
     m, q_true, r_true = (jnp.asarray(a[:n]) for a in data)
     layer = _shear_layer(flow)
     q, r = jax.vmap(dm_dg, in_axes=(None, 0))(layer, m)
-    s = jnp.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1]], axis=-1)[:, None, :]
+    s = _scale(m)[:, None, :]
     print("\nlayer dm/dg vs bfd truth: RMS residual / RMS truth")
-    print(f"{'':10s}" + "".join(f"{n_:>10s}" for n_ in ["Mf", "Mr", "M1", "M2"]))
+    print(f"{'':10s}" + "".join(f"{n_:>10s}"
+                                for n_ in ["Mf", "Mr", "M1", "M2", "Mc"]))
     for name, pred, truth in (("dm/dg", q, q_true), ("d2m/dg2", r, r_true)):
         d = np.asarray((pred - truth) / s)
         t = np.asarray(truth / s)
@@ -190,7 +202,7 @@ def check(flow, data, n=4000):
         print(f"{name:10s}" + "".join(f"{v:10.2%}" for v in frac))
 
 
-def derivs_plot(flow, log10mf, mrmf, m_range, n, out):
+def derivs_plot(flow, log10mf, mrmf, mcmr, m_range, n, out):
     """P and its shear derivatives over the (M1/Mr, M2/Mr) plane at fixed Mf, Mr/Mf."""
     import matplotlib
     matplotlib.use("Agg")
@@ -198,10 +210,12 @@ def derivs_plot(flow, log10mf, mrmf, m_range, n, out):
 
     Mf = 10.0**log10mf
     Mr = mrmf * Mf
+    Mc = mcmr * Mr
     ax1 = np.linspace(-m_range, m_range, n)
     E1, E2 = np.meshgrid(ax1, ax1, indexing="ij")
     x = jnp.asarray(np.stack([np.full(E1.size, Mf), np.full(E1.size, Mr),
-                              Mr * E1.ravel(), Mr * E2.ravel()], axis=-1))
+                              Mr * E1.ravel(), Mr * E2.ravel(),
+                              np.full(E1.size, Mc)], axis=-1))
 
     def prob(row, g1, g2):
         return jnp.exp(flow.log_prob(row, condition=jnp.array([g1, g2])))
@@ -242,7 +256,8 @@ def derivs_plot(flow, log10mf, mrmf, m_range, n, out):
         a.axhline(0.0, color="grey", lw=1)
         plt.colorbar(im, ax=a).set_label(label=label, size=20)
     fig.suptitle(rf"$\log_{{10}}M_f = {log10mf:.3g}$ ($M_f = {Mf:.0f}$), "
-                 rf"$M_r/M_f = {mrmf:.3g}$, $g = (0, 0)$", fontsize=22)
+                 rf"$M_r/M_f = {mrmf:.3g}$, $M_c/M_r = {mcmr:.3g}$, "
+                 rf"$g = (0, 0)$", fontsize=22)
     plt.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches="tight")
     print(f"wrote {out}")
@@ -256,9 +271,16 @@ def main():
     p.add_argument("--init", default="flows/bulk.eqx",
                    help="bulk checkpoint to warm-start from (train only)")
     p.add_argument("--steps", type=int, default=6000)
+    p.add_argument("--deriv-weight", type=float, default=1e4,
+                   help="weight on the velocity-matching term relative to the NLL")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log10mf", type=float, default=3.6)
     p.add_argument("--mrmf", type=float, default=3.3)
+    p.add_argument("--mcmr", type=float, default=None,
+                   help="Mc/Mr slice (default: the catalog median at this Mr/Mf). "
+                        "Mc is nearly determined by the other moments, so an "
+                        "off-locus slice lands where the population has no "
+                        "support and P collapses to zero.")
     p.add_argument("--m-range", type=float, default=0.25)
     p.add_argument("--n", type=int, default=101)
     p.add_argument("--out", default="plots/shear_derivs.png")
@@ -281,7 +303,8 @@ def main():
                 lambda f: f.bijection.bijection.bijections[1:], flow,
                 bulk_only.bijection.bijection.bijections)
             print(f"warm started bulk from {a.init}")
-        flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps)
+        flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps,
+                     deriv_weight=a.deriv_weight)
         print(f"val nll {val_nll(flow, val_set, jr.key(99)):.4f}")
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")
@@ -293,7 +316,14 @@ def main():
         print(f"val nll {val_nll(flow, val_set, jr.key(99)):.4f}")
         check(flow, val_set)
     else:
-        derivs_plot(flow, a.log10mf, a.mrmf, a.m_range, a.n, a.out)
+        mcmr = a.mcmr
+        if mcmr is None:
+            M = data[0]
+            near = np.abs(M[:, 1] / M[:, 0] - a.mrmf) < 0.05
+            mcmr = float(np.median((M[:, 4] / M[:, 1])[near]))
+            print(f"Mc/Mr slice from the catalog at Mr/Mf={a.mrmf}: {mcmr:.4f} "
+                  f"({near.sum()} galaxies)")
+        derivs_plot(flow, a.log10mf, a.mrmf, mcmr, a.m_range, a.n, a.out)
 
 
 if __name__ == "__main__":
