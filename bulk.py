@@ -154,7 +154,13 @@ def main():
 
     # Percentile ranges from the DATA so both sets share axes even if the flow
     # puts mass somewhere the data has none -- that mismatch is the thing to see.
-    plot_range = [tuple(np.percentile(d[:, i], [0.05, 99.95])) for i in range(4)]
+    plot_range = [np.percentile(d[:, i], [0.05, 99.95]) for i in range(4)]
+    # Zoom out on flux and size: both are bounded by the population's own cuts, so
+    # padding puts the point-source line and the empty margin beyond each edge in
+    # frame -- that is where a flow leaking mass off the support would show up.
+    for i in (0, 1):
+        plot_range[i] += 0.25 * np.ptp(plot_range[i]) * np.array([-1.0, 1.0])
+    plot_range = [tuple(r) for r in plot_range]
     style = dict(labels=COORD_LABELS, bins=500, range=plot_range, smooth=5.0,
                  plot_density=False, plot_contours=True, fill_contours=False,
                  label_kwargs={"fontsize": LABEL_FONTSIZE})
