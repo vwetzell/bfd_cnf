@@ -19,7 +19,7 @@ i.e. an elliptical centering uncertainty rigidly **shifts** the (M1,M2) cloud
 ``λ = ½ log det C_X``.
 
 Both shear ``g`` and centering ellipticity ``e`` are spin-2 additive shifts of
-(M1, M2).  ``ExplicitPolyLast`` implements ``g`` with an additive term
+(M1, M2).  ``ShearTaylorLast`` implements ``g`` with an additive term
 (``M1,M2 ← M1,M2 − c·(g1,g2)``); ``SigmaXCouplingLayer`` implements ``e`` with the
 purely *linear* map ``A = s·I + c·E``, which can scale/stretch but cannot
 translate.  This script checks that asymmetry directly:
@@ -195,7 +195,7 @@ def main() -> None:
     slope_e2 = np.polyfit(e2s, d_e2, 1)[0]
     slope_g2 = np.polyfit(g2s, d_g2, 1)[0]
     print(f"  d<M2>/de2 = {slope_e2:+.4e}   (expected nonzero from physics)")
-    print(f"  d<M2>/dg2 = {slope_g2:+.4e}   (ExplicitPolyLast additive Q-term)")
+    print(f"  d<M2>/dg2 = {slope_g2:+.4e}   (ShearTaylorLast additive Q-term)")
     if abs(slope_g2) > 0:
         print(f"  ratio |slope_e2 / slope_g2| = {abs(slope_e2/slope_g2):.3e}")
 

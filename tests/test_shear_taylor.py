@@ -4,13 +4,20 @@ shear-derivative training term.
 Run: python tests/test_shear_taylor.py   (or via pytest)
 
 Covers:
-  1. ShearTaylorLast is a valid bijection: forward∘inverse == identity, log|det|==0,
+  1. ShearTaylorLast is a valid bijection: forward∘inverse == identity (to the
+     Picard-iteration inverse's residual floor, see _INVERSE_PICARD_ITERS),
      and it is the identity at g=0.
-  2. shear_derivs(x) equals the autodiff g-Jacobian / Hessian of the forward map.
-  3. The Sobolev quadratic-fit target recovers known A, B from a synthetic
+  2. shear_derivs(x) matches the autodiff g-Jacobian/Hessian of the forward map
+     (now an exact identity, not an approximation, since both are plain
+     autodiff of the same _shift function).
+  3. The flux/size shift (built from own-e-dependent invariant coefficients)
+     produces a genuinely nonzero first-order A and second-order B12, and the
+     whole shift is exactly rotation-equivariant (invariant for flux/size,
+     spin-2-equivariant for ellipticity).
+  4. The Sobolev quadratic-fit target recovers known A, B from a synthetic
      quadratic-in-g trajectory.
-  4. Both loss paths (make_nll_loss, make_elbo_loss) run with a taylor-layer flow and
-     Sobolev weights > 0, and return a finite gradient.
+  5. Both loss paths (make_nll_loss, make_elbo_loss) run with Sobolev weights
+     > 0, and return a finite gradient.
 """
 
 import equinox as eqx
@@ -34,40 +41,41 @@ from bfd_cnf.models.flows import (
 
 
 def _layer():
-    return ShearTaylorLast(
-        jr.key(0), dim=4, raw_cond_dim=5, last_width=8, last_depth=1,
+    lay = ShearTaylorLast(
+        jr.key(20), dim=4, raw_cond_dim=5, last_width=8, last_depth=1,
         activation=jax.nn.silu,
+    )
+    # perturb coefficients off zero so the layer is non-trivial
+    return jax.tree_util.tree_map(
+        lambda a: a + 0.3 * jr.normal(jr.key(21), a.shape) if eqx_is_arr(a) else a,
+        lay,
     )
 
 
 def test_bijection_roundtrip_and_identity_at_g0():
+    """The inverse is a Picard fixed-point iteration (x = y - shift(x;g), see
+    inverse_and_log_det), not closed-form -- geometric convergence (~3x/pass
+    empirically, even for adversarially large coefficients like this test's
+    perturbed layer), so a few extra passes should comfortably beat this
+    tolerance rather than sit right at an O(g^2) floor."""
     lay = _layer()
-    # perturb coefficients off zero so the layer is non-trivial
-    lay = jax.tree_util.tree_map(
-        lambda a: a + 0.1 * jr.normal(jr.key(1), a.shape) if eqx_is_arr(a) else a,
-        lay,
-    )
     x = jnp.array([0.3, -0.7, 0.2, -0.4])
     cond = jnp.array([0.03, -0.02, 12.0, 0.0, 0.0])  # [g1,g2,log_scale,e1,e2]
 
     y, lad = lay.transform_and_log_det(x, cond)
-    assert jnp.allclose(lad, 0.0), "shift layer must have log|det J| == 0"
+    assert jnp.all(jnp.isfinite(lad))
     x_rt, lad_inv = lay.inverse_and_log_det(y, cond)
-    assert jnp.allclose(x, x_rt, atol=1e-10), "forward∘inverse must be identity"
-    assert jnp.allclose(lad_inv, 0.0)
+    assert jnp.allclose(x, x_rt, atol=2e-3), "forward∘inverse must match to O(g^2)"
+    assert jnp.allclose(lad + lad_inv, 0.0, atol=2e-3), "fwd/inv log|det| must cancel to O(g^2)"
 
     # identity at g=0
     cond0 = cond.at[:2].set(0.0)
     y0, _ = lay.transform_and_log_det(x, cond0)
-    assert jnp.allclose(y0, x, atol=1e-12), "layer must be identity at g=0"
+    assert jnp.allclose(y0, x, atol=1e-9), "layer must be identity at g=0"
 
 
 def test_shear_derivs_match_autodiff():
     lay = _layer()
-    lay = jax.tree_util.tree_map(
-        lambda a: a + 0.1 * jr.normal(jr.key(2), a.shape) if eqx_is_arr(a) else a,
-        lay,
-    )
     x = jnp.array([0.5, 0.1, -0.3, 0.25])
     log_scale_e = jnp.array([12.0, 0.0, 0.0])
 
@@ -81,8 +89,46 @@ def test_shear_derivs_match_autodiff():
     A, B = lay.shear_derivs(x)
     assert jnp.allclose(A, A_ad, atol=1e-9), "shear_derivs A must match autodiff dy/dg"
     assert jnp.allclose(B, B_ad, atol=1e-9), "shear_derivs B must match autodiff d2y/dg2"
-    # spin-0 (flux, size) carry no first-order response
-    assert jnp.allclose(A[:2], 0.0)
+    # spin-0 (flux, size) now carry a real first-order response through own-e:
+    # A[:2].g = cA*(M1 g1 + M2 g2) -- see ShearTaylorLast's __init__ docstring.
+    # Not identically zero in general (only where cA==0 or own-e==0).
+    assert jnp.any(jnp.abs(A[:2]) > 1e-6), "flux/size A should be nonzero for this probe"
+
+
+def test_shift_nonzero_and_equivariant():
+    """The bug the own-e construction fixes: a coefficient net fed only an
+    orientation-blind input can never represent an anisotropic (own-e-
+    dependent) response -- see memory shear-taylor-flux-size-blind-to-
+    orientation. This checks (1) flux/size get a genuinely nonzero first-order
+    A and second-order B12 (both real, per the real BFD Pqr derivatives -- see
+    ShearTaylorLast's docstring), and (2) the whole _shift(x,g) is exactly
+    equivariant under a rotation applied jointly to (M1,M2) and (g1,g2): the
+    flux/size (spin-0) components of the shift are INVARIANT, the ellipticity
+    (spin-2) components ROTATE the same way as (M1,M2) itself."""
+    lay = _layer()
+    x0, x1 = 0.4, -0.2
+    e1, e2 = 0.18, -0.09
+    g1, g2 = 0.02, -0.015
+    x = jnp.array([x0, x1, e1, e2])
+
+    A, B = lay.shear_derivs(x)
+    assert jnp.any(jnp.abs(A[:2]) > 1e-8), "flux/size A must be able to be nonzero"
+    assert abs(float(B[0, 0, 1])) > 1e-8, "flux B12 must be able to be nonzero"
+    assert abs(float(B[1, 0, 1])) > 1e-8, "size B12 must be able to be nonzero"
+
+    theta = 0.7
+    c, s = jnp.cos(theta), jnp.sin(theta)
+    e1r, e2r = c * e1 - s * e2, s * e1 + c * e2
+    g1r, g2r = c * g1 - s * g2, s * g1 + c * g2
+    xr = jnp.array([x0, x1, e1r, e2r])
+
+    sh0 = lay._shift(x, g1, g2)
+    sh1 = lay._shift(xr, g1r, g2r)
+    assert jnp.allclose(sh0[:2], sh1[:2], atol=1e-9), "flux/size shift must be rotation-invariant"
+    m1r = c * sh0[2] - s * sh0[3]
+    m2r = s * sh0[2] + c * sh0[3]
+    assert jnp.allclose(jnp.array([m1r, m2r]), sh1[2:], atol=1e-9), \
+        "ellipticity shift must rotate the same way as (M1,M2) itself"
 
 
 def test_sobolev_target_recovers_known_quadratic():
@@ -136,8 +182,7 @@ def _synthetic_dataset(n=48, seed=5):
 def test_losses_run_with_taylor_and_sobolev():
     y, cov, dg, d2g, X, r2s = _synthetic_dataset()
     N = y.shape[0]
-    prior, q = build_flows(jr.key(6), latent_dim=4, cond_dim=16,
-                           raw2standard=r2s, shear_layer_kind="taylor")
+    prior, q = build_flows(jr.key(6), latent_dim=4, cond_dim=16, raw2standard=r2s)
 
     # NLL path (prior only), Sobolev on, Σ_X off for a compact check.
     nll = make_nll_loss(N, batch_size=16, use_sx=False, raw2standard=r2s,
@@ -168,74 +213,6 @@ def test_losses_run_with_taylor_and_sobolev():
     leaves4 = [a for a in jax.tree_util.tree_leaves(grads4) if eqx.is_inexact_array(a)]
     assert leaves4 and all(jnp.all(jnp.isfinite(a)) for a in leaves4), \
         "ELBO+Sobolev+use_sx grad must be finite"
-
-
-def _fsowne_layer():
-    lay = ShearTaylorLast(
-        jr.key(20), dim=4, raw_cond_dim=5, last_width=8, last_depth=1,
-        activation=jax.nn.silu, split_ab=True, spin2_owne=True, flux_size_owne=True,
-    )
-    return jax.tree_util.tree_map(
-        lambda a: a + 0.3 * jr.normal(jr.key(21), a.shape) if eqx_is_arr(a) else a,
-        lay,
-    )
-
-
-def test_flux_size_owne_bijection_roundtrip():
-    """flux_size_owne (combined with spin2_owne, the trained-flow config) must
-    still be a valid bijection and an identity at g=0. Unlike the plain (non-
-    spin2_owne) layer, log|det| here is the real spin-2 value (not 0), and the
-    spin-2 inverse is only exact to O(g^2) by construction (see
-    inverse_and_log_det's spin2_owne branch docstring) -- flux_size_owne's own
-    stage is exact (block-triangular, see __init__ note), so the roundtrip
-    residual should stay at that same O(g^2) floor, not blow up."""
-    lay = _fsowne_layer()
-    x = jnp.array([0.3, -0.7, 0.2, -0.4])
-    cond = jnp.array([0.03, -0.02, 12.0, 0.0, 0.0])
-
-    y, lad = lay.transform_and_log_det(x, cond)
-    assert jnp.all(jnp.isfinite(lad))
-    x_rt, lad_inv = lay.inverse_and_log_det(y, cond)
-    assert jnp.allclose(x, x_rt, atol=2e-3), "flux_size_owne forward∘inverse must match to O(g^2)"
-    assert jnp.allclose(lad + lad_inv, 0.0, atol=2e-3), "fwd/inv log|det| must cancel to O(g^2)"
-
-    cond0 = cond.at[:2].set(0.0)
-    y0, _ = lay.transform_and_log_det(x, cond0)
-    assert jnp.allclose(y0, x, atol=1e-9), "flux_size_owne layer must be identity at g=0"
-
-
-def test_flux_size_owne_B12_nonzero_and_equivariant():
-    """The bug this fixes: net_flux_e/net_size_e used to emit (B11,B22,B12) directly
-    from an orientation-blind input, which can only ever represent B11==B22, B12==0
-    (see memory shear-taylor-flux-size-blind-to-orientation). The fix builds B from
-    two invariant scalars (c0,c1) combined with the equivariant tensor
-    (e1^2,e2^2,e1e2) — this checks (1) B12 is now generically NONZERO, and (2) the
-    resulting shift is exactly invariant under a rotation applied jointly to
-    (e1,e2) and (g1,g2), the defining property a spin-0 (flux/size) shift must have."""
-    lay = _fsowne_layer()
-    e1, e2 = 0.18, -0.09
-    g1, g2 = 0.02, -0.015
-
-    B_flux = lay._flux_owne_B(e1, e2)
-    B_size = lay._size_owne_B(0.4, e1, e2)
-    assert abs(float(B_flux[2])) > 1e-8, "flux B12 must be able to be nonzero"
-    assert abs(float(B_size[2])) > 1e-8, "size B12 must be able to be nonzero"
-
-    def shift_scalar(e1v, e2v, g1v, g2v):
-        Bf = lay._flux_owne_B(e1v, e2v)
-        Bs = lay._size_owne_B(0.4, e1v, e2v)
-        zeroA = jnp.zeros(2)
-        return lay._shift(zeroA, Bf, g1v, g2v), lay._shift(zeroA, Bs, g1v, g2v)
-
-    theta = 0.7
-    c, s = jnp.cos(theta), jnp.sin(theta)
-    e1r, e2r = c * e1 - s * e2, s * e1 + c * e2
-    g1r, g2r = c * g1 - s * g2, s * g1 + c * g2
-
-    sf0, ss0 = shift_scalar(e1, e2, g1, g2)
-    sf1, ss1 = shift_scalar(e1r, e2r, g1r, g2r)
-    assert jnp.allclose(sf0, sf1, atol=1e-9), "flux shift must be rotation-invariant"
-    assert jnp.allclose(ss0, ss1, atol=1e-9), "size shift must be rotation-invariant"
 
 
 def test_sobolev_row_weights_match_density_softmax_mean():
@@ -282,9 +259,8 @@ def eqx_is_arr(a):
 if __name__ == "__main__":
     test_bijection_roundtrip_and_identity_at_g0()
     test_shear_derivs_match_autodiff()
+    test_shift_nonzero_and_equivariant()
     test_sobolev_target_recovers_known_quadratic()
-    test_flux_size_owne_bijection_roundtrip()
-    test_flux_size_owne_B12_nonzero_and_equivariant()
     test_sobolev_row_weights_match_density_softmax_mean()
     test_losses_run_with_taylor_and_sobolev()
     print("OK: ShearTaylorLast + Sobolev term self-checks passed")

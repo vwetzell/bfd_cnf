@@ -8,20 +8,19 @@ The prior flow is a composition of three trainable stages, each carrying a
 
   1. ``EquivariantAutoregressiveLayer``  (×9, unconditional) — the base galaxy
      moment *shape* ``p(m)`` at the reference condition.
-  2. the **shear layer** (``ExplicitPolyLast`` OR ``ShearTaylorLast``, whichever
-     the flow was built with; conditional on ``[g1, g2]``) — the entire **shear**
-     response of the prior.
+  2. the **shear layer** (``ShearTaylorLast``; conditional on ``[g1, g2]``) —
+     the entire **shear** response of the prior.
   3. ``SigmaXCouplingLayer``             (conditional on ``[log_scale, e1, e2]``)
      — the entire **centroid-covariance** ``C_X`` response (flux/size monopole
      + ellipticity dipole/quadrupole).
 
 Because the prior's conditioning vector ``[g1, g2, log_scale, e1, e2]`` is read
-by exactly one conditional stage per slot (``g`` → ExplicitPolyLast,
+by exactly one conditional stage per slot (``g`` → ShearTaylorLast,
 ``log_scale/e`` → SigmaXCouplingLayer) and the early layers are unconditional,
 the gradient ``∇_cond log p(m | cond)`` evaluated at a fixed reference condition
 *cleanly partitions* into a per-stage functional signature:
 
-  * ``∂ log p / ∂[g1, g2]``           → ExplicitPolyLast signature.
+  * ``∂ log p / ∂[g1, g2]``           → ShearTaylorLast signature.
   * ``∂ log p / ∂[log_scale, e1, e2]`` → SigmaXCouplingLayer signature.
   * ``log p`` itself                  → base-shape (early-layer) signature.
 
@@ -61,9 +60,9 @@ import numpy as np
 
 from .models.bijections import (
     EquivariantAutoregressiveLayer,
-    ExplicitPolyLast,
     ShearTaylorLast,
     SigmaXCouplingLayer,
+    SigmaXBlockLayer,
 )
 
 # Stage identifiers (order = report order).
@@ -72,18 +71,24 @@ STAGE_POLY = "ShearLayer"
 STAGE_SIGMAX = "SigmaXCouplingLayer"
 STAGE_ORDER = (STAGE_EQUIV, STAGE_POLY, STAGE_SIGMAX)
 
-# Each stage matches one OR MORE bijection types (the shear stage is either the
-# ExplicitPolyLast or the structural ShearTaylorLast layer, whichever the flow was
-# built with — so the param-plateau walk tracks the shear layer under both).
+# Each stage matches one bijection type (the shear stage is the structural
+# ShearTaylorLast layer). SigmaX matches EITHER layer kind (--sigmax-layer
+# autoregressive|block, converge_train.py) -- collect_stage_params's isinstance
+# walk previously matched SigmaXCouplingLayer only, so a SigmaXBlockLayer flow's
+# param history came back permanently EMPTY: drift_diffusion_ratio's rms_step
+# on an all-empty history is exactly 0 ("literally frozen"), so the SigmaX
+# stage's param-side plateau check was vacuously True from the first eligible
+# block regardless of what the layer's real weights were doing (functional-side
+# check still real, but a stage needs BOTH to agree -- see stage_converged).
 _STAGE_TYPES: dict[str, tuple[type, ...]] = {
     STAGE_EQUIV: (EquivariantAutoregressiveLayer,),
-    STAGE_POLY: (ExplicitPolyLast, ShearTaylorLast),
-    STAGE_SIGMAX: (SigmaXCouplingLayer,),
+    STAGE_POLY: (ShearTaylorLast,),
+    STAGE_SIGMAX: (SigmaXCouplingLayer, SigmaXBlockLayer),
 }
 
 # Condition-vector layout: [g1, g2, log_scale, e1, e2].  Which columns each
 # conditional stage reads (and therefore which gradient slice is its signature).
-_POLY_COND_COLS = (0, 1)          # ExplicitPolyLast reads g
+_POLY_COND_COLS = (0, 1)          # ShearTaylorLast reads g
 _SIGMAX_COND_COLS = (2, 3, 4)     # SigmaXCouplingLayer reads [log_scale, e1, e2]
 
 
@@ -112,7 +117,7 @@ def collect_stage_params(prior: Any) -> dict[str, jax.Array]:
     """
     buckets: dict[str, list[jax.Array]] = {name: [] for name in STAGE_ORDER}
     # Flatten {stage: (types...)} to {type: stage} so isinstance can match any of a
-    # stage's types (e.g. the shear stage's ExplicitPolyLast OR ShearTaylorLast).
+    # stage's types.
     name_of = {t: name for name, ts in _STAGE_TYPES.items() for t in ts}
     types = tuple(name_of)
 
@@ -230,7 +235,7 @@ def functional_signatures(
     logp : np.ndarray, shape (Nval,)
         Reference-condition log-density (base-shape signature).
     grad_cond : np.ndarray, shape (Nval, 5)
-        ``∂ log p / ∂cond`` per point.  Columns 0:2 are the ExplicitPolyLast
+        ``∂ log p / ∂cond`` per point.  Columns 0:2 are the ShearTaylorLast
         (shear) signature; columns 2:5 are the SigmaXCouplingLayer (C_X)
         signature.
     """

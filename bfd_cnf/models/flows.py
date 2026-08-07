@@ -28,6 +28,8 @@ from paramax import non_trainable
 from .bijections import (
     BoundedAffine,
     ShearTaylorLast,
+    SigmaXCouplingLayer,
+    SigmaXBlockLayer,
     new_masked_autoregressive_flow,
 )
 from ..config import (
@@ -50,15 +52,8 @@ from ..config import (
     g_scale,
     target_flux_min,
     e_max,
-    shear_layer_kind as _shear_layer_kind,
-    prior_conditional_first as _prior_conditional_first,
-    prior_shear_own_e as _prior_shear_own_e,
-    prior_shear_split_ab as _prior_shear_split_ab,
-    prior_shear_spin2_owne as _prior_shear_spin2_owne,
-    prior_shear_flux_size_owne as _prior_shear_flux_size_owne,
     sobolev_g1_weight as _sobolev_g1_weight,
     sobolev_g2_weight as _sobolev_g2_weight,
-    shear_coeff_ood_weight as _shear_coeff_ood_weight,
 )
 
 # ---------------------------------------------------------------------------
@@ -600,8 +595,7 @@ def _flow_shear_derivs(prior_flow, m0_std: jax.Array, sx_ref: jax.Array):
 
 
 def _find_shear_taylor_layer(prior_flow):
-    """Return the flow's ``ShearTaylorLast`` instance, or ``None`` if it uses a
-    different (e.g. ``poly``) shear layer."""
+    """Return the flow's ``ShearTaylorLast`` instance."""
     layers = [
         n
         for n in jax.tree_util.tree_leaves(
@@ -612,44 +606,72 @@ def _find_shear_taylor_layer(prior_flow):
     return layers[0] if layers else None
 
 
+def _find_sigmax_layer(prior_flow):
+    """Return the flow's ``SigmaXCouplingLayer``/``SigmaXBlockLayer`` instance (or ``None``)."""
+    is_sigmax = lambda x: isinstance(x, (SigmaXCouplingLayer, SigmaXBlockLayer))
+    layers = [
+        n
+        for n in jax.tree_util.tree_leaves(prior_flow, is_leaf=is_sigmax)
+        if is_sigmax(n)
+    ]
+    return layers[0] if layers else None
+
+
 def _shear_response(prior_flow, m0, sx_ref):
     """Flow's data-space moment shear-response ``(A, B)`` at each unsheared moment.
 
-    The response is C_X-independent: ``_flow_shear_derivs`` encodes and decodes at the
-    *same* Σ_X, so the SigmaX layer cancels in the round-trip (a single ``sx_ref``
-    suffices — no averaging over C_X draws).
+    ``ShearTaylorLast`` sits right after the unconditional bulk, with
+    :class:`~.bijections.SigmaXCouplingLayer` chained after it — i.e. Σ_X is now
+    the data-adjacent layer (see :class:`~.bijections.EarlyChain`). So the shear
+    layer's own local generative response
+    (:meth:`~.bijections.ShearTaylorLast.shear_derivs_generative`) is the response
+    at ITS coordinate — one step before Σ_X — not yet the data-space response.
+    Since Σ_X does not depend on ``g``, the data-space response is obtained by the
+    (2nd-order) chain rule through Σ_X's own local transform, evaluated at
+    ``sx_ref``::
 
-    Fast path: when the flow uses a **data-adjacent** ``ShearTaylorLast``
-    (``conditional_first=True``), the response is that layer's analytic generative
-    derivs (:meth:`ShearTaylorLast.shear_derivs_generative`) — no whole-flow autodiff.
-    Otherwise (poly last layer, or base-adjacent) fall back to the autodiff round-trip.
-    The kind/order are static pytree structure, so this branch resolves at trace time.
+        A_data        = J_sx . A_shear
+        B_data[j,a,b] = J_sx . B_shear[.,a,b] + H_sx[j,.,.] : A_shear[.,a] A_shear[.,b]
+
+    ``J_sx``/``H_sx`` are the Jacobian/Hessian of Σ_X's ``transform`` at the shear
+    layer's own g=0 point (recovered from ``m0`` via Σ_X's closed-form inverse) —
+    LOCAL derivatives of Σ_X's small coeff nets, same cost class as
+    ``shear_derivs_generative``'s own ``∂A/∂x``; no whole-flow autodiff.
+
+    Unlike before the shear/Σ_X swap, the response is now genuinely C_X-dependent
+    (Σ_X's Jacobian is a function of ``sx_ref``), so evaluating at a single
+    reference ``sx_ref`` (as callers do, for a cheap Sobolev term) is an
+    approximation rather than an exact simplification — see the call sites in
+    :func:`_sobolev_loss`/``make_elbo_loss``.
     """
-    layer = _find_shear_taylor_layer(prior_flow)
-    conditional_first = getattr(prior_flow.bijection.bijection, "conditional_first", False)
-    # The analytic generative formula (A_gen=-A, B_gen=-B+corr) needs only shift(x,0)=0,
-    # which the plain Taylor layer, spin2_owne, AND own_e all satisfy — shear_derivs
-    # folds own_e's net_m1_e correction into A[2],B[2] (with u3 stop-gradiented so the
-    # correction formula's ∂A/∂x Jacobian doesn't mistreat the fixed u3 as the unknown
-    # m3; see ShearTaylorLast.shear_derivs_generative's docstring). spin2's shear_derivs
-    # feeds it the joint (M1,M2) A,B and it reproduces the true inverse-map response to
-    # 2e-7 (the non-unit det is irrelevant: det affects log_prob, not the moment
-    # response m(g)).
-    if layer is not None and conditional_first:
-        return jax.vmap(layer.shear_derivs_generative)(m0)
-    return _flow_shear_derivs(prior_flow, m0, sx_ref)
+    shear_layer = _find_shear_taylor_layer(prior_flow)
+    sigmax_layer = _find_sigmax_layer(prior_flow)
+    if sigmax_layer is None:
+        return jax.vmap(shear_layer.shear_derivs_generative)(m0)
 
+    sx_cond_full = jnp.concatenate([jnp.zeros(2), sx_ref])  # [g1=0,g2=0,log_scale,e1,e2]
 
-def _coeff_ood_penalty(prior_flow, key):
-    """Mean squared shear-coeff magnitude at synthetic off-template probes.
+    def _one(m0_i):
+        # Within the flow's decode direction, Σ_X's OWN generative step is its
+        # `.inverse_and_log_det` (v -> m; see EarlyChain/Chain composition order),
+        # so recovering the shear layer's fixed point v0 from m0 needs Σ_X's
+        # `.transform_and_log_det` (the inverse of that inverse).
+        v0, _ = sigmax_layer.transform_and_log_det(m0_i, sx_cond_full)
+        A_shear, B_shear = shear_layer.shear_derivs_generative(v0)
 
-    Trains ``ShearTaylorLast``'s coefficient nets toward zero output for
-    (flux, size, |e|) combinations no real template ever visits (see
-    :meth:`ShearTaylorLast.coeff_ood_penalty`). ``0.0`` for flows using a
-    different shear layer (e.g. ``poly``).
-    """
-    layer = _find_shear_taylor_layer(prior_flow)
-    return layer.coeff_ood_penalty(key) if layer is not None else jnp.zeros(())
+        def _sx_generative(v):
+            return sigmax_layer.inverse_and_log_det(v, sx_cond_full)[0]  # v -> m
+
+        J_sx = jax.jacfwd(_sx_generative)(v0)               # (4,4) d(m)/d(v)
+        H_sx = jax.jacfwd(jax.jacfwd(_sx_generative))(v0)   # (4,4,4) d^2(m)/d(v)^2
+
+        A_data = jnp.einsum("ji,ia->ja", J_sx, A_shear)
+        B_data = jnp.einsum("ji,iab->jab", J_sx, B_shear) + jnp.einsum(
+            "jik,ia,kb->jab", H_sx, A_shear, A_shear
+        )
+        return A_data, B_data
+
+    return jax.vmap(_one)(m0)
 
 
 def _sobolev_row_weights(
@@ -661,9 +683,11 @@ def _sobolev_row_weights(
     ∝ nda·detj (the shared batch draw — already identical between the density and
     Sobolev terms, no extra factor needed here) followed by a self-normalised
     softmax-over-batch correction for the residual ``L(X|C_X)`` factor, averaged
-    over the C_X stencil (``loss = mean(losses_sx)``).  A_tgt/B_tgt/A_flow/B_flow
-    (the Sobolev integrand) are C_X-independent, so for a c-independent integrand
-    ``mean_c[softmax_i(logL(X_i|c))]`` would be *exactly* the weight the density
+    over the C_X stencil (``loss = mean(losses_sx)``).  A_tgt/B_tgt are C_X-
+    independent, and A_flow/B_flow were too before the shear/Σ_X layer swap (see
+    ``_shear_response``); treating the Sobolev integrand as c-independent here is
+    now an approximation, not exact, but for a (nearly) c-independent integrand
+    ``mean_c[softmax_i(logL(X_i|c))]`` is still close to the weight the density
     loss's own combination collapses to (mean and sum commute).
 
     That uncapped identity caused a real training divergence (2026-07-30, prior
@@ -692,9 +716,11 @@ def _sobolev_row_weights(
 def _sobolev_loss(prior_flow, y_std_grid, sob1_w, sob2_w, pinv, scale, sx_ref, row_w=None):
     """Sobolev penalty: MSE of (flow − template) 1st/2nd moment shear-response.
 
-    Both the template target (A_tgt, B_tgt) and the flow's response are C_X-independent
-    (see :func:`_shear_response`), so this is a single evaluation at ``sx_ref`` — no
-    per-C_X averaging.
+    The template target (A_tgt, B_tgt) is C_X-independent; the flow's response is
+    now genuinely C_X-dependent since the shear/Σ_X layer swap (see
+    :func:`_shear_response`), so evaluating at a single ``sx_ref`` — rather than
+    averaging over the C_X stencil like the density term does — is a deliberate
+    cheap approximation, not an exact simplification.
 
     ``row_w``, if given, is a (B,) population weight (summing to 1) applied across
     the batch axis instead of a plain mean — see :func:`_sobolev_row_weights`.  Pass
@@ -710,227 +736,6 @@ def _sobolev_loss(prior_flow, y_std_grid, sob1_w, sob2_w, pinv, scale, sx_ref, r
     a_err = jnp.mean((A_flow - A_tgt) ** 2, axis=tuple(range(1, A_flow.ndim)))
     b_err = jnp.mean((B_flow - B_tgt) ** 2, axis=tuple(range(1, B_flow.ndim)))
     return sob1_w * jnp.sum(row_w * a_err) + sob2_w * jnp.sum(row_w * b_err)
-
-
-def warmstart_prior_B(prior_flow, raw2standard, moments, cov, dm_dg, d2m_dg2,
-                      steps=800, lr=1e-2, batch=1024, seed=0):
-    """Seed the flow's SECOND-order shear response B from the template truth.
-
-    Minimises the sob2 term (``mean((B_flow − B_tgt)²)``) over the flow's params by
-    Adam.  With a zero-initialised ShearTaylorLast the first-order coeff A (and thus the
-    generative correction term) is 0, so the sob2 gradient w.r.t the A/bulk params
-    vanishes at init and effectively ONLY the B coeff nets move — a direct regression of
-    B onto the per-template target.  Run this on a fresh (``--from-scratch``) split_ab
-    flow before the main NLL training so B starts near-correct instead of at zero (the
-    zero it otherwise never leaves; see the sob2-B-untrained finding).
-
-    Returns the warm-started ``prior_flow``.  Params: raw ``moments`` (N,4), ``cov``
-    (N,4,4), ``dm_dg`` (N,6,2), ``d2m_dg2`` (N,6,2,2) — the trainer-native template
-    arrays (even-4 slice is taken here)."""
-    import optax
-    from ..data import transform_dataset_to_standard
-
-    g0 = jnp.array([[[0.0, 0.0]]])
-    s2 = 1.0 / jnp.sqrt(2.0)
-    ring = jnp.array([[0, 1], [s2, s2], [1, 0], [s2, -s2],
-                      [0, -1], [-s2, -s2], [-1, 0], [-s2, s2]])[jnp.newaxis]
-    g = jnp.concatenate([g0, 0.01 * ring, 0.02 * ring], axis=1)  # (1,G,2)
-    G = g.shape[1]
-    g2d = g.reshape(G, 2)
-    pinv, scale = _sobolev_pinv(g2d)
-    sx_ref = jnp.zeros(3)
-    N = moments.shape[0]
-
-    params, static = eqx.partition(prior_flow, eqx.is_inexact_array)
-
-    # The batch is gathered OUTSIDE the jit and passed in as args — closing over the full
-    # (millions-row) template arrays would inline them as multi-GB captured constants (OOM).
-    def sob2(params, y_b, S_b, dg_b, d2g_b):
-        flow = eqx.combine(params, static)
-        B = y_b.shape[0]
-        y_sheared = shear(y_b, g, dg_b, d2g_b)              # (B,G,4)
-        y_flat = y_sheared.reshape(B * G, -1)
-        S_flat = jnp.broadcast_to(S_b[:, None], (B, G, 4, 4)).reshape(B * G, 4, 4)
-        y_std, _ = transform_dataset_to_standard(raw2standard, y_flat, S_flat)
-        y_std_grid = y_std.reshape(B, G, -1)
-        _, B_tgt = _sobolev_target(y_std_grid, pinv, scale)
-        _, B_flow = _shear_response(flow, y_std_grid[:, 0, :], sx_ref)
-        return jnp.mean((B_flow - B_tgt) ** 2)
-
-    opt = optax.adam(lr)
-    opt_state = opt.init(params)
-
-    @eqx.filter_jit
-    def step(params, opt_state, y_b, S_b, dg_b, d2g_b):
-        loss, grads = eqx.filter_value_and_grad(sob2)(params, y_b, S_b, dg_b, d2g_b)
-        updates, opt_state = opt.update(grads, opt_state, params)
-        return eqx.apply_updates(params, updates), opt_state, loss
-
-    key = jr.key(seed)
-    bs = min(batch, N)
-    print(f"Warm-start B: regressing 2nd-order response over {steps} steps (batch {bs})...")
-    for i in range(steps):
-        key, sk = jr.split(key)
-        idx = jr.randint(sk, (bs,), 0, N)
-        params, opt_state, loss = step(
-            params, opt_state, moments[idx], cov[idx], dm_dg[idx, :4], d2m_dg2[idx, :4]
-        )
-        if i % 100 == 0 or i == steps - 1:
-            print(f"  warmstart step {i:4d}  sob2={float(loss):.4f}")
-    return eqx.combine(params, static)
-
-
-def warmstart_prior_A(prior_flow, raw2standard, moments, cov, dm_dg, d2m_dg2,
-                      steps=800, lr=1e-2, batch=1024, seed=0):
-    """Seed the flow's FIRST-order shear response A from the template truth.
-
-    Minimises the sob1 term (``mean((A_flow − A_tgt)²)``) over the flow's params by
-    Adam.  ``A_gen = -A`` (see :func:`_shear_response`) is the derivative at ``g=0``
-    of a shift that is (at least locally) linear-plus-quadratic in ``g``, so it depends
-    only on the layer's own linear-in-g coefficient — never on the quadratic-in-g
-    coefficient B or any bulk flow parameter, since ``d/dg[A·g + 1/2 B·g²]|_{g=0} = A``
-    regardless of B.  So this is a direct, isolated regression of A onto the
-    per-template target, independent of :func:`warmstart_prior_B` — the two touch
-    disjoint parameters and may be run in either order.
-
-    Run this on a fresh (``--from-scratch``) taylor flow before the main NLL/ELBO
-    training so A starts near the template-derived truth instead of at its zero init —
-    the same treatment :func:`warmstart_prior_B` already gives the second-order
-    coefficient (see the sob2-B-untrained finding this mirrors for first order).
-
-    Returns the warm-started ``prior_flow``.  Params: raw ``moments`` (N,4), ``cov``
-    (N,4,4), ``dm_dg`` (N,6,2), ``d2m_dg2`` (N,6,2,2) — the trainer-native template
-    arrays (even-4 slice is taken here)."""
-    import optax
-    from ..data import transform_dataset_to_standard
-
-    g0 = jnp.array([[[0.0, 0.0]]])
-    s2 = 1.0 / jnp.sqrt(2.0)
-    ring = jnp.array([[0, 1], [s2, s2], [1, 0], [s2, -s2],
-                      [0, -1], [-s2, -s2], [-1, 0], [-s2, s2]])[jnp.newaxis]
-    g = jnp.concatenate([g0, 0.01 * ring, 0.02 * ring], axis=1)  # (1,G,2)
-    G = g.shape[1]
-    g2d = g.reshape(G, 2)
-    pinv, scale = _sobolev_pinv(g2d)
-    sx_ref = jnp.zeros(3)
-    N = moments.shape[0]
-
-    params, static = eqx.partition(prior_flow, eqx.is_inexact_array)
-
-    # The batch is gathered OUTSIDE the jit and passed in as args — closing over the full
-    # (millions-row) template arrays would inline them as multi-GB captured constants (OOM).
-    def sob1(params, y_b, S_b, dg_b, d2g_b):
-        flow = eqx.combine(params, static)
-        B = y_b.shape[0]
-        y_sheared = shear(y_b, g, dg_b, d2g_b)              # (B,G,4)
-        y_flat = y_sheared.reshape(B * G, -1)
-        S_flat = jnp.broadcast_to(S_b[:, None], (B, G, 4, 4)).reshape(B * G, 4, 4)
-        y_std, _ = transform_dataset_to_standard(raw2standard, y_flat, S_flat)
-        y_std_grid = y_std.reshape(B, G, -1)
-        A_tgt, _ = _sobolev_target(y_std_grid, pinv, scale)
-        A_flow, _ = _shear_response(flow, y_std_grid[:, 0, :], sx_ref)
-        return jnp.mean((A_flow - A_tgt) ** 2)
-
-    opt = optax.adam(lr)
-    opt_state = opt.init(params)
-
-    @eqx.filter_jit
-    def step(params, opt_state, y_b, S_b, dg_b, d2g_b):
-        loss, grads = eqx.filter_value_and_grad(sob1)(params, y_b, S_b, dg_b, d2g_b)
-        updates, opt_state = opt.update(grads, opt_state, params)
-        return eqx.apply_updates(params, updates), opt_state, loss
-
-    key = jr.key(seed)
-    bs = min(batch, N)
-    print(f"Warm-start A: regressing 1st-order response over {steps} steps (batch {bs})...")
-    for i in range(steps):
-        key, sk = jr.split(key)
-        idx = jr.randint(sk, (bs,), 0, N)
-        params, opt_state, loss = step(
-            params, opt_state, moments[idx], cov[idx], dm_dg[idx, :4], d2m_dg2[idx, :4]
-        )
-        if i % 100 == 0 or i == steps - 1:
-            print(f"  warmstart step {i:4d}  sob1={float(loss):.4f}")
-    return eqx.combine(params, static)
-
-
-def warmstart_prior_AB(prior_flow, raw2standard, moments, cov, dm_dg, d2m_dg2,
-                       sob1_w=1.0, sob2_w=1.0, steps=800, lr=1e-2, batch=1024, seed=0):
-    """Jointly seed the flow's 1st- AND 2nd-order shear response (A, B) from template
-    truth, in a single pass — the combination-safe alternative to running
-    :func:`warmstart_prior_A` and :func:`warmstart_prior_B` back to back.
-
-    Minimises the SAME combined loss used in main training (:func:`_sobolev_loss`:
-    ``sob1_w·mean((A_flow−A_tgt)²) + sob2_w·mean((B_flow−B_tgt)²)``) over the flow's
-    params by Adam.
-
-    Why not just run A then B (or B then A)?  The generative 2nd-order response is
-    ``B_gen = -B + correction(A, ∂A/∂x)`` (see
-    :meth:`ShearTaylorLast.shear_derivs_generative`) — built entirely from this layer's
-    own coefficient nets, so a sob2-ONLY step's gradient can flow back into A's coeff
-    net too, once A ≠ 0.  :func:`warmstart_prior_B`'s "only B moves" guarantee relies on
-    A being exactly 0 (true only at a fresh, from-scratch init); on an existing/resumed
-    flow A is already nonzero, so a sob2-only step can nudge A away from A_tgt again
-    right after (or before) an A-only step set it correctly — the two steps can fight
-    each other. Minimising both terms simultaneously has no such issue: A_tgt is right
-    there in the same loss, opposing any pull away from it via the B term. Safe to run
-    on either a fresh (``--from-scratch``) OR an already-trained (resumed, via
-    ``--prior-in``) flow — nothing about the argument depends on the checkpoint's
-    current A/B values.
-
-    Returns the warm-started ``prior_flow``.  Params: raw ``moments`` (N,4), ``cov``
-    (N,4,4), ``dm_dg`` (N,6,2), ``d2m_dg2`` (N,6,2,2) — the trainer-native template
-    arrays (even-4 slice is taken here)."""
-    import optax
-    from ..data import transform_dataset_to_standard
-
-    g0 = jnp.array([[[0.0, 0.0]]])
-    s2 = 1.0 / jnp.sqrt(2.0)
-    ring = jnp.array([[0, 1], [s2, s2], [1, 0], [s2, -s2],
-                      [0, -1], [-s2, -s2], [-1, 0], [-s2, s2]])[jnp.newaxis]
-    g = jnp.concatenate([g0, 0.01 * ring, 0.02 * ring], axis=1)  # (1,G,2)
-    G = g.shape[1]
-    g2d = g.reshape(G, 2)
-    pinv, scale = _sobolev_pinv(g2d)
-    sx_ref = jnp.zeros(3)
-    N = moments.shape[0]
-
-    params, static = eqx.partition(prior_flow, eqx.is_inexact_array)
-
-    # The batch is gathered OUTSIDE the jit and passed in as args — closing over the full
-    # (millions-row) template arrays would inline them as multi-GB captured constants (OOM).
-    def sob_ab(params, y_b, S_b, dg_b, d2g_b):
-        flow = eqx.combine(params, static)
-        B = y_b.shape[0]
-        y_sheared = shear(y_b, g, dg_b, d2g_b)              # (B,G,4)
-        y_flat = y_sheared.reshape(B * G, -1)
-        S_flat = jnp.broadcast_to(S_b[:, None], (B, G, 4, 4)).reshape(B * G, 4, 4)
-        y_std, _ = transform_dataset_to_standard(raw2standard, y_flat, S_flat)
-        y_std_grid = y_std.reshape(B, G, -1)
-        return _sobolev_loss(flow, y_std_grid, sob1_w, sob2_w, pinv, scale, sx_ref)
-
-    opt = optax.adam(lr)
-    opt_state = opt.init(params)
-
-    @eqx.filter_jit
-    def step(params, opt_state, y_b, S_b, dg_b, d2g_b):
-        loss, grads = eqx.filter_value_and_grad(sob_ab)(params, y_b, S_b, dg_b, d2g_b)
-        updates, opt_state = opt.update(grads, opt_state, params)
-        return eqx.apply_updates(params, updates), opt_state, loss
-
-    key = jr.key(seed)
-    bs = min(batch, N)
-    print(f"Warm-start A+B: jointly regressing 1st+2nd-order response over {steps} steps "
-          f"(batch {bs})...")
-    for i in range(steps):
-        key, sk = jr.split(key)
-        idx = jr.randint(sk, (bs,), 0, N)
-        params, opt_state, loss = step(
-            params, opt_state, moments[idx], cov[idx], dm_dg[idx, :4], d2m_dg2[idx, :4]
-        )
-        if i % 100 == 0 or i == steps - 1:
-            print(f"  warmstart step {i:4d}  sob1+sob2={float(loss):.4f}")
-    return eqx.combine(params, static)
 
 
 # ---------------------------------------------------------------------------
@@ -954,7 +759,6 @@ def make_elbo_loss(
     std_off: jax.Array | None = None,
     sobolev_g1_weight: float = _sobolev_g1_weight,
     sobolev_g2_weight: float = _sobolev_g2_weight,
-    coeff_ood_weight: float = _shear_coeff_ood_weight,
 ) -> Callable:
     """Build the ELBO loss function for training the (prior_flow, q_flow) pair.
 
@@ -997,11 +801,6 @@ def make_elbo_loss(
         > 0 the loss adds ``λ · MSE`` between the prior flow's own moment shear-
         response (1st / 2nd ``d m / d g`` of its decode map, by autodiff) and the
         template truth (a quadratic fit of the sheared moments over the g-grid).
-    coeff_ood_weight : float, optional
-        Weight for the shear-coeff off-template penalty (0 = off; see
-        ``ShearTaylorLast.coeff_ood_penalty``). Trains the shear layer's
-        coefficient nets toward zero on synthetic (flux, size, |e|) probes beyond
-        where real templates live, independent of the training batch.
 
     Returns
     -------
@@ -1009,8 +808,16 @@ def make_elbo_loss(
         ``(model_tuple, data_y, data_Sigma, data_dg, data_d2g, data_X, key) -> scalar``
     """
     _use_sx = use_sx and (log_scale_range is not None)
+    # A degenerate stencil (log_scale_range collapsed to a single point, e_max=0
+    # -- converge_train.py's --sigmax-layer none) makes every one of the 17
+    # stencil draws land on the SAME sx_cond, so _sample_sx_conds + lax.map
+    # would recompute the identical log_pz 17x for nothing. Skip the stencil
+    # entirely and evaluate once at that single point (L(X|C_X) still applied
+    # -- this is not the same as _use_sx=False, which drops L(X|C_X) too).
+    _sx_fixed_point = (
+        _use_sx and log_scale_range[0] == log_scale_range[1] and e_max == 0.0
+    )
     _sob_on = (sobolev_g1_weight > 0.0) or (sobolev_g2_weight > 0.0)
-    _ood_on = coeff_ood_weight > 0.0
 
     # ``weights`` is the batch-sampling proposal = nda (BFD template weight, HT-corrected;
     # see _finalize_dataset).  Sampling ∝ nda·detj ⇒ residual per-copy weight is L(X|C_X) only.
@@ -1037,7 +844,9 @@ def make_elbo_loss(
             [-sqrt2, sqrt2],
         ]
     )[jnp.newaxis, :, :]
-    g = jnp.concatenate([g0, 0.01 * g_grid, 0.02 * g_grid], axis=1)  # (1, G, 2) centre + 2 rings
+    # 9 radii -- restored 2026-08-05 (see make_nll_loss's matching comment).
+    _radii = jnp.array([0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05])[:, None, None]
+    g = jnp.concatenate([g0] + [r * g_grid for r in _radii], axis=1)  # (1, G, 2)
     G = g.shape[1]
     g2d = g.reshape(G, -1)  # (G, 2)
 
@@ -1045,7 +854,7 @@ def make_elbo_loss(
     if _sob_on:
         _sob_pinv, _sob_scale = _sobolev_pinv(g2d)
         _ls_ref = 0.5 * (log_scale_range[0] + log_scale_range[1]) if _use_sx else 0.0
-        _sob_sx_ref = jnp.array([_ls_ref, 0.0, 0.0])  # single reference Σ_X for the (C_X-independent) Sobolev shear-response
+        _sob_sx_ref = jnp.array([_ls_ref, 0.0, 0.0])  # single reference Σ_X the Sobolev shear-response is evaluated at (approximation, see _shear_response)
 
     # Import here to avoid circular at module level
     from ..data import transform_dataset_to_standard
@@ -1138,8 +947,6 @@ def make_elbo_loss(
         # the old per-template softmax *over* C_X draws.  Losses for the n_sx random
         # C_X draws are then averaged.
         if _use_sx:
-            key, k_sx = jr.split(key)
-            sx_conds = _sample_sx_conds(k_sx, log_scale_range, e_max)  # (17, 3)
             X_b = data_X[idx]  # (B, 2)  true centroid moments [MX, MY] at g=0
             # Shear the centroid by its own derivatives [4:6] so L(X(g)|C_X) tracks
             # the BFD centroid shear response (was held at g=0).  See make_nll_loss.
@@ -1163,9 +970,16 @@ def make_elbo_loss(
                 w_bg = jax.nn.softmax(logL_bg, axis=0)  # (B, G) per-g, cols sum to 1
                 return -jnp.mean(jnp.sum(w_bg * lse, axis=0))  # mean over g
 
-            # jax.checkpoint keeps lax.map from holding all n_sx residuals at once.
-            losses_sx = jax.lax.map(jax.checkpoint(_loss_for_sx), sx_conds)  # (n_sx,)
-            loss = jnp.mean(losses_sx)
+            if _sx_fixed_point:
+                # Every stencil point is the same real (log_scale, 0, 0) -- evaluate
+                # once, no stencil/lax.map, no key spent (nothing random to draw).
+                loss = _loss_for_sx(jnp.array([log_scale_range[0], 0.0, 0.0]))
+            else:
+                key, k_sx = jr.split(key)
+                sx_conds = _sample_sx_conds(k_sx, log_scale_range, e_max)  # (17, 3)
+                # jax.checkpoint keeps lax.map from holding all n_sx residuals at once.
+                losses_sx = jax.lax.map(jax.checkpoint(_loss_for_sx), sx_conds)  # (n_sx,)
+                loss = jnp.mean(losses_sx)
         else:
             # prior conditioned on [g1, g2, log_scale=0, e1=0, e2=0]
             cond_p = jnp.concatenate(
@@ -1183,8 +997,9 @@ def make_elbo_loss(
             loss = -jnp.mean(lse)
 
         if _sob_on:
-            # Shear-response is C_X-independent (see _shear_response), so a single
-            # reference sx_ref suffices — no averaging over the sx_conds draws.
+            # Shear-response is now C_X-dependent post shear/Σ_X swap (see
+            # _shear_response); evaluating at a single reference sx_ref instead of
+            # averaging over the sx_conds draws is a deliberate cheap approximation.
             #
             # The target/anchor must be the DENOISED moment, not y_std (the noisy
             # observed template): ELBO mode exists precisely to avoid the "m≈y"
@@ -1207,13 +1022,12 @@ def make_elbo_loss(
             denoised_std_grid = jax.vmap(raw2standard.transform)(
                 x0_sheared.reshape(BG, -1)
             ).reshape(batch_size, G, -1)
-            # row-weighting rolled back 2026-07-30: _sobolev_row_weights reuses the
-            # density term's centroid-marginalisation softmax (see _batch_log_L_X) as an
-            # importance weight on a per-template SUPERVISED regression target, not an
-            # expectation — that reallocates fitting capacity toward small-|X| (bright/
-            # small) templates instead of correcting an estimator, and produced a large
-            # sign-flipping m-bias regression (verified: clean flows all used row_w=None).
-            row_w = None
+            # 2026-08-05 retry -- see make_nll_loss's matching comment for the full
+            # reasoning (previously rolled back 2026-07-30 for a sign-flipping
+            # m-bias; retrying now that the implicit loss's own B-identifiability
+            # is dramatically better, so starving low-L(X|C_X) regions of Sobolev
+            # supervision should be far less costly than it was back then).
+            row_w = _sobolev_row_weights(X_b, _sob_sx_ref[None, :]) if _use_sx else None
             loss = loss + _sobolev_loss(
                 prior_flow,
                 denoised_std_grid,
@@ -1224,10 +1038,6 @@ def make_elbo_loss(
                 _sob_sx_ref,
                 row_w,
             )
-
-        if _ood_on:
-            key, k_ood = jr.split(key)
-            loss = loss + coeff_ood_weight * _coeff_ood_penalty(prior_flow, k_ood)
 
         return loss
 
@@ -1250,7 +1060,10 @@ def make_nll_loss(
     raw2standard: Any = None,
     sobolev_g1_weight: float = _sobolev_g1_weight,
     sobolev_g2_weight: float = _sobolev_g2_weight,
-    coeff_ood_weight: float = _shear_coeff_ood_weight,
+    freeze_centroid_reweight_at_g0: bool = False,
+    disable_centroid_reweight: bool = False,
+    stencil_radii: jax.Array | None = None,
+    curvature_weight: float = 0.0,
 ) -> Callable:
     """Direct NLL loss for prior-only pre-training (m ≈ y approximation).
 
@@ -1274,12 +1087,50 @@ def make_nll_loss(
     term as :func:`make_elbo_loss` (0 = off): ``λ · MSE`` between the prior flow's own
     moment shear-response and the template quadratic-fit truth.
 
+    ``freeze_centroid_reweight_at_g0`` (default False, EXPERIMENTAL/diagnostic):
+    normally the per-copy softmax weight w_bg = softmax(L(X(g)|C_X)) is recomputed
+    at EACH g-stencil point from the SHEARED centroid X(g) -- i.e. which copies
+    dominate the batch average changes from one stencil point to the next, since
+    each copy's OWN centroid response dX/dg differs (real spread, unlike each
+    copy's m-channel dm/dg which is fairly homogeneous at fixed flux/size -- see
+    the 2026-08-05 investigation). ShearTaylorLast is a PURE bijective transport:
+    it can only move mass along smooth per-point trajectories, it has no
+    mechanism to represent this independent g-dependent REWEIGHTING of which
+    samples matter. The hypothesis: the optimizer, unable to represent this
+    reweighting effect any other way, partially "fakes" it via anomalously large
+    B (2nd-order) coefficients concentrated at the outer stencil ring, where the
+    reweighting-vs-g0 divergence is largest. Setting this True computes w_bg ONCE
+    from the g=0 centroid X_b and reuses it for every stencil column (freezing
+    "which copies count" at its g=0 value) -- a deliberate simplification, not
+    obviously more physically correct, but a clean ablation: if B's blowup
+    shrinks substantially with this on, that's strong evidence the reweighting
+    mechanism (not weak identifiability alone) is the driver.
+
+    ``disable_centroid_reweight`` (default False, EXPERIMENTAL/diagnostic):
+    a stronger ablation than the freeze above -- drops the SNIS L(X|C_X)
+    softmax entirely (flat/uniform mean over the batch, ignoring L(X|C_X)
+    altogether), rather than just freezing its g-dependence. 2026-08-05
+    ESS investigation found a real, flux-localized 2-3% bias in the
+    softmax's finite-batch estimate (loss_lx_ess_check.py); fixing that via
+    an 8x larger batch left the m-tilt unchanged (see
+    snis-batch-size-fix-does-not-fix-tilt memory). This tests the stronger
+    claim -- does the reweighting MECHANISM itself (not just its ESS bias)
+    play any causal role at all.
+
     Returned signature:
         (prior_flow, data_y, data_Sigma, data_dg, data_d2g, data_X, key) -> scalar
     """
     _use_sx = use_sx and (log_scale_range is not None)
+    # A degenerate stencil (log_scale_range collapsed to a single point, e_max=0
+    # -- converge_train.py's --sigmax-layer none) makes every one of the 17
+    # stencil draws land on the SAME sx_cond, so _sample_sx_conds + lax.map
+    # would recompute the identical log_pz 17x for nothing. Skip the stencil
+    # entirely and evaluate once at that single point (L(X|C_X) still applied
+    # -- this is not the same as _use_sx=False, which drops L(X|C_X) too).
+    _sx_fixed_point = (
+        _use_sx and log_scale_range[0] == log_scale_range[1] and e_max == 0.0
+    )
     _sob_on = (sobolev_g1_weight > 0.0) or (sobolev_g2_weight > 0.0)
-    _ood_on = coeff_ood_weight > 0.0
 
     # ``weights`` is the batch-sampling proposal = nda (BFD template weight, HT-corrected;
     # see _finalize_dataset).  Sampling ∝ nda·detj ⇒ residual per-copy weight is L(X|C_X) only.
@@ -1300,7 +1151,34 @@ def make_nll_loss(
             [0.0, -1.0], [-sqrt2, -sqrt2], [-1.0, 0.0], [-sqrt2, sqrt2],
         ]
     )[jnp.newaxis, :, :]
-    g = jnp.concatenate([g0, 0.01 * g_grid, 0.02 * g_grid], axis=1)  # (1, G, 2) centre + 2 rings
+    # 9 radii -- separating a linear (A) from a quadratic (B) response from only 2
+    # non-zero radii is the bare minimum (3 points for 3 unknowns f0,A,B: exactly
+    # determined, zero redundancy to average out per-step batch noise, and a short
+    # lever arm for the g^2 term's curvature to stand out against the g term).
+    # More, wider-spaced radii give the implicit density loss genuine statistical
+    # redundancy + a longer lever arm for B, without any explicit A/B regression
+    # -- see 2026-08-05 investigation (this alone, tried as a std-2-radii-only
+    # rescale, did not fix the nosob B blowup; a wider/denser radial stencil is a
+    # different, untried lever). Round 2: widened/densified further after the
+    # 5-radius version gave a real, consistent ~2-2.5x reduction in B's mismatch
+    # (not full convergence) -- 0.05 stays within the docstring's own noted
+    # physically-relevant |g| range. Round 3 (same day): dropped back to 2 radii
+    # to free up compute for --batch-size 4096 (SNIS ESS investigation). Round 4
+    # (same day): restored to 9 -- that batch-size test showed the m-tilt
+    # unchanged either way (snis-batch-size-fix-does-not-fix-tilt memory), so
+    # there's no reason to keep trading stencil accuracy for batch size.
+    #
+    # ``stencil_radii`` overrides the default 9-radius stencil (diagnostic knob,
+    # 2026-08-06): pass ``jnp.array([])`` to train on ONLY the g0 point, isolating
+    # whether the shared-parameter multi-g averaging itself (vs. the shear layer's
+    # mere presence, or the flux-selection term) is what pulls the bulk layers'
+    # g=0 fit away from a clean unit normal -- see the bulk-only isolation test.
+    _radii = (
+        stencil_radii
+        if stencil_radii is not None
+        else jnp.array([0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05])
+    )[:, None, None]
+    g = jnp.concatenate([g0] + [r * g_grid for r in _radii], axis=1)  # (1, G, 2)
     G = g.shape[1]
     g2d = g.reshape(G, -1)  # (G, 2)
 
@@ -1308,7 +1186,7 @@ def make_nll_loss(
     if _sob_on:
         _sob_pinv, _sob_scale = _sobolev_pinv(g2d)
         _ls_ref = 0.5 * (log_scale_range[0] + log_scale_range[1]) if _use_sx else 0.0
-        _sob_sx_ref = jnp.array([_ls_ref, 0.0, 0.0])  # single reference Σ_X for the (C_X-independent) Sobolev shear-response
+        _sob_sx_ref = jnp.array([_ls_ref, 0.0, 0.0])  # single reference Σ_X the Sobolev shear-response is evaluated at (approximation, see _shear_response)
 
     def nll_loss(prior_flow, data_y, data_Sigma, data_dg, data_d2g, data_X, key):
         # ── batch sampling ∝ nda·detj (proposal == objective's static part) ────
@@ -1347,13 +1225,19 @@ def make_nll_loss(
 
         # ── Σ_X marginalisation ───────────────────────────────────────────
         if _use_sx:
-            key, k_sx = jr.split(key)
-            sx_conds = _sample_sx_conds(k_sx, log_scale_range, e_max)  # (17, 3)
             X_b = data_X[idx]  # (B, 2)  centroid at g=0
             # Shear the centroid by its own derivatives [4:6] so the weight
             # L(X(g)|C_X) tracks the BFD centroid shear response (was held at g=0).
             X_bg = shear(X_b, g, dg_b[:, 4:6], d2g_b[:, 4:6])  # (B, G, 2)
             X_bg_flat = X_bg.reshape(BG, 2)
+            # EXPERIMENTAL (see docstring): reuse the g=0 centroid for every
+            # stencil column instead of the per-g sheared one, so w_bg no longer
+            # varies with g -- ablation for whether the g-dependent REWEIGHTING
+            # (not just weak identifiability) is driving the 2nd-order blowup.
+            X_bg_flat_for_L = (
+                jnp.broadcast_to(X_b[:, None, :], (batch_size, G, 2)).reshape(BG, 2)
+                if freeze_centroid_reweight_at_g0 else X_bg_flat
+            )
 
             def _loss_for_sx(sx_cond):
                 sx_tiled = jnp.broadcast_to(sx_cond[None, :], (BG, 3))
@@ -1362,7 +1246,17 @@ def make_nll_loss(
                     batch_size, G
                 )  # (B, G)
                 log_p_minus_sel = log_p - log_p_sel
-                logL_bg = _batch_log_L_X(X_bg_flat, sx_cond).reshape(batch_size, G)
+                if disable_centroid_reweight:
+                    # FULL ablation (distinct from freeze_centroid_reweight_at_g0, which
+                    # still applies the softmax but freezes its g-dependence): skip the
+                    # SNIS L(X|C_X) correction entirely -- flat mean over the batch, same
+                    # as the _use_sx=False branch below. Tests whether the reweighting
+                    # MECHANISM itself (not just its finite-batch ESS bias, see
+                    # loss_lx_ess_check.py / snis-batch-size-fix-does-not-fix-tilt memory)
+                    # has any causal role in the m-tilt, since fixing the ESS bias via a
+                    # bigger batch (2026-08-05) left the tilt unchanged.
+                    return -jnp.mean(jnp.mean(log_p_minus_sel, axis=0))  # mean over g
+                logL_bg = _batch_log_L_X(X_bg_flat_for_L, sx_cond).reshape(batch_size, G)
                 # Batch drawn ∝ nda·detj ⇒ the ONLY residual per-copy weight is the BFD
                 # centroid marginalisation L(X(g)|C_X), self-normalised per g ⇒ the
                 # nda·detj·L X-marginal for this C_X.  detj is in the proposal, not here;
@@ -1370,8 +1264,15 @@ def make_nll_loss(
                 w_bg = jax.nn.softmax(logL_bg, axis=0)  # (B, G) per-g, cols sum to 1
                 return -jnp.mean(jnp.sum(w_bg * log_p_minus_sel, axis=0))  # mean over g
 
-            losses_sx = jax.lax.map(jax.checkpoint(_loss_for_sx), sx_conds)
-            loss = jnp.mean(losses_sx)
+            if _sx_fixed_point:
+                # Every stencil point is the same real (log_scale, 0, 0) -- evaluate
+                # once, no stencil/lax.map, no key spent (nothing random to draw).
+                loss = _loss_for_sx(jnp.array([log_scale_range[0], 0.0, 0.0]))
+            else:
+                key, k_sx = jr.split(key)
+                sx_conds = _sample_sx_conds(k_sx, log_scale_range, e_max)  # (17, 3)
+                losses_sx = jax.lax.map(jax.checkpoint(_loss_for_sx), sx_conds)
+                loss = jnp.mean(losses_sx)
         else:
             # No C_X ⇒ no L; batch is already ∝ nda·detj ⇒ plain mean NLL over the batch.
             cond_p = jnp.concatenate(
@@ -1380,13 +1281,62 @@ def make_nll_loss(
             log_p = prior_flow.log_prob(y_std, condition=cond_p).reshape(batch_size, G)
             loss = -jnp.mean(log_p - log_p_sel)
 
+            # ``curvature_weight`` (2026-08-06, EXPERIMENTAL, _use_sx=False path only):
+            # direct penalty on d^2[log p(y_fixed; g)]/dg1^2 having the WRONG (positive/
+            # convex) sign at FIXED y (only the CONDITIONING g varies) -- this is the
+            # inference-relevant quantity (BFD's own R=-d2(logP)/dg2 MLE curvature),
+            # NOT the training-stencil quantity log_p[:, col] used for the main loss
+            # above (there y ALSO moves with g, via `shear(y_b, g, ...)`, which mixes
+            # in the response dy/dg and is a different, already-well-fit object -- an
+            # earlier version of this penalty reused those columns and, correctly,
+            # had ZERO effect on the broken quantity). Costs 2 extra prior_flow.log_prob
+            # calls (cheap vs. the existing G=73-point stencil). Motivated by repeated
+            # empirical failure of Sobolev supervision (which only fixes ShearTaylorLast's
+            # OWN A,B coefficients, not the WHOLE flow's fixed-y log p(g) curvature --
+            # these decouple because log p also depends on the base density's score) to
+            # reliably give log p(y_fixed; g) a real peak near the true shear: across
+            # seeds/window-reweighting variants, the sign of this curvature was
+            # essentially a coin flip. A well-specified P(m|g) must be concave in g at
+            # fixed y for BFD's MLE estimator to recover sane shears -- this term
+            # supervises that necessary condition directly.
+            if curvature_weight > 0.0 and _radii.shape[0] > 0:
+                _k = _radii.shape[0] - 1  # widest radius: largest curvature lever arm
+                _r = _radii[_k, 0, 0]  # _radii is (K,1,1) -- squeeze to a scalar
+                _y_g0 = y_std.reshape(batch_size, G, 4)[:, 0, :]  # fixed (unsheared) data
+                _cond_p1 = jnp.concatenate(
+                    [jnp.broadcast_to(jnp.array([_r, 0.0]), (batch_size, 2)),
+                     jnp.zeros((batch_size, 3))], axis=-1,
+                )
+                _cond_m1 = jnp.concatenate(
+                    [jnp.broadcast_to(jnp.array([-_r, 0.0]), (batch_size, 2)),
+                     jnp.zeros((batch_size, 3))], axis=-1,
+                )
+                _lp_p = prior_flow.log_prob(_y_g0, condition=_cond_p1)
+                _lp_m = prior_flow.log_prob(_y_g0, condition=_cond_m1)
+                _d2_g1 = (_lp_p - 2.0 * log_p[:, 0] + _lp_m) / (_r * _r)
+                loss = loss + curvature_weight * jnp.mean(jax.nn.relu(_d2_g1))
+
         if _sob_on:
-            # Shear-response is C_X-independent (see _shear_response), so a single
-            # reference sx_ref suffices — no averaging over the sx_conds draws.
-            # row-weighting rolled back 2026-07-30: see the make_nll_loss call site for
-            # why (_sobolev_row_weights misapplies an SNIS importance weight to a fixed
-            # per-template regression target; caused a large sign-flipping m-bias).
-            row_w = None
+            # Shear-response is now C_X-dependent post shear/Σ_X swap (see
+            # _shear_response); evaluating at a single reference sx_ref instead of
+            # averaging over the sx_conds draws is a deliberate cheap approximation.
+            # 2026-08-05 retry (previously rolled back 2026-07-30, see git/memory
+            # history: "_sobolev_row_weights misapplies an SNIS importance weight
+            # to a fixed per-template regression target, starving supervision in
+            # low-L(X|C_X) [low-flux] regions and letting the (back then, much
+            # more poorly identified) implicit density loss fill the gap badly
+            # -- caused a large sign-flipping m-bias"). Retrying now that the
+            # implicit loss's own B-identifiability is dramatically better
+            # (real-only coefficients, wide stencil, bounded loc1, full LR decay
+            # -- see that day's investigation): the specific failure mode this
+            # was rolled back for should be much less severe as a fallback now,
+            # so this is a genuine re-test, not a blind repeat. Empirically
+            # motivated by the CONFIRMED low-flux-concentrated bias in the
+            # UNWEIGHTED Sobolev target vs the properly nda*detj*L(X|C_X)-
+            # weighted truth (shear_derivs_channel_audit.py): e.g. r1's dA/dg1
+            # off by 15-35% at low flux, ~0% at high flux -- same footprint as
+            # the standard m-tilt's positive (low-flux) lobe.
+            row_w = _sobolev_row_weights(X_b, _sob_sx_ref[None, :]) if _use_sx else None
             loss = loss + _sobolev_loss(
                 prior_flow,
                 y_std.reshape(batch_size, G, -1),
@@ -1397,10 +1347,6 @@ def make_nll_loss(
                 _sob_sx_ref,
                 row_w,
             )
-
-        if _ood_on:
-            key, k_ood = jr.split(key)
-            loss = loss + coeff_ood_weight * _coeff_ood_penalty(prior_flow, k_ood)
 
         return loss
 
@@ -1428,17 +1374,12 @@ def build_flows(
     prior_size_loc_c1: float | None = None,
     raw2standard: Any = None,
     prior_e_max: float = e_max,
+    sigmax_layer_kind: str = "autoregressive",
     q_flow_layers: int = q_flow_layers,
     q_nn_width: int = q_nn_width,
     q_nn_depth: int = q_nn_depth,
     min_scale: float = min_scale,
     max_scale: float = max_scale,
-    shear_layer_kind: str = _shear_layer_kind,
-    prior_conditional_first: bool = _prior_conditional_first,
-    prior_shear_own_e: bool = _prior_shear_own_e,
-    prior_shear_split_ab: bool = _prior_shear_split_ab,
-    prior_shear_spin2_owne: bool = _prior_shear_spin2_owne,
-    prior_shear_flux_size_owne: bool = _prior_shear_flux_size_owne,
 ) -> tuple[Any, Any]:
     """Construct the prior and variational (q) normalizing flows.
 
@@ -1485,6 +1426,13 @@ def build_flows(
     prior_sigmax_log_scale_std : float, optional
         Std of the log-scale prior for SigmaX conditioning.  Default from
         ``config.prior_sigmax_log_scale_std``.
+    sigmax_layer_kind : {"autoregressive", "block", "none"}, optional
+        Which SigmaX layer to build -- see
+        :func:`~.bijections.new_masked_autoregressive_flow`. Default
+        ``"autoregressive"`` (the original :class:`SigmaXCouplingLayer`).
+        ``"none"`` omits the layer entirely (``sigmax_cond_dim=None``): only
+        correct for a homoscedastic dataset whose training data is already
+        weighted at the real (single) Sigma_X.
     q_flow_layers : int, optional
         Number of masked autoregressive layers in the q flow.  Default from
         ``config.q_flow_layers``.
@@ -1536,20 +1484,19 @@ def build_flows(
         last_layer_nn_width=prior_last_nn_width,
         last_layer_cond_dim=5,  # was 2 — full [g1, g2, log_scale, e1, e2]
         invert=True,
-        quadratic_last=True,
-        sigmax_cond_dim=5,  # enables SigmaXCouplingLayer
+        # "none" disables the SigmaX layer entirely (sigmax_cond_dim=None) --
+        # for a homoscedastic dataset (every target shares one Sigma_X) the
+        # layer marginalises over nothing; correct only if the TRAINING DATA's
+        # own nda*detj*L(X|C_X) weighting already reflects that one real
+        # Sigma_X (see imsims.templates.per_copy_weight), not a placeholder.
+        sigmax_cond_dim=(None if sigmax_layer_kind == "none" else 5),
         sigmax_nn_width=prior_sigmax_nn_width,
         sigmax_nn_depth=prior_sigmax_nn_depth,
         sigmax_log_scale_mean=prior_sigmax_log_scale_mean,
         sigmax_log_scale_std=prior_sigmax_log_scale_std,
         sigmax_e_max=prior_e_max,
         sigmax_size_loc=prior_size_loc_c1,
-        shear_layer_kind=shear_layer_kind,
-        conditional_first=prior_conditional_first,
-        shear_own_e=prior_shear_own_e,
-        shear_split_ab=prior_shear_split_ab,
-        shear_spin2_owne=prior_shear_spin2_owne,
-        shear_flux_size_owne=prior_shear_flux_size_owne,
+        sigmax_layer_kind=sigmax_layer_kind,
     )
 
     q_flow = masked_autoregressive_flow(

@@ -9,8 +9,8 @@ Convergence is assessed independently for the three trainable stages of the
 prior (see :mod:`bfd_cnf.convergence_metrics`):
 
   * ``EquivariantAutoregressiveLayer`` — base moment shape.
-  * ``ExplicitPolyLast``              — shear (g) response.
-  * ``SigmaXCouplingLayer``           — centroid-covariance (C_X) response.
+  * ``ShearTaylorLast``                — shear (g) response.
+  * ``SigmaXCouplingLayer``            — centroid-covariance (C_X) response.
 
 For each stage and each block we record:
 
@@ -80,20 +80,15 @@ from .config import (
     PLOTS_DIR,
     PRIOR_FLOW_PATH,
     Q_FLOW_PATH,
-    batch_size,
+    batch_size as _batch_size,
     e_max,
     key as _base_key,
+    log_scale_median,
     log_scale_range,
-    num_samples,
+    num_samples as _num_samples,
     prior_sigmax_log_scale_mean,
-    shear_layer_kind as _shear_layer_kind,
-    prior_shear_own_e as _prior_shear_own_e,
-    prior_shear_split_ab as _prior_shear_split_ab,
-    prior_shear_spin2_owne as _prior_shear_spin2_owne,
-    prior_shear_flux_size_owne as _prior_shear_flux_size_owne,
     sobolev_g1_weight as _sobolev_g1_weight,
     sobolev_g2_weight as _sobolev_g2_weight,
-    shear_coeff_ood_weight as _shear_coeff_ood_weight,
     train_chunk_size,
     use_nda_weight,
 )
@@ -108,12 +103,9 @@ from .convergence_metrics import (
     param_plateau_metrics,
     stage_converged,
 )
-from .data import load_training_dataset, transform_dataset_to_standard
+from .data import _finalize_dataset, load_training_dataset, transform_dataset_to_standard
 from .models.bijections import save_stats
-from .models.flows import (
-    build_flows, make_elbo_loss, make_nll_loss,
-    warmstart_prior_A, warmstart_prior_AB, warmstart_prior_B,
-)
+from .models.flows import build_flows, make_elbo_loss, make_nll_loss
 from .training import _run_training_loop, compute_std_stats, load_models
 
 _LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
@@ -177,6 +169,17 @@ def main() -> int:
     p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--grad-clip", type=float, default=0.5)
+    p.add_argument("--batch-size", type=int, default=_batch_size,
+                   help="Templates per gradient step. Larger = less per-step "
+                        "gradient variance from minibatch sampling (default from "
+                        "config.batch_size) -- raise this to stabilise weakly-"
+                        "identified parameters (e.g. ShearTaylorLast's 2nd-order "
+                        "coefficients) whose true gradient signal is small "
+                        "relative to per-step sampling noise.")
+    p.add_argument("--num-samples", type=int, default=_num_samples,
+                   help="Monte Carlo samples from q per batch element (ELBO loss "
+                        "only; ignored for --loss nll). Default from "
+                        "config.num_samples.")
     p.add_argument("--lr-schedule", choices=["constant", "cosine", "plateau"], default="cosine",
                    help="LR schedule. 'cosine' (default) decays learning_rate -> lr_final over "
                         "lr_decay_steps.  'plateau' = reduce-LR-on-plateau: hold LR until the "
@@ -190,8 +193,8 @@ def main() -> int:
                    help="plateau: multiply LR by this when the loss plateaus (default 0.3 — "
                         "fewer halvings from the start LR down to lr_min than the old 0.5).")
     p.add_argument("--lr-patience", type=int, default=2,
-                   help="plateau: blocks that fail to beat the running-best loss (by tau_loss) "
-                        "before an LR drop.")
+                   help="plateau: blocks that fail to beat the running-best loss (by "
+                        "tau_loss_early, or tau_loss once at the floor) before an LR drop.")
     p.add_argument("--lr-cooldown", type=int, default=0,
                    help="plateau: after an LR drop, ignore this many blocks before counting "
                         "non-improving blocks again (lets the new LR settle; default 0 = off).")
@@ -203,6 +206,31 @@ def main() -> int:
     p.add_argument("--val-logmf-max", type=float, default=np.log10(90000), help="Max log10(Mf) for validation sample.")
     p.add_argument("--val-mrmf-min", type=float, default=2.2, help="Min Mr/Mf for validation sample.")
     p.add_argument("--val-mrmf-max", type=float, default=3.5, help="Max Mr/Mf for validation sample.")
+    p.add_argument("--train-mf-min", type=float, default=None,
+                   help="DIAGNOSTIC (2026-08-06): restrict the actual TRAINING population to "
+                        "raw Mf >= this value (not just the --val-* convergence-monitoring "
+                        "subset, which never touches what's trained on). raw2standard is "
+                        "re-derived from the filtered population, so it re-centers on this "
+                        "window rather than the full quality_cut_mask population. Raw/"
+                        "transformed units (Mf itself), NOT standardised -- matches how the "
+                        "real analysis window (see mf_mrmf_mask) is defined.")
+    p.add_argument("--train-mf-max", type=float, default=None,
+                   help="See --train-mf-min. Raw Mf upper bound for the training population.")
+    p.add_argument("--train-mrmf-min", type=float, default=None,
+                   help="See --train-mf-min. Raw Mr/Mf lower bound for the training population.")
+    p.add_argument("--train-mrmf-max", type=float, default=None,
+                   help="See --train-mf-min. Raw Mr/Mf upper bound for the training population.")
+    p.add_argument("--train-window-boost", type=float, default=1.0,
+                   help="DIAGNOSTIC (2026-08-06): SOFT alternative to the hard --train-mf-*/"
+                        "--train-mrmf-* cut -- multiplies the batch-sampling weight by this "
+                        "factor for templates inside the --train-mf-*/--train-mrmf-* window "
+                        "(raw/transformed coords), instead of excluding everything outside it. "
+                        "Keeps the full population's diversity (needed for the coefficient net "
+                        "to learn a well-curved response) while still concentrating SGD batches "
+                        "on the window that matters for the analysis. 1.0 = no-op. Requires at "
+                        "least one --train-mf-*/--train-mrmf-* bound to define the window; does "
+                        "NOT also hard-filter the population like those flags do on their own -- "
+                        "raw2standard stays derived from the FULL population.")
     p.add_argument("--plateau-window", type=int, default=6,
                    help="Trailing blocks over which each stage's param/functional drift-"
                         "diffusion ratio is computed (see convergence_metrics.stage_converged). "
@@ -222,11 +250,21 @@ def main() -> int:
                         "trains to a noise ball around the optimum rather than a point. "
                         "0 disables (ema == raw).")
     p.add_argument("--tau-loss", type=float, default=0.0015,
-                   help="Relative loss-improvement margin. plateau: a block counts as progress "
-                        "only if it beats the running-best block loss by this fraction; "
+                   help="Relative loss-improvement margin used for the FINAL LR stage (once "
+                        "plateau's LR is at --lr-min): a block counts as progress only if it "
+                        "beats the running-best block loss by this fraction. Also used by "
                         "constant/cosine: consecutive-block rel-improvement below this = plateaued.")
+    p.add_argument("--tau-loss-early", type=float, default=0.05,
+                   help="plateau only: like --tau-loss, but used for the LR-drop decision at "
+                        "every LR stage BEFORE the floor. Noisy blocks at a high LR often clear "
+                        "a tight margin without real progress, stalling the drop; a looser early "
+                        "margin (default 0.05) lets bad_blocks accumulate and the LR drop sooner. "
+                        "--tau-loss (tight) still gates the final stage once LR reaches --lr-min.")
     p.add_argument("--patience", type=int, default=3,
                    help="Consecutive plateaued blocks required to stop.")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Override config.key's fixed seed (18061998) for reproducibility "
+                        "checks across --from-scratch runs. Default: use config.key as before.")
     p.add_argument("--tag", type=str, default="converge", help="Backup/label tag.")
     p.add_argument("--prior-out", type=str, default=PRIOR_FLOW_PATH)
     p.add_argument("--q-out", type=str, default=Q_FLOW_PATH)
@@ -236,82 +274,64 @@ def main() -> int:
                    help="Training objective. 'nll' (default) trains the prior alone on direct "
                         "template NLL (m≈y, no q flow). 'elbo' jointly trains prior+q — same "
                         "loss terms, but denoises via q-sampling instead of the m≈y shortcut.")
-    p.add_argument("--shear-layer", choices=["poly", "taylor"], default=_shear_layer_kind,
-                   help="Shear conditioning layer (default from config.shear_layer_kind). "
-                        "'taylor' = structural ShearTaylorLast (Taylor-in-g displacement, "
-                        "Sobolev-supervisable); needs --from-scratch and a fresh --prior-out "
-                        "(a poly checkpoint won't deserialise into a taylor structure).")
-    p.add_argument("--shear-own-e", action="store_true", default=_prior_shear_own_e,
-                   help="taylor only: give the M1 shear response an own-|e| dependence "
-                        "(ShearTaylorLast second-stage M1 correction) to fix the high-|e| "
-                        "tail under-response. STATIC structure; needs --from-scratch + fresh "
-                        "--prior-out. Default from config.prior_shear_own_e.")
-    p.add_argument("--shear-split-ab", action=argparse.BooleanOptionalAction,
-                   default=_prior_shear_split_ab,
-                   help="taylor only: give the spin-2 2nd-order coeff B its own coeff net "
-                        "instead of sharing the A trunk (so sob2 can train B — a shared "
-                        "trunk is captured by the 1st-order gradient and pins B at ~0). "
-                        "STATIC structure; needs --from-scratch + fresh --prior-out. "
-                        "Default from config.prior_shear_split_ab (now True); "
-                        "pass --no-shear-split-ab for the legacy shared-trunk layer.")
-    p.add_argument("--shear-spin2-owne", action=argparse.BooleanOptionalAction,
-                   default=_prior_shear_spin2_owne,
-                   help="taylor only: condition the spin-2 (M1,M2) shear coeffs on the "
-                        "invariant |e|^2 so the 2nd-order response can depend on the "
-                        "galaxy's own ellipticity (the ONLY way to represent M1's 2nd "
-                        "derivative). Joint block w/ real log-det + iterative inverse. "
-                        "STATIC; needs --from-scratch. Default from config.")
-    p.add_argument("--shear-flux-size-owne", action=argparse.BooleanOptionalAction,
-                   default=_prior_shear_flux_size_owne,
-                   help="taylor only: condition the SPIN-0 (flux,size) shear coeffs on the "
-                        "invariant |e|^2 too, so their g1*g2 cross-term and |g|^2 curvature "
-                        "can depend on the galaxy's own ellipticity/size instead of a "
-                        "flux-only (net_size) or fully global (net_flux) compromise. Fixes "
-                        "a whole-(flux,size)-plane m gradient diagnosed 2026-08-01. Log-det "
-                        "unchanged (deferred correction on already-fixed downstream M1,M2). "
-                        "STATIC structure; needs --from-scratch. Default from config.")
-    p.add_argument("--warmstart-b-steps", type=int, default=300,
-                   help="For a from-scratch split-A/B taylor flow, regress its 2nd-order "
-                        "shear response B onto the template truth for this many steps before "
-                        "the main loop, so B starts near-correct instead of at its zero init. "
-                        "0 disables. Ignored for non-split / non-taylor / resumed runs.")
-    p.add_argument("--warmstart-a-steps", type=int, default=300,
-                   help="Regress the taylor flow's 1st-order shear response A onto the "
-                        "template truth for this many steps before the main loop/resumed "
-                        "fine-tune. Unlike --warmstart-b-steps (from-scratch only, relies "
-                        "on A=0 at init), A_gen=-A is independent of B/bulk params "
-                        "unconditionally, so this runs on EITHER a fresh (--from-scratch) "
-                        "OR a resumed (--prior-in) flow — e.g. to correct an already-"
-                        "trained checkpoint's A before a short fine-tune. 0 disables. "
-                        "Ignored for non-taylor shear layers.")
-    p.add_argument("--warmstart-ab-steps", type=int, default=300,
-                   help="Jointly regress BOTH A and B onto the template truth in one "
-                        "pass (uses --sobolev-g1/-g2 as the two term weights), instead "
-                        "of --warmstart-a-steps/--warmstart-b-steps run separately. "
-                        "Prefer this over sequential A/B warmstarts on an existing "
-                        "(resumed, --prior-in) flow: B_gen depends on A once A != 0, so "
-                        "a sob2-only step can nudge A away from A_tgt again right after "
-                        "an A-only step set it (or vice versa) — the joint loss has no "
-                        "such cross-coupling issue, since A_tgt/B_tgt both constrain the "
-                        "same optimisation simultaneously. Safe for --from-scratch too, "
-                        "and DEFAULT (300) since this is what the validated spin2_owne "
-                        "recipe uses (2026-07-31: --warmstart-a/-b-steps run separately "
-                        "was never validated for spin2_owne, only this joint form). "
-                        "0 disables. Ignored for non-taylor shear layers; if set >0, "
-                        "runs INSTEAD of (not in addition to) the separate A/B "
-                        "warmstarts below (pass --warmstart-ab-steps 0 to fall back to "
-                        "those instead).")
+    p.add_argument("--sigmax-layer", choices=["autoregressive", "block", "none"],
+                   default="autoregressive",
+                   help="'autoregressive' (default) uses SigmaXCouplingLayer: closed-form, "
+                        "triangular, but s0/g_s are structurally blind to flux/size/size "
+                        "respectively. 'block' uses SigmaXBlockLayer: flux shift is additionally "
+                        "aware of the galaxy's own final ellipticity (still closed-form -- see "
+                        "that class's docstring). 'none' OMITS the SigmaX layer from the MODEL "
+                        "only -- the loss's own Sigma_X marginalisation (log_scale_range/e_max, "
+                        "_batch_log_L_X) keeps running unchanged, collapsed to a fixed point at "
+                        "config.log_scale_median (measured off a REAL, noisy target dataset), "
+                        "still reweighting each training copy by its probability under that "
+                        "ASSUMED real-survey centroid noise; only correct for a homoscedastic "
+                        "dataset that actually HAS that real noise level (the model has nothing "
+                        "left to learn a C_X-dependent correction FOR, but the noise itself is "
+                        "real and the reweighting isn't skipped). For genuinely noiseless data "
+                        "with no real centroid uncertainty at all, use --sigmax-layer none "
+                        "--no-sigmax-marginalization instead (see that flag). Different kinds "
+                        "have different static pytree structure -- switching requires "
+                        "--from-scratch, cannot resume a checkpoint trained under a different kind.")
+    p.add_argument("--no-sigmax-marginalization", action="store_true",
+                   help="Only valid with --sigmax-layer none. Fully SKIPS the loss's Sigma_X "
+                        "marginalisation (use_sx=False) instead of collapsing it to the fixed, "
+                        "real-survey-noise point config.log_scale_median -- for genuinely "
+                        "noiseless data (e.g. imsims's *_noiseless* / *_noshift_noiseless* "
+                        "template sets), which has no real centroid uncertainty to marginalise "
+                        "over at all, so that fixed point is a real mismatch, not just an "
+                        "unused generalisation capacity (see --sigmax-layer none's help).")
     p.add_argument("--sobolev-g1", type=float, default=_sobolev_g1_weight,
                    help="Sobolev 1st-order (dm/dg) weight, added to the loss (0=off). "
                         "Default from config.sobolev_g1_weight.")
     p.add_argument("--sobolev-g2", type=float, default=_sobolev_g2_weight,
                    help="Sobolev 2nd-order (d2m/dg2) weight, added to the loss (0=off). "
                         "Default from config.sobolev_g2_weight.")
-    p.add_argument("--coeff-ood-weight", type=float, default=_shear_coeff_ood_weight,
-                   help="Shear-coeff off-template penalty weight (0=off): trains "
-                        "ShearTaylorLast's coefficient nets toward zero on synthetic "
-                        "(flux, size, |e|) probes beyond where real templates live. "
-                        "Default from config.shear_coeff_ood_weight.")
+    p.add_argument("--curvature-weight", type=float, default=0.0,
+                   help="EXPERIMENTAL (2026-08-06, --loss nll only): direct penalty on "
+                        "d2(log p)/dg1^2 having the wrong (convex) sign along the pure-g1 "
+                        "stencil direction -- see make_nll_loss's curvature_weight "
+                        "docstring note. 0=off.")
+    p.add_argument("--freeze-centroid-reweight", action="store_true",
+                   help="EXPERIMENTAL/diagnostic (--loss nll only): freeze the "
+                        "per-copy L(X(g)|C_X) softmax weight at its g=0 value for "
+                        "every stencil column, instead of recomputing it from the "
+                        "sheared centroid X(g) at each g. Ablation for whether "
+                        "g-dependent reweighting (not just weak identifiability) "
+                        "drives ShearTaylorLast's 2nd-order coefficient blowup -- "
+                        "see make_nll_loss's freeze_centroid_reweight_at_g0 docstring.")
+    p.add_argument("--stencil-g0-only", action="store_true",
+                    help="DIAGNOSTIC (--loss nll only): restrict the shear g-stencil to "
+                         "the single g=0 point (drop all 9 stencil radii), isolating "
+                         "whether the shared-parameter multi-g averaging is what pulls "
+                         "the bulk layers' g=0 fit off a clean unit normal. See "
+                         "make_nll_loss's stencil_radii param.")
+    p.add_argument("--disable-centroid-reweight", action="store_true",
+                   help="EXPERIMENTAL/diagnostic (--loss nll only): drop the SNIS "
+                        "L(X|C_X) softmax entirely (flat/uniform batch mean), rather "
+                        "than just freezing its g-dependence like "
+                        "--freeze-centroid-reweight. See make_nll_loss's "
+                        "disable_centroid_reweight docstring.")
     p.add_argument("--from-scratch", action="store_true",
                    help="Initialise fresh flows (skip load_models) and train from random init "
                         "rather than resuming from a checkpoint.")
@@ -338,7 +358,7 @@ def main() -> int:
           f"plateau: window={args.plateau_window} k={args.plateau_k} τ_loss={args.tau_loss}; "
           f"EMA decay={args.ema_decay}")
 
-    key = _base_key
+    key = _base_key if args.seed is None else jr.key(args.seed)
 
     # --------------------------------------------------------------- data
     print("Loading data (reads the configured training template set)...")
@@ -350,35 +370,72 @@ def main() -> int:
     d2m_dg2_jnp = data["d2m_dg2_jnp"]
     centroid_moments_jnp = data["centroid_moments_jnp"]
     weights = data["weights"]   # batch-sampling proposal ∝ nda (BFD template weight)
+    nda_jnp = data["nda"]
     raw2standard = data["raw2standard"]
+
+    # DIAGNOSTIC (2026-08-06): concentrate training on the analysis window in
+    # RAW/transformed (not standardised) Mf, Mr/Mf -- see --train-mf-min's help.
+    # Two mutually exclusive modes:
+    #   hard cut (--train-window-boost left at 1.0): restrict the population to
+    #     the window and re-derive raw2standard from the filtered set. Tried
+    #     2026-08-06: removed the peak in log_prob(g) rather than sharpening it
+    #     (costs the coefficient net the off-window diversity it needs to learn
+    #     a well-curved response) -- kept here as a still-useful ablation knob.
+    #   soft boost (--train-window-boost > 1.0): keep the full population (and
+    #     the full-population raw2standard) but multiply the sampling weight
+    #     for in-window templates, concentrating SGD batches on the window
+    #     without discarding the rest.
+    _win_bounds_set = any(v is not None for v in (
+        args.train_mf_min, args.train_mf_max, args.train_mrmf_min, args.train_mrmf_max
+    ))
+    if _win_bounds_set:
+        m_raw = np.asarray(moments_jnp)
+        mf_raw = m_raw[:, 0]
+        mrmf_raw = m_raw[:, 1] / m_raw[:, 0]
+        win_mask = np.ones(mf_raw.shape[0], bool)
+        if args.train_mf_min is not None: win_mask &= mf_raw >= args.train_mf_min
+        if args.train_mf_max is not None: win_mask &= mf_raw <= args.train_mf_max
+        if args.train_mrmf_min is not None: win_mask &= mrmf_raw >= args.train_mrmf_min
+        if args.train_mrmf_max is not None: win_mask &= mrmf_raw <= args.train_mrmf_max
+
+        if args.train_window_boost != 1.0:
+            print(f"  train window BOOST x{args.train_window_boost}: "
+                  f"{win_mask.sum():,}/{mf_raw.shape[0]:,} templates in-window "
+                  "(full population kept, raw2standard unchanged)")
+            weights = weights * jnp.where(jnp.asarray(win_mask), args.train_window_boost, 1.0)
+        else:
+            print(f"  train window: {win_mask.sum():,}/{mf_raw.shape[0]:,} templates pass "
+                  f"raw Mf/Mr-Mf training-window cut")
+            train_idx = np.flatnonzero(win_mask)
+            moments_jnp = moments_jnp[train_idx]
+            cov_jnp = cov_jnp[train_idx]
+            dm_dg_jnp = dm_dg_jnp[train_idx]
+            d2m_dg2_jnp = d2m_dg2_jnp[train_idx]
+            centroid_moments_jnp = centroid_moments_jnp[train_idx]
+            nda_jnp = nda_jnp[train_idx]
+            key, k_fin = jr.split(key)
+            data = _finalize_dataset(
+                moments_jnp, centroid_moments_jnp, cov_jnp, dm_dg_jnp, d2m_dg2_jnp,
+                nda_jnp, k_fin,
+            )
+            weights = data["weights"]
+            raw2standard = data["raw2standard"]
+
     N = moments_jnp.shape[0]
     print(f"  N templates = {N}")
 
     # ------------------------------------------------ build / load flows
     key, k_build = jr.split(key)
-    prior_flow, q_flow = build_flows(k_build, latent_dim=4, cond_dim=16, raw2standard=raw2standard,
-                                     shear_layer_kind=args.shear_layer,
-                                     prior_shear_own_e=args.shear_own_e,
-                                     prior_shear_split_ab=args.shear_split_ab,
-                                     prior_shear_spin2_owne=args.shear_spin2_owne,
-                                     prior_shear_flux_size_owne=args.shear_flux_size_owne)
-    print(f"Shear layer: {args.shear_layer}"
-          + (f" (split A/B)" if args.shear_split_ab else "")
-          + (f" (flux/size own-e)" if args.shear_flux_size_owne else "")
+    prior_flow, q_flow = build_flows(
+        k_build, latent_dim=4, cond_dim=16, raw2standard=raw2standard,
+        sigmax_layer_kind=args.sigmax_layer,
+    )
+    print(f"Shear layer: taylor   Σ_X layer: {args.sigmax_layer}"
           + (f"   Sobolev g1={args.sobolev_g1} g2={args.sobolev_g2}"
-             if (args.sobolev_g1 > 0 or args.sobolev_g2 > 0) else "   Sobolev off")
-          + (f"   coeff-ood-weight={args.coeff_ood_weight}"
-             if args.coeff_ood_weight > 0 else "   coeff-ood off"))
+             if (args.sobolev_g1 > 0 or args.sobolev_g2 > 0) else "   Sobolev off"))
     if args.from_scratch:
         print("Initialising FRESH flows from scratch (random init, no checkpoint load).")
         prior, q = prior_flow, q_flow  # build_flows pulls arch from config → canonical structure
-        # B's isolated-regression property relies on A=0 at init (the sob2 gradient
-        # w.r.t. A/bulk vanishes only then — see warmstart_prior_B) — from-scratch only.
-        # Skipped when --warmstart-ab-steps runs the joint A+B warmstart instead below.
-        if (args.warmstart_ab_steps == 0 and args.warmstart_b_steps > 0
-                and args.shear_layer == "taylor" and args.shear_split_ab):
-            prior = warmstart_prior_B(prior, raw2standard, moments_jnp, cov_jnp,
-                                      dm_dg_jnp, d2m_dg2_jnp, steps=args.warmstart_b_steps)
     elif args.q_from_scratch:
         print("Resuming prior from checkpoint; initialising FRESH q flow (random init).")
         prior = eqx.tree_deserialise_leaves(args.prior_in, prior_flow)
@@ -386,18 +443,6 @@ def main() -> int:
     else:
         print("Building architecture and loading checkpoints...")
         prior, q = load_models(prior_flow, q_flow, args.prior_in, args.q_in)
-
-    # A's isolated-regression property (A_gen=-A, independent of B/bulk) is an
-    # unconditional algebraic identity — not an at-init argument like B's — so this is
-    # safe to run against an already-trained (resumed) prior too, not just --from-scratch.
-    if args.warmstart_ab_steps > 0 and args.shear_layer == "taylor":
-        prior = warmstart_prior_AB(prior, raw2standard, moments_jnp, cov_jnp,
-                                   dm_dg_jnp, d2m_dg2_jnp,
-                                   sob1_w=args.sobolev_g1, sob2_w=args.sobolev_g2,
-                                   steps=args.warmstart_ab_steps)
-    elif args.warmstart_a_steps > 0 and args.shear_layer == "taylor":
-        prior = warmstart_prior_A(prior, raw2standard, moments_jnp, cov_jnp,
-                                  dm_dg_jnp, d2m_dg2_jnp, steps=args.warmstart_a_steps)
 
     # Polyak/EMA-averaged copy: starts equal to the resume point, updated once per
     # block below. This (not the raw per-block iterate) is what convergence is
@@ -440,28 +485,67 @@ def main() -> int:
     w_np = np.asarray(weights)
     w_np = w_np / w_np.sum()
     sampling_weights = jnp.asarray(w_np) if use_nda_weight else None
+    if args.no_sigmax_marginalization and args.sigmax_layer != "none":
+        raise ValueError("--no-sigmax-marginalization requires --sigmax-layer none.")
+    # --sigmax-layer none removes the MODEL's SigmaX layer only. By default the
+    # loss's own Sigma_X marginalisation (_sample_sx_conds -> _batch_log_L_X)
+    # keeps running -- it reweights each training copy by its true probability
+    # under the REAL centroid noise, which has nothing to do with whether the
+    # model can learn a C_X-dependent correction. But with no SigmaX layer to
+    # generalise for, there is no reason to keep the +/-log_scale_window,
+    # +/-e_max spread either (see config.py) -- collapse BOTH to their exact
+    # single-point values (window=0, e_max=0) so every stencil draw lands on
+    # the real (log_scale_median, e1=0, e2=0) exactly, not a random neighbour.
+    # (An earlier version set log_scale_range=None here unconditionally, which
+    # SKIPS L(X|C_X) entirely and conditions on a placeholder log_scale=0 --
+    # wrong for that dev's REAL, noisy, homoscedastic dataset, where use_sx
+    # must stay on. With no SigmaX layer, log_pz is identical across every
+    # stencil point regardless, so the existing stencil loop degenerates to
+    # recomputing the same log_pz 17x while L(X|C_X) keeps doing its real job
+    # -- correct, if wasteful; a real single-fixed-point fast path would be a
+    # good follow-up.)
+    # --no-sigmax-marginalization opts INTO that log_scale_range=None skip --
+    # for GENUINELY noiseless data (e.g. imsims's *_noiseless* template sets),
+    # log_scale_median (measured off a real, noisy dataset) is a real mismatch,
+    # not just unused generalisation capacity: it would still reweight every
+    # training copy's SHEARED centroid response (X_bg = shear(X, g, ...), real
+    # and nonzero even from g=0 centred templates) at a fake noise temperature.
+    if args.sigmax_layer == "none" and not args.no_sigmax_marginalization:
+        _log_scale_range, _e_max = (log_scale_median, log_scale_median), 0.0
+    elif args.no_sigmax_marginalization:
+        _log_scale_range, _e_max = None, 0.0
+    else:
+        _log_scale_range, _e_max = log_scale_range, e_max
+    print(f"Loss Sigma_X marginalisation actually used: "
+          f"log_scale_range={_log_scale_range} e_max={_e_max}")
     if args.loss == "nll":
         # q-free: prior is supervised directly on log p(y_std | g, C_X) (m≈y).
         loss_fn = make_nll_loss(
-            N=N, batch_size=batch_size,
+            N=N, batch_size=args.batch_size,
             weights=sampling_weights,
-            log_scale_range=log_scale_range, e_max=e_max,
-            use_sx=(log_scale_range is not None),
+            log_scale_range=_log_scale_range, e_max=_e_max,
+            use_sx=(_log_scale_range is not None),
             raw2standard=raw2standard,
             sobolev_g1_weight=args.sobolev_g1, sobolev_g2_weight=args.sobolev_g2,
-            coeff_ood_weight=args.coeff_ood_weight,
+            freeze_centroid_reweight_at_g0=args.freeze_centroid_reweight,
+            disable_centroid_reweight=args.disable_centroid_reweight,
+            stencil_radii=(jnp.array([]) if args.stencil_g0_only else None),
+            curvature_weight=args.curvature_weight,
         )
-        print("Loss: NLL (q-free, prior-only direct template NLL)")
+        print("Loss: NLL (q-free, prior-only direct template NLL)"
+              + (f"  [curvature_weight={args.curvature_weight}]" if args.curvature_weight > 0 else "")
+              + ("  [stencil_g0_only=True]" if args.stencil_g0_only else "")
+              + ("  [freeze_centroid_reweight_at_g0=True]" if args.freeze_centroid_reweight else "")
+              + ("  [disable_centroid_reweight=True]" if args.disable_centroid_reweight else ""))
     else:
         loss_fn = make_elbo_loss(
-            N=N, batch_size=batch_size, num_samples=num_samples,
+            N=N, batch_size=args.batch_size, num_samples=args.num_samples,
             weights=sampling_weights,
-            log_scale_range=log_scale_range, e_max=e_max,
-            use_sx=(log_scale_range is not None),
+            log_scale_range=_log_scale_range, e_max=_e_max,
+            use_sx=(_log_scale_range is not None),
             raw2standard=raw2standard, mean_log_diag=mean_log_diag,
             std_log_diag=std_log_diag, mean_off=mean_off, std_off=std_off,
             sobolev_g1_weight=args.sobolev_g1, sobolev_g2_weight=args.sobolev_g2,
-            coeff_ood_weight=args.coeff_ood_weight,
         )
         print("Loss: ELBO (joint prior+q)")
     def make_opt(lr):
@@ -472,9 +556,26 @@ def main() -> int:
         # counter — ScaleByScheduleState), which would break reusing `opt_state`
         # across a 'plateau'-mode rebuild. 'plateau' below always passes a schedule
         # (constant or ramping) for exactly this reason.
+        #
+        # weight_decay mask: exclude biases and other 1D/scalar params (ndim<2) --
+        # e.g. Linear.bias, Spin0AutoregressiveLayer.log_scale0. These are pure
+        # location/translation parameters with zero log-det cost (see
+        # ShearTaylorLast/_bounded_loc investigation, 2026-08-06): unlike weight
+        # matrices they have no natural pull back toward zero from the loss, so an
+        # unmasked weight_decay just fights the (already weak) loss gradient rather
+        # than regularising capacity, and can leave one collapsed to a near-constant
+        # function with an arbitrary nonzero bias once its own weight decays away
+        # (confirmed directly: layer 0's net_ls1 last-layer weight norm was 0.04 vs
+        # 0.7-2.5 for every other layer, with its output collapsed to a fixed 0.583
+        # regardless of input). Only 2D+ arrays (actual weight matrices) get decayed.
+        def _decay_mask(params):
+            return jax.tree_util.tree_map(lambda x: x.ndim >= 2, params)
+
         return optax.chain(
             optax.clip_by_global_norm(args.grad_clip),
-            optax.adamw(learning_rate=lr, weight_decay=args.weight_decay),
+            optax.adamw(
+                learning_rate=lr, weight_decay=args.weight_decay, mask=_decay_mask
+            ),
         )
 
     def _plateau_schedule(step0, lr_from, lr_to, ramp_steps):
@@ -511,7 +612,8 @@ def main() -> int:
     elif args.lr_schedule == "plateau":
         base_lr = _plateau_schedule(args.start_steps, None, current_lr, args.block_steps)
         print(f"LR schedule: plateau — start {args.learning_rate:.1e}, ×{args.lr_gamma} after "
-              f"{args.lr_patience} blocks not beating best by {args.tau_loss} "
+              f"{args.lr_patience} blocks not beating best by {args.tau_loss_early} "
+              f"(by {args.tau_loss} once at the {args.lr_min:.1e} floor) "
               f"(cooldown {args.lr_cooldown}), floor {args.lr_min:.1e}; "
               f"drops are a 1-block cosine ramp, not a discrete jump")
     else:
@@ -679,11 +781,16 @@ def main() -> int:
         if args.lr_schedule == "plateau":
             at_floor = current_lr <= args.lr_min * 1.0001
             # Noise-robust plateau detection: a block is "progress" only if it beats the
-            # BEST block loss so far by the relative margin tau_loss.  A non-improving
+            # BEST block loss so far by the relative margin tau.  A non-improving
             # block increments bad_blocks instead of resetting a consecutive counter, so
             # a single noisy uptick no longer stalls the decay.  bad_blocks resets only on
             # genuine progress; an optional cooldown skips counting right after a drop.
-            if np.isfinite(med) and med < best_block_loss * (1.0 - args.tau_loss):
+            # Before the floor, use the looser tau_loss_early: at a high LR, noise alone
+            # regularly beats a tight margin without real progress, stalling the drop (the
+            # user's 2026-08-01 observation). Once at the floor (the FINAL LR stage), fall
+            # back to the tight tau_loss, since that's the real stop-training decision.
+            tau = args.tau_loss if at_floor else args.tau_loss_early
+            if np.isfinite(med) and med < best_block_loss * (1.0 - tau):
                 best_block_loss = med
                 bad_blocks = 0
                 improved = True
@@ -707,7 +814,7 @@ def main() -> int:
 
         if args.lr_schedule == "plateau":
             print(f"  → LR={current_lr:.2e}{'  ↓dropped' if dropped else ''}  "
-                  f"best={best_block_loss:.4f} improved={improved}  "
+                  f"best={best_block_loss:.4f} improved={improved} (τ={tau:g})  "
                   f"bad={bad_blocks}/{args.lr_patience}"
                   f"{f' cooldown={lr_cooldown_left}' if lr_cooldown_left else ''}  "
                   f"all-stages={all_stage_ok}  consecutive_ok={consecutive_ok}/{args.patience}")

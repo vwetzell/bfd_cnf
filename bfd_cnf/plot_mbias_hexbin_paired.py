@@ -90,9 +90,12 @@ def main() -> None:
                     help="Paired bootstrap resamples per cell (default 50).")
     ap.add_argument("--mf-lim", type=float, nargs=2, default=_MF_LIM_PAD)
     ap.add_argument("--y-lim", type=float, nargs=2, default=_Y_LIM_PAD)
-    ap.add_argument("--bin-arm", choices=["plus", "minus"], default="plus",
-                    help="Which arm's own noisy (Mf, Mr) decides cell membership "
-                         "(diagnostic: compare plus vs minus to test noise-selection artifacts).")
+    ap.add_argument("--bin-arm", choices=["plus", "minus", "mean"], default="plus",
+                    help="Which moment decides cell membership: a single arm's own noisy "
+                         "(Mf, Mr) ('plus'/'minus', shear-DEPENDENT label), or the pair-"
+                         "averaged 0.5*(plus+minus) ('mean', shear-INDEPENDENT: the +/-g "
+                         "response cancels, so cells aren't defined by the sheared position "
+                         "-- the correct label per the sub8 ring-test analysis).")
     args = ap.parse_args()
 
     d = np.load(args.inp)
@@ -100,8 +103,13 @@ def main() -> None:
     n = len(kp)
     print(f"Matched {n:,} pairs by id (arms had {len(d['ids_p']):,} / {len(d['ids_m']):,} rows).")
 
-    bin_key, bin_idx = ("targets_p", kp) if args.bin_arm == "plus" else ("targets_m", km)
-    x, y = _xy(np.asarray(d[bin_key], dtype=np.float64)[bin_idx], args.yaxis)
+    if args.bin_arm == "mean":
+        bin_targets = 0.5 * (np.asarray(d["targets_p"], dtype=np.float64)[kp]
+                             + np.asarray(d["targets_m"], dtype=np.float64)[km])
+    else:
+        bin_key, bin_idx = ("targets_p", kp) if args.bin_arm == "plus" else ("targets_m", km)
+        bin_targets = np.asarray(d[bin_key], dtype=np.float64)[bin_idx]
+    x, y = _xy(bin_targets, args.yaxis)
     valid = np.isfinite(x) & np.isfinite(y)
     x, y, pqr_p, pqr_m = x[valid], y[valid], pqr_p[valid], pqr_m[valid]
     n = len(x)

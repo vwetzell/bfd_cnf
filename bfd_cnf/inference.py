@@ -903,6 +903,19 @@ def rqmc_pqr_grid(
     Total flow-evals per target = ``n_points × n_replicates``; the replicate split
     only provides the SE (brute MC has no variance reduction, so 16×1024 ≡ 1×16384).
 
+    The measurement noise is physically Gaussian in RAW moment space, not in the
+    standardised (log-flux / moment-ratio) coordinates the flow is trained on — that
+    transform is nonlinear, so a Gaussian in standardised space (built from the
+    delta-method-propagated ``cov_std``) is only a linearised approximation, with
+    growing error at low S/N where the transform's curvature matters. ``bruteforce``
+    quadrature therefore draws points in raw space, ``x_raw ~ N(mu_raw, C_raw)``
+    (``C_raw`` = the augmented raw covariance when ``augment=True``, else ``CM_raw``
+    directly), and pushes each point through the *exact* pointwise
+    ``raw2standard.transform`` before evaluating the flow — not through the
+    linearised ``cov_std`` propagation. Since the draw matches the true kernel
+    exactly, the Gaussian/proposal ratio in the importance weight cancels to 1
+    identically; only the (unrelated) BFD augmentation-Jacobian correction remains.
+
     Set ``bruteforce=False`` to use the retired Laplace-proposal path (mode-find +
     finite-difference Hessian Gaussian proposal, scrambled-Halton points) — kept for
     A/B comparison and as the seat for a future heavy-tailed (Student-t) proposal,
@@ -1039,7 +1052,7 @@ def rqmc_pqr_grid(
             tmp = jax.scipy.linalg.solve(A.T, B_RAW_JNP, assume_a="gen")
             B_std = jax.scipy.linalg.solve(A.T, tmp.T, assume_a="gen").T
 
-            return cov_std_use, B_std, trace_corr, J_base
+            return cov_std_use, B_std, trace_corr, J_base, C_raw
 
         def _noaug_branch(_):
             return (
@@ -1047,9 +1060,10 @@ def rqmc_pqr_grid(
                 jnp.zeros((dim, dim), dtype=cov_std.dtype),
                 0.0,
                 1.0,
+                CM_raw,
             )
 
-        cov_std_use, B_std, trace_correction, J_bfd_base = jax.lax.cond(
+        cov_std_use, B_std, trace_correction, J_bfd_base, C_raw_use = jax.lax.cond(
             not_zero, _aug_branch, _noaug_branch, operand=None
         )
 
@@ -1135,12 +1149,19 @@ def rqmc_pqr_grid(
             return neg_val, grad
 
         if bruteforce:
-            # Proposal = the (augmented) kernel itself => weights reduce to the
-            # jac-correction and x is drawn straight from N(mu_std, cov_std_use).
-            proposal_mu = mu_std
-            proposal_cov = cov_std_use
+            # Proposal = the TRUE (augmented) measurement kernel, which is Gaussian in
+            # RAW moment space -- not standardised space, where the log-flux/ratio
+            # transform's curvature makes a Gaussian only a linearised (delta-method)
+            # approximation (cov_std_use above). Quadrature points are drawn in raw
+            # space, N(mu_raw, C_raw_use), and pushed pointwise through the EXACT
+            # nonlinear raw2standard map before hitting the flow -- see
+            # single_replicate below. Since the draw matches the kernel exactly,
+            # log_gauss - log_prop cancels to 0 identically; no Laplace/Jacobian
+            # bookkeeping is needed for this branch.
+            jitter_raw = 1e-8 * jnp.diag(jnp.maximum(jnp.diag(C_raw_use), 1e-30))
+            L_raw = jnp.linalg.cholesky(C_raw_use + jitter_raw)
         else:
-            # Laplace proposal
+            # Laplace proposal (standardised space, unchanged)
             mode, _ = _find_mode_jax(neg_log_integrand, mu_std, n_steps=20)
 
             mode = jnp.where(jnp.isfinite(mode), mode, mu_std)
@@ -1153,32 +1174,34 @@ def rqmc_pqr_grid(
             proposal_cov = proposal_cov + 1e-6 * jnp.eye(dim)
             proposal_mu = mode
 
-        # proposal_mu = mu_std
-        # proposal_cov = cov_std_use
+            L_prop = jnp.linalg.cholesky(proposal_cov)
+            prop_logdet = 2.0 * jnp.sum(jnp.log(jnp.diag(L_prop)))
+            prop_const = -0.5 * (dim * jnp.log(2.0 * jnp.pi) + prop_logdet)
 
-        # jax.debug.print("Proposal std: {std}", std=jnp.sqrt(jnp.diag(proposal_cov)))
+            def log_proposal(x):
+                diff = x - proposal_mu
+                v = jax.scipy.linalg.solve_triangular(L_prop, diff.T, lower=True)
+                return prop_const - 0.5 * jnp.sum(v**2, axis=0)
 
-        L_prop = jnp.linalg.cholesky(proposal_cov)
-        prop_logdet = 2.0 * jnp.sum(jnp.log(jnp.diag(L_prop)))
-        prop_const = -0.5 * (dim * jnp.log(2.0 * jnp.pi) + prop_logdet)
-
-        def log_proposal(x):
-            diff = x - proposal_mu
-            v = jax.scipy.linalg.solve_triangular(L_prop, diff.T, lower=True)
-            return prop_const - 0.5 * jnp.sum(v**2, axis=0)
+        def _points_and_logw(eps):
+            """(x_std, log_w) for one replicate's (n_points, dim) standard normals."""
+            if bruteforce:
+                x_raw = mu_raw + eps @ L_raw.T          # raw-space quadrature points
+                x = jax.vmap(raw2standard.transform)(x_raw)  # exact pointwise nonlinear map
+                log_w = log_jac_corr_batched(x)          # gauss/proposal cancel exactly
+            else:
+                x = proposal_mu + eps @ L_prop.T          # std-space IS proposal draws
+                log_w = log_gaussian(x) + log_jac_corr_batched(x) - log_proposal(x)
+            return x, log_w
 
         # single_replicate receives standard-normal samples eps (Halton-ppf for the
-        # IS path, plain normals for bruteforce); both map x = mu + eps @ L_prop.T.
+        # IS path, plain normals for bruteforce).
         def single_replicate(eps):  # eps: (n_points, dim)
-            x = proposal_mu + eps @ L_prop.T
+            x, log_w = _points_and_logw(eps)
 
-            log_gauss = log_gaussian(x)
-            log_jc = log_jac_corr_batched(x)
             lp_flow, dlp1, dlp2, d2lp11, d2lp22, d2lp12 = flow_prob_and_derivs(x)
             p_flow = jnp.exp(lp_flow)
-            log_prop = log_proposal(x)
 
-            log_w = log_gauss + log_jc - log_prop
             log_w = jnp.where(
                 jnp.isfinite(log_w), log_w, jnp.full_like(log_w, -jnp.inf)
             )

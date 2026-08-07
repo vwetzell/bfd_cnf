@@ -25,6 +25,7 @@ from .config import (
     TRAIN_FITS_PATH,
     key as _initial_key,
     template_flux_min,
+    template_flux_max,
 )
 
 # ---------------------------------------------------------------------------
@@ -245,6 +246,7 @@ def quality_cut_mask(moments: np.ndarray, cov: np.ndarray) -> np.ndarray:
     """
     good_moments = moments[:, 0] / np.sqrt(cov[:, 0, 0]) > 5.0
     good_moments &= moments[:, 0] > template_flux_min
+    good_moments &= moments[:, 0] < template_flux_max
     good_moments &= moments[:, 1] > 0.0
     good_moments &= np.all(np.isfinite(moments), axis=1)
     good_moments &= (
