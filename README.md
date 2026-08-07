@@ -19,10 +19,14 @@ it one arrow at a time against the simulated catalogs from
 ## Phase 1 — the bulk (here now)
 
 `bulk.py` trains only the unconditional part: the `RawMomentStandardize`
-coordinate change into `[log10 Mf, Mr/Mf, M1/Mr, M2/Mr]` followed by eight
-`EquivariantAutoregressiveLayer` steps.  No `g`, no `Sigma_X` — in the phase-1
-sims `Sigma_X` is the same for every galaxy, so conditioning on it would be
-learning a constant.
+coordinate change into `[log10 Mf, Mr/Mf, Mc/Mr, M1/Mr, M2/Mr]` followed by
+eight `EquivariantAutoregressiveLayer` steps.  The three spin-0 coordinates come
+first and the spin-2 pair last; the permutation between layers cycles through
+all six orderings of the spin-0 slots so none is permanently the head of the
+autoregression, while the spin-2 pair is never permuted — swapping `M1`/`M2`
+would rotate the shape by 45 degrees and break the equivariance.  No `g`, no
+`Sigma_X` — in the phase-1 sims `Sigma_X` is the same for every galaxy, so
+conditioning on it would be learning a constant.
 
 ```
 python -m imsims.sim --n 100000 --out data/moments.fits   # in ../bfd_cnf_imsims
