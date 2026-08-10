@@ -1,0 +1,14 @@
+flows/shear.eqx on the bulgedisc targets
+integrating under C_M with 1024 draws/target: ESS = 134 (median), 6 (5th pct)
+
+20000 targets, g1 = +/-0.02
+  m1 = -0.00504 +/- 0.00883
+  c1 = +1.09e-03 +/- 1.2e-03   c2 = +5.43e-04 +/- 1.3e-03
+  unsheared catalog: ghat = (+1.08e-03, +5.66e-04)
+
+   Mf quintile          m1          c1          c2
+            q1     +0.0127   +2.78e-04   -1.19e-03   (+/- 0.0023)
+            q2     -0.0018   +5.68e-03   +6.92e-04   (+/- 0.0436)
+            q3     -0.0280   +1.42e-04   +2.43e-03   (+/- 0.0307)
+            q4     -0.0121   +1.58e-03   +3.24e-03   (+/- 0.0065)
+            q5     +0.0060   -6.84e-04   -1.83e-03   (+/- 0.0084)

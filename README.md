@@ -103,7 +103,7 @@ with cleaner supervision: these catalogs zero-pad the stamps before the FFTs,
 which halved that residual from the 7.33% measured without padding.  More steps
 still do nothing, which is the point.)
 
-## Sheared targets, and the bias floor they carry
+## Sheared targets, and the bias measured on them
 
 `bfd_cnf_imsims` now also produces targets lensed at the **image level**, for
 measuring a multiplicative bias from the flow's point estimates against ground
@@ -115,12 +115,36 @@ truth rather than against bfd's own derivatives:
 ../bfd_cnf_imsims/data/targets_g0_1M.fits      # unsheared twin, for binning
 ```
 
-Read that repo's README before trusting an `m` from these to better than a
-percent: the image response and bfd's analytic `dm_dg` — what this flow is
-trained on — differ coherently by 0.1–1%, growing towards the resolution limit,
-which puts a floor of `m1 ~ -6e-3` on the bulge + disc population and `-4e-3` on
-the Sersics.  That floor is a property of the appendix-C derivatives, not of the
-flow, and it is larger than the bias most of this work is trying to detect.
+These used to carry a floor: the image response and bfd's analytic `dm_dg` —
+what this flow is trained on — differed coherently by 0.1–1%, growing towards
+the resolution limit, worth `m1 ~ -6e-3` on the bulge + disc population.  That
+was a moving-boundary term in bfd's appendix-C derivatives, traced to the
+Blackman-Harris weight not reaching zero at `kmax`, and it is **fixed** — see
+that repo's README.  Population-weighted `sum(FD)/sum(Q) - 1` on `M1` is now
+`+0.006%` against `-0.61%` before, and flat across resolution.  Every catalog
+and flow here was regenerated after it (`../bfd_cnf_imsims/regen.sh`, then
+`retrain.sh`).
+
+On noiseless targets, which is where this measurement is currently sharpest:
+
+```
+python bias.py --flow flows/shear.eqx        # 1M bulge + disc, g1 = +/-0.02
+
+  m1 = +0.00128 +/- 0.00016
+  c1 = +4.26e-05 +/- 1.1e-04   c2 = +3.16e-05 +/- 1.1e-04
+```
+
+The residual `m1` is about what the two known systematics predict together: the
+`Var[Q|m]` floor of the deterministic transport (~4e-4, the table above) and the
+estimator's own truncation at `O(g^2)` (~4e-4 at `g = 0.02`).  Getting there
+took one real fix on the flow's side — `RawMomentStandardize` was standardising
+`M1/Mr` and `M2/Mr` with independent per-coordinate mean and scale, which is the
+one place in the stack that could give the prior a preferred direction on the
+sky, and a prior with a preferred direction reads out as additive shear.
+Symmetrising it (`_effective()`, zero spin-2 mean and one shared scale, applied
+on use so the optimiser cannot undo it) took `c2` from `+3.78e-4` to `+3.2e-5`
+and `m1` from `+2.05e-3` to the number above.
+`tests/test_shear.py::test_flow_isotropy` guards it.
 
 ## Noisy targets, and the integral under `C_M`
 
@@ -174,11 +198,11 @@ That tail is what dominates the first measurement (`bias_bulgedisc_noisy.txt`,
 20k targets, `S = 1024`, median ESS 134):
 
 ```
-  m1 = -0.00504 +/- 0.00883        # noiseless, 50k targets: +0.00159 +/- 0.00076
+  m1 = -0.00504 +/- 0.00883        # noiseless, same flow: +0.00128 +/- 0.00016
   c1 = +1.09e-03 +/- 1.2e-03   c2 = +5.43e-04 +/- 1.3e-03
 ```
 
-Per target the error bar is ~7x the noiseless one, and it is not spread evenly —
+Per target the error bar is ~8x the noiseless one, and it is not spread evenly —
 the middle flux quintiles carry `+/- 0.03` to `+/- 0.04` while the faintest
 carries `+/- 0.002`.  That is not shape noise (the +/-g pairing removes it, and
 both catalogs share a noise realization and share their kernel draws); it is a
