@@ -84,6 +84,19 @@ def load(path):
     return f64(t["moments"]), f64(t["dm_dg"]), f64(t["d2m_dg2"])
 
 
+def load_labels(path):
+    """The population's `red` flag if the catalog has one, else None.
+
+    Only the two-type Sersic catalogs carry it; it is a diagnostic label, never
+    an input to the flow -- nothing observable tells a target which type it is.
+    """
+    try:
+        pop = fitsio.read(path, ext="POPULATION")
+    except OSError:
+        return None
+    return np.asarray(pop["red"], dtype=bool) if "red" in pop.dtype.names else None
+
+
 def lens(m, q, r, g):
     """Exact lensed moments of a template: m + Q.g + 1/2 g.R.g (batched)."""
     g1, g2 = g[:, 0], g[:, 1]
@@ -179,27 +192,139 @@ def _shear_layer(flow):
     return flow.bijection.bijection.bijections[0]
 
 
-def check(flow, data, n=4000):
+def check(flow, data, n=4000, labels=None):
     """Compare the layer's own dm/dg at g=0 with bfd's exact values.
 
     Diagnostic only.  The layer is a transport that matches DENSITIES, so it is
-    under no obligation to reproduce any individual template's response; on this
-    Gaussian population the two coincide because the response happens to be a
-    function of m, and that is what makes the comparison meaningful here.
+    under no obligation to reproduce any individual template's response; it is
+    meaningful only to the extent that the response really is a function of m,
+    which `response_scatter` measures independently.
     """
     m, q_true, r_true = (jnp.asarray(a[:n]) for a in data)
     layer = _shear_layer(flow)
     q, r = jax.vmap(dm_dg, in_axes=(None, 0))(layer, m)
     s = _scale(m)[:, None, :]
+    groups = [("", slice(None))]
+    if labels is not None:
+        groups += [(" red", labels[:n]), (" blue", ~labels[:n])]
     print("\nlayer dm/dg vs bfd truth: RMS residual / RMS truth")
-    print(f"{'':10s}" + "".join(f"{n_:>10s}"
+    print(f"{'':15s}" + "".join(f"{n_:>10s}"
                                 for n_ in ["Mf", "Mr", "M1", "M2", "Mc"]))
     for name, pred, truth in (("dm/dg", q, q_true), ("d2m/dg2", r, r_true)):
         d = np.asarray((pred - truth) / s)
         t = np.asarray(truth / s)
-        frac = (np.sqrt(np.mean(d**2, axis=(0, 1)))
-                / np.sqrt(np.mean(t**2, axis=(0, 1))))
-        print(f"{name:10s}" + "".join(f"{v:10.2%}" for v in frac))
+        for tag, sel in groups:
+            frac = (np.sqrt(np.mean(d[sel] ** 2, axis=(0, 1)))
+                    / np.sqrt(np.mean(t[sel] ** 2, axis=(0, 1))))
+            print(f"{name + tag:15s}" + "".join(f"{v:10.2%}" for v in frac))
+
+
+def _spin2_AB(m, q_true):
+    """The exact spin-2 response coefficients A, B of each template, from bfd.
+
+    At g = 0 the equivariant response of `models.shear` is
+
+        d(M1 + i M2)/dg1 = Mr (A + B e^2),   d(M1 + i M2)/dg2 = i Mr (A - B e^2)
+
+    with A and B real, so both follow from `dm_dg` by inversion -- no fitting.
+    Together they carry the entire first-order spin-2 response.
+    """
+    Mr = m[:, 1]
+    e = (m[:, 2] + 1j * m[:, 3]) / Mr
+    d1 = (q_true[:, 0, 2] + 1j * q_true[:, 0, 3]) / Mr
+    d2 = (q_true[:, 1, 2] + 1j * q_true[:, 1, 3]) / Mr
+    A, Be2 = 0.5 * (d1 - 1j * d2), 0.5 * (d1 + 1j * d2)
+    # Both are real by parity; if they are not, the spin decomposition is wrong.
+    assert np.abs(A.imag).max() < 1e-6 * np.abs(A.real).max()
+    e_sq = np.abs(e) ** 2
+    # B is Be2/e^2, which blows up as e -> 0.  Carry it as the pair (B, |e|^4)
+    # instead: |e|^4 is exactly the weight B enters every later average with.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        B = np.where(e_sq > 0, (Be2 / np.where(e_sq > 0, e * e, 1.0)).real, 0.0)
+    return A.real, B, e_sq**2
+
+
+def _spin0_a(m, q_true):
+    """The exact first-order spin-0 response coefficient of Mf, Mr and Mc.
+
+    The spin-0 structure at first order is dX/dg = X a_X Re(e* g), i.e.
+    (dX/dg1, dX/dg2) = X a_X (e1, e2), so a_X inverts out of `dm_dg` with |e|^2
+    as its natural weight -- a round galaxy has no first-order spin-0 response
+    at all, and nothing to say about a_X.
+    """
+    Mr = m[:, 1]
+    e = np.stack([m[:, 2] / Mr, m[:, 3] / Mr], axis=-1)
+    e_sq = (e**2).sum(-1)
+    X = m[:, [0, 1, 4]]
+    num = np.einsum("bi,bij->bj", e, q_true[:, :, [0, 1, 4]])
+    return num / (X * e_sq[:, None]), e_sq
+
+
+def _poly(x, deg):
+    """All monomials in the columns of `x` up to total degree `deg`."""
+    import itertools
+
+    x = (x - x.mean(0)) / x.std(0)
+    cols = [np.ones(len(x))]
+    for d in range(1, deg + 1):
+        for p in itertools.combinations_with_replacement(range(x.shape[1]), d):
+            cols.append(np.prod(x[:, p], axis=1))
+    return np.stack(cols, axis=-1)
+
+
+def _wls_resid(basis, y, w):
+    """Weighted least-squares residual of y on basis."""
+    s = np.sqrt(w)
+    beta = np.linalg.lstsq(basis * s[:, None], y * s, rcond=None)[0]
+    return y - basis @ beta
+
+
+def response_scatter(m, q_true, labels=None, deg=4):
+    """The share of the first-order shear response that the moments do not fix.
+
+    A transport layer makes dm/dg a deterministic function of m, so it can only
+    ever carry E[dm/dg | m].  What a flexible regression of the exact response
+    coefficients on the flux-blind invariants CANNOT explain is Var[Q|m] -- the
+    piece no deterministic layer can represent, and the floor on the resulting
+    multiplicative bias (see the module docstring: the bias is ~Var[Q|m]/E[Q|m]^2
+    and does not shrink with g).  Running it with and without the concentration
+    k = Mc Mf/Mr^2 is what says whether modelling Mc is enough for a population,
+    and it is a property of the population alone -- no trained flow involved.
+    """
+    A, B, w4 = _spin2_AB(m, q_true)
+    a0, e_sq = _spin0_a(m, q_true)
+    Mf, Mr, Mc = m[:, 0], m[:, 1], m[:, 4]
+    r, k, q = Mr / Mf, Mc * Mf / (Mr * Mr), e_sq
+    ones = np.ones(len(m))
+
+    # (label, [(coefficient, its weight in the response), ...])
+    parts = [("spin-2 (A, B)", [(A, ones), (B, w4)])]
+    parts += [(f"spin-0 {n}", [(a0[:, i], e_sq)])
+              for i, n in enumerate(["Mf", "Mr", "Mc"])]
+
+    def frac(resid, terms, sel=slice(None)):
+        num = sum(np.mean((d**2 * wt)[sel]) for d, (_, wt) in zip(resid, terms))
+        den = sum(np.mean((c**2 * wt)[sel]) for c, wt in terms)
+        return np.sqrt(num / den)
+
+    bases = {name: _poly(np.stack(cols, axis=-1), deg)
+             for name, cols in (("no Mc", (r, q)), ("with Mc", (r, k, q)))}
+    print("\nfirst-order response scatter at fixed moments: "
+          f"RMS unexplained / RMS response, {len(m)} templates")
+    print("invariants regressed on: Mr/Mf, |e|^2 (no Mc) and + Mc Mf/Mr^2")
+    header = f"{'component':18s}{'no Mc':>10s}{'with Mc':>10s}"
+    if labels is not None:
+        header += f"{'  red':>10s}{'  blue':>10s}   (with Mc)"
+    print(header)
+    for name, terms in parts:
+        resid = {b: [_wls_resid(bases[b], c, wt) for c, wt in terms]
+                 for b in bases}
+        row = (f"{name:18s}{frac(resid['no Mc'], terms):10.2%}"
+               f"{frac(resid['with Mc'], terms):10.2%}")
+        if labels is not None:
+            row += (f"{frac(resid['with Mc'], terms, labels):10.2%}"
+                    f"{frac(resid['with Mc'], terms, ~labels):10.2%}")
+        print(row)
 
 
 def derivs_plot(flow, log10mf, mrmf, mcmr, m_range, n, out):
@@ -265,7 +390,7 @@ def derivs_plot(flow, log10mf, mrmf, mcmr, m_range, n, out):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("mode", choices=["train", "check", "derivs"])
+    p.add_argument("mode", choices=["train", "check", "derivs", "scatter"])
     p.add_argument("--data", default="../bfd_cnf_imsims/data/moments.fits")
     p.add_argument("--flow", default="flows/shear.eqx")
     p.add_argument("--init", default="flows/bulk.eqx",
@@ -287,9 +412,16 @@ def main():
     a = p.parse_args()
 
     data = load(a.data)
+    if a.mode == "scatter":
+        # A property of the population, not of any trained flow -- no checkpoint.
+        response_scatter(data[0], data[1], load_labels(a.data))
+        return
+
     n_train = int(0.9 * len(data[0]))
     train_set = tuple(x[:n_train] for x in data)
     val_set = tuple(x[n_train:] for x in data)
+    labels = load_labels(a.data)
+    val_labels = None if labels is None else labels[n_train:]
 
     flow = bulk.build_flow(jr.key(a.seed), train_set[0], shear=True)
 
@@ -308,13 +440,13 @@ def main():
         print(f"val nll {val_nll(flow, val_set, jr.key(99)):.4f}")
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")
-        check(flow, val_set)
+        check(flow, val_set, labels=val_labels)
         return
 
     flow = eqx.tree_deserialise_leaves(a.flow, flow)
     if a.mode == "check":
         print(f"val nll {val_nll(flow, val_set, jr.key(99)):.4f}")
-        check(flow, val_set)
+        check(flow, val_set, labels=val_labels)
     else:
         mcmr = a.mcmr
         if mcmr is None:

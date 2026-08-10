@@ -288,6 +288,19 @@ class RawMomentStandardize(AbstractBijection):
     and the spin-2 pair last (3, 4); the equivariant layers and the
     permutations between them rely on that split.  Mc/Mr carries the same units
     as Mr/Mf (both are k^2), so the two size-like coordinates share a scale.
+
+    The spin-2 standardisation is SYMMETRISED (`_effective`), which is what
+    keeps the whole stack isotropic.  Every other layer already is -- `Permute`
+    never touches slots 3 and 4, `Spin0AutoregressiveLayer` never reads them,
+    `Spin2CouplingLayer` applies one shared scale to both, the base is
+    isotropic, and `ShearResponse` is spin-covariant by construction -- so a
+    per-coordinate mean and std here is the only thing in the flow that can
+    pick out a direction on the sky.  It is not a harmless initialisation
+    either: `Spin2CouplingLayer` has no location parameter, so the flow's spin-2
+    mean is ENTIRELY this `mean[3:]`, and `bulk.train` hands both slots to Adam
+    independently.  Left free, they fit the training sample's shape-noise mean
+    (~1e-4 in M1/Mr at 90k galaxies) and a spurious axis ratio (~5e-3), and a
+    prior with a preferred direction reads out as additive shear bias.
     """
 
     mean: jax.Array
@@ -312,6 +325,18 @@ class RawMomentStandardize(AbstractBijection):
             self.std = jnp.ones(5)
         else:
             self.std = jnp.asarray(std)
+
+    def _effective(self):
+        """(mean, std) with the spin-2 pair forced isotropic.
+
+        Isotropy fixes both: the mean of (M1/Mr, M2/Mr) is exactly zero, and the
+        two share one scale.  Applying it HERE rather than at construction means
+        the optimiser cannot undo it -- the raw `mean[3:]` is simply never read,
+        and `std[3:]` is read only through the rotation-invariant combination
+        sqrt((s3^2 + s4^2)/2), i.e. half the trace of the spin-2 covariance.
+        """
+        spin2_scale = jnp.sqrt(0.5 * (self.std[3] ** 2 + self.std[4] ** 2))
+        return (self.mean.at[3:].set(0.0), self.std.at[3:].set(spin2_scale))
 
     @property
     def shape(self):  # type: ignore[override]
@@ -348,7 +373,8 @@ class RawMomentStandardize(AbstractBijection):
         z0_4 = M2 / Mr
 
         z0 = jnp.stack([z0_0, z0_1, z0_2, z0_3, z0_4], axis=-1)
-        z = (z0 - self.mean) / self.std
+        mean, std = self._effective()
+        z = (z0 - mean) / std
         return z, z0
 
     def _inverse_transform(self, z):
@@ -366,7 +392,8 @@ class RawMomentStandardize(AbstractBijection):
         z0 : jax.Array, shape (..., 4)
             Intermediate un-standardised coordinates.
         """
-        z0 = z * self.std + self.mean
+        mean, std = self._effective()
+        z0 = z * std + mean
         log10_const = jnp.log(jnp.array(10.0, dtype=z0.dtype))
         Mf = jnp.exp(z0[..., 0] * log10_const)
         Mr = z0[..., 1] * Mf
@@ -397,7 +424,7 @@ class RawMomentStandardize(AbstractBijection):
         Mr = x[..., 1]
         ln10 = jnp.log(jnp.array(10.0, dtype=Mf.dtype))
         lad_geom = -(2.0 * jnp.log(Mf) + 3.0 * jnp.log(Mr) + jnp.log(ln10))
-        lad_std = -jnp.sum(jnp.log(self.std))
+        lad_std = -jnp.sum(jnp.log(self._effective()[1]))
         return z, lad_geom + lad_std
 
     def inverse_and_log_det(self, y, condition=None):

@@ -80,6 +80,43 @@ def test_derivatives_match_finite_differences():
     assert jnp.max(jnp.abs(fd11 - r[0]) / jnp.abs(r[0])) < 1e-4
 
 
+def test_flow_isotropy():
+    """The WHOLE stack must be isotropic, not just the shear layer.
+
+    The unlensed population has no preferred direction on the sky, so rotating
+    a galaxy's shape and the shear together must leave the density alone.  The
+    training sample here is deliberately lopsided in M1 vs M2 -- exactly the
+    shape-noise fluctuation a real catalog has -- because the one place that
+    can absorb it is `RawMomentStandardize`, whose per-coordinate mean and std
+    are fitted to it.  A prior with a preferred direction reads out as additive
+    shear bias, so this is a bias test wearing a symmetry test's clothes.
+    """
+    import bulk
+
+    n = 4000
+    Mf = 10 ** jr.uniform(jr.key(1), (n,), minval=3.0, maxval=4.5)
+    Mr = Mf * jr.uniform(jr.key(2), (n,), minval=1.0, maxval=3.5)
+    Mc = Mr * jr.uniform(jr.key(3), (n,), minval=1.8, maxval=2.4)
+    # Lopsided on purpose: different width AND a nonzero mean on M1/Mr.
+    e1 = 0.05 * jr.normal(jr.key(4), (n,)) + 0.01
+    e2 = 0.04 * jr.normal(jr.key(5), (n,))
+    m_train = jnp.stack([Mf, Mr, e1 * Mr, e2 * Mr, Mc], axis=-1)
+    flow = bulk.build_flow(jr.key(0), np.asarray(m_train), shear=True)
+
+    # The test point must be IN this population.  The module-level M is built
+    # for the layer tests and sits far outside it, where `Spin2CouplingLayer`'s
+    # scale saturates at its floor, crushes the spin-2 coordinates to nothing
+    # and makes log_prob trivially shape-independent -- an asymmetric flow
+    # passes that.  In distribution, this test resolves the asymmetry at ~7e-2
+    # nats, six orders of magnitude above the tolerance.
+    Mr0 = 2.0e4
+    m = jnp.array([1.0e4, Mr0, 0.05 * Mr0, -0.0222 * Mr0, 2.1 * Mr0])
+    ref = flow.log_prob(m, condition=G)
+    for phi in np.linspace(0.0, np.pi, 5):
+        mr_, gr_ = _rot(m, G, phi)
+        assert abs(float(flow.log_prob(mr_, condition=gr_) - ref)) < 1e-8, phi
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
