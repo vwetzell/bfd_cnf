@@ -109,6 +109,17 @@ import bulk
 import shear
 from models.centroid import CentroidMarginalize
 
+# Full float32 matmuls, not the TF32 the GPU defaults to.  TF32 keeps 10
+# mantissa bits, so a log-density that accumulates through a ~12-layer flow
+# comes out with ~1 nat of error -- and XLA picks TF32 kernels by autotuning,
+# which is a per-PROCESS decision, so two runs of the SAME code disagreed by
+# 1.2 nats on draws carrying real weight.  That is fatal here twice over: the
+# paired +g/-g comparison assumes two processes compute identical weights from
+# identical draws, and 1 nat is a factor e in a weight.  Measured on this
+# machine: cross-process max |dlog_wt| 1.2 -> 1.4e-3, for 7% throughput.
+# Only the inference path needs this; training noise at TF32 is harmless.
+jax.config.update("jax_default_matmul_precision", "highest")
+
 # Catalogs, as (label, filename stem), per population.  The +/- pair share a
 # seed and so are the same galaxies; the g=0 run is the same galaxies again.
 CATALOGS = {
@@ -283,20 +294,18 @@ def mixture_draws(flow, m, cov, samples, alpha, seed, batch=None, sigma_x=None):
     n_k = round(alpha * samples)
     n_k -= n_k % 2                       # kernel half stays antithetic (pairs)
     n_f = samples - n_k
+    # The alpha >= 1 branch below skips the flow entirely, so the evenness trim
+    # turning an ODD `samples` into n_f = 1 would silently hand back one draw
+    # fewer than asked -- a shape change, not a weight one.  Every caller passes
+    # a power of two; this is the net under that.
+    if alpha >= 1.0 and n_f:
+        raise ValueError(f"alpha >= 1 needs an even `samples`; got {samples}")
 
     m64 = np.asarray(m, dtype=np.float64)
     kernel = kernel_draws(cov, n, n_k, seed)     # (n, n_k, 5) offsets, empty if n_k=0
 
     L = jnp.asarray(np.linalg.cholesky(cov))
     log_diag = jnp.sum(jnp.log(jnp.diag(L)))
-
-    def log_normal(offset):
-        # log N(offset; 0, cov), via a triangular solve rather than inverting
-        # cov -- the numerically stable way to get the quadratic form.
-        shp = offset.shape[:-1]
-        y = jax.scipy.linalg.solve_triangular(L, offset.reshape(-1, 5).T, lower=True)
-        quad = jnp.sum(y * y, axis=0).reshape(shp)
-        return -0.5 * quad - log_diag - 2.5 * jnp.log(2 * jnp.pi)
 
     # Guard log(alpha) and log(1 - alpha) at the 0/1 endpoints so neither
     # produces a NaN; -inf * (finite log-density) is fine, it just drops that
@@ -308,7 +317,7 @@ def mixture_draws(flow, m, cov, samples, alpha, seed, batch=None, sigma_x=None):
     draws_out, wt_out = [], []
     for i in range(0, n, batch):
         m_i = jnp.asarray(m64[i:i + batch])
-        x = m_i[:, None, :] + jnp.asarray(kernel[i:i + batch])
+        kern_i = jnp.asarray(kernel[i:i + batch])
         # The proposal is evaluated at g = 0, but at each target's OWN Sigma_X:
         # the centroid layer is part of the prior the proposal has to cover, and
         # unlike g it is not something the estimator differentiates.
@@ -316,50 +325,28 @@ def mixture_draws(flow, m, cov, samples, alpha, seed, batch=None, sigma_x=None):
                  jax.vmap(condition, in_axes=(None, 0))(
                      jnp.zeros(2), jnp.asarray(sigma_x[i:i + batch],
                                                dtype=jnp.float32)))
-        if n_f:
-            key, sub = jr.split(key)
-            if cond0.ndim == 1:
-                flow_x = flow.sample(sub, (m_i.shape[0], n_f), condition=cond0)
-            else:
-                # flowjax prepends sample_shape to the CONDITION's batch shape,
-                # so a per-target condition already supplies the target axis --
-                # asking for (B, n_f) on top of it would nest a second one.
-                flow_x = jnp.moveaxis(
-                    flow.sample(sub, (n_f,), condition=cond0), 0, 1)
-            x = jnp.concatenate([x, flow_x], axis=1)
 
         if alpha >= 1.0:
             # q IS the kernel, so log_wt = log_k - log_q is identically zero and
             # log_k need never be formed -- it is a triangular solve over every
-            # draw whose result is then subtracted from itself.
+            # draw whose result is then subtracted from itself.  There is no
+            # flow work in this branch at all, so `_mixture_chunk` -- built to
+            # hoist exactly that work -- is never called here.
+            x = m_i[:, None, :] + kern_i
             draws_out.append(np.asarray(x, dtype=np.float32))
             wt_out.append(np.zeros(x.shape[:-1], dtype=np.float32))
             continue
-        log_k = log_normal(x - m_i[:, None, :])
-        ok = (x[..., 0] > 0) & (x[..., 1] > 0)
-        dummy = m_i.at[:, :2].set(jnp.maximum(m_i[:, :2], 1e-6))
-        safe = jnp.where(ok[..., None], x, dummy[:, None, :])
-        # log_prob vectorises as (5),(5)->(), so a per-target condition has to
-        # be broadcast along the DRAW axis as well as the target axis.
-        cond_f = (cond0 if cond0.ndim == 1 else
-                  jnp.broadcast_to(cond0[:, None, :],
-                                   safe.shape[:-1] + cond0.shape[-1:]))
-        log_f = jnp.where(ok, flow.log_prob(safe, condition=cond_f), -jnp.inf)
-        log_q = jnp.logaddexp(log_alpha + log_k, log_1ma + log_f)
 
-        # Where a draw is far enough out that BOTH densities underflow float32,
-        # log_wt is -inf - (-inf) = NaN -- on a draw that is still nominally
-        # in-domain (Mf, Mr > 0), so `log_conv_is`'s domain mask does not catch
-        # it, and ONE such draw NaNs that target's whole logsumexp and with it
-        # its Q and R.  A draw out where L has underflowed carries no weight, so
-        # -inf is not a patch over the NaN, it IS the answer.
-        log_wt = log_k - log_q
+        sub = None
+        if n_f:
+            key, sub = jr.split(key)
+        x, log_wt = _mixture_chunk(flow, m_i, kern_i, cond0, sub, L, log_diag,
+                                   log_alpha, log_1ma, n_f)
         # float32 on the host: these are (n, samples, 5) and at 32k draws/target
         # float64 would be 26 GB per catalog.  Nothing is lost -- `_over_targets`
         # casts to f32 on the way to the device anyway, because the flow is f32.
         draws_out.append(np.asarray(x, dtype=np.float32))
-        wt_out.append(np.asarray(jnp.where(jnp.isfinite(log_wt), log_wt, -jnp.inf),
-                                 dtype=np.float32))
+        wt_out.append(np.asarray(log_wt, dtype=np.float32))
 
     return np.concatenate(draws_out), np.concatenate(wt_out)
 
@@ -403,6 +390,64 @@ def _centroid_apply(layer, x, cond):
     happens only if the structure or the shapes change, not when weights do.
     """
     return jax.vmap(layer.transform_and_log_det)(x, cond)
+
+
+@eqx.filter_jit
+def _mixture_chunk(flow, m_i, kern, cond0, key, L, log_diag, log_alpha, log_1ma, n_f):
+    """One batch of `mixture_draws`' flow work, jitted ONCE at module level.
+
+    `flow.sample` and `flow.log_prob` each traverse a ~12-layer flow whose
+    every layer holds an MLP -- hundreds of individual kernel launches,
+    dispatched one at a time from Python when called eagerly.  Measured at 8
+    targets x 512 draws: eager `flow.sample` 1123.8 ms, eager `flow.log_prob`
+    717.0 ms, both jitted together 2.0 ms -- 922x, and the difference between
+    8% and full GPU utilisation on a production run.  As with `_centroid_apply`,
+    building the wrapper inside `mixture_draws` would retrace on every batch;
+    built here it retraces only when a batch's shapes actually change.
+
+    Callers must not invoke this at alpha >= 1.0: with the kernel as its own
+    proposal there is no flow work to hoist (log_wt is identically zero), so
+    `mixture_draws` keeps that branch outside this function entirely.
+    """
+    x = m_i[:, None, :] + kern
+    if n_f:
+        if cond0.ndim == 1:
+            flow_x = flow.sample(key, (m_i.shape[0], n_f), condition=cond0)
+        else:
+            # flowjax prepends sample_shape to the CONDITION's batch shape,
+            # so a per-target condition already supplies the target axis --
+            # asking for (B, n_f) on top of it would nest a second one.
+            flow_x = jnp.moveaxis(flow.sample(key, (n_f,), condition=cond0), 0, 1)
+        x = jnp.concatenate([x, flow_x], axis=1)
+
+    def log_normal(offset):
+        # log N(offset; 0, cov), via a triangular solve rather than inverting
+        # cov -- the numerically stable way to get the quadratic form.
+        shp = offset.shape[:-1]
+        y = jax.scipy.linalg.solve_triangular(L, offset.reshape(-1, 5).T, lower=True)
+        quad = jnp.sum(y * y, axis=0).reshape(shp)
+        return -0.5 * quad - log_diag - 2.5 * jnp.log(2 * jnp.pi)
+
+    log_k = log_normal(x - m_i[:, None, :])
+    ok = (x[..., 0] > 0) & (x[..., 1] > 0)
+    dummy = m_i.at[:, :2].set(jnp.maximum(m_i[:, :2], 1e-6))
+    safe = jnp.where(ok[..., None], x, dummy[:, None, :])
+    # log_prob vectorises as (5),(5)->(), so a per-target condition has to
+    # be broadcast along the DRAW axis as well as the target axis.
+    cond_f = (cond0 if cond0.ndim == 1 else
+              jnp.broadcast_to(cond0[:, None, :],
+                               safe.shape[:-1] + cond0.shape[-1:]))
+    log_f = jnp.where(ok, flow.log_prob(safe, condition=cond_f), -jnp.inf)
+    log_q = jnp.logaddexp(log_alpha + log_k, log_1ma + log_f)
+
+    # Where a draw is far enough out that BOTH densities underflow float32,
+    # log_wt is -inf - (-inf) = NaN -- on a draw that is still nominally
+    # in-domain (Mf, Mr > 0), so `log_conv_is`'s domain mask does not catch
+    # it, and ONE such draw NaNs that target's whole logsumexp and with it
+    # its Q and R.  A draw out where L has underflowed carries no weight, so
+    # -inf is not a patch over the NaN, it IS the answer.
+    log_wt = log_k - log_q
+    return x, jnp.where(jnp.isfinite(log_wt), log_wt, -jnp.inf)
 
 
 def centroid_transform(layer, x, sigma_x, batch=200_000, to_host=True):
