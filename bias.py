@@ -245,6 +245,12 @@ def mixture_draws(flow, m, cov, samples, alpha, seed, batch=None, sigma_x=None):
 
         q(m) = alpha * N(m; M_i, C_M) + (1 - alpha) * P(m | g=0)
 
+    `flow` here is the PROPOSAL -- it need not be the flow whose density is
+    being integrated.  A proposal only has to COVER the posterior, not match
+    it, so callers may pass a flow shared across runs (`--proposal-flow`) to
+    keep the flow-component draws common random numbers even when the flow
+    actually being evaluated differs between runs.
+
     Pure-kernel sampling (`kernel_draws`) starves whenever C_M is wide next to
     the prior: the ESS can sit below 10 for a real fraction of targets no
     matter how many draws are spent, because every draw comes from the SAME
@@ -486,7 +492,8 @@ def pqr(flow, m, draws=None, log_wt=None, batch=20000, sigma_x=None):
 
 
 def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
-                 batch=64, chunk=2048, report=None):
+                 batch=64, chunk=2048, report=None,
+                 proposal=None, proposal_sigma_x=None):
     """Per-target (d logP/dg, d2 logP/dg2) WITHOUT materialising the draws.
 
     `Phat = (1/S) sum_s w_s p(x_s|g)` is a plain sum over samples, and so are its
@@ -510,7 +517,13 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
     random numbers across catalogs exactly as before -- at alpha = 1.  With
     alpha < 1 part of the proposal comes from the flow itself, so two runs with
     DIFFERENT flows no longer share draws and the pairing weakens; that is a
-    property of the defensive mixture, not of the streaming.
+    property of the defensive mixture, not of the streaming.  `proposal` (with
+    `proposal_sigma_x`) restores it: `mixture_draws` draws its flow component
+    and evaluates `log_q` from `proposal`/`proposal_sigma_x` instead of
+    `flow`/`sigma_x`, while everything downstream of the draws --
+    `split_centroid(flow)`, the centroid transform of draws and targets, and
+    `log_conv_is` -- keeps evaluating `flow` at `sigma_x`.  `proposal is None`
+    (the default) is exactly today's behavior.
 
     Accuracy, measured against a single logsumexp over the SAME draws:
 
@@ -555,6 +568,7 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
     for i in range(0, len(m), batch):
         m_b = m[i:i + batch]
         sx_b = None if sigma_x is None else sigma_x[i:i + batch]
+        psx_b = None if proposal_sigma_x is None else proposal_sigma_x[i:i + batch]
         # The merge runs in float64 on the host.  It has to: `c_over_a` below is
         # rebuilt as `hess + (B/A)(B/A)^T`, and `hess` was itself computed as
         # `C/A - (B/A)(B/A)^T`, so at low ESS -- where B/A is large -- that is a
@@ -576,9 +590,10 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
             # correlated per-target errors stop averaging down in the eq.
             # (45)-(46) ensemble sums.  Note this makes `batch` part of the
             # random stream: two runs to be compared must use the same one.
-            d, lw = mixture_draws(flow, m_b, cov, chunk, alpha,
-                                  seed + 7919 * c + 104729 * (i // batch),
-                                  batch=len(m_b), sigma_x=sx_b)
+            d, lw = mixture_draws(
+                flow if proposal is None else proposal, m_b, cov, chunk, alpha,
+                seed + 7919 * c + 104729 * (i // batch),
+                batch=len(m_b), sigma_x=sx_b if proposal is None else psx_b)
             lw = jnp.asarray(lw, dtype=jnp.float32)
             if layer is not None:
                 # Stay on device: the transformed draws go straight back into a
@@ -796,6 +811,11 @@ def main():
     p.add_argument("--n-targets", type=int, default=None,
                    help="use only the first N targets (the integration is "
                         "`samples` flow evaluations per target)")
+    p.add_argument("--proposal-flow", default=None,
+                   help="draw the defensive mixture's flow component from THIS "
+                        "flow instead of the one being evaluated, so two runs "
+                        "with different --flow still share draws and --compare "
+                        "keeps its pairing. Only matters when --alpha < 1.")
     a = p.parse_args()
 
     if a.compare:
@@ -821,15 +841,30 @@ def main():
     # is fixed by the training split, so the same 90% has to go in here.  The
     # centroid flow was standardised on the copy catalog's GALAXIES table
     # instead, which is the full population; --train-data selects it.
-    m_train = shear.load(train_data)[0]
-    if not use_centroid:
-        m_train = m_train[:int(0.9 * len(m_train))]
+    m_train_full = shear.load(train_data)[0]
+    slice90 = lambda arr: arr[:int(0.9 * len(arr))]
+    m_train = m_train_full if use_centroid else slice90(m_train_full)
     flow = bulk.build_flow(jr.key(a.seed), m_train, shear=True,
                            centroid=use_centroid)
     flow = eqx.tree_deserialise_leaves(a.flow, flow)
     print(f"{a.flow} on the {a.pop} targets"
           + (" (image noise, recentred; centroid layer on)" if use_centroid
              else ""))
+
+    proposal = None
+    if a.proposal_flow:
+        # Keyed on IMGNOISE, not `use_centroid`/`--no-centroid`: --no-centroid
+        # selects what is being MEASURED, and must not degrade the proposal,
+        # which only has to cover the posterior the CATALOG actually has.  Its
+        # training slice is keyed the same way, for the same reason the eval
+        # flow's is keyed on `use_centroid` above -- get this wrong and the
+        # proposal's RawMomentStandardize is silently off.
+        m_train_prop = m_train_full if img_noise else slice90(m_train_full)
+        proposal = bulk.build_flow(jr.key(a.seed), m_train_prop, shear=True,
+                                   centroid=img_noise)
+        proposal = eqx.tree_deserialise_leaves(a.proposal_flow, proposal)
+        print(f"  proposal flow: {a.proposal_flow} "
+              f"(draws shared across eval flows)")
 
     if img_noise and not a.samples:
         raise SystemExit(
@@ -858,8 +893,19 @@ def main():
 
     # Sigma_X per target: the centroid layer's condition.  Constant in these
     # sims, read per row anyway so a varying-depth catalog needs no change here.
-    sigma_x = (np.asarray(rows["zero"]["cov_odd"], dtype=np.float64)
-               if use_centroid else None)
+    # Read unconditionally: the proposal flow's centroid layer is keyed on
+    # IMGNOISE (see the proposal-flow build above), so it needs Sigma_X even
+    # when the evaluation flow -- keyed on `use_centroid` -- does not.
+    sigma_x_all = np.asarray(rows["zero"]["cov_odd"], dtype=np.float64)
+    sigma_x = sigma_x_all if use_centroid else None
+    proposal_sigma_x = sigma_x_all if img_noise else None
+    # The three mixture_draws call sites below all draw the flow component
+    # from EITHER the proposal, if one was given, or the flow itself --
+    # collapse that choice once instead of three times.  `pqr_streamed` does
+    # the equivalent internally, so it is passed `proposal`/`proposal_sigma_x`
+    # directly rather than through these.
+    draw_flow = flow if proposal is None else proposal
+    draw_sigma_x = sigma_x if proposal is None else proposal_sigma_x
 
     draws = log_wt = None
     batch = 20000
@@ -891,8 +937,8 @@ def main():
             draws, log_wt = {}, {}
             for k, v in m.items():
                 draws[k], log_wt[k] = mixture_draws(
-                    flow, v, cov, a.samples, a.alpha, a.noise_seed + 1000,
-                    sigma_x=sigma_x)
+                    draw_flow, v, cov, a.samples, a.alpha, a.noise_seed + 1000,
+                    sigma_x=draw_sigma_x)
 
     # Peel the centroid layer off and apply it once.  Its log-det is a property
     # of the draw and of Sigma_X, never of g, so it belongs in the importance
@@ -921,9 +967,9 @@ def main():
         # diagnostic, so it does not need the full sample count.  Report it
         # scaled to the full S, since ESS grows linearly with draws.
         n_e = min(2000, len(m["zero"]))
-        d_e, w_e = mixture_draws(flow, m_raw["zero"][:n_e], cov, chunk, a.alpha,
-                                 a.noise_seed + 1000, sigma_x=None
-                                 if sigma_x is None else sigma_x[:n_e])
+        d_e, w_e = mixture_draws(draw_flow, m_raw["zero"][:n_e], cov, chunk,
+                                 a.alpha, a.noise_seed + 1000, sigma_x=None
+                                 if draw_sigma_x is None else draw_sigma_x[:n_e])
         if layer is not None:
             d_e, ld_e = centroid_transform(layer, d_e, sigma_x[:n_e])
             w_e = w_e + ld_e
@@ -942,7 +988,8 @@ def main():
             qr[k] = pqr_streamed(flow, v, cov, a.samples, a.alpha,
                                  a.noise_seed + 1000, sigma_x,
                                  batch=batch, chunk=chunk,
-                                 report=max(1, len(v) // (batch * 10)))
+                                 report=max(1, len(v) // (batch * 10)),
+                                 proposal=proposal, proposal_sigma_x=proposal_sigma_x)
     else:
         qr = {k: pqr(flow_g, v, None if draws is None else draws[k],
                      None if log_wt is None else log_wt[k], batch, sigma_x)

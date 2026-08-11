@@ -19,7 +19,7 @@ import numpy as np
 jax.config.update("jax_enable_x64", True)
 
 from bias import (  # noqa: E402  (after the x64 flag)
-    ess, kernel_draws, log_conv, log_conv_is, mixture_draws)
+    ess, kernel_draws, log_conv, log_conv_is, mixture_draws, pqr_streamed)
 
 # A prior N(mu(g), S0) in raw moment space, with mu linear in g.  mu0 sits far
 # from the Mf, Mr > 0 edges so log_conv's domain mask never fires and the
@@ -50,6 +50,46 @@ class GaussPrior:
         mu = MU0 + condition @ DMU
         z = jax.random.normal(key, sample_shape + (5,))
         return mu + z @ np.linalg.cholesky(S0).T
+
+
+class MismatchedPrior:
+    """A stand-in PROPOSAL that is genuinely different from `GaussPrior`: its
+    mean is shifted by 300 in every raw-moment component and its covariance is
+    1.5x wider.  Used to check that `mixture_draws`'s first argument only has
+    to be A proposal, not the density being integrated -- see
+    `test_mismatched_proposal_is_still_unbiased`."""
+
+    MU = MU0 + 300.0
+    S = 1.5 * S0
+
+    def log_prob(self, x, condition):
+        d = x - (self.MU + condition @ DMU)
+        return (-0.5 * jnp.einsum("...i,ij,...j->...", d, jnp.linalg.inv(self.S), d)
+                - 0.5 * jnp.linalg.slogdet(2 * jnp.pi * self.S)[1])
+
+    def sample(self, key, sample_shape=(), condition=None):
+        mu = self.MU + condition @ DMU
+        z = jax.random.normal(key, sample_shape + (5,))
+        return mu + z @ np.linalg.cholesky(self.S).T
+
+
+class _StubBijection:
+    """Self-referencing stand-in for flowjax's `bijection.bijection.bijections`
+    chain -- just enough of it for `bias.split_centroid` to find no
+    `CentroidMarginalize` at `bijections[0]` and return `(flow, None)`."""
+
+    def __init__(self):
+        self.bijection = self
+        self.bijections = [object()]
+
+
+class GaussPriorEval(GaussPrior):
+    """`GaussPrior` plus the `.bijection` attribute `split_centroid` needs, so
+    it can stand in as the EVAL flow passed to `pqr_streamed` -- see
+    `test_pqr_streamed_proposal_draws_from_proposal_evaluates_with_flow`."""
+
+    def __init__(self):
+        self.bijection = _StubBijection()
 
 
 def exact(M, g):
@@ -149,6 +189,76 @@ def test_mixture_is_unbiased_against_the_exact_convolution():
     # scatter there: std 1.5e-3, max 3.8e-3 over 20 seeds.
     g = jnp.array([0.05, -0.03])
     assert abs(float(f(g)) - exact(M, np.asarray(g))) < 8e-3
+
+
+def test_mismatched_proposal_is_still_unbiased():
+    """The mathematical invariant `mixture_draws`'s docstring now states: its
+    first argument is the PROPOSAL, which only has to COVER the density being
+    integrated, not match it.  Draw from `MismatchedPrior` (a different mean
+    and a wider covariance than `GaussPrior`) at alpha = 0.5, then evaluate
+    with the ORIGINAL `GaussPrior` via `log_conv_is` -- the result must still
+    be the SAME exact convolution as the matched-proposal test above, not
+    merely close to it (a mismatched proposal costs ESS, and a systematic
+    offset would be a real bias, not noise)."""
+    M = MU0 + np.array([2.0e2, -8.0e2, 3.0e2, -2.0e2, 5.0e3])   # same target
+    draws, log_wt = mixture_draws(MismatchedPrior(), jnp.asarray([M]), COV,
+                                  400_000, 0.5, seed=7)
+    f = lambda g: log_conv_is(GaussPrior(), jnp.asarray(M), jnp.asarray(draws[0]),
+                              jnp.asarray(log_wt[0]), g)
+
+    zero = jnp.zeros(2)
+    logP = float(f(zero))
+    q = np.asarray(jax.grad(f)(zero))
+    r = np.asarray(jax.hessian(f)(zero))
+
+    A = np.linalg.inv(S0 + COV)
+    q_true = DMU @ A @ (M - MU0)
+    r_true = -DMU @ A @ DMU.T
+
+    # Tolerances ~2x the scatter measured over 20 seeds at this S: logP std
+    # 1.7e-3 (max 4.7e-3), q rel std 3.7e-4 (max 1.5e-3), r rel std 4.3e-4
+    # (max 1.7e-3) -- close to the matched-proposal test's own numbers, because
+    # MismatchedPrior's offset (300) and width (1.5x) are both mild next to S0.
+    assert abs(logP - exact(M, np.zeros(2))) < 1e-2, (logP, exact(M, np.zeros(2)))
+    assert np.max(np.abs(q - q_true) / np.abs(q_true)) < 3e-3, (q, q_true)
+    assert np.max(np.abs(r - r_true) / np.abs(r_true)) < 4e-3, (r, r_true)
+
+    # ...and at a shear well away from zero, where mu(g) has moved.  Measured
+    # scatter there: std 1.5e-3, max 4.0e-3 over 20 seeds.
+    g = jnp.array([0.05, -0.03])
+    assert abs(float(f(g)) - exact(M, np.asarray(g))) < 1e-2
+
+
+def test_pqr_streamed_proposal_draws_from_proposal_evaluates_with_flow():
+    """`pqr_streamed(..., proposal=...)` must feed `proposal` to the internal
+    `mixture_draws` call for the DRAWS, while everything downstream --
+    `split_centroid(flow)` and `log_conv_is` -- keeps evaluating `flow`, the
+    density actually being integrated.  `GaussPriorEval` stands in for a flow
+    with no centroid layer (`split_centroid` sees no `CentroidMarginalize` and
+    returns `(flow, None)`); `MismatchedPrior` supplies the draws.  A single
+    chunk (`chunk = samples`) sidesteps the merge entirely, so this is a
+    one-target plumbing check, not a merge-accuracy one."""
+    M = MU0 + np.array([2.0e2, -8.0e2, 3.0e2, -2.0e2, 5.0e3])
+    m = jnp.asarray([M])
+    S = 200_000
+
+    A = np.linalg.inv(S0 + COV)
+    q_true = DMU @ A @ (M - MU0)
+    r_true = -DMU @ A @ DMU.T
+
+    q, r = pqr_streamed(GaussPriorEval(), m, COV, S, 0.5, seed=13, chunk=S,
+                        proposal=MismatchedPrior())
+    # Tolerances ~2x the scatter measured over 15 seeds at this S: q rel std
+    # 4.4e-4 (max 2.0e-3), r rel std 5.8e-4 (max 1.9e-3).
+    assert np.max(np.abs(q[0] - q_true) / np.abs(q_true)) < 4e-3, (q[0], q_true)
+    assert np.max(np.abs(r[0] - r_true) / np.abs(r_true)) < 4e-3, (r[0], r_true)
+
+    # `proposal=None` must be unchanged: the SAME flow drawn from directly, to
+    # machine precision (same seed, same draws, no mismatch to cost ESS).
+    q0, r0 = pqr_streamed(GaussPriorEval(), m, COV, S, 0.5, seed=13, chunk=S)
+    q1, r1 = pqr_streamed(GaussPriorEval(), m, COV, S, 0.5, seed=13, chunk=S,
+                          proposal=None)
+    assert np.array_equal(q0, q1) and np.array_equal(r0, r1)
 
 
 def test_alpha_one_is_the_kernel_estimator():
