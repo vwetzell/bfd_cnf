@@ -214,9 +214,168 @@ final lensing estimator" — and its answer is the same prior-aware proposal.
 So `m1` here is consistent with zero, but only because it cannot yet say
 anything sharper than +/-1%.
 
-Not yet handled: centroid marginalisation (targets and templates are both
-measured at their known centre, so the `L(X^G)|J|` factors of eq. (27)/(38) are
-absent), and selection — `bias.py` cuts on nothing, so `P(s|g) = 1` and the
+## Phase 3 — centroid marginalisation (here now)
+
+A real target's centroid is not known: it is *found*, by solving `X = 0` on a
+noisy image, so the moments a target reports are those of the galaxy seen from a
+slightly wrong origin.  BFD never assumes the template's origin either — each
+template is replicated over a grid of origins `u` and the prior is the weighted
+sum over that grid (eq. 36) — and `models/centroid.py` is that marginalisation as
+a layer.  It is data-adjacent, so the stack is now complete:
+
+    base -> bulk -> shear(g) -> centroid(Sigma_X) -> data
+
+Centroid comes last because it happens last: a galaxy is lensed on the sky and
+only then measured about a centroid somebody had to guess.
+
+```
+python -m imsims.copies --n 100000 --out data/copies_bulgedisc.fits   # in ../bfd_cnf_imsims
+python centroid.py train --copies ../bfd_cnf_imsims/data/copies_bulgedisc.fits
+python -m tests.test_centroid
+```
+
+**What it buys.**  The marginalisation coherently *amplifies* apparent
+ellipticity (the copies' `|e|` grows faster than their position-angle scatter
+kills it), by `+3.5e-4` at `S/N > 40` rising to `+1.4e-2` below 20 — a
+multiplicative shear bias of the same size if left out.  Against the 100k copy
+catalog, 8000 steps:
+
+```
+         layer shift  catalog shift      resid
+  Mf      -5.146e-04     -5.795e-04  2.398e-04
+  Mr      -1.233e-03     -1.164e-03  3.096e-04
+  M1      -8.382e-07     -8.581e-07  1.756e-04
+  M2      -3.232e-06     -9.136e-07  1.220e-04
+  Mc      -1.677e-03     -1.734e-03  2.582e-04
+  ellipticity response  catalog +2.6925e-03   layer +3.1858e-03
+```
+
+So the spin-0 shifts land within 3–11% and the ellipticity response within 18%,
+i.e. the layer removes about 5.5× of the bias and leaves `~5e-4`.  The `resid`
+column — per-galaxy RMS, larger than the mean shifts themselves — is the
+`Var[.|m]` floor again: two galaxies with identical moments marginalise
+differently, and a deterministic transport can only carry the conditional mean.
+Same diagnosis and same eventual fix as the shear layer's `d2m/dg2`.
+
+**The form is fixed by symmetry, not chosen.**  `Sigma_X` is a symmetric
+2-tensor, so it splits into a spin-0 trace and a spin-2 traceless part exactly as
+`(|g|², g)` does for shear, and the same three symmetries then fix the map.  The
+variable is not `Sigma_X` but the displacement covariance it induces,
+`Sigma_u = J^-1 Sigma_X J^-T` with `J = dX/du` bfd's own `xyJacobian`, made
+dimensionless as `T = (Mr/Mf) Sigma_u`.  The marginalisation is second order in
+`u` and hence first order in `T`, leaving two spin-0 structures and three spin-2
+ones — nine real coefficients, functions of the same three flux-blind invariants
+the shear layer uses.
+
+One subtlety worth stating because it is easy to get backwards: with `Sigma_X`
+isotropic `t2` does **not** vanish, because `J` is elliptical and an elliptical
+galaxy's centroid error is anisotropic — larger along the major axis, where the
+flux gradient is shallower.  What holds is that `J` depends only on the galaxy's
+own `e`, so `t2` comes out *parallel* to `e`: the marginalisation rescales
+ellipticity without rotating it and picks out no axis on the sky.  Only a
+genuinely anisotropic `Sigma_X` — an elliptical PSF — can turn a galaxy, and then
+it should.  `tests/test_centroid.py` pins both halves, in float64 (see below).
+
+**Trained by supervision, not by likelihood alone.**  The marginalisation moves
+the moments by `~1e-3` fractionally, which is worth far less likelihood than the
+batch noise on a 1024-galaxy NLL — on the NLL alone the `nll` does not move at
+all.  So `centroid.py` adds a supervised MSE against the catalog's weighted copy
+mean, exactly as `shear.py` does against bfd's `dm/dg`, and here the supervision
+is *exact* rather than approximate: the weighted copy mean **is** eq. (36)'s
+first moment, computed from the catalog with no model in between.  It took the
+shift MSE from `6.1e-6` to `5.3e-8`.
+
+**Sampling needs no importance weights.**  Copy weights span `e^-8` across a
+galaxy's grid, so a flat batch of copies has ESS ~13% of its length — the reason
+this needed SNIS before.  It does not need it here: `CopySampler` draws a galaxy
+in proportion to the *sum* of its copy weights, then one copy within it in
+proportion to `w`, which is exact stratification at full ESS.
+
+That per-galaxy sum is the galaxy's detection probability.  On the shallow
+catalog it is 1.00000 for every galaxy, but it is not an identity: at
+`noise_sigma = 2.73` the faintest ~1% fall below 0.99 and the worst to 0.69,
+because their centroid distribution reaches the `det J <= 0` boundary
+`makeTemplates` cuts on — the paper's positive-Jacobian assumption (§5.3)
+failing at low S/N, not a grid that is too small.  Those galaxies genuinely are
+less likely to be detected, so drawing galaxies by that sum rather than
+uniformly is the correct weighting, and it is what makes the sampler right at
+both depths.  A flux cut would move the same quantity further from 1 without
+changing anything else here.
+
+**A term no eq.-(36) prior can absorb.**  See the imsims README: recentring lands
+on a maximum of the *noisy* flux surface, so the moment noise at the found origin
+is correlated with the first-moment noise that moved the origin there — which
+eq. (26) factorises away.  Measured at `+4 sigma_XY²/Mr` on `Mf`, i.e. `+0.18σ`
+at `S/N 14`, isotropic and so spin-0 only.  It is a floor on this whole approach,
+not something the layer is failing to learn.
+
+## Noisy targets, end to end
+
+`bfd_cnf_imsims` produces targets with pixel noise in the *image*, measured with
+`recenter()`, so the centroid is found rather than assumed
+(`data/targets_noisy_g{0,1p02,1m02}_200k.fits`), and `bias.py` runs on them:
+
+```
+python bias.py --flow flows/centroid.eqx --pop bulgedisc_noisy --samples 2048
+python bias.py --flow flows/shear.eqx --no-centroid --pop bulgedisc_noisy --samples 2048
+```
+
+The `IMGNOISE` header decides the mode.  For such a catalog `bias.py` does *not*
+apply `add_noise` — adding `N(0, C_M)` at load time is exact only at a fixed
+centre, and these already carry their noise in the image, where recentring can
+respond to it — and it switches the centroid layer on.  `--samples 0` is refused
+there: a point evaluation of the prior at a noisy `M` lands in its tails.
+Targets whose recentring did not converge (`badcenter`) are dropped from all
+three catalogs together, so the `+g`/`−g` pairing stays aligned galaxy for
+galaxy.
+
+**The `jacfwd` never enters the shear derivative.**  The centroid layer is
+data-adjacent, so in data → base order it is applied first, to the raw moments,
+conditioned only on `Σ_X` — both its input and its condition are independent of
+`g`.  Hence
+
+    log p(x | g, Σ) = log p_rest(centroid(x, Σ) | g) + log|det ∂centroid/∂x|
+
+with the second term exactly `g`-independent, contributing nothing to `Q` or
+`R`.  `split_centroid` peels the layer off and `centroid_transform` applies it
+once, folding the log-det into the importance weight; the forward-over-reverse
+Hessian then never traverses the layer's 5×5 `jacfwd`, which is 5 extra JVPs of
+the coefficient network *per draw* and is what made the Hessian run out of
+memory at the batch sizes the shear-only flow used.  This is exact, and
+`tests/test_centroid.py::test_peeling_the_layer_off_is_exact_and_g_independent`
+checks both the identity and that the offset carries no shear signal.
+
+### Cost, and the two numbers that set it
+
+`S` flow evaluations per target per catalog, so the integral is the whole cost:
+`~33 ms/target at S = 1024` on the shear-only flow, scaling linearly in `S`.  The
+noiseless path (`--samples 0`) is a *point* evaluation of the prior and ~1000x
+cheaper per target; that is why the 1M-target noiseless runs above are quick and
+these are not.
+
+Three fixes took the deep configuration (`S = 32768`) from 60 to **1384
+targets/min**, all of them plumbing rather than physics:
+
+* `centroid_transform` built its `eqx.filter_jit` wrapper *inside* the function,
+  so a fresh wrapper was made per call and JAX recompiled on **every chunk** —
+  1181 ms against 11.7 ms once hoisted to module scope, and it had been 91% of
+  the per-chunk time.  Worth remembering as a class of bug: a jit wrapper
+  created in a function body is a recompile, not a cache hit.
+* `pqr_streamed`'s per-target kernel called `f`, `jax.grad(f)` and
+  `jax.hessian(f)` separately — three evaluations of the flow, when `hessian` is
+  `jacfwd(grad)` and had already computed the other two.  One `jax.jvp` of
+  `value_and_grad` per `g` direction returns the value, the gradient and a
+  Hessian column together.  Verified bit-identical, per target.
+* `mixture_draws` at `alpha = 1` formed `log_k` and then returned
+  `log_k - log_k`.  The kernel is its own proposal there, so the weights are
+  identically zero and the triangular solve over every draw is pure waste.
+
+What is *not* removable: the centroid layer's log-det.  It looks like
+`log(1 + O(T))` with `T ~ 4e-3` and therefore negligible, but measured it varies
+by **18 nats** across a chunk — kernel draws at depth reach the poorly resolved
+region where `T` is large — and dropping it moves `R` by 7.9%.
+
+Still not handled: selection — `bias.py` cuts on nothing, so `P(s|g) = 1` and the
 non-detection terms of eq. (45)–(46) are legitimately absent.  Bin or cut on a
 *noisy* flux and they stop being.
 
@@ -225,10 +384,23 @@ non-detection terms of eq. (45)–(46) are legitimately absent.  Bin or cut on a
 ```
 bulk.py               phase-1 build / train / corner plot
 shear.py              phase-2 train / check / scatter / shear-derivative plot
+centroid.py           phase-3 train / check, and the CopySampler
 bias.py               m and c on the targets, noiseless or integrated under C_M
 models/shear.py       the ShearResponse layer
-models/bijections.py  the bulk layers, and the Sigma_X layer phase 3 needs
+models/centroid.py    the CentroidMarginalize layer
+models/bijections.py  the bulk layers
 ```
+
+## Note on precision
+
+The flow runs in float32.  `models/centroid.py`'s spin-2 part `t2` is ~1% of
+`t0`, so forming it as a difference of two nearly-equal `Sigma_u` diagonals loses
+most of its float32 significance: the spin-2 response picks up a component
+perpendicular to `e` of up to 1.5%, against `5e-11` in float64.  It is structured
+by the coordinate axes (period `pi/2`, alternating sign) and averages to zero
+over an isotropic population, so it does not read out as additive shear — but it
+is why `tests/test_centroid.py` runs its symmetry checks in float64, and the
+analytic fix is noted in `_tensor` should it ever need to be exact.
 
 ## Notes
 

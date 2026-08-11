@@ -44,6 +44,7 @@ from flowjax.distributions import MultivariateNormal, Transformed
 from paramax import non_trainable
 
 from models.bijections import EquivariantAutoregressiveLayer, RawMomentStandardize
+from models.centroid import CentroidMarginalize
 from models.shear import ShearResponse
 
 # All six permutations of the three spin-0 slots, cycled between bulk layers.
@@ -77,17 +78,20 @@ def to_coords(m):
 
 
 def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH,
-               shear=False):
-    """Bulk flow standardised against `m_train`; with `shear`, conditioned on g.
+               shear=False, centroid=False):
+    """Bulk flow standardised against `m_train`; conditioned on g and/or Sigma_X.
 
-    The generative stack is ``base -> bulk -> shear(g) -> data``, so the shear
-    layer is data-adjacent and acts in raw moment space -- which is where shear
-    physically acts, and where its coefficients are comparable to bfd's dm/dg.
+    The generative stack is ``base -> bulk -> shear(g) -> centroid(Sigma_X) ->
+    data``.  Both conditional layers act in raw moment space, which is where the
+    physics acts: shear's coefficients are then comparable to bfd's dm/dg, and
+    the centroid layer's to the weighted copy means of an `imsims.copies`
+    catalog.  Centroid comes last because it happens last -- a galaxy is lensed
+    on the sky and only then measured about a centroid somebody had to guess.
     """
     t = to_coords(m_train)
     raw2standard = RawMomentStandardize(mean=t.mean(0), std=t.std(0))
 
-    key, k_shear = jr.split(key)
+    key, k_shear, k_centroid = jr.split(key, 3)
     keys = jr.split(key, layers)
     bulk = []
     for i, k in enumerate(keys):
@@ -100,8 +104,13 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
         bulk.append(Permute(jnp.array(_SPIN0_PERMS[i % len(_SPIN0_PERMS)] + [3, 4])))
 
     # Chain.transform runs in list order and maps data -> base, so the
-    # data-adjacent layers come first; Invert flips it for sampling.
-    head = [ShearResponse(k_shear)] if shear else []
+    # data-adjacent layers come first; Invert flips it for sampling.  Centroid
+    # is generatively last, hence first in this list.
+    # With both on, the chain carries one condition vector for the pair:
+    # [g1, g2, C00, C01, C11].  Shear reads the first two, centroid the last three.
+    cond = 5 if (shear and centroid) else None
+    head = ([CentroidMarginalize(k_centroid, cond_dim=cond or 3)] if centroid else []) + \
+           ([ShearResponse(k_shear, cond_dim=cond or 2)] if shear else [])
     bijection = Invert(Chain([*head, raw2standard, *bulk]).merge_chains())
     base = non_trainable(MultivariateNormal(jnp.zeros(5), jnp.eye(5)))
     return Transformed(base, bijection)

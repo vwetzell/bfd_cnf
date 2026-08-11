@@ -68,10 +68,15 @@ a diagnostic that can be compared to bfd, not the training target.
 Direction and invertibility
 ---------------------------
 `transform` (data -> base, "unshear") is the closed-form direction, because it
-is the one likelihood training calls.  `inverse` (sampling) solves it by Newton;
-the map is O(g) from the identity, so from a cold start the error goes as
-|g|^(2^n) and `_NEWTON_STEPS = 4` is exact at g = 0 and at machine precision by
-|g| = 0.1.  Log-dets are taken by autodiff of the 5x5 Jacobian.
+is the one likelihood training calls.  `inverse` (sampling) is closed form too:
+the map is the identity at g = 0, so its g-series inverts term by term and
+`shear` evaluates that inverted series directly.  Nothing here iterates.
+
+The price is that the two directions are exact inverses only through O(g^2) --
+which is every order this layer claims to model, `response` being a second-order
+shear response by construction.  Beyond that the round trip drifts; see
+`tests/test_shear.py::test_bijection_round_trip` for the measured residual
+versus |g|.  Log-dets are taken by autodiff of the 5x5 Jacobian.
 """
 
 from __future__ import annotations
@@ -84,10 +89,6 @@ import jax.random as jr
 from flowjax.bijections import AbstractBijection
 
 from .bijections import CoeffNet
-
-# Newton steps for the data -> base direction.  Error goes as |g|^(2^n) from a
-# cold start, so 4 is machine precision over any shear this model is valid for.
-_NEWTON_STEPS = 4
 
 # Coefficients are bounded so the map stays a diffeomorphism for any g the
 # network might see.  The true values span roughly [-2, 7] (see the ranges
@@ -161,25 +162,59 @@ class ShearResponse(AbstractBijection):
     """
 
     shape: tuple = (5,)
-    cond_shape: tuple = (2,)
+    # Static: it is metadata, not a parameter.  Assigning a plain field in
+    # __init__ would make its contents pytree LEAVES, which changes the
+    # serialised leaf count and breaks every existing checkpoint.
+    cond_shape: tuple = eqx.field(static=True, default=(2,))
     coeffs: _Coeffs
 
-    def __init__(self, key, nn_width=128, nn_depth=3, activation=jnn.silu):
+    def __init__(self, key, nn_width=128, nn_depth=3, activation=jnn.silu,
+                 cond_dim=2):
         self.coeffs = _Coeffs(key, nn_width, nn_depth, activation)
+        # (2,) alone, or (5,) = [g1, g2, C00, C01, C11] when chained with the
+        # centroid layer, which reads the other three.
+        self.cond_shape = (cond_dim,)
 
-    def unshear(self, x, g):
-        """Closed form; `transform`'s map, from observed moments back to base."""
+    def unshear(self, x, condition):
+        """Closed form; `transform`'s map, from observed moments back to base.
+
+        Reads g as the FIRST two entries of `condition` -- see `cond_dim`.
+        """
+        g = condition[:2]
         r, k, q, _ = _invariants(x)
         return response(self.coeffs(r, k, q), x, g)
 
-    def shear(self, y, g):
-        """Solve unshear(x, g) = y for x by Newton, cold-started at the identity."""
-        def step(x, _):
-            J = jax.jacfwd(self.unshear)(x, g)
-            return x - jnp.linalg.solve(J, self.unshear(x, g) - y), None
+    def shear(self, y, condition):
+        """Invert `unshear` in closed form, by inverting its g-series.
 
-        x, _ = jax.lax.scan(step, y, None, length=_NEWTON_STEPS)
-        return x
+        `unshear` is the identity at g = 0, so write it as
+        U(x, g) = x + A(x).g + (1/2) g.B(x).g + O(g^3) and solve
+        U(X(y, g), g) = y order by order:
+
+            X = y - A.g + (1/2) g.[ (C + C^T) - B ].g,   C_iab = d_j A_ia A_jb
+
+        with A, B and dA/dx all evaluated at y.  No iteration, no solve, no
+        convergence criterion -- three nested jacfwd calls of fixed cost.
+
+        The residual is O(g^3), which is the order at which `response` stops
+        modelling anything: the layer IS a second-order shear response, so
+        inverting it past second order would be inverting its truncation error.
+        Exact at g = 0, where the map is the identity in both directions and
+        where every proposal this flow samples for is drawn.  What it costs is
+        exact invertibility at g != 0 -- see tests/test_shear.py for the
+        measured round-trip residual, and note that a proposal drawn through
+        this path is importance-weighted by a log_prob that uses the exact
+        `unshear`, so the residual biases nothing, it only costs ESS.
+        """
+        g = condition[:2]
+        zero = jnp.zeros(2)
+        A = lambda x: jax.jacfwd(self.unshear, argnums=1)(x, zero)
+        a = A(y)                                                # (5, 2)
+        b = jax.jacfwd(A)(y)                                    # (5, 2, 5)
+        B = jax.jacfwd(jax.jacfwd(self.unshear, argnums=1), argnums=1)(y, zero)
+        C = jnp.einsum("iaj,jb->iab", b, a)                     # (5, 2, 2)
+        quad = C + C.transpose(0, 2, 1) - B
+        return y - a @ g + 0.5 * jnp.einsum("iab,a,b->i", quad, g, g)
 
     def transform_and_log_det(self, x, condition=None):
         return (self.unshear(x, condition),

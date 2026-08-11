@@ -18,7 +18,8 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
-from bias import kernel_draws, log_conv  # noqa: E402  (after the x64 flag)
+from bias import (  # noqa: E402  (after the x64 flag)
+    ess, kernel_draws, log_conv, log_conv_is, mixture_draws)
 
 # A prior N(mu(g), S0) in raw moment space, with mu linear in g.  mu0 sits far
 # from the Mf, Mr > 0 edges so log_conv's domain mask never fires and the
@@ -42,6 +43,13 @@ class GaussPrior:
         d = x - (MU0 + condition @ DMU)
         return (-0.5 * jnp.einsum("...i,ij,...j->...", d, jnp.linalg.inv(S0), d)
                 - 0.5 * jnp.linalg.slogdet(2 * jnp.pi * S0)[1])
+
+    def sample(self, key, sample_shape=(), condition=None):
+        """N(MU0 + condition @ DMU, S0) -- flowjax's `sample` convention, so this
+        stands in for the flow on the sampling side too, for `mixture_draws`."""
+        mu = MU0 + condition @ DMU
+        z = jax.random.normal(key, sample_shape + (5,))
+        return mu + z @ np.linalg.cholesky(S0).T
 
 
 def exact(M, g):
@@ -106,6 +114,106 @@ def test_out_of_domain_draws_get_zero_weight_not_nan():
     lp = np.asarray(GaussPrior().log_prob(jnp.asarray(x[ok]), jnp.zeros(2)))
     want = jax.scipy.special.logsumexp(lp) - np.log(len(x))
     assert abs(float(f(jnp.zeros(2))) - float(want)) < 1e-9
+
+
+def test_mixture_is_unbiased_against_the_exact_convolution():
+    """`mixture_draws` + `log_conv_is` at alpha = 0.5 must reproduce the SAME
+    exact convolution and its shear derivatives as the pure-kernel estimator
+    does above.  A wrong mixture normalisation, an alpha bookkeeping slip, or
+    an inverted L/q ratio all show up here as a biased (not just noisier)
+    logP, Q or R."""
+    M = MU0 + np.array([2.0e2, -8.0e2, 3.0e2, -2.0e2, 5.0e3])   # same target
+    draws, log_wt = mixture_draws(GaussPrior(), jnp.asarray([M]), COV,
+                                  400_000, 0.5, seed=7)
+    f = lambda g: log_conv_is(GaussPrior(), jnp.asarray(M), jnp.asarray(draws[0]),
+                              jnp.asarray(log_wt[0]), g)
+
+    zero = jnp.zeros(2)
+    logP = float(f(zero))
+    q = np.asarray(jax.grad(f)(zero))
+    r = np.asarray(jax.hessian(f)(zero))
+
+    A = np.linalg.inv(S0 + COV)
+    q_true = DMU @ A @ (M - MU0)
+    r_true = -DMU @ A @ DMU.T
+
+    # Tolerances ~2x the scatter measured over 20 seeds at this S (half the
+    # draws going to the flow component costs some precision relative to the
+    # all-kernel test above): logP std 1.7e-3 (max 4.6e-3), q rel std 4e-4
+    # (max 1.5e-3), r rel std 4e-4 (max 1.6e-3).
+    assert abs(logP - exact(M, np.zeros(2))) < 8e-3, (logP, exact(M, np.zeros(2)))
+    assert np.max(np.abs(q - q_true) / np.abs(q_true)) < 3e-3, (q, q_true)
+    assert np.max(np.abs(r - r_true) / np.abs(r_true)) < 4e-3, (r, r_true)
+
+    # ...and at a shear well away from zero, where mu(g) has moved.  Measured
+    # scatter there: std 1.5e-3, max 3.8e-3 over 20 seeds.
+    g = jnp.array([0.05, -0.03])
+    assert abs(float(f(g)) - exact(M, np.asarray(g))) < 8e-3
+
+
+def test_alpha_one_is_the_kernel_estimator():
+    """alpha = 1.0 draws nothing from the flow (guard 4 of `mixture_draws`) and
+    log_wt = 0 everywhere, so log_conv_is on its output must reproduce
+    `log_conv` on the SAME kernel draws to machine precision -- not just to
+    Monte Carlo tolerance."""
+    M = MU0 + np.array([1.0e2, 5.0e2, -2.0e2, 1.0e2, -3.0e3])
+    seed, S = 9, 4096
+    eps = kernel_draws(COV, 1, S, seed=seed)[0]
+
+    draws, log_wt = mixture_draws(GaussPrior(), jnp.asarray([M]), COV, S, 1.0, seed)
+    assert np.all(log_wt == 0.0), "alpha = 1 must give log_wt identically zero"
+    # The draws must be the kernel ones, up to the float32 `mixture_draws`
+    # stores them in (its docstring: float64 would be 26 GB per catalog at 32k
+    # draws/target).  Moments are ~1e5, so f32 costs ~8e-3 in moment space.
+    assert np.abs(np.asarray(draws[0], np.float64)
+                  - (np.asarray(M) + eps)).max() < 1e-2
+
+    # Compare like with like.  The claim is that alpha = 1 IS the kernel
+    # estimator, not that f32 and f64 round identically: fed the same f32
+    # numbers the two agree to 2e-12, while against the f64 eps the shear layer
+    # amplifies the storage difference to 5e-9 at g != 0.
+    eps32 = np.asarray(draws[0], np.float32) - np.asarray(M, np.float32)
+    want = lambda g: log_conv(GaussPrior(), jnp.asarray(M), jnp.asarray(eps32), g)
+    got = lambda g: log_conv_is(GaussPrior(), jnp.asarray(M), jnp.asarray(draws[0]),
+                                jnp.asarray(log_wt[0]), g)
+
+    for g in (jnp.zeros(2), jnp.array([0.03, -0.01])):
+        assert abs(float(want(g)) - float(got(g))) < 1e-10
+
+
+def test_mixture_rescues_the_starved_kernel():
+    """Widen the kernel far past the prior's own width (100x S0, against a
+    prior-scale kernel of ~0.02x S0 elsewhere in this file) and the pure-
+    kernel estimator starves: draws from N(M_i, C_M) almost never land where
+    the prior has mass, so its ESS collapses to a handful even at S = 20000.
+    The mixture's flow component covers that mass directly, so its ESS should
+    recover by orders of magnitude -- AND the estimate must still be right;
+    a high ESS on a biased answer would be worse than no fix at all."""
+    M = MU0 + np.array([2.0e2, -8.0e2, 3.0e2, -2.0e2, 5.0e3])
+    cov = 100.0 * S0
+    seed, S = 5, 20_000
+
+    eps = kernel_draws(cov, 1, S, seed=seed)[0]
+    e_kernel = float(ess(GaussPrior(), jnp.asarray([M]), jnp.asarray([M + eps]),
+                         jnp.zeros((1, S)))[0])
+
+    draws, log_wt = mixture_draws(GaussPrior(), jnp.asarray([M]), cov, S, 0.5, seed)
+    e_mix = float(ess(GaussPrior(), jnp.asarray([M]), jnp.asarray(draws),
+                      jnp.asarray(log_wt))[0])
+
+    assert e_kernel < 10, f"test kernel not actually starved: ESS = {e_kernel}"
+    assert e_mix > 5 * e_kernel, (e_mix, e_kernel)
+
+    def exact_wide(M, g):
+        d = M - (MU0 + g @ DMU)
+        S_ = S0 + cov
+        return (-0.5 * d @ np.linalg.solve(S_, d)
+                - 0.5 * np.linalg.slogdet(2 * np.pi * S_)[1])
+
+    logP = float(log_conv_is(GaussPrior(), jnp.asarray(M), jnp.asarray(draws[0]),
+                             jnp.asarray(log_wt[0]), jnp.zeros(2)))
+    # Scatter measured over 15 seeds at this (factor, S): std 5e-4, max 1.1e-3.
+    assert abs(logP - exact_wide(M, np.zeros(2))) < 3e-3, (logP, exact_wide(M, np.zeros(2)))
 
 
 if __name__ == "__main__":

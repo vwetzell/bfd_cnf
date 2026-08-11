@@ -1,0 +1,361 @@
+"""
+centroid.py
+===========
+Phase 3: learn the centroid-marginalisation conditioning of P(m | g, Sigma_X),
+by likelihood on a catalog of shifted template copies.
+
+The training set is not the galaxies -- it is their *copies*.
+`imsims.copies` replicates every template galaxy over a grid of coordinate
+origins u and records the moments m(u) and first moments X(u) of each, which is
+the left-hand side of the paper's eq. (36).  The weight of a copy under a target
+whose first moments have covariance Sigma_X is
+
+    w(u) = d2u . |J(u)| . N(X(u); 0, Sigma_X)
+
+so the marginalised prior is the w-weighted distribution of the m(u).  That is
+what this trains against, and `CentroidMarginalize` is a transport that carries
+the unmarginalised population onto it.
+
+Why draw rather than weight
+---------------------------
+Copy weights span e^-8 across a galaxy's grid, so a flat batch of copies has an
+effective sample size of ~13% of its length -- the classic reason this needed
+self-normalised importance sampling before.  It does not need it here.  The
+weights of ONE galaxy's copies sum to that galaxy's detection probability, and
+`imsims` measures that as 1.00000 for every galaxy when sn_min = 0.  So drawing
+galaxies uniformly and then one copy each in proportion to w is exact
+stratification at full ESS, with no importance weights anywhere.
+
+That equality is a property of the no-selection case, not a general one.  Turn on
+a flux cut and the per-galaxy sum becomes P(s|G) < 1 and genuinely varies between
+galaxies; `CopySampler` would then have to carry it as a per-galaxy weight
+instead of normalising it away.  `tests/test_centroid.py::test_sampler_is_the
+_weighted_distribution` and imsims' own
+`test_copy_weights_sum_to_the_detection_probability` are what license it today.
+
+Staging
+-------
+Sigma_X is the same for every galaxy in the current sims (fixed noise level,
+circular PSF), so this stage asks only whether the layer can represent the
+marginalisation at all -- the conditioning is on a constant.  `--sigma-scale`
+reweights the same catalog to a different Sigma_X without regenerating it, which
+is what the catalog's factor-1.4 grid margin is for, and is the cheap way to see
+the layer's Sigma_X dependence before the sims grow a varying noise level and
+then an elliptical PSF.
+
+Usage:
+    python centroid.py train --copies ../bfd_cnf_imsims/data/copies_bulgedisc.fits
+    python centroid.py check --copies ../bfd_cnf_imsims/data/copies_bulgedisc.fits
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import equinox as eqx
+import fitsio
+import jax
+import jax.numpy as jnp
+import jax.random as jr
+import numpy as np
+import optax
+
+import bulk
+from models.centroid import dm_dsigma
+
+# The copy-weight convention lives in imsims and must not be duplicated here: it
+# is the one place the |J| choice of eq. (35) vs (36) is made, and two copies of
+# that would drift.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bfd_cnf_imsims"))
+try:
+    from imsims.copies import log_weights
+except ImportError as exc:                                  # pragma: no cover
+    raise SystemExit("centroid.py needs ../bfd_cnf_imsims on the path: "
+                     f"{exc}") from None
+
+MOMENT_LABELS = ["Mf", "Mr", "M1", "M2", "Mc"]
+
+
+def load_copies(path):
+    """Read an `imsims.copies` catalog -> (copies, galaxies)."""
+    with fitsio.FITS(path) as f:
+        return f["COPIES"].read(), f["GALAXIES"].read()
+
+
+class CopySampler:
+    """Draw one shifted copy per galaxy, in proportion to its eq.-36 weight.
+
+    Galaxies are drawn in proportion to the SUM of their copy weights, not
+    uniformly.  That sum is the galaxy's detection probability, and it is not
+    always 1: on a shallow catalog it is 1.00000 for every galaxy, but at
+    noise_sigma = 2.73 the faintest ~1% fall to 0.98 and the worst to 0.69,
+    because their centroid distribution reaches the `det J <= 0` boundary that
+    `makeTemplates` cuts on -- the paper's positive-Jacobian assumption (sec.
+    5.3) failing at low S/N, not a grid that is too small (none of them come
+    near `XY_MAX`).  Those galaxies really are less likely to be detected at all,
+    so normalising the sum away would over-weight exactly the objects the
+    formalism represents worst.
+
+    Within a galaxy the copies are then drawn by weight, which is exact
+    stratification at full ESS -- the point of doing it this way rather than
+    self-normalised importance weighting over a flat batch of copies, where the
+    e^-8 spread of the weights leaves an ESS of ~13% of the batch.
+
+    Copies must be grouped by `gal`, which `imsims.copies` writes them as.
+    """
+
+    def __init__(self, copies, sigma_x):
+        w = np.exp(log_weights(copies, sigma_x))
+        self.m = np.ascontiguousarray(copies["moments"], dtype=np.float64)
+        # One running cumulative sum serves every galaxy: within a group the CDF
+        # is just cw shifted by the group's base, so a single searchsorted over
+        # the whole array does the per-galaxy draw for the entire batch at once.
+        self.cw = np.cumsum(w)
+        gal = copies["gal"]
+        # FITS hands back big-endian ints, which JAX will not accept.
+        self.ids = np.unique(gal).astype(np.int64)
+        self.starts = np.searchsorted(gal, self.ids, side="left")
+        self.ends = np.searchsorted(gal, self.ids, side="right")
+        self.base = self.cw[self.starts] - w[self.starts]
+        self.total = self.cw[self.ends - 1] - self.base
+        # P(s|G) as a galaxy-selection probability -- see the class docstring.
+        self._gal_cdf = np.cumsum(self.total)
+        self._gal_cdf /= self._gal_cdf[-1]
+
+    @property
+    def n_galaxies(self):
+        return len(self.ids)
+
+    def ess(self):
+        """Effective sample size per galaxy -- the paper's own sec.-2.5 diagnostic."""
+        w = np.diff(np.concatenate([[0.0], self.cw]))
+        num = np.add.reduceat(w, self.starts) ** 2
+        den = np.add.reduceat(w * w, self.starts)
+        return num / den
+
+    def draw(self, rng, batch):
+        """`batch` galaxies drawn by detection probability, one copy each by weight.
+
+        Returns (copy moments, galaxy row indices) -- the second so the caller can
+        line the batch up with per-galaxy quantities.
+        """
+        gi = np.searchsorted(self._gal_cdf, rng.random(batch))
+        gi = np.clip(gi, 0, len(self.ids) - 1)
+        target = self.base[gi] + rng.random(batch) * self.total[gi]
+        idx = np.searchsorted(self.cw, target, side="left")
+        # Guard the group edges against float error in the cumulative sum.
+        idx = np.clip(idx, self.starts[gi], self.ends[gi] - 1)
+        return self.m[idx], self.ids[gi]
+
+
+def _centroid_layer(flow):
+    """The CentroidMarginalize sitting data-adjacent inside the built flow."""
+    return flow.bijection.bijection.bijections[0]
+
+
+def _trainable(flow):
+    """Filter spec selecting only the centroid layer.
+
+    Same reasoning as `shear._trainable`: the Sigma_X dependence is a small part
+    of the total likelihood, so a free bulk will absorb batch noise and drown it.
+    """
+    spec = jax.tree.map(lambda _: False, flow)
+    return eqx.tree_at(
+        lambda f: f.bijection.bijection.bijections[0], spec,
+        replace=jax.tree.map(eqx.is_inexact_array, _centroid_layer(flow)))
+
+
+def condition(sigma_x, batch, g=(0.0, 0.0)):
+    """The chain's condition vector [g1, g2, C00, C01, C11], tiled over a batch.
+
+    The copies are unlensed, so training runs at g = 0, where the shear layer is
+    the identity and the composition is bulk -> centroid.  That is the whole
+    content of putting the marginalisation in ONE layer conditioned on Sigma_X
+    alone: it assumes the form of the marginalisation does not itself depend on
+    g.  True to the order that matters here -- shear changes Sigma_u only through
+    the O(g) change in the galaxy's own J -- but it is an assumption, and the
+    place it would be tested is a copy catalog built from lensed templates.
+    """
+    row = jnp.concatenate([jnp.asarray(g, dtype=jnp.float32),
+                           jnp.asarray(sigma_x, dtype=jnp.float32)])
+    return jnp.tile(row, (batch, 1))
+
+
+def _scale(m):
+    """Per-moment normalisation [Mf, Mr, Mr, Mr, Mc], as in `shear._scale`.
+
+    Each moment is divided by its own magnitude so residuals are fractional and
+    flux-blind -- except the spin-2 pair, divided by Mr because M1 and M2 pass
+    through zero.
+    """
+    return jnp.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1], m[:, 4]], axis=-1)
+
+
+def _shift_mse(layer, m0, target, sigma_x):
+    """L2 between the layer's shift and the catalog's weighted copy mean shift.
+
+    The direct analogue of `shear._velocity_mse`, and needed for the same reason:
+    the marginalisation moves the moments by ~1e-3 fractionally, which is worth
+    far less likelihood than the batch noise on a 1024-galaxy NLL, so on the NLL
+    alone the signal never surfaces.  Here the supervision is exact rather than
+    approximate -- the weighted copy mean IS eq. (36)'s first moment, computed
+    from the catalog with no model in between.
+
+    Its minimiser is E[shift | m], which is all a deterministic transport can
+    carry anyway; the rest is the `Var[.|m]` floor.
+    """
+    pred = jax.vmap(dm_dsigma, in_axes=(None, 0, None))(layer, m0, sigma_x)
+    return jnp.mean(((pred - target) / _scale(m0)) ** 2)
+
+
+def train(flow, sampler, sigma_x, shift_target, key, steps=4000, batch=1024,
+          lr=3e-3, shift_weight=1e4):
+    cond = condition(sigma_x, batch)
+    sx = jnp.asarray(sigma_x, dtype=jnp.float32)
+    m_gal = jnp.asarray(shift_target[0], dtype=jnp.float32)
+    d_gal = jnp.asarray(shift_target[1], dtype=jnp.float32)
+    opt = optax.chain(optax.clip_by_global_norm(1.0),
+                      optax.adam(optax.cosine_decay_schedule(lr, steps)))
+    params, static = eqx.partition(flow, _trainable(flow))
+    state = opt.init(params)
+    rng = np.random.default_rng(int(jr.randint(key, (), 0, 2**30)))
+
+    @eqx.filter_jit
+    def step(params, state, x, gi):
+        def loss_fn(p):
+            model = eqx.combine(p, static)
+            nll = -jnp.mean(model.log_prob(x, condition=cond))
+            mse = _shift_mse(_centroid_layer(model), m_gal[gi], d_gal[gi], sx)
+            return nll + shift_weight * mse, (nll, mse)
+
+        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        updates, state = opt.update(grads, state, params)
+        return eqx.apply_updates(params, updates), state, aux
+
+    for i in range(steps):
+        x, gi = sampler.draw(rng, batch)
+        params, state, (nll, mse) = step(params, state, jnp.asarray(x),
+                                         jnp.asarray(gi))
+        if i % 250 == 0 or i == steps - 1:
+            print(f"step {i:5d}  nll {nll:.4f}  shift mse {mse:.3e}")
+    return eqx.combine(params, static)
+
+
+def weighted_copy_mean(copies, galaxies, sigma_x):
+    """Per-galaxy w-weighted mean of the copy moments -- the layer's target.
+
+    This is what the marginalisation does to each galaxy, straight from the
+    catalog and with no flow involved.
+    """
+    w = np.exp(log_weights(copies, sigma_x))
+    n = len(galaxies)
+    den = np.bincount(copies["gal"], weights=w, minlength=n)
+    num = np.stack([np.bincount(copies["gal"], weights=w * copies["moments"][:, j],
+                                minlength=n) for j in range(5)], axis=1)
+    keep = den > 0
+    return num[keep] / den[keep, None], keep
+
+
+def check(flow, copies, galaxies, sigma_x, n=4000):
+    """Compare the layer's own shift with the catalog's weighted copy means.
+
+    Diagnostic only, exactly as `shear.check` is: the layer is a transport that
+    matches DENSITIES, so it is not obliged to reproduce any single galaxy's
+    marginalisation -- only the conditional mean of it, which is what the columns
+    below measure.  The scatter that no deterministic transport can carry is the
+    `Var[.|m]` floor of the module docstring.
+    """
+    target, keep = weighted_copy_mean(copies, galaxies, sigma_x)
+    m0 = galaxies["moments"][keep][:n]
+    target = target[:n]
+    layer = _centroid_layer(flow)
+    sx = jnp.asarray(sigma_x, dtype=jnp.float32)
+    pred = np.asarray(jax.vmap(dm_dsigma, in_axes=(None, 0, None))(
+        layer, jnp.asarray(m0, dtype=jnp.float32), sx))
+    truth = target - m0
+
+    # Normalise by each moment's own magnitude; the spin-2 pair by Mr, since M1
+    # and M2 pass through zero (same convention as shear._scale).
+    scale = np.stack([m0[:, 0], m0[:, 1], m0[:, 1], m0[:, 1], m0[:, 4]], axis=1)
+    print(f"  {'':4s} {'layer shift':>13s} {'catalog shift':>14s} {'resid':>10s}")
+    for j, lab in enumerate(MOMENT_LABELS):
+        p, t = pred[:, j] / scale[:, j], truth[:, j] / scale[:, j]
+        print(f"  {lab:4s} {p.mean():+13.3e} {t.mean():+14.3e} "
+              f"{np.sqrt(np.mean((p - t) ** 2)):10.3e}")
+
+    # The number that decides whether this was worth doing: how much of the
+    # ellipticity amplification the layer reproduces.
+    def e(m):
+        return (m[:, 2] + 1j * m[:, 3]) / m[:, 1]
+
+    e0 = e(m0)
+    resp = lambda mm: ((e(mm) * np.conj(e0)).real.sum()
+                       / (e0 * np.conj(e0)).real.sum() - 1.0)
+    print(f"  ellipticity response  catalog {resp(target):+.4e}   "
+          f"layer {resp(m0 + pred):+.4e}")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("mode", choices=["train", "check"])
+    p.add_argument("--copies", default="../bfd_cnf_imsims/data/copies_bulgedisc.fits")
+    p.add_argument("--flow", default="flows/centroid.eqx")
+    p.add_argument("--init", default="flows/shear.eqx",
+                   help="shear checkpoint to warm-start bulk+shear from")
+    p.add_argument("--steps", type=int, default=4000)
+    p.add_argument("--batch", type=int, default=1024)
+    p.add_argument("--shift-weight", type=float, default=1e4,
+                   help="weight on the supervised shift MSE; 0 trains on the "
+                        "likelihood alone, which the 1e-3 signal is too small for")
+    p.add_argument("--sigma-scale", type=float, default=1.0,
+                   help="rescale Sigma_X by this factor squared; the catalog "
+                        "grid is valid over roughly [1/1.4, 1.4]")
+    p.add_argument("--seed", type=int, default=0)
+    a = p.parse_args()
+
+    copies, galaxies = load_copies(a.copies)
+    sigma_x = galaxies["cov_odd"][0] * a.sigma_scale**2
+    sampler = CopySampler(copies, sigma_x)
+    ess = sampler.ess()
+    print(f"{sampler.n_galaxies} galaxies, {len(copies)} copies, "
+          f"Sigma_X = {np.round(sigma_x, 1)}")
+    print(f"copies/galaxy ESS: median {np.median(ess):.0f}, "
+          f"5th pct {np.percentile(ess, 5):.0f}")
+
+    # Standardise the bulk against the unmarginalised galaxy moments, which is
+    # the population the frozen bulk was trained on.
+    m_train = np.asarray(galaxies["moments"], dtype=np.float64)
+    flow = bulk.build_flow(jr.key(a.seed), m_train, shear=True, centroid=True)
+
+    if a.mode == "train":
+        if a.init:
+            prior = eqx.tree_deserialise_leaves(
+                a.init, bulk.build_flow(jr.key(a.seed), m_train, shear=True))
+            pb = prior.bijection.bijection.bijections
+            # Chains differ by the leading centroid layer: prior is
+            # [shear, raw2standard, *bulk], this is [centroid, shear, ...].
+            # Graft the shear layer's PARAMETERS rather than the layer itself --
+            # the prior's copy carries cond_shape (2,) and this chain needs (5,).
+            flow = eqx.tree_at(lambda f: f.bijection.bijection.bijections[2:],
+                               flow, pb[1:])
+            flow = eqx.tree_at(lambda f: f.bijection.bijection.bijections[1].coeffs,
+                               flow, pb[0].coeffs)
+            print(f"warm started bulk + shear from {a.init}")
+        # Indexed by galaxy ROW, so `CopySampler.draw`'s ids address it directly.
+        target, keep = weighted_copy_mean(copies, galaxies, sigma_x)
+        shift = np.zeros_like(m_train)
+        shift[keep] = target - m_train[keep]
+        flow = train(flow, sampler, sigma_x, (m_train, shift),
+                     jr.key(a.seed + 1), steps=a.steps, batch=a.batch,
+                     shift_weight=a.shift_weight)
+        eqx.tree_serialise_leaves(a.flow, flow)
+        print(f"wrote {a.flow}")
+    else:
+        flow = eqx.tree_deserialise_leaves(a.flow, flow)
+    check(flow, copies, galaxies, sigma_x)
+
+
+if __name__ == "__main__":
+    main()

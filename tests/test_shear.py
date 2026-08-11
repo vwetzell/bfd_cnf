@@ -55,13 +55,36 @@ def test_flux_homogeneity():
 
 
 def test_bijection_round_trip():
-    """Newton must invert the map exactly, and the two log-dets must cancel."""
-    for gmag in (0.0, 0.01, 0.05, 0.1, 0.2):
+    """`shear` inverts `unshear` through second order in g -- every order the
+    layer models -- so the round trip is EXACT at g = 0 and drifts as |g|^3.
+
+    This is weaker than the Newton solve it replaced, which round-tripped to
+    machine precision at any |g|.  What is asserted here is the real guarantee
+    of the closed form: exactness where the map is the identity, and a cubic
+    residual beyond it.  The cubic scaling is the sharp part of the test -- a
+    first- or second-order error in the inverted series would still look small
+    at |g| = 0.01 but would break the x8-per-doubling ratio immediately.
+
+    The log-dets cancel exactly at every g regardless, because both directions
+    evaluate the same 5x5 Jacobian at the same point.
+    """
+    assert jnp.max(jnp.abs(LAYER.shear(M, jnp.zeros(2)) - M)) == 0.0
+
+    res = {}
+    for gmag in (0.0, 0.01, 0.02, 0.05, 0.1, 0.2):
         g = jnp.array([gmag, -0.6 * gmag])
         y, ld_i = LAYER.inverse_and_log_det(M, g)
         back, ld_t = LAYER.transform_and_log_det(y, g)
-        assert jnp.max(jnp.abs(back / M - 1.0)) < 1e-12, gmag
+        res[gmag] = float(jnp.max(jnp.abs(back / M - 1.0)))
         assert abs(float(ld_i + ld_t)) < 1e-10, gmag
+
+    assert res[0.0] == 0.0
+    # Measured 2.8e-7 / 2.2e-6 / 3.4e-5 / 2.7e-4 / 2.2e-3; bound at ~3x.
+    assert res[0.01] < 1e-6, res
+    assert res[0.02] < 7e-6, res
+    assert res[0.2] < 7e-3, res
+    for lo, hi in ((0.01, 0.02), (0.05, 0.1)):
+        assert 6.0 < res[hi] / res[lo] < 11.0, (lo, hi, res)   # cubic: x8
 
 
 def test_identity_at_zero_shear():
