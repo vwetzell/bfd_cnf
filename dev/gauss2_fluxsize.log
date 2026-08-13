@@ -1,0 +1,4 @@
+flows/shear_gauss2.eqx on 1000000 exact noiseless targets from ../bfd_cnf_imsims/data/gauss2_g0_1M.fits
+  dropping 0 non-finite targets
+wrote dev/bias_flux_size_cache_gauss2.npz
+wrote dev/bias_flux_size_gauss2.png

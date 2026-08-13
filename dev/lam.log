@@ -1,0 +1,45 @@
+added -1 x the Var[Q|m] offset to the second-order target
+step     0  nll 42.8427  velocity mse 2.161e-01
+step   500  nll 41.5372  velocity mse 5.444e-03
+step  1000  nll 41.3542  velocity mse 5.342e-03
+step  1500  nll 41.4990  velocity mse 4.939e-03
+step  2000  nll 41.3585  velocity mse 3.951e-03
+step  2500  nll 41.2347  velocity mse 3.658e-03
+step  3000  nll 41.5912  velocity mse 3.420e-03
+step  3500  nll 41.5887  velocity mse 1.371e-01
+step  4000  nll 41.1326  velocity mse 3.662e-03
+step  4500  nll 41.0280  velocity mse 1.496e-01
+step  5000  nll 41.3134  velocity mse 3.266e-03
+step  5500  nll 41.4233  velocity mse 2.715e-03
+step  5999  nll 41.2111  velocity mse 3.092e-03
+RESULT lam=-1.0  val_nll 41.2829  m1 -0.0004  RMS 0.0106
+added -0.5 x the Var[Q|m] offset to the second-order target
+step     0  nll 42.8427  velocity mse 2.163e-01
+step   500  nll 41.5380  velocity mse 5.100e-03
+step  1000  nll 41.3249  velocity mse 4.715e-03
+step  1500  nll 41.5870  velocity mse 5.019e-03
+step  2000  nll 41.3600  velocity mse 3.380e-03
+step  2500  nll 41.2432  velocity mse 3.309e-03
+step  3000  nll 41.5888  velocity mse 3.047e-03
+step  3500  nll 41.5403  velocity mse 3.545e-02
+step  4000  nll 41.1268  velocity mse 3.050e-03
+step  4500  nll 41.0226  velocity mse 3.741e-02
+step  5000  nll 41.3060  velocity mse 2.989e-03
+step  5500  nll 41.4199  velocity mse 2.412e-03
+step  5999  nll 41.2124  velocity mse 2.737e-03
+RESULT lam=-0.5  val_nll 41.2800  m1 +0.0036  RMS 0.0115
+added 0.5 x the Var[Q|m] offset to the second-order target
+step     0  nll 42.8427  velocity mse 2.176e-01
+step   500  nll 41.5518  velocity mse 6.226e-03
+step  1000  nll 41.3302  velocity mse 5.654e-03
+step  1500  nll 41.5046  velocity mse 3.100e-03
+step  2000  nll 41.3895  velocity mse 3.627e-03
+step  2500  nll 41.2384  velocity mse 3.056e-03
+step  3000  nll 41.6004  velocity mse 3.089e-03
+step  3500  nll 41.5242  velocity mse 3.881e-02
+step  4000  nll 41.1287  velocity mse 3.431e-03
+step  4500  nll 41.0017  velocity mse 4.012e-02
+step  5000  nll 41.3066  velocity mse 2.889e-03
+step  5500  nll 41.4216  velocity mse 2.360e-03
+step  5999  nll 41.2250  velocity mse 2.625e-03
+RESULT lam=+0.5  val_nll 41.2814  m1 -0.0015  RMS 0.0168

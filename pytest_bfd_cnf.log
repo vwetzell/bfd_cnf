@@ -1,0 +1,48 @@
+........................F.............                                   [100%]
+=================================== FAILURES ===================================
+___________________ test_mixture_rescues_the_starved_kernel ____________________
+
+    def test_mixture_rescues_the_starved_kernel():
+        """Widen the kernel far past the prior's own width (100x S0, against a
+        prior-scale kernel of ~0.02x S0 elsewhere in this file) and the pure-
+        kernel estimator starves: draws from N(M_i, C_M) almost never land where
+        the prior has mass, so its ESS collapses to a handful even at S = 20000.
+        The mixture's flow component covers that mass directly, so its ESS should
+        recover by orders of magnitude -- AND the estimate must still be right;
+        a high ESS on a biased answer would be worse than no fix at all."""
+        M = MU0 + np.array([2.0e2, -8.0e2, 3.0e2, -2.0e2, 5.0e3])
+        cov = 100.0 * S0
+        seed, S = 5, 20_000
+    
+        eps = kernel_draws(cov, 1, S, seed=seed)[0]
+        e_kernel = float(ess(GaussPrior(), jnp.asarray([M]), jnp.asarray([M + eps]),
+                             jnp.zeros((1, S)))[0])
+    
+        draws, log_wt = mixture_draws(GaussPrior(), jnp.asarray([M]), cov, S, 0.5, seed)
+        e_mix = float(ess(GaussPrior(), jnp.asarray([M]), jnp.asarray(draws),
+                          jnp.asarray(log_wt))[0])
+    
+        assert e_kernel < 10, f"test kernel not actually starved: ESS = {e_kernel}"
+        assert e_mix > 5 * e_kernel, (e_mix, e_kernel)
+    
+        def exact_wide(M, g):
+            d = M - (MU0 + g @ DMU)
+            S_ = S0 + cov
+            return (-0.5 * d @ np.linalg.solve(S_, d)
+                    - 0.5 * np.linalg.slogdet(2 * np.pi * S_)[1])
+    
+        logP = float(log_conv_is(GaussPrior(), jnp.asarray(M), jnp.asarray(draws[0]),
+                                 jnp.asarray(log_wt[0]), jnp.zeros(2)))
+        # Scatter measured over 15 seeds at this (factor, S): std 5e-4, max 1.1e-3.
+>       assert abs(logP - exact_wide(M, np.zeros(2))) < 3e-3, (logP, exact_wide(M, np.zeros(2)))
+E       AssertionError: (-45.798955005985235, np.float64(-45.392571583579155))
+E       assert np.float64(0.40638342240607983) < 0.003
+E        +  where np.float64(0.40638342240607983) = abs((-45.798955005985235 - np.float64(-45.392571583579155)))
+E        +    where np.float64(-45.392571583579155) = <function test_mixture_rescues_the_starved_kernel.<locals>.exact_wide at 0x7f3ebb3ed9e0>(array([ 6.20e+03,  2.12e+04,  1.50e+02, -8.00e+01,  1.55e+05]), array([0., 0.]))
+E        +      where array([0., 0.]) = <built-in function zeros>(2)
+E        +        where <built-in function zeros> = np.zeros
+
+tests/test_conv.py:326: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_conv.py::test_mixture_rescues_the_starved_kernel - Assertio...
+1 failed, 37 passed in 434.84s (0:07:14)

@@ -1,0 +1,14 @@
+E0808 11:49:36.870016 2062958 cuda_timer.cc:87] Delay kernel timed out: measured time has sub-optimal accuracy. There may be a missing warmup execution, please investigate in Nsight Systems.
+flows/shear.eqx on the bulgedisc targets
+
+1000000 targets, g1 = +/-0.02
+  m1 = +0.00205 +/- 0.00016
+  c1 = +1.21e-06 +/- 1.1e-04   c2 = +3.78e-04 +/- 1.1e-04
+  unsheared catalog: ghat = (+2.11e-06, +3.77e-04)
+
+   Mf quintile          m1          c1          c2
+            q1     +0.0028   +2.03e-04   +4.53e-04   (+/- 0.0002)
+            q2     +0.0083   -1.89e-04   +4.28e-04   (+/- 0.0004)
+            q3     -0.0027   -2.18e-05   +3.33e-04   (+/- 0.0003)
+            q4     +0.0034   +1.57e-04   +3.56e-04   (+/- 0.0005)
+            q5     -0.0015   -1.50e-04   +3.17e-04   (+/- 0.0006)

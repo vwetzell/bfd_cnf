@@ -68,6 +68,8 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import optax
+from flowjax.bijections import Chain, Invert
+from flowjax.distributions import Transformed
 
 import bulk
 from models.shear import dm_dg
@@ -134,19 +136,98 @@ def _scale(m):
     return jnp.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1], m[:, 4]], axis=-1)
 
 
-def _velocity_mse(layer, m, q_true, r_true):
+BAND = 3.4          # where the response fit starts failing
+
+
+def band_weight(m, k, edge=BAND, width=0.08):
+    """Per-galaxy weights that upweight the poorly-fitted resolution band by `k`.
+
+    The response supervision is a REGRESSION against bfd's exact per-galaxy
+    `dm_dg`, so reweighting it is free of the objection that would sink a
+    reweighted NLL: it moves where the fit is accurate, not what it converges
+    to.  The density term is deliberately left unweighted.
+
+    NOT an inverse-density weight.  The band is ~45% of the population, not a
+    sparse tail, so equalising the Mr/Mf histogram would DE-weight it.  The
+    reason to upweight it is that the REACHABLE (above the Var[Q|m] floor) part
+    of the response error is 0.14-0.38 rms through the middle octiles and
+    1.16/1.78 in the top two -- the fit is worst exactly where every noisy
+    target's convolution integral has to be evaluated.
+
+    Smooth in `Mr/Mf` rather than a step, so the layer is not asked to learn a
+    discontinuity in its own loss; renormalised to mean 1 so `deriv_weight` and
+    `score_weight` keep their meaning.
+    """
+    r = np.asarray(m[:, 1] / m[:, 0], dtype=np.float64)
+    w = 1.0 + (k - 1.0) / (1.0 + np.exp(-(r - edge) / width))
+    return jnp.asarray(w / w.mean())
+
+
+def _velocity_mse(layer, m, q_true, r_true, score=None, wt=None):
     """L2 distance between the layer's transport velocity and the templates'
     own shear derivatives, normalised by `_scale` so it is
     dimensionless, flux-blind, and weighs every galaxy equally.  Its minimiser
-    is E[dm/dg | m] -- see the module docstring."""
+    is E[dm/dg | m] -- see the module docstring.
+
+    Returns `(mse, first)`.  `first` is the same first-order residual contracted
+    with the FROZEN bulk's score, which is the combination that actually reaches
+    the bias: Q = score . u + div u, so a component with a small response but a
+    large score matters to Q while `_scale` -- which divides by the response --
+    barely weighs it.  Measured, the Mr and Mc columns each contribute ~15 to
+    Q1's error and cancel to 1.8, a cancellation nothing in the loss enforces.
+    Zero unless a score is supplied.
+    """
     q, r = jax.vmap(dm_dg, in_axes=(None, 0))(layer, m)
     s = _scale(m)[:, None, :]
-    return jnp.mean(((q - q_true) / s) ** 2) + jnp.mean(((r - r_true) / s) ** 2)
+    w = 1.0 if wt is None else wt[:, None, None]
+    mse = (jnp.mean(w * ((q - q_true) / s) ** 2)
+           + jnp.mean(w * ((r - r_true) / s) ** 2))
+    if score is None:
+        return mse, jnp.zeros(())
+    # q is (batch, shear, moment); the score contracts the moment index.
+    w2 = 1.0 if wt is None else wt[:, None]
+    return mse, jnp.mean(w2 * jnp.einsum("bm,bam->ba", score, q - q_true) ** 2)
+
+
+def bulk_of(flow):
+    """The g-independent density behind the shear layer, whose score drives Q.
+
+    Data -> base order is [shear, raw2standard, bulk], so peeling off
+    `bijections[0]` leaves exactly the density evaluated at g = 0.
+    """
+    bij = flow.bijection.bijection.bijections
+    return Transformed(flow.base_dist,
+                       Invert(Chain(list(bij[1:])).merge_chains()))
+
+
+def bulk_score(flow, m, chunk=10000):
+    """grad log p_bulk at each m, from the frozen bulk (constant during training)."""
+    g = eqx.filter_jit(jax.vmap(jax.grad(bulk_of(flow).log_prob)))
+    return jnp.concatenate([g(m[i:i + chunk]) for i in range(0, len(m), chunk)])
 
 
 def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
-          deriv_weight=1e4):
+          deriv_weight=1e4, varq=0.0, score_weight=0.0, band=1.0):
     m, q, r = (jnp.asarray(a) for a in data)
+    wt = band_weight(data[0], band) if band != 1.0 else None
+    score = None
+    if score_weight:
+        if not bulk_frozen:
+            raise ValueError("the score term uses the frozen bulk's score, "
+                             "which would otherwise move under the optimiser")
+        score = bulk_score(flow, m)
+    # The velocity term's target and the LENSED MOMENTS are different objects.
+    # `lens` must keep the exact physical d2m_dg2 -- those moments are what the
+    # templates really have -- while the velocity term is fitted to E[R_t|m]
+    # plus the Var[Q|m] offset (varq.py).  Only the latter moves.
+    r_tgt = r
+    if varq:
+        if not bulk_frozen:
+            raise ValueError("the Var[Q|m] offset is built from the frozen "
+                             "bulk's score, so the bulk must be frozen")
+        import varq as varq_mod
+        r_tgt = r + varq * varq_mod.target_offset(flow, m, q)
+        print(f"added {varq:g} x the Var[Q|m] offset to the second-order target")
     opt = optax.chain(optax.clip_by_global_norm(1.0),
                       optax.adam(optax.cosine_decay_schedule(lr, steps)))
     params, static = eqx.partition(flow, _trainable(flow, bulk_frozen))
@@ -165,8 +246,12 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
         def loss_fn(p):
             model = eqx.combine(p, static)
             nll = -jnp.mean(model.log_prob(x, condition=g))
-            mse = _velocity_mse(_shear_layer(model), m[idx], q[idx], r[idx])
-            return nll + deriv_weight * mse, (nll, mse)
+            mse, first = _velocity_mse(_shear_layer(model), m[idx], q[idx],
+                                       r_tgt[idx],
+                                       None if score is None else score[idx],
+                                       None if wt is None else wt[idx])
+            return (nll + deriv_weight * mse + score_weight * first,
+                    (nll, mse, first))
 
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, state = opt.update(grads, state, params)
@@ -174,10 +259,11 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
 
     for i in range(steps):
         key, sk, gk = jr.split(key, 3)
-        params, state, (nll, mse) = step(
+        params, state, (nll, mse, first) = step(
             params, state, jr.randint(sk, (batch // 2,), 0, m.shape[0]), gk)
         if i % 500 == 0 or i == steps - 1:
-            print(f"step {i:5d}  nll {nll:.4f}  velocity mse {mse:.3e}")
+            print(f"step {i:5d}  nll {nll:.4f}  velocity mse {mse:.3e}"
+                  f"  score term {first:.3e}")
     return eqx.combine(params, static)
 
 
@@ -396,8 +482,24 @@ def main():
     p.add_argument("--init", default="flows/bulk.eqx",
                    help="bulk checkpoint to warm-start from (train only)")
     p.add_argument("--steps", type=int, default=6000)
+    p.add_argument("--lr", type=float, default=3e-3,
+                   help="shear-stage learning rate. It has never been tuned "
+                        "UPWARD, and it moved the old noiseless metric 5x -- "
+                        "more than every architectural axis combined.")
     p.add_argument("--deriv-weight", type=float, default=1e4,
                    help="weight on the velocity-matching term relative to the NLL")
+    p.add_argument("--varq", type=float, default=0.0,
+                   help="scale on the Var[Q|m] offset to the second-order "
+                        "target (0 = off, 1 = the derived value)")
+    p.add_argument("--band", type=float, default=1.0,
+                   help="upweight the derivative supervision above Mr/Mf ~ 3.4 "
+                        "by this factor -- the band every noisy target's "
+                        "convolution integrates through, and where the "
+                        "reachable response error is 4-6x larger (the NLL "
+                        "stays unweighted). 1.0 = off")
+    p.add_argument("--score-weight", type=float, default=0.0,
+                   help="weight on the score-contracted first-order residual "
+                        "(the combination that reaches Q); 0 = off")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log10mf", type=float, default=3.6)
     p.add_argument("--mrmf", type=float, default=3.3)
@@ -435,8 +537,9 @@ def main():
                 lambda f: f.bijection.bijection.bijections[1:], flow,
                 bulk_only.bijection.bijection.bijections)
             print(f"warm started bulk from {a.init}")
-        flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps,
-                     deriv_weight=a.deriv_weight)
+        flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps, lr=a.lr,
+                     deriv_weight=a.deriv_weight, varq=a.varq,
+                     score_weight=a.score_weight, band=a.band)
         print(f"val nll {val_nll(flow, val_set, jr.key(99)):.4f}")
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")

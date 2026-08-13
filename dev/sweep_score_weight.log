@@ -1,0 +1,162 @@
+
+======================================================================
+score_weight=0 seed=0
+======================================================================
+step     0  nll 42.8427  velocity mse 2.168e-01  score mse 0.000e+00
+step   500  nll 41.4889  velocity mse 4.718e-03  score mse 0.000e+00
+step  1000  nll 41.3457  velocity mse 3.208e-03  score mse 0.000e+00
+step  1500  nll 41.4922  velocity mse 3.109e-03  score mse 0.000e+00
+step  2000  nll 41.3475  velocity mse 3.027e-03  score mse 0.000e+00
+step  2500  nll 41.2356  velocity mse 3.070e-03  score mse 0.000e+00
+step  3000  nll 41.5918  velocity mse 3.390e-03  score mse 0.000e+00
+step  3500  nll 41.5274  velocity mse 2.865e-03  score mse 0.000e+00
+step  4000  nll 41.1296  velocity mse 2.950e-03  score mse 0.000e+00
+step  4500  nll 41.0643  velocity mse 2.717e-03  score mse 0.000e+00
+step  5000  nll 41.3022  velocity mse 2.824e-03  score mse 0.000e+00
+step  5500  nll 41.4198  velocity mse 2.296e-03  score mse 0.000e+00
+step  5999  nll 41.2171  velocity mse 2.577e-03  score mse 0.000e+00
+  w=0 s=0: heldout m1 +0.0018  RMS 0.0117  vel 2.585e-03  score 3.918e+02  [1.8 min]
+
+======================================================================
+score_weight=0 seed=1
+======================================================================
+step     0  nll 43.3690  velocity mse 2.232e-01  score mse 0.000e+00
+step   500  nll 41.1275  velocity mse 4.210e-03  score mse 0.000e+00
+step  1000  nll 41.2338  velocity mse 4.930e-03  score mse 0.000e+00
+step  1500  nll 41.3834  velocity mse 3.972e-03  score mse 0.000e+00
+step  2000  nll 41.4922  velocity mse 2.854e-03  score mse 0.000e+00
+step  2500  nll 41.1573  velocity mse 2.648e-03  score mse 0.000e+00
+step  3000  nll 41.4057  velocity mse 3.445e-03  score mse 0.000e+00
+step  3500  nll 41.0265  velocity mse 2.787e-03  score mse 0.000e+00
+step  4000  nll 41.1274  velocity mse 2.455e-03  score mse 0.000e+00
+step  4500  nll 41.0807  velocity mse 2.973e-03  score mse 0.000e+00
+step  5000  nll 41.6053  velocity mse 2.902e-03  score mse 0.000e+00
+step  5500  nll 41.1921  velocity mse 2.468e-03  score mse 0.000e+00
+step  5999  nll 41.4955  velocity mse 2.756e-03  score mse 0.000e+00
+  w=0 s=1: heldout m1 +0.0016  RMS 0.0147  vel 2.581e-03  score 3.876e+02  [1.6 min]
+
+======================================================================
+score_weight=0 seed=2
+======================================================================
+step     0  nll 43.9866  velocity mse 2.210e-01  score mse 0.000e+00
+step   500  nll 41.1076  velocity mse 3.144e-03  score mse 0.000e+00
+step  1000  nll 41.2413  velocity mse 3.236e-03  score mse 0.000e+00
+step  1500  nll 41.0111  velocity mse 3.131e-03  score mse 0.000e+00
+step  2000  nll 41.1207  velocity mse 2.852e-03  score mse 0.000e+00
+step  2500  nll 41.5760  velocity mse 3.259e-03  score mse 0.000e+00
+step  3000  nll 41.2885  velocity mse 3.520e-03  score mse 0.000e+00
+step  3500  nll 41.1171  velocity mse 2.736e-03  score mse 0.000e+00
+step  4000  nll 41.6253  velocity mse 3.125e-03  score mse 0.000e+00
+step  4500  nll 41.6639  velocity mse 2.573e-03  score mse 0.000e+00
+step  5000  nll 40.9750  velocity mse 2.915e-03  score mse 0.000e+00
+step  5500  nll 41.5151  velocity mse 2.829e-03  score mse 0.000e+00
+step  5999  nll 41.1582  velocity mse 2.651e-03  score mse 0.000e+00
+  w=0 s=2: heldout m1 +0.0015  RMS 0.0126  vel 2.582e-03  score 3.888e+02  [1.7 min]
+
+======================================================================
+score_weight=0.03 seed=0
+======================================================================
+step     0  nll 42.8427  velocity mse 2.168e-01  score mse 9.670e+04
+step   500  nll 41.5078  velocity mse 6.585e-03  score mse 8.143e+02
+step  1000  nll 41.3371  velocity mse 3.857e-03  score mse 4.232e+02
+step  1500  nll 41.5052  velocity mse 3.625e-03  score mse 4.236e+02
+step  2000  nll 41.3499  velocity mse 4.199e-03  score mse 2.516e+02
+step  2500  nll 41.2433  velocity mse 3.040e-03  score mse 8.127e+02
+step  3000  nll 41.5836  velocity mse 3.308e-03  score mse 5.166e+02
+step  3500  nll 41.5639  velocity mse 3.547e-03  score mse 1.446e+03
+step  4000  nll 41.1264  velocity mse 3.022e-03  score mse 3.189e+02
+step  4500  nll 41.0508  velocity mse 2.539e-03  score mse 3.695e+02
+step  5000  nll 41.3020  velocity mse 2.860e-03  score mse 3.736e+02
+step  5500  nll 41.4194  velocity mse 2.271e-03  score mse 4.381e+02
+step  5999  nll 41.2140  velocity mse 2.612e-03  score mse 3.909e+02
+  w=0.03 s=0: heldout m1 -0.0044  RMS 0.0195  vel 2.598e-03  score 3.758e+02  [1.9 min]
+
+======================================================================
+score_weight=0.03 seed=1
+======================================================================
+step     0  nll 43.3690  velocity mse 2.232e-01  score mse 1.638e+05
+step   500  nll 41.1198  velocity mse 4.216e-03  score mse 5.786e+02
+step  1000  nll 41.2047  velocity mse 5.135e-03  score mse 8.609e+02
+step  1500  nll 41.3750  velocity mse 3.734e-03  score mse 3.187e+02
+step  2000  nll 41.4710  velocity mse 4.563e-03  score mse 7.026e+02
+step  2500  nll 41.1747  velocity mse 3.245e-03  score mse 5.724e+02
+step  3000  nll 41.4056  velocity mse 3.010e-03  score mse 3.244e+02
+step  3500  nll 41.0384  velocity mse 2.766e-03  score mse 5.623e+02
+step  4000  nll 41.1291  velocity mse 2.202e-03  score mse 7.340e+02
+step  4500  nll 41.0829  velocity mse 2.990e-03  score mse 5.309e+02
+step  5000  nll 41.6039  velocity mse 2.869e-03  score mse 3.711e+02
+step  5500  nll 41.1928  velocity mse 2.495e-03  score mse 3.812e+02
+step  5999  nll 41.4939  velocity mse 2.765e-03  score mse 3.533e+02
+  w=0.03 s=1: heldout m1 -0.0037  RMS 0.0179  vel 2.592e-03  score 3.757e+02  [1.9 min]
+
+======================================================================
+score_weight=0.03 seed=2
+======================================================================
+step     0  nll 43.9866  velocity mse 2.210e-01  score mse 1.211e+05
+step   500  nll 41.0888  velocity mse 4.052e-03  score mse 5.436e+02
+step  1000  nll 41.2429  velocity mse 4.233e-03  score mse 3.669e+02
+step  1500  nll 41.0135  velocity mse 4.383e-03  score mse 4.449e+02
+step  2000  nll 41.1182  velocity mse 3.105e-03  score mse 3.491e+02
+step  2500  nll 41.5612  velocity mse 3.613e-03  score mse 3.442e+02
+step  3000  nll 41.2825  velocity mse 3.342e-03  score mse 3.455e+02
+step  3500  nll 41.1186  velocity mse 2.769e-03  score mse 3.107e+02
+step  4000  nll 41.6231  velocity mse 3.146e-03  score mse 3.621e+02
+step  4500  nll 41.6550  velocity mse 2.469e-03  score mse 2.753e+02
+step  5000  nll 40.9765  velocity mse 2.847e-03  score mse 3.870e+02
+step  5500  nll 41.5119  velocity mse 2.873e-03  score mse 3.786e+02
+step  5999  nll 41.1577  velocity mse 2.681e-03  score mse 4.027e+02
+  w=0.03 s=2: heldout m1 -0.0041  RMS 0.0184  vel 2.593e-03  score 3.755e+02  [1.8 min]
+
+======================================================================
+score_weight=0.1 seed=0
+======================================================================
+step     0  nll 42.8427  velocity mse 2.168e-01  score mse 9.670e+04
+step   500  nll 41.5373  velocity mse 9.460e-03  score mse 6.410e+02
+step  1000  nll 41.3774  velocity mse 8.825e-03  score mse 7.668e+02
+step  1500  nll 41.5171  velocity mse 5.767e-03  score mse 3.716e+02
+step  2000  nll 41.3538  velocity mse 4.201e-03  score mse 2.263e+02
+step  2500  nll 41.2502  velocity mse 5.287e-03  score mse 5.813e+02
+step  3000  nll 41.5909  velocity mse 4.836e-03  score mse 3.973e+02
+step  3500  nll 41.5232  velocity mse 3.868e-03  score mse 9.683e+03
+step  4000  nll 41.1299  velocity mse 3.340e-03  score mse 3.360e+02
+step  4500  nll 41.0490  velocity mse 3.528e-03  score mse 9.367e+02
+step  5000  nll 41.3013  velocity mse 2.955e-03  score mse 3.745e+02
+step  5500  nll 41.4204  velocity mse 2.372e-03  score mse 4.386e+02
+step  5999  nll 41.2160  velocity mse 2.667e-03  score mse 3.923e+02
+  w=0.1 s=0: heldout m1 -0.0126  RMS 0.0322  vel 2.690e-03  score 3.766e+02  [1.7 min]
+
+======================================================================
+score_weight=0.1 seed=1
+======================================================================
+step     0  nll 43.3690  velocity mse 2.232e-01  score mse 1.638e+05
+step   500  nll 41.1160  velocity mse 5.914e-03  score mse 5.895e+02
+step  1000  nll 41.1833  velocity mse 5.479e-03  score mse 4.105e+02
+step  1500  nll 41.3832  velocity mse 4.685e-03  score mse 3.502e+02
+step  2000  nll 41.4744  velocity mse 3.854e-03  score mse 5.299e+02
+step  2500  nll 41.1650  velocity mse 3.534e-03  score mse 5.934e+02
+step  3000  nll 41.4081  velocity mse 4.024e-03  score mse 3.262e+02
+step  3500  nll 41.0391  velocity mse 3.175e-03  score mse 3.448e+02
+step  4000  nll 41.1679  velocity mse 2.663e-03  score mse 1.224e+03
+step  4500  nll 41.0803  velocity mse 3.159e-03  score mse 5.658e+02
+step  5000  nll 41.6068  velocity mse 2.984e-03  score mse 3.832e+02
+step  5500  nll 41.1937  velocity mse 2.585e-03  score mse 3.825e+02
+step  5999  nll 41.4965  velocity mse 2.845e-03  score mse 3.525e+02
+  w=0.1 s=1: heldout m1 -0.0133  RMS 0.0327  vel 2.671e-03  score 3.762e+02  [1.8 min]
+
+======================================================================
+score_weight=0.1 seed=2
+======================================================================
+step     0  nll 43.9866  velocity mse 2.210e-01  score mse 1.211e+05
+step   500  nll 41.0917  velocity mse 5.041e-03  score mse 5.542e+02
+step  1000  nll 41.2470  velocity mse 5.591e-03  score mse 5.067e+02
+step  1500  nll 41.0385  velocity mse 5.905e-03  score mse 4.045e+02
+step  2000  nll 41.1237  velocity mse 3.507e-03  score mse 5.665e+02
+step  2500  nll 41.5630  velocity mse 3.729e-03  score mse 2.872e+02
+step  3000  nll 41.3021  velocity mse 4.160e-03  score mse 6.683e+02
+step  3500  nll 41.1224  velocity mse 3.440e-03  score mse 3.308e+02
+step  4000  nll 41.6307  velocity mse 3.383e-03  score mse 3.455e+02
+step  4500  nll 41.6571  velocity mse 2.646e-03  score mse 2.954e+02
+step  5000  nll 40.9755  velocity mse 2.929e-03  score mse 3.921e+02
+step  5500  nll 41.5125  velocity mse 2.942e-03  score mse 3.802e+02
+step  5999  nll 41.1583  velocity mse 2.773e-03  score mse 4.034e+02
+  w=0.1 s=2: heldout m1 -0.0138  RMS 0.0327  vel 2.666e-03  score 3.758e+02  [1.9 min]

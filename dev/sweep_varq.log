@@ -1,0 +1,116 @@
+
+======================================================================
+varq=False seed=0
+======================================================================
+step     0  nll 42.8427  velocity mse 2.168e-01
+step   500  nll 41.5157  velocity mse 5.047e-03
+step  1000  nll 41.3540  velocity mse 4.225e-03
+step  1500  nll 41.4945  velocity mse 3.207e-03
+step  2000  nll 41.4337  velocity mse 3.529e-03
+step  2500  nll 41.2507  velocity mse 2.992e-03
+step  3000  nll 41.5849  velocity mse 3.128e-03
+step  3500  nll 41.5314  velocity mse 2.777e-03
+step  4000  nll 41.1292  velocity mse 3.003e-03
+step  4500  nll 41.0287  velocity mse 2.485e-03
+step  5000  nll 41.3017  velocity mse 2.824e-03
+step  5500  nll 41.4206  velocity mse 2.283e-03
+step  5999  nll 41.2189  velocity mse 2.572e-03
+  varq=False s=0: heldout m1 +0.0010  RMS 0.0140  ptp 0.0410  [1.6 min]
+
+======================================================================
+varq=False seed=1
+======================================================================
+step     0  nll 43.3690  velocity mse 2.232e-01
+step   500  nll 41.1085  velocity mse 3.689e-03
+step  1000  nll 41.2098  velocity mse 4.797e-03
+step  1500  nll 41.3740  velocity mse 3.391e-03
+step  2000  nll 41.4774  velocity mse 3.486e-03
+step  2500  nll 41.1578  velocity mse 2.638e-03
+step  3000  nll 41.4086  velocity mse 3.017e-03
+step  3500  nll 41.0373  velocity mse 3.160e-03
+step  4000  nll 41.1373  velocity mse 2.493e-03
+step  4500  nll 41.0806  velocity mse 2.859e-03
+step  5000  nll 41.6049  velocity mse 2.885e-03
+step  5500  nll 41.1921  velocity mse 2.464e-03
+step  5999  nll 41.4953  velocity mse 2.757e-03
+  varq=False s=1: heldout m1 +0.0015  RMS 0.0135  ptp 0.0385  [1.5 min]
+
+======================================================================
+varq=False seed=2
+======================================================================
+step     0  nll 43.9866  velocity mse 2.210e-01
+step   500  nll 41.0878  velocity mse 3.582e-03
+step  1000  nll 41.2282  velocity mse 3.187e-03
+step  1500  nll 41.0034  velocity mse 3.265e-03
+step  2000  nll 41.1167  velocity mse 2.752e-03
+step  2500  nll 41.5661  velocity mse 3.846e-03
+step  3000  nll 41.3003  velocity mse 3.080e-03
+step  3500  nll 41.1121  velocity mse 2.968e-03
+step  4000  nll 41.6251  velocity mse 3.419e-03
+step  4500  nll 41.6561  velocity mse 2.466e-03
+step  5000  nll 40.9762  velocity mse 2.935e-03
+step  5500  nll 41.5150  velocity mse 2.840e-03
+step  5999  nll 41.1583  velocity mse 2.656e-03
+  varq=False s=2: heldout m1 +0.0011  RMS 0.0129  ptp 0.0376  [1.5 min]
+
+======================================================================
+varq=True seed=0
+======================================================================
+added the Var[Q|m] offset to the second-order target
+step     0  nll 42.8427  velocity mse 2.187e-01
+step   500  nll 41.5113  velocity mse 5.125e-03
+step  1000  nll 41.3518  velocity mse 5.151e-03
+step  1500  nll 41.4958  velocity mse 4.329e-03
+step  2000  nll 41.3772  velocity mse 4.609e-03
+step  2500  nll 41.2328  velocity mse 3.556e-03
+step  3000  nll 41.6034  velocity mse 3.619e-03
+step  3500  nll 41.5267  velocity mse 1.477e-01
+step  4000  nll 41.1291  velocity mse 3.351e-03
+step  4500  nll 41.0193  velocity mse 1.513e-01
+step  5000  nll 41.3015  velocity mse 3.109e-03
+step  5500  nll 41.4270  velocity mse 2.606e-03
+step  5999  nll 41.2384  velocity mse 2.860e-03
+  varq=True s=0: heldout m1 -0.0114  RMS 0.0238  ptp 0.0684  [1.6 min]
+
+======================================================================
+varq=True seed=1
+======================================================================
+added the Var[Q|m] offset to the second-order target
+step     0  nll 43.3690  velocity mse 2.243e-01
+step   500  nll 41.1210  velocity mse 4.479e-03
+step  1000  nll 41.2225  velocity mse 5.107e-03
+step  1500  nll 41.3909  velocity mse 3.701e-03
+step  2000  nll 41.5562  velocity mse 5.338e-03
+step  2500  nll 41.1667  velocity mse 6.299e-03
+step  3000  nll 41.4311  velocity mse 3.335e-03
+step  3500  nll 41.0338  velocity mse 3.031e-03
+step  4000  nll 41.1408  velocity mse 3.286e-03
+step  4500  nll 41.0899  velocity mse 3.272e-03
+step  5000  nll 41.6094  velocity mse 3.180e-03
+step  5500  nll 41.1969  velocity mse 2.735e-03
+step  5999  nll 41.5072  velocity mse 3.055e-03
+  varq=True s=1: heldout m1 -0.0146  RMS 0.0280  ptp 0.0783  [1.6 min]
+
+======================================================================
+varq=True seed=2
+======================================================================
+added the Var[Q|m] offset to the second-order target
+step     0  nll 43.9866  velocity mse 2.224e-01
+step   500  nll 41.1131  velocity mse 4.621e-03
+step  1000  nll 41.3222  velocity mse 4.266e-03
+step  1500  nll 41.0205  velocity mse 4.039e-03
+step  2000  nll 41.1255  velocity mse 3.375e-03
+step  2500  nll 41.5857  velocity mse 4.752e-03
+step  3000  nll 41.3074  velocity mse 3.571e-03
+step  3500  nll 41.1250  velocity mse 3.255e-03
+step  4000  nll 41.6397  velocity mse 3.422e-03
+step  4500  nll 41.6598  velocity mse 2.691e-03
+step  5000  nll 41.0030  velocity mse 3.128e-03
+step  5500  nll 41.5219  velocity mse 3.232e-03
+step  5999  nll 41.1622  velocity mse 2.969e-03
+  varq=True s=2: heldout m1 -0.0151  RMS 0.0282  ptp 0.0788  [1.6 min]
+
+varq=False: RMS 0.0140 0.0135 0.0129   mean 0.0135 +/- 0.0006
+
+varq=True: RMS 0.0238 0.0280 0.0282   mean 0.0267 +/- 0.0025
+paired difference +0.0132 +/- 0.0017 (7.6 sigma)

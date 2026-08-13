@@ -107,7 +107,21 @@ from flowjax.distributions import Transformed
 
 import bulk
 import shear
+from models.bijections import POINT_SOURCE, in_domain
 from models.centroid import CentroidMarginalize
+
+
+def safe_point(m):
+    """An in-domain stand-in for rows the mask will discard anyway.
+
+    The flow is still CALLED on masked rows -- `jnp.where` evaluates both
+    branches, and a NaN in the discarded one still poisons the gradient -- so
+    they need coordinates the chart can actually evaluate, comfortably inside
+    the point-source ceiling rather than merely below it.
+    """
+    mf = jnp.maximum(m[..., 0], 1e-6)
+    mr = jnp.clip(m[..., 1], 1e-6, 0.5 * POINT_SOURCE * mf)
+    return m.at[..., 0].set(mf).at[..., 1].set(mr)
 
 # Full float32 matmuls, not the TF32 the GPU defaults to.  TF32 keeps 10
 # mantissa bits, so a log-density that accumulates through a ~12-layer flow
@@ -144,6 +158,18 @@ CATALOGS = {
     "bulgedisc_deep": {"plus": "targets_deep_g1p02_200k",
                        "minus": "targets_deep_g1m02_200k",
                        "zero": "targets_deep_g0_200k"},
+    # The analytic population: two co-elliptical Gaussians whose moments were
+    # DRAWN from a chosen density rather than pushed forward from galaxy
+    # parameters, so P(m|g), Q and R are known in closed form -- `truth.py`.
+    # This is the only population where a measured m or c can be compared
+    # against what it should have been, rather than only against zero.
+    "gauss2": {"plus": "gauss2_g1p02_1M", "minus": "gauss2_g1m02_1M",
+               "zero": "gauss2_g0_1M"},
+    # A 2k version of the same, for smoke-testing the pipeline end to end
+    # without waiting on a 1M-galaxy render.  Far too small to measure a bias
+    # with -- it is there so `check_flow_vs_truth` can be exercised in minutes.
+    "gauss2_2k": {"plus": "gauss2_g1p02_2k", "minus": "gauss2_g1m02_2k",
+                  "zero": "gauss2_g0_2k"},
 }
 
 
@@ -220,15 +246,15 @@ def log_conv_is(flow, m_i, draws, log_wt, g):
     draws are the alpha = 1 special case, log_wt = 0 everywhere: the kernel is
     its own proposal, so L cancels out of the ratio entirely.
     """
-    # The prior's chart is [log10 Mf, Mr/Mf, ...], so a draw with Mf <= 0 or
-    # Mr <= 0 cannot be evaluated -- and needs no evaluating: no galaxy has a
-    # negative flux or size, the true prior is zero there, and zero weight is
-    # the right answer.  The flow is still called at an in-domain dummy point
-    # for those rows so that no NaN can reach the gradient.  m_i itself can
-    # have Mf <= 0 or Mr <= 0 for a faint noisy target, so the dummy floors
-    # m_i's first two coordinates rather than using it raw.
-    ok = (draws[:, 0] > 0) & (draws[:, 1] > 0)
-    dummy = m_i.at[:2].set(jnp.maximum(m_i[:2], 1e-6))
+    # The prior's chart cannot evaluate a draw with Mf <= 0, Mr <= 0, or
+    # Mr/Mf at or above the point-source ceiling -- and needs no evaluating:
+    # no galaxy has a negative flux or size or is larger than the PSF is small,
+    # the true prior is zero there, and zero weight is the right answer.  The
+    # ceiling is the half that matters here: the kernel is wide enough that a
+    # well-resolved target still puts draws past it, and before the chart was
+    # bounded the flow answered those with a positive density.
+    ok = in_domain(draws)
+    dummy = safe_point(m_i)
     lp = flow.log_prob(jnp.where(ok[:, None], draws, dummy), condition=g)
     return (jax.nn.logsumexp(jnp.where(ok, lp + log_wt, -jnp.inf))
             - jnp.log(draws.shape[0]))
@@ -429,8 +455,8 @@ def _mixture_chunk(flow, m_i, kern, cond0, key, L, log_diag, log_alpha, log_1ma,
         return -0.5 * quad - log_diag - 2.5 * jnp.log(2 * jnp.pi)
 
     log_k = log_normal(x - m_i[:, None, :])
-    ok = (x[..., 0] > 0) & (x[..., 1] > 0)
-    dummy = m_i.at[:, :2].set(jnp.maximum(m_i[:, :2], 1e-6))
+    ok = in_domain(x)
+    dummy = safe_point(m_i)
     safe = jnp.where(ok[..., None], x, dummy[:, None, :])
     # log_prob vectorises as (5),(5)->(), so a per-target condition has to
     # be broadcast along the DRAW axis as well as the target axis.
@@ -711,8 +737,8 @@ def ess(flow, m, draws, log_wt, batch=20000, sigma_x=None):
     With log_wt = 0 (the pure-kernel case) this is exactly the old w_s = P(M+eps_s).
     """
     def one(m_i, draws_i, log_wt_i, sigma_x_i):
-        ok = (draws_i[:, 0] > 0) & (draws_i[:, 1] > 0)
-        dummy = m_i.at[:2].set(jnp.maximum(m_i[:2], 1e-6))
+        ok = in_domain(draws_i)
+        dummy = safe_point(m_i)
         cond = condition(jnp.zeros(2), sigma_x_i)
         lp = flow.log_prob(jnp.where(ok[:, None], draws_i, dummy), condition=cond)
         lw = jnp.where(ok, lp + log_wt_i, -jnp.inf)
@@ -857,7 +883,17 @@ def main():
                    help="use only the first N targets (the integration is "
                         "`samples` flow evaluations per target)")
     p.add_argument("--proposal-flow", default=None,
-                   help="draw the defensive mixture's flow component from THIS "
+                   help="DANGEROUS unless it EQUALS --flow: at alpha < 1 the "
+                        "weights carry P_eval/q_proposal, and wherever the "
+                        "evaluated flow has mass the proposal does not cover "
+                        "that ratio explodes. Measured: sharing one proposal "
+                        "across two flows put 73%% of the ensemble sum|R11| on "
+                        "a SINGLE target and returned m1 = -0.84 where the "
+                        "self-proposed run gave +0.023, with the ESS "
+                        "diagnostic and every training metric looking normal. "
+                        "Use it only for the alpha=1 kernel, where the "
+                        "proposal does not involve a flow at all. "
+                        "Otherwise: draw the defensive mixture's flow component from THIS"
                         "flow instead of the one being evaluated, so two runs "
                         "with different --flow still share draws and --compare "
                         "keeps its pairing. Only matters when --alpha < 1.")
@@ -1039,18 +1075,35 @@ def main():
         qr = {k: pqr(flow_g, v, None if draws is None else draws[k],
                      None if log_wt is None else log_wt[k], batch, sigma_x)
               for k, v in m.items()}
-    # A single non-finite target takes out the whole eq. (45)-(46) sum, so drop
-    # them from ALL catalogs together and keep the +/- pairing aligned.  With
-    # the `pqr_streamed` merge guard these should not arise; this is the net
-    # under it, and the count is the thing to watch.
+    # A single non-finite target, or one with |R| many orders of magnitude
+    # above the rest, takes out the whole eq. (45)-(46) sum -- so drop both
+    # kinds from ALL catalogs together and keep the +/- pairing aligned.  The
+    # magnitude cut catches flow density-curvature spikes: a handful of fully
+    # in_domain targets (median |R| ~1e2) where the flow's local Hessian
+    # blows up to |R| ~1e6-1e9, a normalising-flow generalisation artifact in
+    # a sparsely-trained pocket, not a support-boundary effect.  Measured:
+    # dropping the worst 5 of 200000 in one quintile took ghat[0] on a g=0
+    # null test from +8.7e-3 to -3.6e-4.  With the `pqr_streamed` merge guard
+    # non-finite entries should not arise; this is the net under it.
     finite = np.ones(len(qr["plus"][0]), dtype=bool)
     for q, r in qr.values():
         finite &= np.isfinite(q).all(1) & np.isfinite(r).reshape(len(r), -1).all(1)
+    rnorm = {k: np.linalg.norm(r.reshape(len(r), -1), axis=1) for k, (q, r) in qr.items()}
+    med = np.median(np.concatenate([rn[finite] for rn in rnorm.values()]))
+    sane = finite.copy()
+    for rn in rnorm.values():
+        sane &= rn < 1000 * med
     if not finite.all():
         print(f"  dropping {int((~finite).sum())} targets with a non-finite "
               f"Q or R ({(~finite).mean():.1e})")
-        qr = {k: (q[finite], r[finite]) for k, (q, r) in qr.items()}
-        truth = truth[finite]
+    if (finite & ~sane).any():
+        n = int((finite & ~sane).sum())
+        print(f"  dropping {n} targets with |R| > 1000x the population "
+              f"median ({n / len(finite):.1e}); a flow density-curvature "
+              f"spike, not a domain effect")
+    if not sane.all():
+        qr = {k: (q[sane], r[sane]) for k, (q, r) in qr.items()}
+        truth = truth[sane]
 
     qp, rp = qr["plus"]
     qm, rm = qr["minus"]

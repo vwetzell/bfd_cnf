@@ -30,6 +30,32 @@ from flowjax.utils import arraylike_to_array
 from jaxtyping import Array, ArrayLike, Shaped
 from paramax import Parameterize, AbstractUnwrappable
 
+# Mr/Mf ceiling: a point source, i.e. the PSF itself.  Anything at or above it
+# is unresolved and carries no shape information.  It lives here rather than in
+# `bulk` because `RawMomentStandardize` makes it a hard support boundary and
+# `bulk` imports this module, not the other way round; `bulk.POINT_SOURCE`
+# re-exports it.
+#
+# THIS IS A PROPERTY OF THE WEIGHT FUNCTION and must be recomputed whenever the
+# weight changes -- it is sum(W k^2)/sum(W) over the k grid.  It was 3.976167
+# for Harris's coefficients and stayed at that value through the switch to
+# Nuttall's, whose true ceiling is 3.909604: stale by 1.7%.  That is not
+# cosmetic.  The whole point of slot 1's logit is to put the support boundary
+# at infinity so the density vanishes there on its own; with the ceiling set too
+# high the real boundary lands at a FINITE logit (4.07 for the Nuttall
+# catalogs, whose moments top out at Mr/Mf = 3.8925), i.e. an interior cliff the
+# flow has to learn instead of one the chart handles for free.  It also made the
+# "nothing lies above the ceiling" check vacuous.  3.692575 is the value for the
+# second-order-safe window now in bfd/weightfunction.py.
+POINT_SOURCE = 3.692575
+
+
+def in_domain(m):
+    """Rows whose raw moments the flow's chart can evaluate: Mf, Mr > 0 and
+    Mr/Mf strictly below the point-source ceiling."""
+    return (m[..., 0] > 0) & (m[..., 1] > 0) & (m[..., 1] < POINT_SOURCE * m[..., 0])
+
+
 # ---------------------------------------------------------------------------
 # Bounded-scale helpers
 # ---------------------------------------------------------------------------
@@ -281,8 +307,25 @@ def propagate_cov_to_std_jax(
 class RawMomentStandardize(AbstractBijection):
     """
     Raw x = [Mf, Mr, M1, M2, Mc]   (bfd's even-moment order)
-    Transformed z0 = [log10(Mf), Mr/Mf, Mc/Mr, M1/Mr, M2/Mr]
+    Transformed z0 = [log10(Mf), logit(Mr/Mf/r*), Mc/Mr, M1/Mr, M2/Mr]
     Then standardized: z = (z0 - mean) / std
+
+    Slot 1 carries the point-source ceiling `r* = POINT_SOURCE` as a HARD
+    boundary: `Mr/Mf` is the galaxy's size in units of the PSF's, and `r*` is
+    the PSF itself, so the true density is exactly zero at and above it.  With
+    the bare ratio the flow had no way to know that and duly leaked mass past
+    the edge, which is a wrong SCORE in the region every noisy target's
+    convolution integral reaches through.  The logit closes the support by
+    construction, at the cost of stretching the top of the population -- if
+    that stretch turns out to cost more resolution than the closure buys,
+    the map to try next is gentler (a power, or `-log(1 - r/r*)`), not absent.
+
+    NOTE this makes the chart undefined for `Mr/Mf >= r*`, which real NOISY
+    moments do reach (~1.8% of the deep targets).  That is legal only because
+    the flow is the density of the LATENT moment: a noisy M never enters
+    `log_prob` directly, only through `P(M) = INT dm P(m) L(M-m)`, whose draws
+    are latent points.  Anything evaluating the flow at measured moments must
+    mask on `in_domain` first -- see `bias.in_domain`.
 
     The transformed order groups the three SPIN-0 coordinates first (0, 1, 2)
     and the spin-2 pair last (3, 4); the equivariant layers and the
@@ -367,7 +410,8 @@ class RawMomentStandardize(AbstractBijection):
                               x[..., 3], x[..., 4])
 
         z0_0 = jnp.log10(Mf)
-        z0_1 = Mr / Mf
+        u = Mr / (POINT_SOURCE * Mf)
+        z0_1 = jnp.log(u) - jnp.log1p(-u)
         z0_2 = Mc / Mr
         z0_3 = M1 / Mr
         z0_4 = M2 / Mr
@@ -396,7 +440,7 @@ class RawMomentStandardize(AbstractBijection):
         z0 = z * std + mean
         log10_const = jnp.log(jnp.array(10.0, dtype=z0.dtype))
         Mf = jnp.exp(z0[..., 0] * log10_const)
-        Mr = z0[..., 1] * Mf
+        Mr = POINT_SOURCE * jnn.sigmoid(z0[..., 1]) * Mf
         Mc = z0[..., 2] * Mr
         M1 = z0[..., 3] * Mr
         M2 = z0[..., 4] * Mr
@@ -423,7 +467,12 @@ class RawMomentStandardize(AbstractBijection):
         Mf = x[..., 0]
         Mr = x[..., 1]
         ln10 = jnp.log(jnp.array(10.0, dtype=Mf.dtype))
-        lad_geom = -(2.0 * jnp.log(Mf) + 3.0 * jnp.log(Mr) + jnp.log(ln10))
+        # Triangular in the order (Mf, Mr, Mc, M1, M2): the extra factor over
+        # the bare-ratio chart is d logit(u)/dMr = 1 / (u (1-u) r* Mf).
+        u = Mr / (POINT_SOURCE * Mf)
+        lad_geom = -(2.0 * jnp.log(Mf) + 3.0 * jnp.log(Mr) + jnp.log(ln10)
+                     + jnp.log(u) + jnp.log1p(-u)
+                     + jnp.log(jnp.array(POINT_SOURCE, dtype=Mf.dtype)))
         lad_std = -jnp.sum(jnp.log(self._effective()[1]))
         return z, lad_geom + lad_std
 

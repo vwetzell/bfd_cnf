@@ -1,0 +1,617 @@
+
+======================================================================
+base-s1: layers=8 width=64 depth=2 steps=4000/6000 seed=1
+======================================================================
+E0811 13:10:00.090100 2397666 cuda_timer.cc:87] Delay kernel timed out: measured time has sub-optimal accuracy. There may be a missing warmup execution, please investigate in Nsight Systems.
+E0811 13:10:00.198659 2397674 cuda_timer.cc:87] Delay kernel timed out: measured time has sub-optimal accuracy. There may be a missing warmup execution, please investigate in Nsight Systems.
+step     0  nll 52.1017
+step   500  nll 41.8110
+step  1000  nll 41.4413
+step  1500  nll 41.2711
+step  2000  nll 41.1029
+step  2500  nll 41.2306
+step  3000  nll 41.3204
+step  3500  nll 41.3372
+step  3999  nll 41.0795
+step     0  nll 631.4327  velocity mse 2.803e-01
+step   500  nll 41.1035  velocity mse 3.598e-03
+step  1000  nll 41.1804  velocity mse 3.817e-03
+step  1500  nll 41.3716  velocity mse 3.741e-03
+step  2000  nll 41.5096  velocity mse 3.054e-03
+step  2500  nll 41.1533  velocity mse 3.592e-03
+step  3000  nll 41.3892  velocity mse 3.356e-03
+step  3500  nll 41.0043  velocity mse 2.954e-03
+step  4000  nll 41.1274  velocity mse 2.312e-03
+step  4500  nll 41.0622  velocity mse 2.887e-03
+step  5000  nll 41.5909  velocity mse 2.879e-03
+step  5500  nll 41.1863  velocity mse 2.468e-03
+step  5999  nll 41.4784  velocity mse 2.756e-03
+  base-s1: bulk nll 41.2609  params 107616  heldout m1 -0.0045  RMS 0.0190  ptp 0.0520  [2.5 min]
+
+======================================================================
+base-s2: layers=8 width=64 depth=2 steps=4000/6000 seed=2
+======================================================================
+step     0  nll 275665824.0000
+step   500  nll 41.7855
+step  1000  nll 41.3632
+step  1500  nll 41.7173
+step  2000  nll 41.2451
+step  2500  nll 41.5681
+step  3000  nll 41.2387
+step  3500  nll 41.0845
+step  3999  nll 41.0073
+step     0  nll 285.9763  velocity mse 2.530e-01
+step   500  nll 41.0318  velocity mse 3.639e-03
+step  1000  nll 41.2333  velocity mse 3.385e-03
+step  1500  nll 41.0061  velocity mse 3.279e-03
+step  2000  nll 41.0942  velocity mse 3.052e-03
+step  2500  nll 41.5470  velocity mse 2.951e-03
+step  3000  nll 41.2716  velocity mse 3.040e-03
+step  3500  nll 41.1576  velocity mse 2.711e-03
+step  4000  nll 41.6222  velocity mse 3.120e-03
+step  4500  nll 41.6274  velocity mse 2.514e-03
+step  5000  nll 40.9683  velocity mse 2.938e-03
+step  5500  nll 41.4985  velocity mse 2.852e-03
+step  5999  nll 41.1287  velocity mse 2.648e-03
+  base-s2: bulk nll 41.2607  params 107616  heldout m1 -0.0055  RMS 0.0218  ptp 0.0621  [2.2 min]
+
+======================================================================
+layers12: layers=12 width=64 depth=2 steps=4000/6000 seed=0
+======================================================================
+step     0  nll 662784097394884608.0000
+step   500  nll 41.6431
+step  1000  nll 41.3578
+step  1500  nll 41.7691
+step  2000  nll 41.5880
+step  2500  nll 41.0929
+step  3000  nll 41.2430
+step  3500  nll 41.2194
+step  3999  nll 41.2597
+step     0  nll 157.3455  velocity mse 2.168e-01
+step   500  nll 69253454751543460888576.0000  velocity mse 5.733e-01
+step  1000  nll 75958341819178617405440.0000  velocity mse 5.643e-01
+step  1500  nll 58130333787474616123392.0000  velocity mse 5.621e-01
+step  2000  nll 78301943007668185595904.0000  velocity mse 5.653e-01
+step  2500  nll 58048967253006913372160.0000  velocity mse 5.693e-01
+step  3000  nll 63616789990323194429440.0000  velocity mse 5.538e-01
+step  3500  nll 62232824817632986267648.0000  velocity mse 5.860e-01
+step  4000  nll 90001862494012506636288.0000  velocity mse 5.612e-01
+step  4500  nll 59169030494732465209344.0000  velocity mse 5.810e-01
+step  5000  nll 72311155704148149665792.0000  velocity mse 5.647e-01
+step  5500  nll 86661794851970942500864.0000  velocity mse 5.741e-01
+step  5999  nll 83406557012510529028096.0000  velocity mse 5.688e-01
+  layers12: bulk nll 41.2523  params 161404  heldout m1 -1.1764  RMS 3.3700  ptp 11.1905  [3.2 min]
+
+======================================================================
+layers16: layers=16 width=64 depth=2 steps=4000/6000 seed=0
+======================================================================
+step     0  nll 64880879032679198089019392.0000
+step   500  nll inf
+step  1000  nll inf
+step  1500  nll inf
+step  2000  nll inf
+step  2500  nll inf
+step  3000  nll inf
+step  3500  nll inf
+step  3999  nll inf
+step     0  nll inf  velocity mse 2.168e-01
+step   500  nll inf  velocity mse nan
+step  1000  nll inf  velocity mse nan
+step  1500  nll inf  velocity mse nan
+step  2000  nll inf  velocity mse nan
+step  2500  nll inf  velocity mse nan
+step  3000  nll inf  velocity mse nan
+step  3500  nll inf  velocity mse nan
+step  4000  nll inf  velocity mse nan
+step  4500  nll inf  velocity mse nan
+step  5000  nll inf  velocity mse nan
+step  5500  nll inf  velocity mse nan
+step  5999  nll inf  velocity mse nan
+  layers16: bulk nll inf  params 215192  heldout m1 +nan  RMS nan  ptp nan  [5.0 min]
+
+======================================================================
+width128: layers=8 width=128 depth=2 steps=4000/6000 seed=0
+======================================================================
+step     0  nll 3880025405259776.0000
+step   500  nll 41.7285
+step  1000  nll 41.6755
+step  1500  nll 41.3484
+step  2000  nll 41.5176
+step  2500  nll 41.1706
+step  3000  nll 41.2029
+step  3500  nll 41.2192
+step  3999  nll 41.2673
+step     0  nll 43.0871  velocity mse 2.168e-01
+step   500  nll 41.5325  velocity mse 6.403e-03
+step  1000  nll 41.3368  velocity mse 3.533e-03
+step  1500  nll 41.4744  velocity mse 2.809e-03
+step  2000  nll 41.3416  velocity mse 5.123e-03
+step  2500  nll 41.2025  velocity mse 2.859e-03
+step  3000  nll 41.5739  velocity mse 3.270e-03
+step  3500  nll 41.5049  velocity mse 2.895e-03
+step  4000  nll 41.1073  velocity mse 3.173e-03
+step  4500  nll 40.9636  velocity mse 2.628e-03
+step  5000  nll 41.2916  velocity mse 2.788e-03
+step  5500  nll 41.3794  velocity mse 2.289e-03
+step  5999  nll 41.2000  velocity mse 2.563e-03
+  width128: bulk nll 41.2541  params 411744  heldout m1 +0.0020  RMS 0.0135  ptp 0.0361  [2.2 min]
+
+======================================================================
+width256: layers=8 width=256 depth=2 steps=4000/6000 seed=0
+======================================================================
+step     0  nll 151.6180
+step   500  nll 41.8452
+step  1000  nll 41.5557
+step  1500  nll 42.0017
+step  2000  nll 41.5388
+step  2500  nll 41.1243
+step  3000  nll 41.1971
+step  3500  nll 41.2112
+step  3999  nll 41.2530
+step     0  nll 108.4343  velocity mse 2.168e-01
+step   500  nll 41.5171  velocity mse 5.103e-03
+step  1000  nll 41.3197  velocity mse 3.253e-03
+step  1500  nll 41.4555  velocity mse 2.867e-03
+step  2000  nll 41.3451  velocity mse 2.924e-03
+step  2500  nll 41.2042  velocity mse 2.872e-03
+step  3000  nll 41.5591  velocity mse 3.101e-03
+step  3500  nll 41.6520  velocity mse 2.762e-03
+step  4000  nll 41.0981  velocity mse 2.925e-03
+step  4500  nll 40.9609  velocity mse 2.599e-03
+step  5000  nll 41.2893  velocity mse 2.866e-03
+step  5500  nll 41.3897  velocity mse 2.292e-03
+step  5999  nll 41.1919  velocity mse 2.567e-03
+  width256: bulk nll 41.2469  params 1609824  heldout m1 -0.0014  RMS 0.0136  ptp 0.0371  [2.3 min]
+
+======================================================================
+depth3: layers=8 width=64 depth=3 steps=4000/6000 seed=0
+======================================================================
+step     0  nll 52.5546
+step   500  nll 41.7794
+step  1000  nll 41.4634
+step  1500  nll 41.2904
+step  2000  nll 41.5393
+step  2500  nll 41.1548
+step  3000  nll 41.2281
+step  3500  nll 41.2292
+step  3999  nll 41.2710
+step     0  nll 42.6041  velocity mse 2.168e-01
+step   500  nll 41.5018  velocity mse 6.006e-03
+step  1000  nll 41.3407  velocity mse 3.970e-03
+step  1500  nll 41.4823  velocity mse 3.311e-03
+step  2000  nll 41.3560  velocity mse 2.889e-03
+step  2500  nll 41.2003  velocity mse 3.144e-03
+step  3000  nll 41.5744  velocity mse 3.057e-03
+step  3500  nll 41.5057  velocity mse 2.999e-03
+step  4000  nll 41.1053  velocity mse 3.122e-03
+step  4500  nll 40.9729  velocity mse 2.634e-03
+step  5000  nll 41.2931  velocity mse 2.816e-03
+step  5500  nll 41.3870  velocity mse 2.288e-03
+step  5999  nll 41.2000  velocity mse 2.568e-03
+  depth3: bulk nll 41.2599  params 207456  heldout m1 +0.0016  RMS 0.0124  ptp 0.0320  [2.4 min]
+
+======================================================================
+depth4: layers=8 width=64 depth=4 steps=4000/6000 seed=0
+======================================================================
+step     0  nll 46.8427
+step   500  nll 41.9507
+step  1000  nll 41.5874
+step  1500  nll 41.3242
+step  2000  nll 41.4635
+step  2500  nll 41.1098
+step  3000  nll 41.2178
+step  3500  nll 41.2181
+step  3999  nll 41.2631
+step     0  nll 231.1909  velocity mse 2.168e-01
+step   500  nll 41.4997  velocity mse 4.308e-03
+step  1000  nll 41.3223  velocity mse 3.188e-03
+step  1500  nll 41.5193  velocity mse 3.940e-03
+step  2000  nll 41.3473  velocity mse 3.585e-03
+step  2500  nll 41.1922  velocity mse 3.167e-03
+step  3000  nll 41.5690  velocity mse 3.008e-03
+step  3500  nll 41.5117  velocity mse 2.907e-03
+step  4000  nll 41.0956  velocity mse 2.936e-03
+step  4500  nll 40.9480  velocity mse 2.507e-03
+step  5000  nll 41.2800  velocity mse 2.823e-03
+step  5500  nll 41.3762  velocity mse 2.277e-03
+step  5999  nll 41.1870  velocity mse 2.567e-03
+  depth4: bulk nll 41.2507  params 307296  heldout m1 +0.0020  RMS 0.0103  ptp 0.0290  [2.7 min]
+
+======================================================================
+base-2xsteps: layers=8 width=64 depth=2 steps=8000/12000 seed=0
+======================================================================
+step     0  nll 50827132928.0000
+step   500  nll 41.8594
+step  1000  nll 41.4644
+step  1500  nll 41.5015
+step  2000  nll 41.5799
+step  2500  nll 41.2661
+step  3000  nll 41.3450
+step  3500  nll 41.3453
+step  4000  nll 41.2732
+step  4500  nll 41.3371
+step  5000  nll 41.0871
+step  5500  nll 41.2107
+step  6000  nll 41.0171
+step  6500  nll 41.2900
+step  7000  nll 41.3724
+step  7500  nll 41.2217
+step  7999  nll 41.2284
+step     0  nll 44.1161  velocity mse 2.168e-01
+step   500  nll 41.4764  velocity mse 5.052e-03
+step  1000  nll 41.3323  velocity mse 3.668e-03
+step  1500  nll 41.4686  velocity mse 3.337e-03
+step  2000  nll 41.3371  velocity mse 2.961e-03
+step  2500  nll 41.1944  velocity mse 3.714e-03
+step  3000  nll 41.5617  velocity mse 3.220e-03
+step  3500  nll 41.5116  velocity mse 3.248e-03
+step  4000  nll 41.0929  velocity mse 3.546e-03
+step  4500  nll 40.9854  velocity mse 2.854e-03
+step  5000  nll 41.2768  velocity mse 2.961e-03
+step  5500  nll 41.3977  velocity mse 2.732e-03
+step  6000  nll 41.2812  velocity mse 3.116e-03
+step  6500  nll 41.1627  velocity mse 2.973e-03
+step  7000  nll 41.5822  velocity mse 2.863e-03
+step  7500  nll 41.4129  velocity mse 2.818e-03
+step  8000  nll 41.1597  velocity mse 2.557e-03
+step  8500  nll 40.9685  velocity mse 3.056e-03
+step  9000  nll 41.4723  velocity mse 2.616e-03
+step  9500  nll 41.3973  velocity mse 2.396e-03
+step 10000  nll 41.3384  velocity mse 2.602e-03
+step 10500  nll 40.9672  velocity mse 2.077e-03
+step 11000  nll 41.2416  velocity mse 2.372e-03
+step 11500  nll 41.7508  velocity mse 2.589e-03
+step 11999  nll 41.1405  velocity mse 2.534e-03
+  base-2xsteps: bulk nll 41.2428  params 107616  heldout m1 +0.0009  RMS 0.0164  ptp 0.0543  [3.2 min]
+
+======================================================================
+layers12-lr1e3: layers=12 width=64 depth=2 steps=4000/6000 seed=0 shear_lr=0.001 bulk_lr=0.001
+======================================================================
+E0811 13:40:22.138085 2450158 cuda_timer.cc:87] Delay kernel timed out: measured time has sub-optimal accuracy. There may be a missing warmup execution, please investigate in Nsight Systems.
+step     0  nll 662784097394884608.0000
+step   500  nll 41.8581
+step  1000  nll 41.4678
+step  1500  nll 41.2999
+step  2000  nll 41.4715
+step  2500  nll 41.0641
+step  3000  nll 41.2227
+step  3500  nll 41.2327
+step  3999  nll 41.2623
+step     0  nll 44.3211  velocity mse 2.168e-01
+step   500  nll 41.4610  velocity mse 4.572e-03
+step  1000  nll 41.3317  velocity mse 3.864e-03
+step  1500  nll 41.4899  velocity mse 4.386e-03
+step  2000  nll 41.3470  velocity mse 3.404e-03
+step  2500  nll 41.1828  velocity mse 2.991e-03
+step  3000  nll 41.5507  velocity mse 3.399e-03
+step  3500  nll 41.5058  velocity mse 2.960e-03
+step  4000  nll 41.0872  velocity mse 3.124e-03
+step  4500  nll 40.9581  velocity mse 2.585e-03
+step  5000  nll 41.2751  velocity mse 2.957e-03
+step  5500  nll 41.3832  velocity mse 2.367e-03
+step  5999  nll 41.1836  velocity mse 2.626e-03
+  layers12-lr1e3: bulk nll 41.2468  params 161404  heldout m1 -0.0126  RMS 0.0340  ptp 0.1108  [3.5 min]
+
+======================================================================
+layers12-lr3e4: layers=12 width=64 depth=2 steps=4000/6000 seed=0 shear_lr=0.0003 bulk_lr=0.001
+======================================================================
+step     0  nll 662784097394884608.0000
+step   500  nll 41.8581
+step  1000  nll 41.4678
+step  1500  nll 41.2999
+step  2000  nll 41.4715
+step  2500  nll 41.0641
+step  3000  nll 41.2227
+step  3500  nll 41.2327
+step  3999  nll 41.2623
+step     0  nll 44.3211  velocity mse 2.168e-01
+step   500  nll 41.5269  velocity mse 5.219e-03
+step  1000  nll 41.3298  velocity mse 3.683e-03
+step  1500  nll 41.4981  velocity mse 3.435e-03
+step  2000  nll 41.3863  velocity mse 3.484e-03
+step  2500  nll 41.2288  velocity mse 3.158e-03
+step  3000  nll 41.5628  velocity mse 3.389e-03
+step  3500  nll 41.5233  velocity mse 3.042e-03
+step  4000  nll 41.1093  velocity mse 3.383e-03
+step  4500  nll 40.9622  velocity mse 2.850e-03
+step  5000  nll 41.2735  velocity mse 3.019e-03
+step  5500  nll 41.4030  velocity mse 2.491e-03
+step  5999  nll 41.2027  velocity mse 2.775e-03
+  layers12-lr3e4: bulk nll 41.2468  params 161404  heldout m1 -0.0596  RMS 0.1002  ptp 0.3106  [3.2 min]
+
+======================================================================
+layers16-blr3e4: layers=16 width=64 depth=2 steps=4000/6000 seed=0 shear_lr=0.0003 bulk_lr=0.0003
+======================================================================
+step     0  nll 64880879032679198089019392.0000
+step   500  nll 41.7460
+step  1000  nll 41.4590
+step  1500  nll 41.2737
+step  2000  nll 41.6270
+step  2500  nll 41.2728
+step  3000  nll 41.1966
+step  3500  nll 41.2271
+step  3999  nll 41.2768
+step     0  nll 42.5059  velocity mse 2.168e-01
+step   500  nll 41.5239  velocity mse 5.001e-03
+step  1000  nll 41.3357  velocity mse 3.665e-03
+step  1500  nll 41.5140  velocity mse 4.257e-03
+step  2000  nll 41.3565  velocity mse 3.802e-03
+step  2500  nll 41.2308  velocity mse 3.307e-03
+step  3000  nll 41.5923  velocity mse 3.298e-03
+step  3500  nll 41.5486  velocity mse 3.043e-03
+step  4000  nll 41.1306  velocity mse 3.414e-03
+step  4500  nll 40.9951  velocity mse 2.715e-03
+step  5000  nll 41.2865  velocity mse 3.050e-03
+step  5500  nll 41.4238  velocity mse 2.485e-03
+step  5999  nll 41.2286  velocity mse 2.769e-03
+  layers16-blr3e4: bulk nll 41.2645  params 215192  heldout m1 -0.0561  RMS 0.0960  ptp 0.2988  [4.7 min]
+
+======================================================================
+base-lr1e3: layers=8 width=64 depth=2 steps=4000/6000 seed=0 shear_lr=0.001 bulk_lr=0.001
+======================================================================
+step     0  nll 50827132928.0000
+step   500  nll 41.7503
+step  1000  nll 41.6613
+step  1500  nll 41.2780
+step  2000  nll 41.4651
+step  2500  nll 41.1113
+step  3000  nll 41.2232
+step  3500  nll 41.2256
+step  3999  nll 41.2859
+step     0  nll 42.8144  velocity mse 2.168e-01
+step   500  nll 41.5738  velocity mse 6.831e-03
+step  1000  nll 41.3445  velocity mse 4.265e-03
+step  1500  nll 41.4807  velocity mse 3.019e-03
+step  2000  nll 41.3759  velocity mse 4.125e-03
+step  2500  nll 41.2192  velocity mse 3.086e-03
+step  3000  nll 41.5853  velocity mse 3.112e-03
+step  3500  nll 41.5273  velocity mse 3.076e-03
+step  4000  nll 41.1237  velocity mse 3.114e-03
+step  4500  nll 40.9967  velocity mse 2.642e-03
+step  5000  nll 41.2982  velocity mse 2.922e-03
+step  5500  nll 41.4119  velocity mse 2.360e-03
+step  5999  nll 41.2066  velocity mse 2.615e-03
+  base-lr1e3: bulk nll 41.2722  params 107616  heldout m1 -0.0102  RMS 0.0275  ptp 0.0895  [2.2 min]
+
+======================================================================
+base-lr3e4: layers=8 width=64 depth=2 steps=4000/6000 seed=0 shear_lr=0.0003 bulk_lr=0.001
+======================================================================
+step     0  nll 50827132928.0000
+step   500  nll 41.7503
+step  1000  nll 41.6613
+step  1500  nll 41.2780
+step  2000  nll 41.4651
+step  2500  nll 41.1113
+step  3000  nll 41.2232
+step  3500  nll 41.2256
+step  3999  nll 41.2859
+step     0  nll 42.8144  velocity mse 2.168e-01
+step   500  nll 41.5508  velocity mse 5.017e-03
+step  1000  nll 41.3516  velocity mse 3.693e-03
+step  1500  nll 41.4930  velocity mse 3.487e-03
+step  2000  nll 41.4090  velocity mse 3.540e-03
+step  2500  nll 41.2667  velocity mse 3.175e-03
+step  3000  nll 41.5971  velocity mse 3.388e-03
+step  3500  nll 41.5509  velocity mse 3.044e-03
+step  4000  nll 41.1436  velocity mse 3.285e-03
+step  4500  nll 41.0051  velocity mse 2.805e-03
+step  5000  nll 41.2959  velocity mse 2.970e-03
+step  5500  nll 41.4300  velocity mse 2.488e-03
+step  5999  nll 41.2185  velocity mse 2.767e-03
+  base-lr3e4: bulk nll 41.2722  params 107616  heldout m1 -0.0564  RMS 0.0973  ptp 0.3036  [2.0 min]
+
+======================================================================
+width128-s1: layers=8 width=128 depth=2 steps=4000/6000 seed=1 shear_lr=0.003 bulk_lr=0.001
+======================================================================
+step     0  nll 59777810432.0000
+step   500  nll 41.7640
+step  1000  nll 41.5116
+step  1500  nll 41.4067
+step  2000  nll 41.1565
+step  2500  nll 41.2795
+step  3000  nll 41.3531
+step  3500  nll 41.3460
+step  3999  nll 41.0831
+step     0  nll 5137.7378  velocity mse 2.803e-01
+step   500  nll 41.0902  velocity mse 3.337e-03
+step  1000  nll 41.2395  velocity mse 3.565e-03
+step  1500  nll 41.3756  velocity mse 3.213e-03
+step  2000  nll 41.5046  velocity mse 3.493e-03
+step  2500  nll 41.1676  velocity mse 3.162e-03
+step  3000  nll 41.4011  velocity mse 3.085e-03
+step  3500  nll 41.0057  velocity mse 2.909e-03
+step  4000  nll 41.1288  velocity mse 2.161e-03
+step  4500  nll 41.0763  velocity mse 2.912e-03
+step  5000  nll 41.5976  velocity mse 2.892e-03
+step  5500  nll 41.1865  velocity mse 2.483e-03
+step  5999  nll 41.4694  velocity mse 2.751e-03
+  width128-s1: bulk nll 41.2636  params 411744  heldout m1 -0.0038  RMS 0.0187  ptp 0.0517  [2.0 min]
+
+======================================================================
+width128-s2: layers=8 width=128 depth=2 steps=4000/6000 seed=2 shear_lr=0.003 bulk_lr=0.001
+======================================================================
+step     0  nll 211.6497
+step   500  nll 41.7344
+step  1000  nll 41.3984
+step  1500  nll 41.5169
+step  2000  nll 41.3321
+step  2500  nll 41.7166
+step  3000  nll 41.2474
+step  3500  nll 41.0823
+step  3999  nll 41.0140
+step     0  nll 47992168448.0000  velocity mse 2.530e-01
+step   500  nll 41.0501  velocity mse 3.200e-03
+step  1000  nll 41.2472  velocity mse 3.732e-03
+step  1500  nll 41.0202  velocity mse 3.257e-03
+step  2000  nll 41.1161  velocity mse 3.055e-03
+step  2500  nll 41.5342  velocity mse 3.422e-03
+step  3000  nll 41.2691  velocity mse 3.252e-03
+step  3500  nll 41.0955  velocity mse 2.845e-03
+step  4000  nll 41.6226  velocity mse 3.057e-03
+step  4500  nll 41.6203  velocity mse 2.528e-03
+step  5000  nll 40.9600  velocity mse 2.904e-03
+step  5500  nll 41.5021  velocity mse 2.851e-03
+step  5999  nll 41.1330  velocity mse 2.651e-03
+  width128-s2: bulk nll 41.2616  params 411744  heldout m1 +0.0001  RMS 0.0114  ptp 0.0349  [2.0 min]
+
+======================================================================
+depth4-s1: layers=8 width=64 depth=4 steps=4000/6000 seed=1 shear_lr=0.003 bulk_lr=0.001
+======================================================================
+step     0  nll 51.1833
+step   500  nll 41.9311
+step  1000  nll 41.5293
+step  1500  nll 41.3446
+step  2000  nll 41.2503
+step  2500  nll 41.2906
+step  3000  nll 41.3455
+step  3500  nll 41.3422
+step  3999  nll 41.0850
+step     0  nll 37810.2891  velocity mse 2.803e-01
+step   500  nll 41.1341  velocity mse 3.950e-03
+step  1000  nll 41.2276  velocity mse 4.498e-03
+step  1500  nll 41.3877  velocity mse 3.331e-03
+step  2000  nll 41.4875  velocity mse 3.039e-03
+step  2500  nll 41.1637  velocity mse 2.809e-03
+step  3000  nll 41.4079  velocity mse 3.215e-03
+step  3500  nll 41.0233  velocity mse 3.493e-03
+step  4000  nll 41.1298  velocity mse 2.171e-03
+step  4500  nll 41.0885  velocity mse 2.899e-03
+step  5000  nll 41.6073  velocity mse 2.867e-03
+step  5500  nll 41.1910  velocity mse 2.466e-03
+step  5999  nll 41.4817  velocity mse 2.734e-03
+  depth4-s1: bulk nll 41.2681  params 307296  heldout m1 -0.0094  RMS 0.0256  ptp 0.0625  [2.5 min]
+
+======================================================================
+depth4-s2: layers=8 width=64 depth=4 steps=4000/6000 seed=2 shear_lr=0.003 bulk_lr=0.001
+======================================================================
+step     0  nll 47.6534
+step   500  nll 42.0926
+step  1000  nll 41.5622
+step  1500  nll 41.6955
+step  2000  nll 41.2446
+step  2500  nll 41.6447
+step  3000  nll 41.1657
+step  3500  nll 41.0748
+step  3999  nll 41.0084
+step     0  nll 47.6614  velocity mse 2.530e-01
+step   500  nll 41.0784  velocity mse 3.114e-03
+step  1000  nll 41.2234  velocity mse 3.246e-03
+step  1500  nll 41.0456  velocity mse 3.323e-03
+step  2000  nll 41.1116  velocity mse 3.008e-03
+step  2500  nll 41.5353  velocity mse 2.995e-03
+step  3000  nll 41.3335  velocity mse 5.272e-03
+step  3500  nll 41.1044  velocity mse 2.877e-03
+step  4000  nll 41.6142  velocity mse 3.074e-03
+step  4500  nll 41.6440  velocity mse 2.503e-03
+step  5000  nll 40.9658  velocity mse 2.958e-03
+step  5500  nll 41.4862  velocity mse 2.839e-03
+step  5999  nll 41.1469  velocity mse 2.646e-03
+  depth4-s2: bulk nll 41.2640  params 307296  heldout m1 -0.0026  RMS 0.0151  ptp 0.0435  [2.6 min]
+
+======================================================================
+depth5: layers=8 width=64 depth=5 steps=4000/6000 seed=0 shear_lr=0.003 bulk_lr=0.001
+======================================================================
+step     0  nll 53.2691
+step   500  nll 41.9893
+step  1000  nll 41.4123
+step  1500  nll 41.3969
+step  2000  nll 41.4928
+step  2500  nll 41.1096
+step  3000  nll 41.2349
+step  3500  nll 41.2142
+step  3999  nll 41.2594
+step     0  nll 42.9909  velocity mse 2.168e-01
+step   500  nll 41.5540  velocity mse 4.868e-03
+step  1000  nll 41.3315  velocity mse 3.514e-03
+step  1500  nll 41.4735  velocity mse 2.913e-03
+step  2000  nll 41.3453  velocity mse 3.096e-03
+step  2500  nll 41.1974  velocity mse 3.107e-03
+step  3000  nll 41.5622  velocity mse 3.099e-03
+step  3500  nll 41.5078  velocity mse 3.084e-03
+step  4000  nll 41.1074  velocity mse 3.062e-03
+step  4500  nll 40.9608  velocity mse 2.526e-03
+step  5000  nll 41.2811  velocity mse 2.792e-03
+step  5500  nll 41.3824  velocity mse 2.297e-03
+step  5999  nll 41.1928  velocity mse 2.569e-03
+  depth5: bulk nll 41.2525  params 407136  heldout m1 -0.0035  RMS 0.0183  ptp 0.0487  [3.0 min]
+
+======================================================================
+depth6: layers=8 width=64 depth=6 steps=4000/6000 seed=0 shear_lr=0.003 bulk_lr=0.001
+======================================================================
+step     0  nll 48.1711
+step   500  nll 41.6330
+step  1000  nll 41.3819
+step  1500  nll 41.3198
+step  2000  nll 41.4706
+step  2500  nll 41.1088
+step  3000  nll 41.2034
+step  3500  nll 41.2091
+step  3999  nll 41.2670
+step     0  nll 42.7218  velocity mse 2.168e-01
+step   500  nll 41.4743  velocity mse 5.061e-03
+step  1000  nll 41.3146  velocity mse 3.191e-03
+step  1500  nll 41.4738  velocity mse 2.811e-03
+step  2000  nll 41.3299  velocity mse 2.918e-03
+step  2500  nll 41.1872  velocity mse 3.016e-03
+step  3000  nll 41.5839  velocity mse 2.955e-03
+step  3500  nll 41.5079  velocity mse 2.805e-03
+step  4000  nll 41.0992  velocity mse 3.220e-03
+step  4500  nll 40.9709  velocity mse 2.519e-03
+step  5000  nll 41.2689  velocity mse 2.792e-03
+step  5500  nll 41.3767  velocity mse 2.300e-03
+step  5999  nll 41.1932  velocity mse 2.558e-03
+  depth6: bulk nll 41.2472  params 506976  heldout m1 +0.0005  RMS 0.0100  ptp 0.0265  [3.3 min]
+
+======================================================================
+depth6-s1: layers=8 width=64 depth=6 steps=4000/6000 seed=1 shear_lr=0.003 bulk_lr=0.001
+======================================================================
+step     0  nll 47.6568
+step   500  nll 41.8317
+step  1000  nll 41.5502
+step  1500  nll 41.4817
+step  2000  nll 41.2608
+step  2500  nll 41.6455
+step  3000  nll 41.3840
+step  3500  nll 41.3401
+step  3999  nll 41.0743
+step     0  nll 74.9134  velocity mse 2.803e-01
+step   500  nll 41.1007  velocity mse 3.377e-03
+step  1000  nll 41.2003  velocity mse 3.704e-03
+step  1500  nll 41.3687  velocity mse 3.623e-03
+step  2000  nll 41.4663  velocity mse 2.826e-03
+step  2500  nll 41.1401  velocity mse 3.265e-03
+step  3000  nll 41.3850  velocity mse 3.055e-03
+step  3500  nll 41.0001  velocity mse 2.761e-03
+step  4000  nll 41.1000  velocity mse 2.296e-03
+step  4500  nll 41.0482  velocity mse 2.993e-03
+step  5000  nll 41.5815  velocity mse 2.886e-03
+step  5500  nll 41.1787  velocity mse 2.470e-03
+step  5999  nll 41.4687  velocity mse 2.761e-03
+  depth6-s1: bulk nll 41.2589  params 506976  heldout m1 -0.0046  RMS 0.0202  ptp 0.0549  [3.6 min]
+
+======================================================================
+depth6-s2: layers=8 width=64 depth=6 steps=4000/6000 seed=2 shear_lr=0.003 bulk_lr=0.001
+======================================================================
+step     0  nll 46.8581
+step   500  nll 41.8437
+step  1000  nll 41.4545
+step  1500  nll 41.4913
+step  2000  nll 41.3722
+step  2500  nll 41.5676
+step  3000  nll 41.1689
+step  3500  nll 41.0875
+step  3999  nll 41.0068
+step     0  nll 45.1234  velocity mse 2.530e-01
+step   500  nll 41.0395  velocity mse 3.461e-03
+step  1000  nll 41.2534  velocity mse 3.671e-03
+step  1500  nll 41.0446  velocity mse 3.336e-03
+step  2000  nll 41.1372  velocity mse 4.330e-03
+step  2500  nll 41.5403  velocity mse 3.394e-03
+step  3000  nll 41.2817  velocity mse 3.547e-03
+step  3500  nll 41.1092  velocity mse 2.723e-03
+step  4000  nll 41.5949  velocity mse 3.177e-03
+step  4500  nll 41.6294  velocity mse 2.456e-03
+step  5000  nll 40.9836  velocity mse 2.925e-03
+step  5500  nll 41.4907  velocity mse 2.823e-03
+step  5999  nll 41.1419  velocity mse 2.652e-03
+  depth6-s2: bulk nll 41.2576  params 506976  heldout m1 -0.0058  RMS 0.0214  ptp 0.0659  [3.4 min]

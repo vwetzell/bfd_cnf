@@ -1,0 +1,14 @@
+flows/shear.eqx on the bulgedisc targets
+  dropping 7 targets with |R| > 1000x the population median (7.0e-06); a flow density-curvature spike, not a domain effect
+
+999993 targets, g1 = +/-0.02
+  m1 = +0.00353 +/- 0.00326
+  c1 = -7.37e-05 +/- 1.2e-04   c2 = -1.56e-04 +/- 1.5e-04
+  unsheared catalog: ghat = (-5.73e-05, -1.59e-04)
+
+   Mf quintile          m1          c1          c2
+            q1     +0.0404   -6.16e-04   +4.96e-05   (+/- 0.0135)
+            q2     -0.0035   +1.91e-04   -1.22e-04   (+/- 0.0002)
+            q3     -0.0067   -1.00e-04   -4.83e-05   (+/- 0.0002)
+            q4     -0.0085   +3.26e-06   -4.05e-04   (+/- 0.0002)
+            q5     -0.0039   +1.57e-04   -2.52e-04   (+/- 0.0002)
