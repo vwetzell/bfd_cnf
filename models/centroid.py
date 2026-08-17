@@ -348,12 +348,19 @@ class CentroidMarginalize(AbstractBijection):
             jax.jacfwd(self.unmarginalize)(x, condition))[1]
 
 
-def dm_dsigma(layer, m, sigma_x):
-    """The layer's generative shift of `m` at this Sigma_X --- a diagnostic.
+def dm_dsigma(layer, m, sigma_x, chart):
+    """The layer's generative shift of `m` at this Sigma_X, in RAW moments.
 
-    Returns ``marginalize(m) - m``, i.e. what the layer thinks the centroid
-    marginalisation does to a galaxy sitting at `m`.  Compare against the
-    weighted copy mean from an `imsims.copies` catalog; the layer is trained by
-    likelihood on that population, not fitted to this.
+    Returns the raw-moment displacement the layer thinks centroid
+    marginalisation produces for a galaxy sitting at `m`, to compare against the
+    weighted copy mean from an `imsims.copies` catalog -- which is a raw-moment
+    quantity.
+
+    `chart` is NOT optional, for the same reason as `models/shear.dm_dg`: the
+    layer marginalises in STANDARDISED coordinates now, so its bare shift is in
+    z.  Composing the chart on both sides converts it.  And this is not just a
+    diagnostic -- `centroid.train` regresses against it with
+    `shift_weight = 1e4`, so feeding raw moments to a z-space layer would train
+    the layer against an incommensurate target, silently.
     """
-    return layer.marginalize(m, sigma_x) - m
+    return chart.inverse(layer.marginalize(chart.transform(m), sigma_x)) - m

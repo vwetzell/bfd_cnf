@@ -63,6 +63,7 @@ import numpy as np
 import optax
 
 import bulk
+from paramax import non_trainable
 from models.bijections import in_domain, safe_point
 from models.centroid import dm_dsigma
 
@@ -152,7 +153,21 @@ class CopySampler:
 
 
 def _centroid_layer(flow):
-    """The CentroidMarginalize sitting data-adjacent inside the built flow."""
+    """The CentroidMarginalize inside the built flow.
+
+    Located BY TYPE: the chart is bijections[0] now, so an index here would
+    return the chart and train it instead of this layer.
+    """
+    from models.centroid import CentroidMarginalize
+    for b in flow.bijection.bijection.bijections:
+        if isinstance(b, CentroidMarginalize):
+            return b
+    raise ValueError("no CentroidMarginalize in this flow")
+
+
+def _chart(flow):
+    """The RawMomentStandardize, which `dm_dsigma` needs to convert its z-space
+    shift back to the raw moments the copy catalog is measured in."""
     return flow.bijection.bijection.bijections[0]
 
 
@@ -164,7 +179,7 @@ def _trainable(flow):
     """
     spec = jax.tree.map(lambda _: False, flow)
     return eqx.tree_at(
-        lambda f: f.bijection.bijection.bijections[0], spec,
+        lambda f: _centroid_layer(f), spec,
         replace=jax.tree.map(eqx.is_inexact_array, _centroid_layer(flow)))
 
 
@@ -194,7 +209,7 @@ def _scale(m):
     return jnp.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1], m[:, 4]], axis=-1)
 
 
-def _shift_mse(layer, m0, target, sigma_x):
+def _shift_mse(layer, chart, m0, target, sigma_x):
     """L2 between the layer's shift and the catalog's weighted copy mean shift.
 
     The direct analogue of `shear._velocity_mse`, and needed for the same reason:
@@ -207,7 +222,8 @@ def _shift_mse(layer, m0, target, sigma_x):
     Its minimiser is E[shift | m], which is all a deterministic transport can
     carry anyway; the rest is the `Var[.|m]` floor.
     """
-    pred = jax.vmap(dm_dsigma, in_axes=(None, 0, None))(layer, m0, sigma_x)
+    pred = jax.vmap(dm_dsigma, in_axes=(None, 0, None, None))(
+        layer, m0, sigma_x, chart)
     return jnp.mean(((pred - target) / _scale(m0)) ** 2)
 
 
@@ -227,21 +243,24 @@ def train(flow, sampler, sigma_x, shift_target, key, steps=4000, batch=1024,
     def step(params, state, x, gi):
         def loss_fn(p):
             model = eqx.combine(p, static)
-            # Un-marginalising makes a copy brighter, smaller and MORE
-            # concentrated, i.e. it moves Mr/Mf and Mc/Mr UP -- towards their
-            # point-source ceilings.  bulgedisc sits within 0.34% of the Mc/Mr
-            # one and the deep Sigma_X asks for a ~1.2% shift, so a handful of
-            # copies per batch land outside the chart, where log_prob is -inf.
-            # Masking the RESULT is not enough: `jnp.where` still differentiates
+            # The chart is now the FIRST thing applied, so nothing downstream
+            # of it -- this layer included -- can carry a point across a
+            # point-source ceiling.  The only domain question left is whether
+            # the raw copy itself is on-chart, which is a property of the data
+            # and does not depend on the layer at all.  (Under the old ordering
+            # this had to un-marginalise first and test the RESULT, because
+            # un-marginalising pushed Mr/Mf and Mc/Mr up toward their ceilings.)
+            #
+            # Masking the RESULT is still not enough: `jnp.where` differentiates
             # the -inf branch and hands back NaN, which took out an entire 8000
-            # step deep run at step 144.  So substitute the INPUT, exactly as
-            # the noisy path does, and drop those rows from the mean.
-            z = jax.vmap(_centroid_layer(model).unmarginalize)(x, cond)
-            ok = in_domain(z)
+            # step deep run at step 144.  So substitute the INPUT and drop those
+            # rows from the mean.
+            ok = in_domain(x)
             lp = model.log_prob(jnp.where(ok[:, None], x, safe_point(x)),
                                 condition=cond)
             nll = -jnp.sum(jnp.where(ok, lp, 0.0)) / jnp.maximum(jnp.sum(ok), 1)
-            mse = _shift_mse(_centroid_layer(model), m_gal[gi], d_gal[gi], sx)
+            mse = _shift_mse(_centroid_layer(model), _chart(model),
+                             m_gal[gi], d_gal[gi], sx)
             return nll + shift_weight * mse, (nll, mse, 1.0 - jnp.mean(ok))
 
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -290,10 +309,10 @@ def check(flow, copies, galaxies, sigma_x, n=4000):
     target, keep = weighted_copy_mean(copies, galaxies, sigma_x)
     m0 = galaxies["moments"][keep][:n]
     target = target[:n]
-    layer = _centroid_layer(flow)
+    layer, chart = _centroid_layer(flow), _chart(flow)
     sx = jnp.asarray(sigma_x, dtype=jnp.float32)
-    pred = np.asarray(jax.vmap(dm_dsigma, in_axes=(None, 0, None))(
-        layer, jnp.asarray(m0, dtype=jnp.float32), sx))
+    pred = np.asarray(jax.vmap(dm_dsigma, in_axes=(None, 0, None, None))(
+        layer, jnp.asarray(m0, dtype=jnp.float32), sx, chart))
     truth = target - m0
 
     # Normalise by each moment's own magnitude; the spin-2 pair by Mr, since M1
@@ -354,14 +373,25 @@ def main():
             prior = eqx.tree_deserialise_leaves(
                 a.init, bulk.build_flow(jr.key(a.seed), m_train, shear=True))
             pb = prior.bijection.bijection.bijections
-            # Chains differ by the leading centroid layer: prior is
-            # [shear, raw2standard, *bulk], this is [centroid, shear, ...].
-            # Graft the shear layer's PARAMETERS rather than the layer itself --
-            # the prior's copy carries cond_shape (2,) and this chain needs (5,).
-            flow = eqx.tree_at(lambda f: f.bijection.bijection.bijections[2:],
-                               flow, pb[1:])
-            flow = eqx.tree_at(lambda f: f.bijection.bijection.bijections[1].coeffs,
-                               flow, pb[0].coeffs)
+            # prior is [raw2standard, shear, *bulk]; this chain inserts the
+            # centroid layer after the chart, so it is
+            # [raw2standard, centroid, shear, *bulk].  Graft the chart and the
+            # bulk wholesale, and the shear layer's PARAMETERS rather than the
+            # layer itself -- the prior's copy carries cond_shape (2,) and this
+            # chain needs (5,).
+            flow = eqx.tree_at(lambda f: f.bijection.bijection.bijections[0],
+                               flow, pb[0])
+            flow = eqx.tree_at(lambda f: f.bijection.bijection.bijections[3:],
+                               flow, pb[2:])
+            flow = eqx.tree_at(lambda f: f.bijection.bijection.bijections[2].coeffs,
+                               flow, pb[1].coeffs)
+            # The centroid layer's frozen mean/std must match the chart it now
+            # sits behind -- `bulk.train` moves the chart's, so the copy
+            # `build_flow` made from the raw sample is already stale.
+            flow = eqx.tree_at(
+                lambda f: (f.bijection.bijection.bijections[1].mean,
+                           f.bijection.bijection.bijections[1].std),
+                flow, (non_trainable(pb[0].mean), non_trainable(pb[0].std)))
             print(f"warm started bulk + shear from {a.init}")
         # Indexed by galaxy ROW, so `CopySampler.draw`'s ids address it directly.
         target, keep = weighted_copy_mean(copies, galaxies, sigma_x)

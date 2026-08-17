@@ -124,8 +124,11 @@ def _trainable(flow, bulk_frozen):
     if not bulk_frozen:
         return eqx.is_inexact_array
     spec = jax.tree.map(lambda _: False, flow)
+    # Located BY TYPE, not by index: the chart is bijections[0] now and the
+    # conditional layers follow it, so an index here silently froze the shear
+    # layer and trained the chart instead.
     return eqx.tree_at(
-        lambda f: f.bijection.bijection.bijections[0], spec,
+        lambda f: _shear_layer(f), spec,
         replace=jax.tree.map(eqx.is_inexact_array, _shear_layer(flow)))
 
 
@@ -192,12 +195,14 @@ def _velocity_mse(layer, chart, m, q_true, r_true, score=None, wt=None):
 def bulk_of(flow):
     """The g-independent density behind the shear layer, whose score drives Q.
 
-    Data -> base order is [shear, raw2standard, bulk], so peeling off
-    `bijections[0]` leaves exactly the density evaluated at g = 0.
+    Data -> base order is [raw2standard, shear, *bulk], so what has to come out
+    is the SHEAR layer -- and the chart, which is now in front of it, has to
+    stay.  Dropping by type rather than by position, since the position moved.
     """
-    bij = flow.bijection.bijection.bijections
+    keep = [b for b in flow.bijection.bijection.bijections
+            if not isinstance(b, ShearResponse)]
     return Transformed(flow.base_dist,
-                       Invert(Chain(list(bij[1:])).merge_chains()))
+                       Invert(Chain(keep).merge_chains()))
 
 
 def bulk_score(flow, m, chunk=10000):
@@ -547,9 +552,13 @@ def main():
         if a.init:
             bulk_only = eqx.tree_deserialise_leaves(
                 a.init, bulk.build_flow(jr.key(a.seed), train_set[0]))
+            # `flow` is [raw2standard, shear, *bulk]; `bulk_only` is
+            # [raw2standard, *bulk].  Graft every non-shear slot, in order.
+            keep = [i for i, b in enumerate(flow.bijection.bijection.bijections)
+                    if not isinstance(b, ShearResponse)]
             flow = eqx.tree_at(
-                lambda f: f.bijection.bijection.bijections[1:], flow,
-                bulk_only.bijection.bijection.bijections)
+                lambda f: [f.bijection.bijection.bijections[i] for i in keep],
+                flow, list(bulk_only.bijection.bijection.bijections))
             print(f"warm started bulk from {a.init}")
         flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps, lr=a.lr,
                      deriv_weight=a.deriv_weight, varq=a.varq,
