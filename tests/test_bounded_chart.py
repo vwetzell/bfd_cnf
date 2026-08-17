@@ -16,15 +16,17 @@ import pytest
 sys.path.insert(0, ".")
 
 import bulk                                          # noqa: E402
-from models.bijections import POINT_SOURCE, RawMomentStandardize, in_domain  # noqa: E402
+from models.bijections import (POINT_SOURCE, POINT_SOURCE_MC,  # noqa: E402
+                               RawMomentStandardize, in_domain)
 
 
 def sample_moments(n=64, seed=0):
-    """Plausible in-domain raw moments, spanning most of the Mr/Mf range."""
+    """Plausible in-domain raw moments, spanning most of the Mr/Mf and
+    Mc/Mr ranges."""
     rng = np.random.default_rng(seed)
     Mf = 10 ** rng.uniform(3.0, 4.6, n)
     Mr = Mf * rng.uniform(1.8, 0.995 * POINT_SOURCE, n)
-    Mc = Mr * rng.uniform(0.3, 0.9, n)
+    Mc = Mr * rng.uniform(0.1, 0.995 * POINT_SOURCE_MC, n)
     e = rng.normal(0, 0.15, (n, 2))
     return jnp.asarray(np.stack([Mf, Mr, e[:, 0] * Mr, e[:, 1] * Mr, Mc], -1))
 
@@ -57,12 +59,44 @@ def test_support_closes_at_the_ceiling():
     assert in_domain(x[:3]).all()
 
 
+def test_support_closes_at_the_mc_ceiling():
+    """No latent coordinate, however large, maps to Mc/Mr >= POINT_SOURCE_MC."""
+    b = RawMomentStandardize(mean=jnp.zeros(5), std=jnp.ones(5))
+    z = jnp.zeros((5, 5)).at[:, 2].set(jnp.array([0.0, 5.0, 10.0, 50.0, 1e4]))
+    x, _ = jax.vmap(b.inverse_and_log_det)(z)
+    c = np.asarray(x[:, 4] / x[:, 1])
+    # Same saturation argument as slot 1's version above.
+    assert (c <= POINT_SOURCE_MC).all(), c
+    assert in_domain(x[:3]).all()
+
+
 def test_in_domain_rejects_the_ceiling():
     m = sample_moments(8)
     over = m.at[0, 1].set(POINT_SOURCE * m[0, 0] * 1.001)
     at = m.at[1, 1].set(POINT_SOURCE * m[1, 0])
     ok = np.asarray(in_domain(over.at[1].set(at[1])))
     assert not ok[0] and not ok[1] and ok[2:].all()
+
+
+def test_in_domain_rejects_the_mc_ceiling():
+    m = sample_moments(8)
+    over = m.at[0, 4].set(POINT_SOURCE_MC * m[0, 1] * 1.001)
+    at = m.at[1, 4].set(POINT_SOURCE_MC * m[1, 1])
+    ok = np.asarray(in_domain(over.at[1].set(at[1])))
+    assert not ok[0] and not ok[1] and ok[2:].all()
+
+
+def test_in_domain_rejects_non_positive_mc():
+    """Slot 2 is logit(Mc / (rc* Mr)), so Mc <= 0 is a log of a negative -- NaN,
+    which no downstream mask survives.  Reachable: 1.5e-4 of the copy catalog
+    and a comparable share of the noisy path's kernel draws land there."""
+    m = sample_moments(8)
+    m = m.at[0, 4].set(0.0).at[1, 4].set(-abs(m[1, 4]))
+    ok = np.asarray(in_domain(m))
+    assert not ok[0] and not ok[1] and ok[2:].all()
+    z, _ = RawMomentStandardize(mean=jnp.zeros(5), std=jnp.ones(5)) \
+        .transform_and_log_det(m[1])
+    assert not np.isfinite(np.asarray(z)).all(), "the chart survived Mc < 0"
 
 
 def test_build_flow_rejects_out_of_domain_training_data():

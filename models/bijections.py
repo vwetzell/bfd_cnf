@@ -49,11 +49,56 @@ from paramax import Parameterize, AbstractUnwrappable
 # second-order-safe window now in bfd/weightfunction.py.
 POINT_SOURCE = 3.692575
 
+# Mc/Mr ceiling, by the identical argument: a point source has Itilde/T = 1
+# everywhere, so its moments are the pure weight moments and
+# sum(W k^4)/sum(W k^2) is the point-source value of Mc/Mr, exactly as
+# sum(W k^2)/sum(W) is the point-source value of Mr/Mf above.  Any extended
+# galaxy has a positive, decreasing Itilde/T that downweights high k more than
+# low k, so Mc/Mr sits strictly below this the same way Mr/Mf sits strictly
+# below POINT_SOURCE -- verified on both catalogs (bulgedisc tops out at
+# 6.6365, gauss2 at 6.5110).
+#
+# THIS IS A PROPERTY OF THE WEIGHT FUNCTION and must be recomputed whenever
+# the weight changes, same as POINT_SOURCE above -- see that comment for what
+# happens when it goes stale.
+POINT_SOURCE_MC = 6.662089
+
 
 def in_domain(m):
-    """Rows whose raw moments the flow's chart can evaluate: Mf, Mr > 0 and
-    Mr/Mf strictly below the point-source ceiling."""
-    return (m[..., 0] > 0) & (m[..., 1] > 0) & (m[..., 1] < POINT_SOURCE * m[..., 0])
+    """Rows whose raw moments the flow's chart can evaluate: Mf, Mr, Mc > 0, and
+    both size-like ratios strictly below their point-source ceilings --
+    Mr/Mf < POINT_SOURCE and Mc/Mr < POINT_SOURCE_MC.
+
+    `Mc > 0` is not decoration.  Slot 2 is `logit(Mc / (rc* Mr))`, so a
+    non-positive Mc is a log of a negative number -- NaN, not -inf, which no
+    downstream mask survives.  It is reachable: 1.5e-4 of the shallow copy
+    catalog and 4.1e-4 of the deep one have Mc <= 0 (a badly off-centre copy
+    loses its high-k moment first), as do kernel draws in the noisy path.
+    """
+    return ((m[..., 0] > 0) & (m[..., 1] > 0) & (m[..., 4] > 0)
+            & (m[..., 1] < POINT_SOURCE * m[..., 0])
+            & (m[..., 4] < POINT_SOURCE_MC * m[..., 1]))
+
+
+def safe_point(m):
+    """An in-domain stand-in for rows a mask will discard anyway.
+
+    The chart is still EVALUATED on masked rows -- `jnp.where` evaluates both
+    branches, and a NaN or an infinity in the discarded one still poisons the
+    gradient -- so they need coordinates it can actually evaluate, at half of
+    each point-source ceiling rather than merely below it.
+
+    BOTH ceilings, and Mc last.  Clamping Mr DOWN raises Mc/Mr, so a row that
+    only violated slot 1 comes out of the slot-1 clamp violating slot 2 --
+    which is silent: the dummy's own derivative overflows, `jnp.where`
+    multiplies it by zero, 0 * inf = NaN, and the caller discards the whole
+    row.  That cost 18.9% of the noisy targets when `POINT_SOURCE_MC` was added
+    without updating this function.
+    """
+    mf = jnp.maximum(m[..., 0], 1e-6)
+    mr = jnp.clip(m[..., 1], 1e-6, 0.5 * POINT_SOURCE * mf)
+    mc = jnp.clip(m[..., 4], 1e-6, 0.5 * POINT_SOURCE_MC * mr)
+    return m.at[..., 0].set(mf).at[..., 1].set(mr).at[..., 4].set(mc)
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +352,7 @@ def propagate_cov_to_std_jax(
 class RawMomentStandardize(AbstractBijection):
     """
     Raw x = [Mf, Mr, M1, M2, Mc]   (bfd's even-moment order)
-    Transformed z0 = [log10(Mf), logit(Mr/Mf/r*), Mc/Mr, M1/Mr, M2/Mr]
+    Transformed z0 = [log10(Mf), logit(Mr/Mf/r*), logit(Mc/Mr/rc*), M1/Mr, M2/Mr]
     Then standardized: z = (z0 - mean) / std
 
     Slot 1 carries the point-source ceiling `r* = POINT_SOURCE` as a HARD
@@ -320,12 +365,18 @@ class RawMomentStandardize(AbstractBijection):
     that stretch turns out to cost more resolution than the closure buys,
     the map to try next is gentler (a power, or `-log(1 - r/r*)`), not absent.
 
-    NOTE this makes the chart undefined for `Mr/Mf >= r*`, which real NOISY
-    moments do reach (~1.8% of the deep targets).  That is legal only because
-    the flow is the density of the LATENT moment: a noisy M never enters
-    `log_prob` directly, only through `P(M) = INT dm P(m) L(M-m)`, whose draws
-    are latent points.  Anything evaluating the flow at measured moments must
-    mask on `in_domain` first -- see `bias.in_domain`.
+    Slot 2 carries the identical treatment for `Mc/Mr` against its own
+    point-source ceiling `rc* = POINT_SOURCE_MC`: the same argument that makes
+    `r*` a hard boundary on `Mr/Mf` makes `rc*` one on `Mc/Mr`, since both are
+    the pure-weight-moment ratio a point source (Itilde/T = 1) would produce.
+
+    NOTE this makes the chart undefined for `Mr/Mf >= r*` or `Mc/Mr >= rc*`,
+    which real NOISY moments do reach (~1.8% of the deep targets for slot 1).
+    That is legal only because the flow is the density of the LATENT moment: a
+    noisy M never enters `log_prob` directly, only through
+    `P(M) = INT dm P(m) L(M-m)`, whose draws are latent points.  Anything
+    evaluating the flow at measured moments must mask on `in_domain` first --
+    see `in_domain` above.
 
     The transformed order groups the three SPIN-0 coordinates first (0, 1, 2)
     and the spin-2 pair last (3, 4); the equivariant layers and the
@@ -412,7 +463,8 @@ class RawMomentStandardize(AbstractBijection):
         z0_0 = jnp.log10(Mf)
         u = Mr / (POINT_SOURCE * Mf)
         z0_1 = jnp.log(u) - jnp.log1p(-u)
-        z0_2 = Mc / Mr
+        v = Mc / (POINT_SOURCE_MC * Mr)
+        z0_2 = jnp.log(v) - jnp.log1p(-v)
         z0_3 = M1 / Mr
         z0_4 = M2 / Mr
 
@@ -441,7 +493,7 @@ class RawMomentStandardize(AbstractBijection):
         log10_const = jnp.log(jnp.array(10.0, dtype=z0.dtype))
         Mf = jnp.exp(z0[..., 0] * log10_const)
         Mr = POINT_SOURCE * jnn.sigmoid(z0[..., 1]) * Mf
-        Mc = z0[..., 2] * Mr
+        Mc = POINT_SOURCE_MC * jnn.sigmoid(z0[..., 2]) * Mr
         M1 = z0[..., 3] * Mr
         M2 = z0[..., 4] * Mr
         x = jnp.stack([Mf, Mr, M1, M2, Mc], axis=-1).astype(z0.dtype)
@@ -466,6 +518,7 @@ class RawMomentStandardize(AbstractBijection):
         z, _ = self._forward_transform(x)
         Mf = x[..., 0]
         Mr = x[..., 1]
+        Mc = x[..., 4]
         ln10 = jnp.log(jnp.array(10.0, dtype=Mf.dtype))
         # Triangular in the order (Mf, Mr, Mc, M1, M2): the extra factor over
         # the bare-ratio chart is d logit(u)/dMr = 1 / (u (1-u) r* Mf).
@@ -473,6 +526,13 @@ class RawMomentStandardize(AbstractBijection):
         lad_geom = -(2.0 * jnp.log(Mf) + 3.0 * jnp.log(Mr) + jnp.log(ln10)
                      + jnp.log(u) + jnp.log1p(-u)
                      + jnp.log(jnp.array(POINT_SOURCE, dtype=Mf.dtype)))
+        # Slot 2's logit replaces its plain 1/Mr factor with
+        # d logit(v)/dMc = 1 / (v (1-v) rc* Mr) -- the 1/Mr is already folded
+        # into the `3.0 * log(Mr)` term above, so only the extra logit factor
+        # (v (1-v) rc*) needs subtracting here.
+        v = Mc / (POINT_SOURCE_MC * Mr)
+        lad_geom = lad_geom - (jnp.log(v) + jnp.log1p(-v)
+                                + jnp.log(jnp.array(POINT_SOURCE_MC, dtype=Mf.dtype)))
         lad_std = -jnp.sum(jnp.log(self._effective()[1]))
         return z, lad_geom + lad_std
 

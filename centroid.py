@@ -63,6 +63,7 @@ import numpy as np
 import optax
 
 import bulk
+from models.bijections import in_domain, safe_point
 from models.centroid import dm_dsigma
 
 # The copy-weight convention lives in imsims and must not be duplicated here: it
@@ -226,9 +227,22 @@ def train(flow, sampler, sigma_x, shift_target, key, steps=4000, batch=1024,
     def step(params, state, x, gi):
         def loss_fn(p):
             model = eqx.combine(p, static)
-            nll = -jnp.mean(model.log_prob(x, condition=cond))
+            # Un-marginalising makes a copy brighter, smaller and MORE
+            # concentrated, i.e. it moves Mr/Mf and Mc/Mr UP -- towards their
+            # point-source ceilings.  bulgedisc sits within 0.34% of the Mc/Mr
+            # one and the deep Sigma_X asks for a ~1.2% shift, so a handful of
+            # copies per batch land outside the chart, where log_prob is -inf.
+            # Masking the RESULT is not enough: `jnp.where` still differentiates
+            # the -inf branch and hands back NaN, which took out an entire 8000
+            # step deep run at step 144.  So substitute the INPUT, exactly as
+            # the noisy path does, and drop those rows from the mean.
+            z = jax.vmap(_centroid_layer(model).unmarginalize)(x, cond)
+            ok = in_domain(z)
+            lp = model.log_prob(jnp.where(ok[:, None], x, safe_point(x)),
+                                condition=cond)
+            nll = -jnp.sum(jnp.where(ok, lp, 0.0)) / jnp.maximum(jnp.sum(ok), 1)
             mse = _shift_mse(_centroid_layer(model), m_gal[gi], d_gal[gi], sx)
-            return nll + shift_weight * mse, (nll, mse)
+            return nll + shift_weight * mse, (nll, mse, 1.0 - jnp.mean(ok))
 
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, state = opt.update(grads, state, params)
@@ -236,10 +250,16 @@ def train(flow, sampler, sigma_x, shift_target, key, steps=4000, batch=1024,
 
     for i in range(steps):
         x, gi = sampler.draw(rng, batch)
-        params, state, (nll, mse) = step(params, state, jnp.asarray(x),
-                                         jnp.asarray(gi))
+        params, state, (nll, mse, off) = step(params, state, jnp.asarray(x),
+                                              jnp.asarray(gi))
+        # `off` is the fraction of copies the layer maps out of the chart, and
+        # it is the diagnostic for the guard above: those copies contribute no
+        # gradient, so nothing stops the layer pushing MORE of them out.  It
+        # measured ~1e-4 and flat at the deep depth; a rising trend means the
+        # map needs bounding rather than masking (see models/centroid.py).
         if i % 250 == 0 or i == steps - 1:
-            print(f"step {i:5d}  nll {nll:.4f}  shift mse {mse:.3e}")
+            print(f"step {i:5d}  nll {nll:.4f}  shift mse {mse:.3e}  "
+                  f"off-chart {off:.2e}")
     return eqx.combine(params, static)
 
 

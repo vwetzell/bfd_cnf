@@ -20,11 +20,16 @@ jax.config.update("jax_enable_x64", True)
 
 from bias import (  # noqa: E402  (after the x64 flag)
     ess, kernel_draws, log_conv, log_conv_is, mixture_draws, pqr_streamed)
+from models.bijections import in_domain  # noqa: E402
 
 # A prior N(mu(g), S0) in raw moment space, with mu linear in g.  mu0 sits far
-# from the Mf, Mr > 0 edges so log_conv's domain mask never fires and the
-# comparison is against the unmasked integral.
-MU0 = np.array([6.0e3, 2.2e4, -1.5e2, 1.2e2, 1.5e5])
+# from EVERY edge of `in_domain` -- Mf, Mr > 0, Mr/Mf < POINT_SOURCE and
+# Mc/Mr < POINT_SOURCE_MC -- so log_conv's domain mask never fires and the
+# comparison is against the unmasked integral.  Mr/Mf = 3.0 and Mc/Mr = 5.0
+# here, against ceilings of 3.69 and 6.66; the earlier values (Mr/Mf = 3.667,
+# Mc/Mr = 6.818) predate the slot-2 ceiling and sat outside it, which silently
+# turned every "unmasked" comparison below into a masked one.
+MU0 = np.array([6.0e3, 1.8e4, -1.5e2, 1.2e2, 9.0e4])
 DMU = np.array([[30.0, 400.0, 4.4e3, 10.0, 2.0e3],       # d mu / d g1
                 [-20.0, 250.0, 15.0, 4.1e3, -1.5e3]])    # d mu / d g2
 _A = np.diag([80.0, 340.0, 240.0, 240.0, 2900.0])
@@ -149,8 +154,10 @@ def test_out_of_domain_draws_get_zero_weight_not_nan():
     assert np.all(np.isfinite(np.asarray(jax.grad(f)(jnp.zeros(2)))))
     assert np.all(np.isfinite(np.asarray(jax.hessian(f)(jnp.zeros(2)))))
 
-    # And the value is the masked sum: the same draws, restricted by hand.
-    ok = (x[:, 0] > 0) & (x[:, 1] > 0)
+    # And the value is the masked sum: the same draws, restricted by the SAME
+    # predicate the estimator uses.  Spelling the conditions out by hand here
+    # silently drifted once the chart grew a second ceiling.
+    ok = np.asarray(in_domain(jnp.asarray(x)))
     lp = np.asarray(GaussPrior().log_prob(jnp.asarray(x[ok]), jnp.zeros(2)))
     want = jax.scipy.special.logsumexp(lp) - np.log(len(x))
     assert abs(float(f(jnp.zeros(2))) - float(want)) < 1e-9

@@ -89,10 +89,15 @@ except ImportError as exc:                                  # pragma: no cover
     raise SystemExit("truth.py needs ../bfd_cnf_imsims on the path: "
                      f"{exc}") from None
 
+# sim.py only duplicates the slot-1 ceiling (POINT_SOURCE) as its own literal;
+# slot 2's has no imsims-side twin to match, so pull it straight from the
+# source of truth rather than add one.
+from models.bijections import POINT_SOURCE_MC
+
 
 def to_coords(m):
     """Raw moments -> chart coordinates t = [log10 Mf, logit(Mr/(POINT_SOURCE
-    Mf)), Mc/Mr, M1/Mr, M2/Mr].
+    Mf)), logit(Mc/(POINT_SOURCE_MC Mr)), M1/Mr, M2/Mr].
 
     Duplicates `bulk.to_coords` line for line (ellipsis indexing in place of a
     fixed leading batch axis, so this same function autodiffs a single (5,)
@@ -101,8 +106,9 @@ def to_coords(m):
     guard.
     """
     u = m[..., 1] / (sim.POINT_SOURCE * m[..., 0])
+    v = m[..., 4] / (POINT_SOURCE_MC * m[..., 1])
     return jnp.stack([jnp.log10(m[..., 0]), jnp.log(u) - jnp.log1p(-u),
-                      m[..., 4] / m[..., 1], m[..., 2] / m[..., 1],
+                      jnp.log(v) - jnp.log1p(-v), m[..., 2] / m[..., 1],
                       m[..., 3] / m[..., 1]], axis=-1)
 
 

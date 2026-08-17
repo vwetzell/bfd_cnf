@@ -64,7 +64,9 @@ LABEL_FONTSIZE, TICK_LABELSIZE = 34, 24
 # unresolved and carries no shape information -- the old repo drew it as the
 # "stellar locus", and it is the same number here (same weight function).  It is
 # now a hard boundary of the flow's chart, so it is defined next to the chart.
-from models.bijections import POINT_SOURCE  # noqa: E402,F401
+# Mc/Mr ceiling, the identical point-source argument one moment order up --
+# see models.bijections.POINT_SOURCE_MC.
+from models.bijections import POINT_SOURCE, POINT_SOURCE_MC  # noqa: E402,F401
 
 
 def load_moments(path):
@@ -75,13 +77,14 @@ def load_moments(path):
 def to_coords(m):
     """Raw moments -> the flow's transformed coordinates t (for plotting).
 
-    Mirrors `RawMomentStandardize._forward_transform`, including slot 1's
-    logit: this is what fixes the standardisation's mean/std, so the two must
-    not drift apart.
+    Mirrors `RawMomentStandardize._forward_transform`, including slots 1 and
+    2's logits: this is what fixes the standardisation's mean/std, so the two
+    must not drift apart.
     """
     u = m[:, 1] / (POINT_SOURCE * m[:, 0])
+    v = m[:, 4] / (POINT_SOURCE_MC * m[:, 1])
     return np.stack([np.log10(m[:, 0]), np.log(u) - np.log1p(-u),
-                     m[:, 4] / m[:, 1], m[:, 2] / m[:, 1], m[:, 3] / m[:, 1]],
+                     np.log(v) - np.log1p(-v), m[:, 2] / m[:, 1], m[:, 3] / m[:, 1]],
                     axis=-1)
 
 

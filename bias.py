@@ -107,21 +107,12 @@ from flowjax.distributions import Transformed
 
 import bulk
 import shear
-from models.bijections import POINT_SOURCE, in_domain
+# `safe_point` lives beside `in_domain` in models/bijections.py: the centroid
+# TRAINING loss needs the identical guard, and the last bug here was one copy
+# of it not learning about a new ceiling.
+from models.bijections import in_domain, safe_point
 from models.centroid import CentroidMarginalize
 
-
-def safe_point(m):
-    """An in-domain stand-in for rows the mask will discard anyway.
-
-    The flow is still CALLED on masked rows -- `jnp.where` evaluates both
-    branches, and a NaN in the discarded one still poisons the gradient -- so
-    they need coordinates the chart can actually evaluate, comfortably inside
-    the point-source ceiling rather than merely below it.
-    """
-    mf = jnp.maximum(m[..., 0], 1e-6)
-    mr = jnp.clip(m[..., 1], 1e-6, 0.5 * POINT_SOURCE * mf)
-    return m.at[..., 0].set(mf).at[..., 1].set(mr)
 
 # Full float32 matmuls, not the TF32 the GPU defaults to.  TF32 keeps 10
 # mantissa bits, so a log-density that accumulates through a ~12-layer flow
@@ -866,6 +857,12 @@ def main():
                         "chunks of this size and keeps only per-target running "
                         "sums, so `--samples` is not limited by memory. Defaults "
                         "to min(samples, 8192).")
+    p.add_argument("--noise-scale", type=float, default=1.0,
+                   help="multiply C_M by this factor (in sigma, so the variance "
+                        "goes as its square) -- a moment-space stand-in for a "
+                        "deeper catalog. Only meaningful where the noise is "
+                        "ADDED in moment space; an IMGNOISE catalog carries its "
+                        "own realization and this would rescale only the kernel.")
     p.add_argument("--noise-seed", type=int, default=1,
                    help="the targets' noise realization; shared by the +g, -g "
                         "and unsheared catalogs so the pairing still cancels "
@@ -947,6 +944,11 @@ def main():
         print(f"  proposal flow: {a.proposal_flow} "
               f"(draws shared across eval flows)")
 
+    if img_noise and a.noise_scale != 1.0:
+        raise SystemExit(
+            "--noise-scale on an IMGNOISE catalog would rescale the KERNEL "
+            "without touching the noise already in the moments; render a "
+            "deeper catalog instead (see CATALOGS['bulgedisc_deep']).")
     if img_noise and not a.samples:
         raise SystemExit(
             "these targets carry image noise, so P(M|g) is the prior CONVOLVED "
@@ -992,7 +994,13 @@ def main():
     batch = 20000
     chunk = None
     if a.samples:
-        cov = load_cov(path(cat["zero"]))
+        # `--noise-scale` reaches C_M before anything else uses it, so the
+        # target's own noise realization, the kernel the proposal draws from and
+        # the convolution integral all move together -- which is what makes a
+        # moment-space catalog stand in for a deeper render.  It is exact only
+        # for the noise; a deeper IMAGE would also re-find the centroid, which
+        # is why the bulgedisc deep study renders instead of scaling.
+        cov = load_cov(path(cat["zero"])) * a.noise_scale ** 2
         if not img_noise:
             # The SAME noise realization for a galaxy in all three catalogs, so
             # what the +/- difference cancels stays cancelled.
