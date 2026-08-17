@@ -89,6 +89,19 @@ def main():
                         "so an O(g^3) error in ghat -- the PQR expansion's own "
                         "truncation -- shows up as m1 proportional to g^2.")
     p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--draw-seed", type=int, default=None,
+                   help="seed for the KERNEL/PROPOSAL draws alone, leaving the "
+                        "targets and their noise realisation fixed. Defaults to "
+                        "--seed + 100, i.e. every run before this flag existed. "
+                        "Two runs differing only here isolate the Monte-Carlo "
+                        "integral: their per-target Qhat differ by 2 Var_MC(Qhat), "
+                        "which is the term that biases Rhat LOW (Rhat contains "
+                        "(B/A)^2, the square of an MC estimate) and so biases m1 "
+                        "HIGH by sum Var_MC(Qhat) / sum j -- positive, flat in g, "
+                        "a pure response-scale error. It is also the only way to "
+                        "get a DRAW-realisation error bar: the bootstrap "
+                        "everywhere in HANDOFF.md resamples TARGETS and leaves "
+                        "every target's draws untouched, so it cannot see this.")
     p.add_argument("--nbin", type=int, default=8)
     p.add_argument("--save-pqr", default=None,
                    help="write the control PQR (+ its size axis) here, "
@@ -146,10 +159,14 @@ def main():
     Mp = bias.add_noise(mp, cov, a.seed + 1)
     Mm = bias.add_noise(mm, cov, a.seed + 1)
 
+    dseed = a.seed + 100 if a.draw_seed is None else a.draw_seed
+    if a.draw_seed is not None:
+        print(f"draw seed: {dseed} (targets and noise unchanged)")
+
     qr = {}
     for k, M in (("plus", Mp), ("minus", Mm)):
         q, r = bias.pqr_streamed(flow, jnp.asarray(M), cov, a.samples, a.alpha,
-                                 a.seed + 100, sigma_x=sigma_x, chunk=a.chunk,
+                                 dseed, sigma_x=sigma_x, chunk=a.chunk,
                                  batch=a.batch)
         qr[k] = (np.asarray(q, np.float64), np.asarray(r, np.float64))
         print(f"  {k} arm done")

@@ -1113,6 +1113,128 @@ factor that dies between x1 and x3 while the first grows monotonically.
 
 ---
 
+## 2026-08-17: the control can only be biased four ways, and two more are now dead
+
+No new simulation in this section: everything below is analysis plus arithmetic
+on PQR already saved in `dev/`.
+
+**The pruning argument, which should have been written down much earlier.**  In
+the self-consistency control the targets are drawn from the flow and scored by
+the same flow, and the noise is added with the same `C_M` the estimator
+convolves with.  The prior and the likelihood are therefore both exact *by
+construction*, so **no model misspecification of any kind can make m1 nonzero
+there**.  That disposes, with no run at all, of the entire physics list: the
+layer's first-order-in-T truncation, the `Var[.|m]` transport floor, centroid
+noise bias, template incompleteness, selection, and the `|J(u)|`-inside versus
+`J(M)`-outside question against the paper's eq. (35)-(36) -- which was checked
+this session and is *consistent*: the paper's `J(M)` is a per-sky-area detection
+density, the layer's `|J(u)|` is the per-detection recentring density, and
+`INT |J(u)| N(X^G(u); Sigma_X) d2u = 1` under the same convexity assumption the
+paper makes in section 5.3.  Two different bookkeepings of the same physics.
+
+What survives is only four terms: `O(g^2)`, `O(1/N)` in TARGETS, `O(1/S)` in
+draws, and numerics.  Numerics was already dead (1.3e-8) and `O(g^2)` was
+already dead (flat in g at 10 sigma).  So:
+
+**`O(1/N)` is dead too, and this is new.**  `ghat = -(sum r)^-1 (sum q)` is a
+ratio of two finite sums and is biased at O(1/N) even with perfect per-target
+`q` and `r` -- the target-side analogue of the paper's Fig. 4 `1/N_template`
+effect, which nobody had checked.  `dev/check_finite_targets.py`, on the saved
+deep centroid control: the jackknife O(1/N) bias is **|b/N| < 3e-6**, and the
+subsample curve is FLAT over 32x in N (+0.00066 at N = 20000, +0.00132 at
+N = 625, where a 1/N term would have grown 32-fold).  Same on the shallow
+control.
+
+**Which leaves `O(1/S)` as the only survivor -- and it has a named mechanism
+that no ESS diagnostic can see.**  `pqr_streamed` forms `qhat = B/A` and
+`jhat = -(C/A - (B/A)^2)`.  That `(B/A)^2` is the SQUARE of a Monte-Carlo
+estimate, so
+
+    E[jhat] = j - Cov_MC(qhat)
+
+i.e. the observed information comes out systematically LOW, with no matching
+term in `qhat`, and since `m1 = sum qhat / (g sum jhat) - 1` the estimator reads
+systematically HIGH by
+
+    dm1 = sum_i Cov_MC(qhat_i)_11 / sum_i j_i,11
+
+**positive, exactly flat in g, and a pure response-scale error** -- every
+fingerprint of the +0.006.  `dev/toy_is_bias.py` validates it against exact
+quadrature on a 1-D problem: the predicted deficit tracks the measured one,
+scales as 1/S (0.0504, 0.0132, 0.0034, 0.0009 at S = 512..32768), is dead flat
+in g (0.01325 / 0.01324 / 0.01324 at g = 0.01/0.02/0.04), and grows steeply as
+the density sharpens (6e-4 at spike width 1.0 to 0.12 at 0.05, fixed S).
+
+Critically it is **invisible to `check_ess_logdet.py`**: the defensive mixture
+bounds the importance weights, so ESS/S is flat in S exactly as that script
+measured -- but what carries this bias is the variance of the RATIO `B/A`, not
+the concentration of `w`.  The flat ESS/S at alpha = 0.5 is therefore *not*
+evidence that this term has converged, and the earlier reading of it as such is
+the gap in the elimination chain.
+
+**Measured on the real runs, from two saved S values** (`dev/check_var_mc.py`,
+which needs no new compute -- two runs differing only in S bracket `V/S` within
+a factor <2 whether or not the draws are nested):
+
+| path | predicted dm1 at S = 32768 |
+|---|---|
+| moment-space, deep | +0.00176 to +0.00294 |
+| image-noise + centroid, deep | +0.00178 to +0.00301 |
+
+So the term is **real and not small -- but it is the SAME in both paths**, and
+therefore is not by itself the centroid path's differential +0.006.
+
+**Two consequences that outlive that null.**
+
+1. **"Converged in S" is a CANCELLATION, not a convergence.**  This one term is
+   ~+0.0025 at S = 32768 and would be ~+0.010 at 8192, yet the measured net
+   moves the other way (moment-space control -0.0048 -> -0.0002).  Competing
+   O(1/S) terms are cancelling at the ~0.003 level, which is larger than several
+   conclusions in this file rest on.
+2. **Every error bar in this file is missing the draw realisation.**  The
+   bootstrap resamples TARGETS and leaves each target's draws untouched, so it
+   is structurally blind to the Monte-Carlo error of the integral.  The merge
+   test already hinted at it (+0.0070 vs +0.0055 at the same S on a different
+   stream) but it was read as a null rather than as a scatter measurement.
+
+**A new free diagnostic worth keeping: the information identity.**
+`dev/check_info_identity.py`.  Any normalised density obeys
+`E_0[s s^T] = -E_0[h]`, i.e. `sum q^2 = sum j`, and arm-averaging leaves
+
+    sum q^2 / sum j - 1  =  (g^2/2) Var_0(s_1^2 + h_11) / F  +  2 Var_MC(qhat)/sum j
+
+| run | 11 | 22 |
+|---|---|---|
+| centroid control, deep | **+0.0566** | +0.0048 |
+| centroid control, shallow | +0.0514 | -0.0005 |
+| moment-space control | **+0.0067** | -0.0003 |
+| centroid real, S = 32768 | +0.0264 | -0.0046 |
+
+The 22 component is ~0 everywhere, as it must be with shear in g1 only (there it
+is a cross-covariance, not a variance) -- that split is what identifies the term
+rather than leaving it as "the estimator is inconsistent", which is the trap.
+Read as the first line, the centroid path's per-target `log P` is **8.5x more
+non-Gaussian in g** than the moment-space path's.  That is exactly the regime
+the paper's eq. (61) warns about ("alpha is expected to be of order unity UNLESS
+d log P/dg becomes large for some targets").  It is NOT the +0.006 itself --
+alpha g^2 is excluded at ~10 sigma by the g-scan -- but it is the first
+quantitative statement of what the centroid layer does to the estimator's
+conditioning, and it costs nothing to compute on any saved PQR.
+
+**The measurement this points at, now running.**  `--draw-seed` added to
+`check_selfconsistency_noisy.py` (until now `--seed` moved the targets too, so
+two runs could never differ in draws alone).  Two deep centroid controls at
+S = 32768, identical but for the draw seed, feed `dev/check_draw_seed.py`, which
+returns (a) the draw-realisation sigma every number in this file is missing and
+(b) a **bias-corrected m1**, adding `Cov_MC(qhat) = (1/2)(qhat_A - qhat_B)^2`
+back into R.  Corrected ~ 0 means the +0.006 is this term after all and the
+"same in both paths" reading above was measured on the wrong runs; corrected
+still ~ +0.006 means it is not, and the candidate list is empty with the
+pruning argument saying it has to be O(1/S) regardless.  Logs:
+`logs_control_drawseed.txt`.
+
+---
+
 ## Open questions for the next session
 
 1. **What is actually causing the multi-lobe shape?** Both mechanisms tried
