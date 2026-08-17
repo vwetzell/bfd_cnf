@@ -47,8 +47,38 @@ from models.bijections import EquivariantAutoregressiveLayer, RawMomentStandardi
 from models.centroid import CentroidMarginalize
 from models.shear import ShearResponse
 
-# All six permutations of the three spin-0 slots, cycled between bulk layers.
+# All six permutations of the three spin-0 slots.  These are the orderings each
+# autoregressive layer should SEE -- see `_spin0_increments` for why that is not
+# the same as the permutation inserted between layers.
 _SPIN0_PERMS = [[0, 1, 2], [1, 2, 0], [2, 0, 1], [0, 2, 1], [2, 1, 0], [1, 0, 2]]
+
+
+def _spin0_increments(n_layers):
+    """Permutations to insert BETWEEN layers so the cumulative ordering walks
+    `_SPIN0_PERMS`.
+
+    `Permute` sits after each autoregressive layer, so the orderings COMPOSE:
+    what layer i sees is perm_0 . perm_1 . ... . perm_{i-1}, not perm_i.
+    Inserting `_SPIN0_PERMS[i]` directly -- which this did -- therefore does not
+    cycle the orderings at all.  Measured over the 8 layers it gave
+
+        z0 (log10 Mf) the autoregressive head in 4 of 8 layers, against 2 each
+        for z1 and z2, and presented only 4 of the 6 orderings,
+
+    so the flux coordinate spent half the stack modelled unconditionally and
+    some pairwise dependences were only ever seen in one direction -- both of
+    which the design comment says must not happen.  The first inserted
+    permutation was also the identity, so layers 0 and 1 saw the same ordering.
+
+    `Permute` maps y[k] = x[perm[k]], so to go from ordering `cur` to `nxt` the
+    increment is `cur^-1 . nxt`.
+    """
+    out = []
+    for i in range(n_layers):
+        cur, nxt = _SPIN0_PERMS[i % 6], _SPIN0_PERMS[(i + 1) % 6]
+        pos = {v: k for k, v in enumerate(cur)}
+        out.append([pos[v] for v in nxt])
+    return out
 
 LAYERS = 8
 NN_WIDTH = 64
@@ -115,6 +145,7 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
 
     key, k_shear, k_centroid = jr.split(key, 3)
     keys = jr.split(key, layers)
+    _incs = _spin0_increments(layers)
     bulk = []
     for i, k in enumerate(keys):
         bulk.append(EquivariantAutoregressiveLayer(k, nn_width, nn_depth, jax.nn.silu))
@@ -123,7 +154,7 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
         # and every pairwise dependence gets modelled in both directions.  The
         # spin-2 pair (3, 4) is never touched: swapping M1/M2 would rotate the
         # shape by 45 degrees and destroy the equivariance.
-        bulk.append(Permute(jnp.array(_SPIN0_PERMS[i % len(_SPIN0_PERMS)] + [3, 4])))
+        bulk.append(Permute(jnp.array(_incs[i] + [3, 4])))
 
     # Chain.transform runs in list order and maps data -> base, so the
     # data-adjacent layer comes first; Invert flips it for sampling.
