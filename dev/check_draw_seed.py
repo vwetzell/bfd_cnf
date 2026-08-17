@@ -16,23 +16,22 @@ Two things come out that nothing else in this investigation can give.
 
    and (B/A)^2 is the square of a Monte-Carlo estimate, so
 
-       E[jhat] = j - Cov_MC(qhat)
+       E[jhat] = j + Cov_MC(qhat)
 
-   i.e. the observed information comes out systematically LOW, and since
-   m1 = sum qhat / (g sum jhat) - 1 the estimator reads systematically HIGH by
+   i.e. the observed information comes out systematically HIGH, ghat too small,
+   and since m1 = sum qhat / (g sum jhat) - 1 the estimator reads systematically
+   LOW by
 
-       dm1 = sum_i Cov_MC(qhat_i)_11 / sum_i j_i,11
+       dm1 = - sum_i Cov_MC(qhat_i)_11 / sum_i j_i,11
 
-   which is positive, exactly flat in g, and a pure response-scale error --
-   the fingerprint of the unexplained +0.006 (see `dev/toy_is_bias.py` for the
-   mechanism validated against exact quadrature, and `dev/check_var_mc.py` for
-   the same term measured on the real runs from two S values).
+   exactly flat in g, and a pure response-scale error.  (Settled in closed form
+   on a Gaussian where P(M|g) is exact: <jhat> tracks j + Var_MC at every M and
+   every S.  See `dev/toy_is_bias.py` for the mechanism against exact
+   quadrature, `dev/check_var_mc.py` for the term on the real runs.)
 
    Two independent draw realisations estimate that covariance directly,
    Cov_MC = (1/2) (qhat_A - qhat_B)(qhat_A - qhat_B)^T, per target, unbiased.
-   Adding it back gives a corrected m1.  If the mechanism is the answer the
-   corrected value lands on zero; if it does not, this is the number that says
-   how much of the +0.006 is still unexplained.
+   SUBTRACTING it from R gives a corrected m1, which moves m1 UP.
 
     python dev/check_draw_seed.py dev/pqr_control_deep_dsA.npz \\
                                   dev/pqr_control_deep_dsB.npz
@@ -45,10 +44,12 @@ draw seeds 107 and 500, everything else identical:
     DRAW-realisation sigma           0.00051     (1 dof)
     sum Cov_MC(qhat)_11 / sum j_11  +0.00263
     m1, averaged, uncorrected       +0.00486
-    m1, Cov_MC added back to R      +0.00223 +/- 0.00161   (1.4 sigma)
+    m1, Cov_MC SUBTRACTED from R    +0.00751 +/- 0.00158
 
-So **about half the centroid control's bias is this one estimator artifact**,
-and what is left is not significantly different from zero.
+So the artifact does **NOT** explain the centroid control's bias -- removing it
+DEEPENS the bias, from +0.0049 to +0.0075.  The artifact is real and worth
+removing on its own account (`bias.pqr_streamed(crossfit=True)`), but the
++0.006 thread stays open.
 
 Three things to keep straight before quoting that.
 
@@ -60,21 +61,19 @@ Three things to keep straight before quoting that.
 2. The draw-realisation sigma is SMALL, 0.0005 against the target bootstrap's
    0.0017.  That worry is closed: the bootstrap does dominate after all, even
    though it could never have shown so by itself.
-3. The correction is NOT a universal fix and must not be applied blind.  It
-   removes only the `(B/A)^2` term; the other O(1/S) terms are still there, and
-   applying this one alone to the moment-space control (which reads -0.0002)
-   would take it to -0.0028, i.e. away from the zero it is known to converge to.
-   The correct reading is that the estimator carries SEVERAL O(1/S) terms of
-   order 0.003 with opposing signs, and +0.006 sits inside that budget.
+3. The correction is NOT a universal fix.  It removes only the `(B/A)^2` term.
+   Applied to the moment-space control it gives +0.0057 at S = 8192 and +0.0024
+   at 32768 -- away from that path's known zero, and not constant.  So other
+   O(1/S) terms of comparable size and opposite sign are present; the honest
+   budget is several terms of order 0.003.
 
-Consistency check that does NOT fully work, reported rather than buried: scaling
-the information identity (`check_info_identity.py`) from S = 8192 to 32768
-predicts a Var_MC three times smaller than the direct two-seed measurement here
-(identity moved 0.0566 -> 0.0524, where a clean 1/S term of this size would have
-moved it ~0.016).  The two-seed number is the trustworthy one -- it is a direct
-measurement, not a difference of two large numbers -- but the mismatch says the
-O(1/S) structure is not a single clean 1/S term, which is the same conclusion as
-point 3 from a different direction.
+A tension the sign fix mostly resolves: the information identity moved only
+0.0566 -> 0.0524 between S = 8192 and 32768, which looked incompatible with a
+Var_MC changing 4x.  With the right sign it is not -- the identity is
+`sum qhat^2 / sum jhat - 1`, and Var_MC inflates numerator and denominator
+alike (`sum qhat^2 = sum q^2 + V`, `sum jhat = sum j + V`), so with
+`sum q^2 ~ sum j` at small g the two largely cancel and the identity is nearly
+blind to this term.  A ~7% residual drop against a predicted ~0.8% remains.
 """
 import sys
 
@@ -137,14 +136,18 @@ def main(pa, pb, g=0.02):
           f"   (+g {dm1['p']:+.5f}, -g {dm1['m']:+.5f})")
     print(f"  => predicted finite-S excess in m1 = {pred:+.5f}")
 
-    # bias-corrected: add the missing information back, averaging the two runs'
-    # qhat so the corrected estimate also uses 2S worth of draws in the numerator
+    # Bias-corrected.  j = qhat qhat^T - C/A, and E[qhat qhat^T] carries an
+    # extra Cov_MC(qhat), so jhat is too LARGE and must have it SUBTRACTED --
+    # verified in closed form (a Gaussian where P(M|g) is known exactly, so
+    # <jhat> can be compared with j directly: it tracks j + Var_MC at every S).
+    # Too-large R means ghat too small, so the uncorrected m1 is too NEGATIVE
+    # and correcting it moves m1 UP.
     qm_ = {a: 0.5 * (qA[a] + qB[a]) for a in ("p", "m")}
-    jc = {a: 0.5 * (jA[a] + jB[a]) + cov[a] for a in ("p", "m")}
+    junc = {a: 0.5 * (jA[a] + jB[a]) for a in ("p", "m")}
+    jc = {a: junc[a] - cov[a] for a in ("p", "m")}
     mc = m1(qm_, jc)
-    print(f"\n  m1, both realisations averaged, UNcorrected = "
-          f"{m1(qm_, {a: 0.5*(jA[a]+jB[a]) for a in ('p','m')}):+.5f}")
-    print(f"  m1, Cov_MC added back to R  (CORRECTED)     = {mc:+.5f}")
+    print(f"\n  m1, both realisations averaged, UNcorrected = {m1(qm_, junc):+.5f}")
+    print(f"  m1, Cov_MC SUBTRACTED from R  (CORRECTED)   = {mc:+.5f}")
 
     rng = np.random.default_rng(0)
     idx = np.arange(len(qA["p"]))

@@ -1,31 +1,40 @@
-"""Does the importance-sampled convolution bias R DOWN, and m1 UP, at O(1/S)?
+"""Does the importance-sampled convolution bias R UP, and m1 DOWN, at O(1/S)?
 
 `pqr_streamed` accumulates, per target, over S draws from a proposal q:
 
     A = sum w p,   B = sum w dp/dg,   C = sum w d2p/dg2
-    qhat = B/A                       jhat = -(C/A - (B/A)^2)
+    qhat = B/A                       jhat = (B/A)^2 - C/A
 
 The (B/A)^2 is a SQUARE of a Monte-Carlo estimate, so
 
     E[(B/A)^2] = (B/A)_true^2 + Var_MC(B/A)
 
-and jhat is therefore biased DOWNWARD by Var_MC(qhat) -- at O(1/S), with no
-matching term in qhat.  Since m1 = sum qhat / (g sum jhat) - 1, a deficit in
-sum jhat is a POSITIVE, g-flat, pure response-scale error:
+and jhat is therefore biased UPWARD by Var_MC(qhat) -- at O(1/S), with no
+matching term in qhat.  Since m1 = sum qhat / (g sum jhat) - 1, a SURPLUS in
+sum jhat makes ghat too small, i.e. a NEGATIVE, g-flat, pure response-scale
+error:
 
-    m1  ~  sum_i Var_MC(qhat_i) / sum_i j_i
+    m1  ~  - sum_i Var_MC(qhat_i) / sum_i j_i
 
-which is exactly the fingerprint of the unexplained centroid-control +0.006:
-flat in g, a response-scale error, needing whatever makes the per-target
-integrand sharp, and INVISIBLE to a weight-ESS diagnostic (the weights w are
-bounded and their ESS is flat in S; it is the VARIANCE OF THE RATIO B/A that
-carries this, not the concentration of w).
+SIGN NOTE: an earlier version of this file had that backwards and called the
+surplus a deficit.  It is settled in closed form by
+`scratchpad sign check` -- latent m ~ N(g,1), M = m + N(0,s^2), so
+P(M|g) = N(M; g, 1+s^2) exactly and `<jhat>` can be compared with j directly:
+it tracks `j + Var_MC` at every M and every S from 64 to 4096, to 3-4 digits.
+The `Rdef` column below was positive all along; it is a surplus.
+
+The term is g-flat, is a pure response-scale error, grows with whatever makes
+the per-target integrand sharp, and is INVISIBLE to a weight-ESS diagnostic
+(the weights w are bounded by the defensive mixture and their ESS is flat in S;
+it is the VARIANCE OF THE RATIO B/A that carries this, not the concentration
+of w).
 
 This toy runs that exact arithmetic on an exactly-solvable 1-D problem.
 
-ANSWER (2026-08-17): YES, on all four fingerprints.  With a narrow spike of
+ANSWER (2026-08-17): YES, on all four fingerprints (the SIGN is a surplus in
+R, see the note above).  With a narrow spike of
 width w in the latent density (the toy's stand-in for the centroid layer's
-curvature), the predicted deficit sum Var_MC(qhat)/sum j tracks the measured
+curvature), the predicted surplus sum Var_MC(qhat)/sum j tracks the measured
 sum jhat / sum j_exact - 1, and:
 
   * it scales as 1/S exactly -- w = 0.12 gives 0.0504, 0.0132, 0.0034, 0.0009
@@ -41,12 +50,14 @@ sum jhat / sum j_exact - 1, and:
 
 `check_var_mc.py` then measures the same quantity on the real runs, where it is
 +0.002 to +0.003 at S = 32768 -- large, but equal in the centroid and
-moment-space paths, so real and worth fixing yet not the centroid differential.
+moment-space paths.  Removing it moves m1 UP, so it does not explain the
+centroid control's +0.006; it deepens it to +0.0075.  It is still worth removing
+on its own account, which `bias.pqr_streamed(crossfit=True)` now does.
 
 NOT RUN, and deliberately: the `avg` driver below (mean of m1_IS - m1_exact over
 independent draw realisations) was abandoned after two attempts.  It is only
-confirming that an R deficit propagates into m1, which is one line of algebra --
-if sum jhat = sum j (1 - d) then m1 -> (1 + d)(1 + m1_true) - 1 ~ m1_true + d --
+confirming that an R surplus propagates into m1, which is one line of algebra --
+if sum jhat = sum j (1 + d) then m1 -> (1 - d)(1 + m1_true) - 1 ~ m1_true - d --
 so simulating it only adds Monte-Carlo scatter to a known identity.  The
 load-bearing claims above come from the single-realisation sweep, where the
 1/S scaling and the g-flatness are unambiguous, and from `check_var_mc.py` on
@@ -161,7 +172,7 @@ def run(w, S, g=0.02, n=4000, sig=0.8, alpha=0.5, seed=1):
     (qp, jp), (eqp, ejp) = out["p"]
     (qm, jm), (eqm, ejm) = out["m"]
     return (m1_of(qp, jp, qm, jm, g), m1_of(eqp, ejp, eqm, ejm, g),
-            # the predicted deficit: sum Var_MC(qhat) / sum j
+            # the predicted surplus: sum Var_MC(qhat) / sum j
             ((qp - eqp).var() + (qm - eqm).var()) / (jp.mean() + jm.mean()),
             (jp.sum() / ejp.sum() - 1))
 
@@ -176,7 +187,7 @@ def avg(w, S, g=0.02, reps=24, **kw):
 if __name__ == "__main__":
     print("dm1  : <m1_IS - m1_exact>, the bias the finite-S integral ADDS")
     print("pred : <sum Var_MC(qhat) / sum j>, predicted from the (B/A)^2 term")
-    print("Rdef : <sum jhat / sum j_exact - 1>, the measured R deficit\n")
+    print("Rdef : <sum jhat / sum j_exact - 1>, the measured R surplus\n")
     for w in (1.0, 0.30, 0.12):
         print(f"  spike width w = {w}   (small = sharp density structure)")
         for S in (512, 2048, 8192, 32768):

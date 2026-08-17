@@ -2,11 +2,16 @@
 
 jhat = -(C/A - (B/A)^2) contains the square of a Monte-Carlo estimate, so
 
-    E[jhat] = j - Var_MC(qhat)      =>   sum jhat is too SMALL
+    E[jhat] = j + Var_MC(qhat)      =>   sum jhat is too LARGE
 
-and since m1 = sum qhat / (g sum jhat) - 1, the estimator picks up
+and since m1 = sum qhat / (g sum jhat) - 1, ghat comes out too small:
 
-    dm1 = sum_i Var_MC(qhat_i) / sum_i j_i          (positive, flat in g)
+    dm1 = - sum_i Var_MC(qhat_i) / sum_i j_i        (negative, flat in g)
+
+SIGN NOTE: an earlier version said too SMALL / positive.  Settled in closed
+form on a Gaussian where P(M|g) is exact -- <jhat> tracks j + Var_MC at
+every M and every S.  The magnitudes below are unaffected; the sign of the
+correction is not.
 
 Two saved runs over the same targets at S and S' give Var_MC without any new
 compute: with q(S) = q + d(S) and Var(d) = V/S,
@@ -16,18 +21,19 @@ compute: with q(S) = q + d(S) and Var(d) = V/S,
 
 so V/S is bracketed within a factor <2 either way.  Both brackets are printed.
 
-ANSWER (2026-08-17): the term is REAL and it is NOT SMALL -- it contributes
-+0.0018 to +0.0030 to m1 at S = 32768 -- but it is the SAME in both paths
+ANSWER (2026-08-17): the term is REAL and it is NOT SMALL -- it moves m1 by
+0.0018 to 0.0030 at S = 32768 (DOWNWARD, per the sign note) -- but it is the
+SAME in both paths
 (moment-space +0.00176..+0.00294, centroid +0.00178..+0.00301), so it is not
 the centroid path's differential +0.006.
 
 Two consequences that outlive that null:
 
-1. "Converged in S" is a CANCELLATION, not a convergence.  This one term is
-   +0.0025 at S = 32768 and would be +0.010 at 8192, yet the measured net
-   moves the other way (moment-space control -0.0048 -> -0.0002).  So the
-   competing O(1/S) terms are cancelling at the ~0.003 level and every
-   "converged" number in HANDOFF.md is converged only to about that.
+1. "Converged in S" is a CANCELLATION, not a convergence.  Removing this one
+   term from the moment-space control gives +0.0057 at S = 8192 and +0.0024
+   at 32768 -- away from that path's known zero, and not constant.  So other
+   O(1/S) terms of comparable size and opposite sign are present, and every
+   "converged" number in HANDOFF.md is converged only to about 0.003.
 2. The obvious next measurement is the same quantity for the CENTROID CONTROL
    specifically, which needs two runs differing only in the DRAW seed --
    `check_selfconsistency_noisy.py` has no such flag today (`--seed` moves the
@@ -61,7 +67,7 @@ def compare(lo_path, hi_path, S_lo, S_hi, label, g=0.02):
         vS = d.var()                       # = V/S_lo * (1 -/+ S_lo/S_hi)
         lo = vS / (1.0 + S_lo / S_hi)      # independent-draws reading
         hi = vS / (1.0 - S_lo / S_hi)      # nested-draws reading
-        # translate to the R deficit AT THE HIGHER S
+        # translate to the R surplus AT THE HIGHER S
         f = S_lo / S_hi
         print(f"    {arm}: Var[q(S)-q(S')] = {vS:.4g} ->  V/S_lo in "
               f"[{lo:.4g}, {hi:.4g}]")

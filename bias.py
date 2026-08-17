@@ -553,9 +553,108 @@ def pqr(flow, m, draws=None, log_wt=None, batch=20000, sigma_x=None):
     return _over_targets(one, (m, draws, log_wt, sigma_x), batch)
 
 
+def _merge_init(n):
+    """Running state for the chunk merge.
+
+    Chunks are INDEPENDENT draw sets, so keeping them separate (rather than
+    only their running total) is what makes the delete-one jackknife in
+    `_merge_finish` possible.  Per chunk we keep `log A_c` and the two
+    normalised ratios `B_c/A_c`, `C_c/A_c`; the absolute scale of A never
+    leaves log space, so nothing can overflow.  Storage is
+    `n_chunks x 7 x batch` floats -- 28k at 64 chunks and batch 64.
+    """
+    return {"la": [], "b": [], "c": []}
+
+
+def _merge_chunk(st, la, df, c_over_a, good):
+    """Record one chunk's (log A_c, B_c/A_c, C_c/A_c)."""
+    st["la"].append(np.where(good, la, -np.inf))
+    st["b"].append(np.where(good[:, None], df, 0.0))
+    st["c"].append(np.where(good[:, None, None], c_over_a, 0.0))
+    return st
+
+
+def _shares(la):
+    """A_c / sum_c A_c, computed stably; all -inf gives all zeros."""
+    mx = la.max(0)
+    mxs = np.where(np.isfinite(mx), mx, 0.0)
+    w = np.where(np.isfinite(la), np.exp(la - mxs), 0.0)
+    tot = w.sum(0)
+    return np.where(tot > 0.0, w / np.where(tot > 0.0, tot, 1.0), 0.0), tot > 0.0
+
+
+def _merge_finish(st, jackknife=True, min_left=0.05):
+    """(Q, R, n_fallback) from the per-chunk record, optionally bias-corrected.
+
+    The plain estimator is `Q = B/A`, `R = C/A - (B/A)(B/A)^T`, and it carries
+    TWO O(1/S) biases that partly cancel:
+
+      * `(B/A)(B/A)^T` is a squared Monte-Carlo estimate, so
+        `E[(B/A)(B/A)^T] = q q^T + Cov_MC(B/A)` and R comes out LARGE;
+      * `C/A` and `B/A` are self-normalised ratios, whose own O(1/S) ratio bias
+        pulls the other way.
+
+    Measured in closed form (`tests/test_pqr_crossfit.py`, a Gaussian where
+    `P(M|g) = N(M; g, 1+s^2)` so `j` is known): at 8 chunks of 48 draws the
+    square contributes +0.00080 and the `C/A` ratio -0.00055, i.e. **opposite
+    signs and the same order**, for a net +0.00025.  So the obvious cross-fit /
+    U-statistic on `(B/A)^2` alone is a trap: it was tried first and it does
+    cleanly kill its own term (+0.00080 -> +0.00001), but that leaves the ratio
+    bias uncancelled and the total is then no better -- sometimes worse,
+    sometimes better, depending on the configuration.  Not a reliable gain.
+
+    So debias the estimator as a whole instead: a delete-one jackknife over the
+    chunks.  With `theta_hat` the full-sample value and `theta_(e)` the value
+    recomputed dropping chunk `e`,
+
+        theta_jack = k theta_hat - (k - 1) mean_e theta_(e)
+
+    which removes the entire leading O(1/S) bias of any smooth function of the
+    chunk sums, whatever its source.  The leave-one-out sums cost nothing: with
+    `a_c = A_c / A_tot`,
+
+        B/A dropping e  =  (bhat - a_e b_e) / (1 - a_e)
+
+    and likewise for `C/A`, so it is arithmetic on what is already stored.
+
+    Both Q and R are corrected.  Q's own O(1/S) bias is odd in g by isotropy, so
+    it acts multiplicatively on m1 exactly as R's does, and there is no reason
+    to fix one and not the other.
+
+    Falls back to the plain estimator, per target, when fewer than two chunks
+    carry weight or one chunk holds more than `1 - min_left` of it: the
+    jackknife then divides by a vanishing `1 - a_e`.  The count is returned.
+    """
+    la = np.stack(st["la"])                       # (k, n)
+    b = np.stack(st["b"])                         # (k, n, 2)
+    c = np.stack(st["c"])                         # (k, n, 2, 2)
+    a, alive = _shares(la)                        # (k, n)
+
+    bhat = np.einsum("kn,kna->na", a, b)
+    chat = np.einsum("kn,knab->nab", a, c)
+    r_plain = chat - np.einsum("na,nb->nab", bhat, bhat)
+    k = len(la)
+    if not jackknife or k < 2:
+        return bhat, r_plain, int(alive.sum()) if k < 2 and jackknife else 0
+
+    # delete-one, vectorised over chunks
+    left = 1.0 - a                                                  # (k, n)
+    ok = alive & (left > min_left).all(0) & (np.isfinite(la).sum(0) >= 2)
+    safe = np.where(left > min_left, left, 1.0)
+    b_e = (bhat[None] - a[..., None] * b) / safe[..., None]         # (k, n, 2)
+    c_e = (chat[None] - a[..., None, None] * c) / safe[..., None, None]
+    r_e = c_e - np.einsum("kna,knb->knab", b_e, b_e)
+
+    q_j = k * bhat - (k - 1) * b_e.mean(0)
+    r_j = k * r_plain - (k - 1) * r_e.mean(0)
+    q = np.where(ok[:, None], q_j, bhat)
+    r = np.where(ok[:, None, None], r_j, r_plain)
+    return q, r, int((alive & ~ok).sum())
+
+
 def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
                  batch=64, chunk=2048, report=None,
-                 proposal=None, proposal_sigma_x=None):
+                 proposal=None, proposal_sigma_x=None, jackknife=True):
     """Per-target (d logP/dg, d2 logP/dg2) WITHOUT materialising the draws.
 
     `Phat = (1/S) sum_s w_s p(x_s|g)` is a plain sum over samples, and so are its
@@ -563,7 +662,14 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
 
         A = sum_s w_s p_s      B = sum_s w_s grad p_s     C = sum_s w_s hess p_s
 
-    from which `grad log P = B/A` and `hess log P = C/A - (B/A)(B/A)^T`.  Memory
+    from which `grad log P = B/A` and `hess log P = C/A - (B/A)(B/A)^T`.  That
+    last square is a squared MONTE-CARLO estimate, so R comes out biased LARGE
+    by `Cov_MC(B/A)` at O(1/S) -- ghat too small, m1 too negative, flat in g,
+    and invisible to the weight ESS -- while the self-normalised ratios pull the
+    other way.  `jackknife=True` (the default) removes the whole leading O(1/S)
+    bias with a delete-one jackknife over the chunks; see `_merge_finish`, and
+    note it CHANGES EVERY NUMBER relative to runs made before it existed.  Pass
+    `jackknife=False` to reproduce those.  Memory
     is then O(targets) instead of O(targets x samples): the (n, S, 5) draw array
     is 26 GB per catalog at n = 20000, S = 32768, and it never exists here.  That
     is what makes a large S affordable, which is the only thing that fixes the
@@ -626,6 +732,7 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
     n_chunks = max(1, samples // chunk)
     q_out, r_out = [], []
     n_empty = 0
+    n_fallback = 0
 
     for i in range(0, len(m), batch):
         m_b = m[i:i + batch]
@@ -636,9 +743,7 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
         # `C/A - (B/A)(B/A)^T`, so at low ESS -- where B/A is large -- that is a
         # cancellation undone.  In float32 it costs 1.7% on R; in float64 it is
         # exact to 1e-7 against a single logsumexp over the same draws.
-        log_a = np.full(len(m_b), -np.inf)
-        bhat = np.zeros((len(m_b), 2))
-        chat = np.zeros((len(m_b), 2, 2))
+        st = _merge_init(len(m_b))
         # The targets' own transform does not depend on the chunk, so do it once
         # per target batch rather than once per chunk.
         m_z = (jnp.asarray(m_b, dtype=jnp.float32) if layer is None else
@@ -682,28 +787,13 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
             # takes out R_tot and with it m1, c1 and c2 for the WHOLE ensemble.
             good = (np.isfinite(la) & np.isfinite(df).all(1)
                     & np.isfinite(c_over_a).reshape(len(la), -1).all(1))
-            df = np.where(good[:, None], df, 0.0)
-            c_over_a = np.where(good[:, None, None], c_over_a, 0.0)
+            st = _merge_chunk(st, la, df, c_over_a, good)
 
-            mx = np.maximum(log_a, np.where(good, la, -np.inf))
-            mxs = np.where(np.isfinite(mx), mx, 0.0)
-            wa = np.where(np.isfinite(log_a), np.exp(log_a - mxs), 0.0)
-            wc = np.where(good, np.exp(la - mxs), 0.0)
-            tot = wa + wc
-            upd = tot > 0.0
-            den = np.where(upd, tot, 1.0)
-            bhat = np.where(upd[:, None],
-                            (bhat * wa[:, None] + df * wc[:, None]) / den[:, None],
-                            bhat)
-            chat = np.where(upd[:, None, None],
-                            (chat * wa[:, None, None]
-                             + c_over_a * wc[:, None, None]) / den[:, None, None],
-                            chat)
-            log_a = np.where(upd, mxs + np.log(den), log_a)
-
-        q_out.append(bhat)
-        r_out.append(chat - np.einsum("ia,ib->iab", bhat, bhat))
-        n_empty += int((~np.isfinite(log_a)).sum())
+        q_b, r_b, n_fb = _merge_finish(st, jackknife)
+        q_out.append(q_b)
+        r_out.append(r_b)
+        n_fallback += n_fb
+        n_empty += int((~_shares(np.stack(st["la"]))[1]).sum())
         if report and (i // batch) % report == 0:
             print(f"    {i + len(m_b)}/{len(m)} targets", flush=True)
 
@@ -713,6 +803,14 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
         # failing, not that the targets are uninformative.
         print(f"    {n_empty} targets had no draw with any weight; "
               f"they contribute nothing", flush=True)
+    if n_fallback:
+        # One chunk holds nearly all of this target's weight, so the delete-one
+        # jackknife would divide by a vanishing 1 - a_e and these targets keep
+        # the plain, biased estimator.  A large count means the per-chunk ESS is
+        # so concentrated that the debiasing cannot bite -- raise `samples`, or
+        # lower `chunk` so there are more independent draw sets.
+        print(f"    {n_fallback} targets kept the plain Q, R "
+              f"(one chunk carries the weight)", flush=True)
     return np.concatenate(q_out), np.concatenate(r_out)
 
 

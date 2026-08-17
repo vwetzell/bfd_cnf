@@ -1235,10 +1235,20 @@ identical in everything else (`logs_control_drawseed.txt`,
 | **draw-realisation sigma** | **0.00051** (1 dof) |
 | `sum Cov_MC(qhat)_11 / sum j_11` | **+0.00263** |
 | m1, averaged, uncorrected | +0.00486 |
-| **m1, `Cov_MC` added back to R** | **+0.00223 +/- 0.00161** (1.4 sigma) |
+| **m1, `Cov_MC` SUBTRACTED from R** | **+0.00751 +/- 0.00158** |
 
-**About half the centroid control's bias is the `(B/A)^2` artifact, and the
-remainder is not significantly different from zero.**
+**SIGN, settled in closed form -- an earlier version of this section had it
+backwards.**  `j = qhat qhat^T - C/A` and `E[qhat qhat^T] = q q^T + Cov_MC`, so
+`E[jhat] = j + Cov_MC`: **R comes out too LARGE**, ghat too small, and m1 too
+NEGATIVE.  Correcting therefore moves m1 UP.  Verified on a Gaussian where
+`P(M|g) = N(M; g, 1+s^2)` is exact, so `<jhat>` can be compared with `j`
+directly -- it tracks `j + Var_MC` at every M and every S from 64 to 4096, to
+3-4 digits.  The toy's own `Rdef` column was positive all along, i.e. a surplus,
+and was mislabelled a deficit.
+
+**So this term does NOT explain the centroid control's bias -- it deepens it**,
+from +0.0049 to +0.0075.  It is real, it is worth removing, and the thread it
+was supposed to close stays open.
 
 Three things to keep straight before quoting that.
 
@@ -1253,30 +1263,93 @@ Three things to keep straight before quoting that.
    bootstrap's 0.0017.  That worry is closed -- the bootstrap does dominate --
    but note it could never have shown that by itself.
 3. **The correction is not a universal fix and must not be applied blind.**  It
-   removes only the `(B/A)^2` term.  Applied alone to the moment-space control
-   (which reads -0.0002) it would give -0.0028, i.e. away from the zero that
-   path is known to converge to.  The right reading is that the estimator
-   carries SEVERAL O(1/S) terms of order 0.003 with opposing signs, and +0.006
-   sits inside that budget.
+   removes only the `(B/A)^2` term.  Applied to the moment-space control it
+   takes -0.0002 -> +0.0024 at S = 32768 and -0.0048 -> +0.0057 at 8192, i.e.
+   away from the zero that path is known to converge to, and not to a constant.
+   So other O(1/S) terms of comparable size and opposite sign are present, and
+   the honest budget is SEVERAL terms of order 0.003.
 
-**A consistency check that does not fully work, reported rather than buried:**
-scaling the information identity from S = 8192 to 32768 predicts a `Var_MC`
-three times smaller than the direct two-seed measurement (the identity moved
-+0.0566 -> +0.0524, where a clean 1/S term of this size would have moved it
-~0.016).  The two-seed number is the trustworthy one -- a direct measurement
-rather than a difference of two large numbers -- but the mismatch independently
-says the O(1/S) structure is not a single clean 1/S term.
+**A tension that the sign fix mostly resolves.**  The information identity moved
+only +0.0566 -> +0.0524 between S = 8192 and 32768, which looked incompatible
+with a `Var_MC` changing 4x.  With the correct sign it is not: the identity is
+`sum qhat^2 / sum jhat - 1`, and `Var_MC` inflates the NUMERATOR and the
+DENOMINATOR alike (`sum qhat^2 = sum q^2 + V`, `sum jhat = sum j + V`), so with
+`sum q^2 ~ sum j` at small g the two largely cancel and the identity is nearly
+blind to this term.  It is therefore close to a pure measurement of the
+`(g^2/2) Var_0(s_1^2 + h_11)/F` fourth-moment term, which strengthens rather
+than weakens the "8.5x more non-Gaussian in g" reading above.  A ~7% residual
+drop against a predicted ~0.8% remains unexplained.
 
-**So the honest status of the centroid +0.006 is no longer "unexplained".**  It
-is: ~+0.0056 at the operating point, of which +0.0026 is a named and now
-directly measured estimator artifact, leaving +0.0022 +/- 0.0016 -- inside an
-O(1/S) error budget of about +/-0.003 per term that had never been quantified.
+**So the honest status of the centroid +0.006: still open, and slightly worse.**
+It is ~+0.0056 uncorrected at the operating point and **+0.0075 +/- 0.0016** once
+this artifact is removed.  The artifact is nevertheless real and worth removing
+on its own account -- it is ~+0.0026 at S = 32768, comparable to the whole
+effect being chased, and it rides on a term the ESS diagnostic cannot see.
 **The consequence for the rest of this file is larger than the consequence for
 this thread: at S = 32768 the machinery cannot resolve a multiplicative bias
 below ~0.003, so every conclusion here resting on a difference smaller than that
 needs re-reading.**  The way forward is to reduce the estimator's O(1/S) error
--- more draws, or a Rao-Blackwellised `R` that does not square an MC estimate --
-not to look for an eleventh mechanism.
+-- more draws, or a debiased `R` (now implemented, see the next section) -- not
+to look for an eleventh mechanism.
+
+---
+
+## 2026-08-17 (cont.): R is debiased by a delete-one jackknife, not a cross-fit
+
+`bias.pqr_streamed(jackknife=True)`, now the default.  `jackknife=False`
+reproduces the old estimator.
+
+**The obvious fix is a trap, and this is the useful part.**  The first attempt
+was the direct one: `R = C/A - (B/A)(B/A)^T` has exactly one squared
+Monte-Carlo estimate in it, so replace `(B/A)(B/A)^T` with a weighted
+U-statistic over the chunks (which are independent draw sets),
+`(bhat bhat^T - sum_c a_c^2 b_c b_c^T) / (1 - sum_c a_c^2)`, keeping only cross
+terms between DIFFERENT chunks.  That works exactly as designed -- on the
+closed-form Gaussian at M = 0, where the true `q` is 0 so `E[(B/A)^2]` is pure
+Monte-Carlo variance, it takes the term from +0.00080 to +0.00001.
+
+**And the total gets no better**, because `C/A` is a self-normalised ratio
+carrying its OWN O(1/S) bias, measured at -0.00055 in the same configuration --
+opposite sign, same order.  The plain estimator's net +0.00025 is those two
+partly cancelling.  Kill one and the other stands uncancelled; which of the two
+estimators then wins depends on the configuration.  This is the same "converged
+in S is a cancellation" fact as above, now visible inside a single target.
+
+**So debias the estimator as a whole.**  With `theta_hat` the full-sample value
+and `theta_(e)` the value recomputed dropping chunk `e`,
+
+    theta_jack = k theta_hat - (k-1) mean_e theta_(e)
+
+removes the entire leading O(1/S) bias of any smooth function of the chunk sums,
+whatever its source.  It costs nothing: `_merge_init` now keeps each chunk's
+`(log A_c, B_c/A_c, C_c/A_c)` instead of only a running total (28k floats at 64
+chunks and batch 64), and the leave-one-out sums are
+`(bhat - a_e b_e) / (1 - a_e)`.  Both Q and R are corrected -- Q's own O(1/S)
+bias is odd in g by isotropy, so it acts multiplicatively on m1 exactly as R's
+does.  Targets where one chunk holds nearly all the weight keep the plain
+estimator (the jackknife would divide by a vanishing `1 - a_e`) and are counted
+in the run log.
+
+**Measured end to end**, deep centroid control, n = 2000, S = 8192, alpha 0.5,
+same targets and same draws in both arms:
+
+| | m1 |
+|---|---|
+| `jackknife=False` (old estimator) | +0.00697 |
+| `jackknife=True` | **+0.01635** |
+
+a paired shift of +0.0094 against the +0.0105 predicted from `Var_MC/j` at
+S = 8192 -- right sign, right size.  It moves m1 UP, so it makes the centroid
+control's residual larger, exactly as the sign fix above says it must.
+
+`tests/test_pqr_crossfit.py` (9 tests) pins the algebra (the plain path is still
+the A-weighted ratio; the jackknife matches an explicit delete-one computation;
+single-chunk and dominant-chunk fall back; dead chunks are dropped) and the
+statistics on the closed-form Gaussian, where `j = 1/(1+s^2)` is known: the
+jackknife more than halves the R bias at two values of M and beats the plain
+estimator at two draw counts.  One test exists purely to guard the reasoning
+above -- that the two O(1/S) biases are opposite in sign and within a factor of
+4 of each other -- so nobody re-tries the cross-fit alone.
 
 ---
 
