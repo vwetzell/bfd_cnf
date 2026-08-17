@@ -30,13 +30,19 @@ i.e. a FOURTH-moment property of the per-target log-likelihood plus the finite-S
 term.  Measured (11 component, g = 0.02):
 
     centroid control, deep     +0.0566        centroid control, shallow  +0.0514
-    moment-space control       +0.0067        centroid real, S 32768     +0.0264
+    moment-space CONTROL       +0.0372        moment-space REAL          +0.0067
+    centroid control, jk on    +0.0544        centroid real, S 32768     +0.0264
+
+CORRECTION (same day): the first version of this block put the moment-space REAL
+run on the "moment-space control" row and read off a 8.5x ratio.  Control vs
+real is the wrong comparison; against the actual moment-space CONTROL the ratio
+is 1.4x.
 
 The 22 component is ~0 everywhere, as it must be -- with shear applied in g1
 only, the g2 version is a cross-covariance, not a variance.  That the 11/22
 split comes out right is what identifies the term.
 
-So the centroid path's per-target log P is ~8.5x more non-Gaussian in g than
+So the centroid path's per-target log P is ~1.4x more non-Gaussian in g than
 the moment-space path's.  This is exactly the regime the BFD paper's eq. (61)
 warns about ("alpha is expected to be of order unity UNLESS d log P/dg becomes
 large for some targets"), and it is a genuine, previously unmeasured difference

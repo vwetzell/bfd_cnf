@@ -1207,13 +1207,21 @@ therefore is not by itself the centroid path's differential +0.006.
 |---|---|---|
 | centroid control, deep | **+0.0566** | +0.0048 |
 | centroid control, shallow | +0.0514 | -0.0005 |
-| moment-space control | **+0.0067** | -0.0003 |
+| **moment-space CONTROL** | **+0.0372** | -0.0003 |
+| moment-space REAL, S = 32768 | +0.0067 | -0.0003 |
 | centroid real, S = 32768 | +0.0264 | -0.0046 |
+
+**Corrected 2026-08-17:** an earlier version of this table put the moment-space
+REAL run (`dev/pqr_depth_2.73_S32k.npz`, +0.0067) on the "moment-space control"
+row and concluded the centroid path was **8.5x** more non-Gaussian in g.  Wrong
+comparison -- control against real.  The moment-space CONTROL is +0.0372, so the
+true ratio is **1.4x**, not 8.5x.  The qualitative statement survives; the
+factor does not, and nothing should be built on the larger number.
 
 The 22 component is ~0 everywhere, as it must be with shear in g1 only (there it
 is a cross-covariance, not a variance) -- that split is what identifies the term
 rather than leaving it as "the estimator is inconsistent", which is the trap.
-Read as the first line, the centroid path's per-target `log P` is **8.5x more
+Read as the first line, the centroid path's per-target `log P` is **~1.4x more
 non-Gaussian in g** than the moment-space path's.  That is exactly the regime
 the paper's eq. (61) warns about ("alpha is expected to be of order unity UNLESS
 d log P/dg becomes large for some targets").  It is NOT the +0.006 itself --
@@ -1277,7 +1285,7 @@ DENOMINATOR alike (`sum qhat^2 = sum q^2 + V`, `sum jhat = sum j + V`), so with
 `sum q^2 ~ sum j` at small g the two largely cancel and the identity is nearly
 blind to this term.  It is therefore close to a pure measurement of the
 `(g^2/2) Var_0(s_1^2 + h_11)/F` fourth-moment term, which strengthens rather
-than weakens the "8.5x more non-Gaussian in g" reading above.  A ~7% residual
+than weakens the "more non-Gaussian in g" reading above.  A ~7% residual
 drop against a predicted ~0.8% remains unexplained.
 
 **So the honest status of the centroid +0.006: still open, and slightly worse.**
@@ -1350,6 +1358,57 @@ jackknife more than halves the R bias at two values of M and beats the plain
 estimator at two draw counts.  One test exists purely to guard the reasoning
 above -- that the two O(1/S) biases are opposite in sign and within a factor of
 4 of each other -- so nobody re-tries the cross-fit alone.
+
+---
+
+## 2026-08-17 (last): the estimator now PASSES its null, and the centroid bias survives
+
+Three runs at S = 32768, n = 20000, alpha 0.5, draw seed 107
+(`logs_control_fork.txt`), 0 dropped and 0 jackknife fallbacks throughout:
+
+| control | jackknife OFF | jackknife ON |
+|---|---|---|
+| moment-space (`shear.eqx`, `--noise-scale 2.73`) | -0.0018 +/- 0.0017 | **+0.0001 +/- 0.0017** |
+| centroid (`centroid_deep.eqx`) | +0.0052 / +0.0045 | **+0.0070 +/- 0.0018** |
+
+Row 1 column 1 reproduces the historical -0.0002 +/- 0.0015 anchor within 0.7
+sigma, so the configuration is right.
+
+**The debiased estimator lands on zero where the answer is known.**  That is the
+result: with the jackknife the moment-space control reads +0.0001 +/- 0.0017 --
+not by a cancellation of competing O(1/S) terms, but because the leading one is
+gone.  The prediction in the previous section that it would move AWAY from zero,
+to about +0.0025, was wrong; extrapolating one term while ignoring the rest is
+what made it wrong.
+
+**And the same estimator gives +0.0070 +/- 0.0018 on the centroid path** -- same
+target count, same C_M, same S, same alpha, same seed.  A 3.9 sigma difference
+that can no longer be charged to the estimator's O(1/S), because the estimator
+just passed its own null on the sibling path.  So the centroid control's bias is
+REAL and is now isolated as cleanly as this machinery can isolate it.
+
+**Which means the pruning argument has a hole, and it is findable.**  That
+argument said prior and likelihood are exact by construction, leaving only
+O(g^2) / O(1/N) / O(1/S) / numerics.  It is exact only if the centroid layer is
+a BIJECTION -- and it is not.  This file's own fold measurement:
+4.7e-3 of KERNEL DRAWS at Sigma_X x1 land on a folded branch, and **2% of
+targets take more than 1% of their Phat from such draws, the worst 25%**.  On a
+folded branch `unmarginalize`'s log-det is not the whole change of variables, so
+`log_prob` there is simply the wrong density -- the estimator is not evaluating
+the distribution that generated the targets.  Centroid-only, draw-count
+independent, and untouched by everything eliminated so far.
+
+It was dismissed earlier because the folded fraction is MONOTONE in Sigma_X
+while m1 bumps.  **But that ladder was measured with the biased estimator**, and
+the correction is Sigma_X-dependent (it scales with how sharp the integrand is),
+so the bump shape itself may be an artifact of the old R.
+
+**Next, and it is the highest-value run available:** the Sigma_X ladder again
+with `--jackknife`, six points x0 .. x3.  If the bump flattens into something
+monotone, the fold is the prime suspect again and the fix is in
+`models/centroid.py`'s forward parametrisation (keep `response` a diffeomorphism
+at large T), not in `bias.py`.  x0 comes free as a null, since the layer is
+exactly the identity there.  ~2.5 h.
 
 ---
 
