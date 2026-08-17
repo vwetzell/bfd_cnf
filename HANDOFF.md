@@ -1412,6 +1412,58 @@ exactly the identity there.  ~2.5 h.
 
 ---
 
+## 2026-08-17 (last): the bump is REAL, and the fold is still not it
+
+The ladder, rerun with `--jackknife` at settings otherwise identical to the
+2026-08-14 one, so those numbers are the paired jackknife-OFF arm.  S = 32768,
+n = 20000, alpha 0.5, draw seed 107, 0 dropped and 0 fallbacks throughout
+(`logs_control_sxjk.txt`, PQR in `dev/pqr_sxjk_*.npz`):
+
+| Sigma_X | jackknife OFF | jackknife ON | shift |
+|---|---|---|---|
+| x0    | +0.0001 | +0.0019 +/- 0.0016 | +0.0018 |
+| x0.03 | +0.0032 | +0.0050 +/- 0.0017 | +0.0018 |
+| x0.1  | +0.0048 | +0.0066 +/- 0.0017 | +0.0018 |
+| x0.3  | +0.0075 | **+0.0095 +/- 0.0017** | +0.0020 |
+| x1    | +0.0070 | +0.0070 +/- 0.0018 | +0.0000 |
+| x3    | +0.0011 | +0.0031 +/- 0.0019 | +0.0020 |
+
+**The correction is FLAT in Sigma_X: +0.00188 over five points with a spread of
+0.0002.**  The prediction that made this run worth doing -- that the correction
+would be Sigma_X-dependent, so the bump might be an artifact of the biased R --
+is therefore WRONG.  The whole ladder moves up rigidly and **the bump shape is
+preserved exactly**.
+
+The x1 row's apparent zero shift is not an exception, it is the anchor: the
+historical x1 = +0.0070 is the high member of the seven-run cluster noted above.
+Against this session's own jackknife-OFF measurement at x1 (+0.0052 / +0.0045,
+mean +0.0049) the shift is **+0.0021**, in family with the other five.  So the
+ladder independently reconfirms both that the correction is uniform and that
++0.0070 was an unlucky draw.
+
+**Consequences.**
+
+1. **The bump is real**, not an estimator artifact.  It survives an estimator
+   that has been shown to read zero on a control where the answer is known.
+2. **The fold is still ruled out by the pre-registered discriminator.**  Folded
+   draw fraction is MONOTONE in Sigma_X (1.2e-3 -> 9.6e-3 over x0.03 -> x3);
+   the bias is a bump peaking at x0.3 and falling by a factor 3 by x3.  Reviving
+   it was the point of this run and it did not survive.
+3. **The peak has sharpened and moved to x0.3** (+0.0095), with x1 at +0.0070 --
+   the old "plateau over x0.3-x1" was the anomalous x1 anchor.
+4. **"Zero at both ends" is now weaker.**  x0 reads +0.0019 +/- 0.0016 and x3
+   +0.0031 +/- 0.0019, each 1.2-1.6 sigma from zero rather than on it.  x0 is
+   still consistent with the moment-space control's +0.0001 (0.8 sigma apart),
+   which it must be -- the layer is exactly the identity there, so that point is
+   the underlying shear flow and nothing else.
+
+So the object to explain is now: a **real** bump of amplitude ~+0.008 over a
+~+0.002 pedestal, peaking at Sigma_X ~ 0.3x the deep value, measured with an
+estimator that passes its own null.  Every monotone-in-Sigma_X mechanism --
+which is all of them tested so far, the fold included -- is the wrong shape.
+
+---
+
 ## Open questions for the next session
 
 1. **What is actually causing the multi-lobe shape?** Both mechanisms tried
