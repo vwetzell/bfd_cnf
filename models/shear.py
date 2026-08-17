@@ -88,6 +88,8 @@ import jax.nn as jnn
 import jax.random as jr
 from flowjax.bijections import AbstractBijection
 
+from paramax import non_trainable, unwrap
+
 from .bijections import CoeffNet
 
 # Coefficients are bounded so the map stays a diffeomorphism for any g the
@@ -95,20 +97,47 @@ from .bijections import CoeffNet
 # printed by tests/test_shear.py), so 12 constrains nothing real.
 _COEFF_MAX = 12.0
 
-# The invariants fed to the network, shifted/scaled to O(1).  For this weight
-# function r = Mr/Mf runs over ~[0.7, 4.0], the concentration k = Mc Mf/Mr^2
-# over ~[1.85, 2.4], and q = |e|^2 over ~[0, 0.3].
-_R_LOC, _R_SCALE, _Q_SCALE = 2.5, 1.0, 0.1
-_K_LOC, _K_SCALE = 2.0, 0.2
+# This layer now acts on the STANDARDISED coordinates
+#     z = [log10 Mf, logit(Mr/(r* Mf)), logit(Mc/(rc* Mr)), M1/Mr, M2/Mr]
+# minus mean over std, i.e. downstream of `RawMomentStandardize` rather than on
+# raw moments.  Three things get simpler and one gets harder.
+#
+#   * z3, z4 ARE M1/Mr and M2/Mr up to the shared spin-2 std, so the complex
+#     shape e needs no division by Mr.
+#   * z0, z1, z2 are unbounded, so the spin-0 response is ADDITIVE.  The raw
+#     version had to exponentiate to keep Mf, Mr, Mc positive; here there is
+#     nothing to keep positive and nothing to overflow.
+#   * the chart's point-source ceilings live in `RawMomentStandardize`, which is
+#     now applied FIRST, so no map downstream of it can push a point off-chart.
+#     That removes a g-dependent seam: `bias.log_conv_is` masks draws with
+#     `in_domain` before the flow runs, and under the old ordering the chart saw
+#     the POST-shear moment while the mask saw the pre-shear one.
+#   * what is lost: the coefficients are no longer directly comparable to bfd's
+#     dm/dg, because they are responses of z rather than of m.  `dm_dg` below
+#     returns dz/dg now; converting needs the standardiser's Jacobian.
+#
+# The spin structure survives the change untouched, which is what makes it
+# cheap: `RawMomentStandardize` keeps the three spin-0 coordinates in slots
+# 0, 1, 2 and the spin-2 pair in 3, 4, exactly as the raw vector did.
+
+# z1 and z2 are already standardised, so they need no shift.  q = |e|^2 is a
+# chi^2 with two degrees of freedom on standardised spin-2 slots, hence mean 2.
+_Q_LOC, _Q_SCALE = 2.0, 2.0
 
 N_COEFFS = 14
 
 
-def _invariants(m):
-    """(r, k, q) and the complex shape e, from m = [Mf, Mr, M1, M2, Mc]."""
-    Mf, Mr, M1, M2, Mc = m[0], m[1], m[2], m[3], m[4]
-    e = jax.lax.complex(M1 / Mr, M2 / Mr)
-    return Mr / Mf, Mc * Mf / (Mr * Mr), (e * jnp.conj(e)).real, e
+def _invariants(z):
+    """(a, b, q) and the complex shape e, from the STANDARDISED z.
+
+    `a = z1` and `b = z2` are monotone functions of Mr/Mf and Mc/Mr, so they
+    carry exactly the size and concentration information the raw (r, k) pair
+    did; `q = |e|^2` is the same shape invariant.  Flux (z0) is deliberately
+    absent: moments are linear in the image, so the response coefficients are
+    flux-blind, and that was true in raw space for the same reason.
+    """
+    e = jax.lax.complex(z[3], z[4])
+    return z[1], z[2], (e * jnp.conj(e)).real, e
 
 
 class _Coeffs(eqx.Module):
@@ -119,24 +148,33 @@ class _Coeffs(eqx.Module):
     def __init__(self, key, nn_width, nn_depth, activation):
         self.net = CoeffNet(key, 3, N_COEFFS, nn_width, nn_depth, activation)
 
-    def __call__(self, r, k, q):
-        u = jnp.stack([(r - _R_LOC) / _R_SCALE, (k - _K_LOC) / _K_SCALE,
-                       q / _Q_SCALE])
+    def __call__(self, a, b, q):
+        u = jnp.stack([a, b, (q - _Q_LOC) / _Q_SCALE])
         return _COEFF_MAX * jnp.tanh(self.net(u) / _COEFF_MAX)
 
 
-def response(coeffs, m, g):
-    """The equivariant second-order response of `m` to `g`; the layer's core map.
+def response(coeffs, z, g, e_scale):
+    """The equivariant second-order response of `z` to `g`; the layer's core map.
 
-    `coeffs` is the 14-vector [a, b, c] x [Mf, Mr, Mc] followed by
-    [A, B, mu, nu, rho], evaluated at `m`'s invariants.  Spin-0 responses are
-    exponentiated so Mf, Mr and Mc stay positive; to second order in g that only
-    relabels b and c.
+    `coeffs` is the 14-vector [a, b, c] x [z0, z1, z2] followed by
+    [A, B, mu, nu, rho], evaluated at `z`'s invariants.
+
+    Both blocks are ADDITIVE.  In raw moment space the spin-0 block had to be
+    multiplicative-with-an-exponential to keep Mf, Mr and Mc positive; z is
+    unbounded, so the exponential buys nothing and costs conditioning.  The
+    spin-2 block loses its factor of Mr for the same kind of reason: z3, z4 are
+    already M1/Mr, M2/Mr over the shared spin-2 std, i.e. dimensionless, so the
+    response is a pure shift of the shape vector.
     """
     s0, A, B, mu, nu, rho = (coeffs[:9].reshape(3, 3), coeffs[9], coeffs[10],
                              coeffs[11], coeffs[12], coeffs[13])
-    Mf, Mr, Mc = m[0], m[1], m[4]
-    e = jax.lax.complex(m[2] / Mr, m[3] / Mr)
+    # `e_scale` puts the shape back in PHYSICAL units before the polynomial
+    # runs.  z3, z4 are M1/Mr, M2/Mr divided by the shared spin-2 std (~0.04),
+    # so a standardised |e| runs to ~5 where the physical one stops near 0.5 --
+    # and `response` is cubic in e, so using the standardised value would inflate
+    # the top term by ~(1/0.04)^3 and destroy the meaning of the coefficient
+    # bound.  The response is formed in physical units and divided back out.
+    e = e_scale * jax.lax.complex(z[3], z[4])
     gc = jax.lax.complex(g[0], g[1])
     ec, gcc = jnp.conj(e), jnp.conj(gc)
 
@@ -145,13 +183,14 @@ def response(coeffs, m, g):
     p2 = (gc * gcc).real
     p3 = (ec * ec * gc * gc).real
 
-    spin0 = jnp.stack([Mf, Mr, Mc]) * jnp.exp(s0 @ jnp.stack([p1, p2, p3]))
-    # Spin-2: an additive response scaled by the UNLENSED Mr, which is how bfd's
-    # d(M1 + i M2)/dg is normalised, so A and B are directly comparable to it.
-    de = Mr * (A * gc + B * e * e * gcc + mu * ec * gc * gc
-               + nu * e * p2 + rho * e * e * e * gcc * gcc)
-    return jnp.stack([spin0[0], spin0[1], m[2] + de.real, m[3] + de.imag,
-                      spin0[2]])
+    spin0 = z[:3] + s0 @ jnp.stack([p1, p2, p3])
+    de = (A * gc + B * e * e * gcc + mu * ec * gc * gc
+          + nu * e * p2 + rho * e * e * e * gcc * gcc) / e_scale
+    # SLOT LAYOUT: `RawMomentStandardize` groups the three spin-0 coordinates in
+    # slots 0, 1, 2 and the spin-2 pair in 3, 4.  That is NOT the raw layout,
+    # where spin-0 is (Mf, Mr, Mc) = slots 0, 1, 4 and spin-2 is (M1, M2) = 2, 3.
+    return jnp.stack([spin0[0], spin0[1], spin0[2],
+                      z[3] + de.real, z[4] + de.imag])
 
 
 class ShearResponse(AbstractBijection):
@@ -167,10 +206,13 @@ class ShearResponse(AbstractBijection):
     # serialised leaf count and breaks every existing checkpoint.
     cond_shape: tuple = eqx.field(static=True, default=(2,))
     coeffs: _Coeffs
+    # The standardiser's spin-2 std, FROZEN -- see `response`.
+    e_scale: jax.Array = eqx.field(default=None)
 
     def __init__(self, key, nn_width=128, nn_depth=3, activation=jnn.silu,
-                 cond_dim=2):
+                 cond_dim=2, e_scale=1.0):
         self.coeffs = _Coeffs(key, nn_width, nn_depth, activation)
+        self.e_scale = non_trainable(jnp.asarray(e_scale))
         # (2,) alone, or (5,) = [g1, g2, C00, C01, C11] when chained with the
         # centroid layer, which reads the other three.
         self.cond_shape = (cond_dim,)
@@ -181,8 +223,8 @@ class ShearResponse(AbstractBijection):
         Reads g as the FIRST two entries of `condition` -- see `cond_dim`.
         """
         g = condition[:2]
-        r, k, q, _ = _invariants(x)
-        return response(self.coeffs(r, k, q), x, g)
+        a, b, q, _ = _invariants(x)
+        return response(self.coeffs(a, b, q), x, g, unwrap(self.e_scale))
 
     def shear(self, y, condition):
         """Invert `unshear` in closed form, by inverting its g-series.
@@ -225,15 +267,27 @@ class ShearResponse(AbstractBijection):
         return x, -jnp.linalg.slogdet(jax.jacfwd(self.unshear)(x, condition))[1]
 
 
-def dm_dg(layer, m):
+def dm_dg(layer, m, chart):
     """The layer's generative (dm/dg, d2m/dg2) at g = 0, in bfd's column layout.
 
     Returns ``(2, 5)`` ordered [g1, g2] and ``(3, 5)`` ordered
     [g1g1, g1g2, g2g2] -- directly comparable to the ``dm_dg`` / ``d2m_dg2``
-    columns an imsims catalog carries.  This is a *diagnostic*: the layer is
-    trained by likelihood on the sheared population, not fitted to these.
+    columns an imsims catalog carries.
+
+    `chart` is the `RawMomentStandardize` the layer now sits behind, and it is
+    NOT optional.  The layer responds in standardised coordinates, so its raw
+    g-derivative is dz/dg; what bfd tabulates is dm/dg.  Composing the chart on
+    both sides -- raw in, shear in z, raw out -- converts it, and taking the
+    g-derivatives of that composite gets the second order right too (a bare
+    Jacobian factor would miss the chart's own curvature term).
+
+    This is not only a diagnostic: `shear.train` regresses against it with
+    `deriv_weight = 1e4`, so it is the dominant term in the loss and the model's
+    one piece of external ground truth.  Feeding the layer raw moments here
+    after the reordering would compare z-derivatives against raw truth and train
+    the layer to fit noise.
     """
-    f = lambda g: layer.shear(m, g)
+    f = lambda g: chart.inverse(layer.shear(chart.transform(m), g))
     g0 = jnp.zeros(2)
     first = jax.jacfwd(f)(g0).T                      # (2, 5)
     H = jax.jacfwd(jax.jacfwd(f))(g0)                # (5, 2, 2)

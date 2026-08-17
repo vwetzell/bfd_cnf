@@ -19,19 +19,45 @@ import jax.numpy as jnp        # noqa: E402  -- must follow the x64 switch
 import jax.random as jr        # noqa: E402
 import numpy as np             # noqa: E402
 
+from models.bijections import POINT_SOURCE, POINT_SOURCE_MC
 from models.centroid import (CentroidMarginalize, displacement_covariance,
-                             response, _tensor)
+                             raw_from_standard, response, _tensor)
 
 # A representative bulge+disc galaxy and the imsims Sigma_X at the nominal noise.
 M = jnp.array([57026.8, 135254.4, -9006.5, -8736.6, 658762.5])
 SIGMA_X = jnp.array([15941.4, 0.0, 15941.4])
-LAYER = CentroidMarginalize(jr.key(0))
+
+# The layer now acts on STANDARDISED coordinates, so the tests need the
+# standardiser's constants -- the layer carries a frozen copy to rebuild a
+# physical scale for T (see `raw_from_standard`).  These are representative of
+# what `build_flow` measures on bulgedisc; the exact values do not matter to a
+# symmetry test, but two things do: the spin-2 slots must share a std and have
+# ZERO mean, which is the symmetrisation that keeps the chart isotropic.
+MEAN = jnp.array([4.35, 0.95, 1.05, 0.0, 0.0])
+STD = jnp.array([0.35, 0.75, 0.60, 0.040, 0.040])
 
 
-def _rotate(m, phi):
-    """Rotate the frame by phi: spin-0 fixed, the spin-2 pair turns by 2 phi."""
+def _to_z(m):
+    """`bulk.to_coords` then standardise -- the inverse of `raw_from_standard`."""
+    u = m[1] / (POINT_SOURCE * m[0])
+    v = m[4] / (POINT_SOURCE_MC * m[1])
+    c = jnp.stack([jnp.log10(m[0]), jnp.log(u) - jnp.log1p(-u),
+                   jnp.log(v) - jnp.log1p(-v), m[2] / m[1], m[3] / m[1]])
+    return (c - MEAN) / STD
+
+
+Z = _to_z(M)
+LAYER = CentroidMarginalize(jr.key(0), mean=MEAN, std=STD)
+
+
+def _rotate(z, phi):
+    """Rotate the frame by phi: spin-0 fixed, the spin-2 pair turns by 2 phi.
+
+    In standardised coordinates the spin-2 pair is slots 3, 4 -- not the raw
+    layout's 2, 3.
+    """
     c, s = jnp.cos(2 * phi), jnp.sin(2 * phi)
-    return m.at[2].set(c * m[2] - s * m[3]).at[3].set(s * m[2] + c * m[3])
+    return z.at[3].set(c * z[3] - s * z[4]).at[4].set(s * z[3] + c * z[4])
 
 
 def _rotate_sigma(sx, phi):
@@ -45,8 +71,8 @@ def _rotate_sigma(sx, phi):
 
 def test_identity_at_zero_sigma():
     """No centroid uncertainty, no marginalisation.  Exact, not approximate."""
-    out = LAYER.unmarginalize(M, jnp.zeros(3))
-    assert float(jnp.abs(out - M).max()) == 0.0
+    out = LAYER.unmarginalize(Z, jnp.zeros(3))
+    assert float(jnp.abs(out - Z).max()) == 0.0
 
 
 def test_round_trip():
@@ -57,9 +83,9 @@ def test_round_trip():
     """
     for scale in (1.0, 4.0, 16.0):
         sx = SIGMA_X * scale
-        y, ld = LAYER.inverse_and_log_det(M, sx)
+        y, ld = LAYER.inverse_and_log_det(Z, sx)
         x, ld2 = LAYER.transform_and_log_det(y, sx)
-        assert float(jnp.abs(x - M).max() / jnp.abs(M).max()) < 1e-6, scale
+        assert float(jnp.abs(x - Z).max()) < 1e-6, scale
         assert abs(float(ld + ld2)) < 1e-5, scale
 
 
@@ -71,9 +97,9 @@ def test_rotation_equivariance():
     part, and only spin-covariant combinations of those with e may appear.
     """
     for phi in (0.3, 1.1, 2.7):
-        a = _rotate(LAYER.unmarginalize(M, SIGMA_X), phi)
-        b = LAYER.unmarginalize(_rotate(M, phi), _rotate_sigma(SIGMA_X, phi))
-        assert float(jnp.abs(a - b).max() / jnp.abs(M).max()) < 1e-6, phi
+        a = _rotate(LAYER.unmarginalize(Z, SIGMA_X), phi)
+        b = LAYER.unmarginalize(_rotate(Z, phi), _rotate_sigma(SIGMA_X, phi))
+        assert float(jnp.abs(a - b).max()) < 1e-6, phi
 
 
 def test_isotropic_sigma_x_leaves_no_preferred_direction():
@@ -90,14 +116,16 @@ def test_isotropic_sigma_x_leaves_no_preferred_direction():
     out as additive shear, the same failure `RawMomentStandardize` was
     symmetrised to avoid.
     """
-    _, t2 = _tensor(M, SIGMA_X)
+    _, t2 = _tensor(Z, SIGMA_X, MEAN, STD)
     e0_t = M[2] + 1j * M[3]
     assert abs(float((t2 * jnp.conj(e0_t)).imag
                      / (jnp.abs(t2) * jnp.abs(e0_t)))) < 1e-6
 
-    out = LAYER.unmarginalize(M, SIGMA_X)
-    e0 = M[2] + 1j * M[3]
-    de = (out[2] - M[2]) + 1j * (out[3] - M[3])
+    out = LAYER.unmarginalize(Z, SIGMA_X)
+    # The spin-2 slots are 3, 4 and carry zero mean, so z3 + i z4 is parallel to
+    # the physical e; the response's shift must be parallel to it too.
+    e0 = Z[3] + 1j * Z[4]
+    de = (out[3] - Z[3]) + 1j * (out[4] - Z[4])
     # de is parallel to e: the cross product of the two vanishes.
     cross = float((de * jnp.conj(e0)).imag / (jnp.abs(de) * jnp.abs(e0) + 1e-30))
     assert abs(cross) < 1e-6, cross
@@ -112,11 +140,13 @@ def test_flux_homogeneity():
     and not five.
     """
     for f in (0.1, 10.0, 1000.0):
-        # Scaling flux at fixed shape scales Mf, Mr, M1, M2, Mc together, and
-        # leaves T unchanged only if Sigma_X scales with the square of the flux.
-        a = f * LAYER.unmarginalize(M, SIGMA_X)
-        b = LAYER.unmarginalize(f * M, SIGMA_X * f * f)
-        assert float(jnp.abs(a - b).max() / jnp.abs(a).max()) < 1e-5, f
+        # Scaling flux at fixed shape shifts z0 by log10(f)/std0 and leaves the
+        # other four alone, and leaves T unchanged only if Sigma_X scales with
+        # the square of the flux.  So the whole map must COMMUTE with that shift.
+        d = jnp.log10(f) / STD[0]
+        a = LAYER.unmarginalize(Z, SIGMA_X).at[0].add(d)
+        b = LAYER.unmarginalize(Z.at[0].add(d), SIGMA_X * f * f)
+        assert float(jnp.abs(a - b).max()) < 1e-5, f
 
 
 def test_displacement_covariance_matches_the_linearisation():
@@ -140,11 +170,15 @@ def test_response_is_first_order_in_sigma_x():
     in Sigma_X, so the leading response must be too.  Checked by halving Sigma_X
     and asking that the shift halves.
     """
-    coeffs = LAYER.coeffs(3.5, 2.05, 0.02)      # (r, k, q) for a typical galaxy
-    big = response(coeffs, M, SIGMA_X * 1e-3) - M
-    small = response(coeffs, M, SIGMA_X * 5e-4) - M
+    coeffs = LAYER.coeffs(Z[1], Z[2], Z[3] ** 2 + Z[4] ** 2)
+    big = response(coeffs, Z, SIGMA_X * 1e-3, MEAN, STD) - Z
+    small = response(coeffs, Z, SIGMA_X * 5e-4, MEAN, STD) - Z
     ratio = np.asarray(big / jnp.where(jnp.abs(small) > 0, small, jnp.inf))
-    finite = np.isfinite(ratio) & (np.abs(np.asarray(big)) > 1e-8)
+    b = np.abs(np.asarray(big))
+    # z is O(1) where raw moments were O(1e5), so the "is this slot actually
+    # moving" cut has to be relative to the shift itself, not an absolute 1e-8.
+    finite = np.isfinite(ratio) & (b > 1e-6 * b.max())
+    assert finite.any(), (big, small)
     assert np.abs(ratio[finite] - 2.0).max() < 0.05, ratio[finite]
 
 
@@ -157,16 +191,18 @@ def test_saturates_instead_of_overflowing():
     poisoning the whole batch.
     """
     for scale in (1e3, 1e6, 1e9):
-        out = LAYER.unmarginalize(M, SIGMA_X * scale)
+        out = LAYER.unmarginalize(Z, SIGMA_X * scale)
         assert bool(jnp.all(jnp.isfinite(out))), scale
-        assert float(out[0]) > 0.0 and float(out[1]) > 0.0, scale
+        # z is unbounded, so "stays positive" is not the statement any more --
+        # what must hold is that the saturation caps the shift.
+        assert float(jnp.abs(out - Z).max()) < 1.0, (scale, out - Z)
 
 
 def test_gradients_are_finite_for_a_round_galaxy():
     """A round galaxy under isotropic Sigma_X is the commonest batch member and
     the one place a complex modulus would hand back NaN.  See `response`."""
-    round_m = M.at[2].set(0.0).at[3].set(0.0)
-    g = jax.grad(lambda m: LAYER.unmarginalize(m, SIGMA_X).sum())(round_m)
+    round_z = Z.at[3].set(0.0).at[4].set(0.0)
+    g = jax.grad(lambda z: LAYER.unmarginalize(z, SIGMA_X).sum())(round_z)
     assert bool(jnp.all(jnp.isfinite(g))), g
 
 

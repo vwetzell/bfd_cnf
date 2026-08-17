@@ -125,8 +125,9 @@ import jax
 import jax.nn as jnn
 import jax.numpy as jnp
 from flowjax.bijections import AbstractBijection
+from paramax import non_trainable, unwrap
 
-from .bijections import CoeffNet
+from .bijections import POINT_SOURCE, CoeffNet
 from .shear import _invariants
 
 # As in models/shear.py: bound the coefficients so the map stays a
@@ -137,8 +138,9 @@ _COEFF_MAX = 12.0
 # Invariant normalisation, shared with the shear layer (same population, same
 # weight function): r = Mr/Mf over ~[0.7, 4.0], k = Mc Mf/Mr^2 over ~[1.85, 2.4],
 # q = |e|^2 over ~[0, 0.3].
-_R_LOC, _R_SCALE, _Q_SCALE = 2.5, 1.0, 0.1
-_K_LOC, _K_SCALE = 2.0, 0.2
+# As in models/shear.py, this layer now acts on the STANDARDISED z rather than
+# on raw moments, so z1 and z2 need no shift and q = |e|^2 is a chi^2_2.
+_Q_LOC, _Q_SCALE = 2.0, 2.0
 
 # T is fed in RAW, not rescaled to O(1).  Its median over the imsims bulge+disc
 # population is 1.4e-3, and the fractional moment shift it has to produce is the
@@ -178,12 +180,38 @@ def displacement_covariance(m, sigma_x):
     return jinv @ sx @ jinv.T
 
 
-def _tensor(m, sigma_x):
+def raw_from_standard(z, mean, std):
+    """Undo `RawMomentStandardize` far enough to rebuild [Mf, Mr, M1, M2].
+
+    This layer acts on z, but T is a PHYSICAL object: Sigma_X is an area and has
+    to be made dimensionless with the galaxy's own scale, which only exists in
+    raw moment space.  So reconstruct just the four moments the Jacobian needs.
+    Mc is not among them and is not rebuilt.
+
+    The reconstruction does NOT have to track a trained standardiser exactly.
+    `mean`/`std` are frozen at the values `build_flow` measured, and the only
+    thing they set is the overall scale of T -- which the response coefficients
+    absorb, since they are free functions of the invariants.  What must be right
+    is how T SCALES with Sigma_X and with the galaxy's size and shape, and that
+    is exact regardless of where the standardiser drifts to.
+    """
+    z0 = std[0] * z[0] + mean[0]
+    z1 = std[1] * z[1] + mean[1]
+    Mf = jnp.power(10.0, z0)
+    Mr = POINT_SOURCE * jnn.sigmoid(z1) * Mf
+    M1 = (std[3] * z[3] + mean[3]) * Mr
+    M2 = (std[4] * z[4] + mean[4]) * Mr
+    return jnp.stack([Mf, Mr, M1, M2, Mr])      # slot 4 unused by the Jacobian
+
+
+def _tensor(z, sigma_x, mean, std):
     """The dimensionless (t0, t2) that drive the response.
 
     T = (Mr/Mf) Sigma_u is dimensionless because Sigma_u is an area and Mr/Mf is
-    an inverse area under this weight function.
+    an inverse area under this weight function.  `z` is standardised, so the
+    physical moments are rebuilt first -- see `raw_from_standard`.
     """
+    m = raw_from_standard(z, mean, std)
     su = displacement_covariance(m, sigma_x)
     t = (m[1] / m[0]) * su
     t0 = 0.5 * (t[0, 0] + t[1, 1])
@@ -201,50 +229,56 @@ def _tensor(m, sigma_x):
 
 
 class _Coeffs(eqx.Module):
-    """(r, k, q) -> the nine real response coefficients, bounded by _COEFF_MAX."""
+    """(a, b, q) -> the nine real response coefficients, bounded by _COEFF_MAX."""
 
     net: CoeffNet
 
     def __init__(self, key, nn_width, nn_depth, activation):
         self.net = CoeffNet(key, 3, N_COEFFS, nn_width, nn_depth, activation)
 
-    def __call__(self, r, k, q):
-        u = jnp.stack([(r - _R_LOC) / _R_SCALE, (k - _K_LOC) / _K_SCALE,
-                       q / _Q_SCALE])
+    def __call__(self, a, b, q):
+        u = jnp.stack([a, b, (q - _Q_LOC) / _Q_SCALE])
         return _COEFF_MAX * jnp.tanh(self.net(u) / _COEFF_MAX)
 
 
-def response(coeffs, m, sigma_x):
-    """The equivariant first-order-in-Sigma_X response of `m`; the layer's map.
+def response(coeffs, z, sigma_x, mean, std):
+    """The equivariant first-order-in-Sigma_X response of `z`; the layer's map.
 
-    `coeffs` is [a, b] x [Mf, Mr, Mc] followed by [A, B, D].  Spin-0 responses
-    are exponentiated so Mf, Mr and Mc stay positive, which to first order in T
-    only relabels the coefficients.
+    `coeffs` is [a, b] x [z0, z1, z2] followed by [A, B, D].  Both blocks are
+    ADDITIVE, for the reason given in models/shear.py's `response`: z is
+    unbounded, so nothing needs exponentiating to stay positive, and z3, z4 are
+    already dimensionless so the spin-2 term needs no factor of Mr.
     """
     s0, A, B, D = coeffs[:6].reshape(3, 2), coeffs[6], coeffs[7], coeffs[8]
-    Mf, Mr, Mc = m[0], m[1], m[4]
-    e = jax.lax.complex(m[2] / Mr, m[3] / Mr)
-    t0, t2 = _tensor(m, sigma_x)
+    # Physical shape, for the same reason as models/shear.py's `response`.
+    m = raw_from_standard(z, mean, std)
+    e = jax.lax.complex(m[2] / m[1], m[3] / m[1])
+    t0, t2 = _tensor(z, sigma_x, mean, std)
     ec, t2c = jnp.conj(e), jnp.conj(t2)
 
-    # The two spin-0 invariants of (e, T) at first order in T, with the exponent
-    # saturated so the unresolved tail cannot blow the map up (see _EXP_MAX).
-    expo = s0 @ jnp.stack([t0, (ec * t2).real])
-    spin0 = jnp.stack([Mf, Mr, Mc]) * jnp.exp(
-        _EXP_MAX * jnp.tanh(expo / _EXP_MAX))
-    # Spin-2: additive, scaled by Mr, matching how the shear layer normalises its
-    # d(M1 + i M2) so the two are directly comparable.  Bounded the same way, so
-    # |de| < _EXP_MAX * Mr and the ellipticity cannot run away.
+    # The two spin-0 invariants of (e, T) at first order in T, saturated so the
+    # unresolved tail cannot blow the map up (see _EXP_MAX).
+    shift = s0 @ jnp.stack([t0, (ec * t2).real])
+    spin0 = z[:3] + _EXP_MAX * jnp.tanh(shift / _EXP_MAX)
+    # Spin-2: additive in the standardised shape slots, bounded the same way, so
+    # |de| < _EXP_MAX and the shape cannot run away.
     de_raw = A * t2 + B * e * t0 + D * e * e * t2c
     # Saturate as a scalar function of |de|^2, which keeps the term spin-2
     # equivariant AND analytic at de = 0.  `jnp.abs` would not be: with an
     # isotropic Sigma_X and a round galaxy de_raw is exactly zero, and the
     # gradient of a complex modulus there is NaN -- which is precisely the batch
     # this layer sees most often.
-    q = (de_raw * jnp.conj(de_raw)).real
-    de = Mr * de_raw / jnp.sqrt(1.0 + q / _EXP_MAX**2)
-    return jnp.stack([spin0[0], spin0[1], m[2] + de.real, m[3] + de.imag,
-                      spin0[2]])
+    # Convert to standardised units BEFORE saturating, so the cap means the same
+    # thing as the spin-0 one: at most `_EXP_MAX` of a standard deviation.
+    # Saturating in physical units and then dividing by the spin-2 std (~0.04)
+    # would leave the shape free to move ~12 sigma, which is no cap at all.
+    de_z = de_raw / std[3]
+    q = (de_z * jnp.conj(de_z)).real
+    de = de_z / jnp.sqrt(1.0 + q / _EXP_MAX**2)
+    # SLOT LAYOUT: spin-0 is 0, 1, 2 and spin-2 is 3, 4 in standardised
+    # coordinates -- not the raw (0, 1, 4) / (2, 3) layout.
+    return jnp.stack([spin0[0], spin0[1], spin0[2],
+                      z[3] + de.real, z[4] + de.imag])
 
 
 class CentroidMarginalize(AbstractBijection):
@@ -261,11 +295,20 @@ class CentroidMarginalize(AbstractBijection):
     cond_shape: tuple = eqx.field(static=True, default=(3,))
     coeffs: _Coeffs
     n_iter: int = eqx.field(static=True, default=3)
+    # The standardiser's constants, FROZEN: the layer needs them only to rebuild
+    # a physical scale for T, and `raw_from_standard` explains why a frozen copy
+    # is enough even though `RawMomentStandardize` trains its own.
+    mean: jax.Array = eqx.field(default=None)
+    std: jax.Array = eqx.field(default=None)
 
     def __init__(self, key, nn_width=128, nn_depth=3, activation=jnn.silu,
-                 n_iter=3, cond_dim=3):
+                 n_iter=3, cond_dim=3, mean=None, std=None):
         self.coeffs = _Coeffs(key, nn_width, nn_depth, activation)
         self.n_iter = n_iter
+        self.mean = non_trainable(jnp.zeros(5) if mean is None
+                                  else jnp.asarray(mean))
+        self.std = non_trainable(jnp.ones(5) if std is None
+                                 else jnp.asarray(std))
         # (3,) alone, or (5,) = [g1, g2, C00, C01, C11] when chained after shear.
         self.cond_shape = (cond_dim,)
 
@@ -278,8 +321,9 @@ class CentroidMarginalize(AbstractBijection):
         the chain.
         """
         sigma_x = condition[-3:]
-        r, k, q, _ = _invariants(x)
-        return response(self.coeffs(r, k, q), x, sigma_x)
+        a, b, q, _ = _invariants(x)
+        return response(self.coeffs(a, b, q), x, sigma_x,
+                        unwrap(self.mean), unwrap(self.std))
 
     def marginalize(self, y, sigma_x):
         """Invert `unmarginalize` by fixed point: x = y - (U(x) - x).

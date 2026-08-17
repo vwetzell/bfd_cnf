@@ -15,43 +15,66 @@ from models.shear import ShearResponse, dm_dg
 
 jax.config.update("jax_enable_x64", True)
 
-LAYER = ShearResponse(jr.key(0))
-M = jnp.array([5.0e3, 1.8e4, 900.0, -400.0, 1.1e5])
+# The layer now acts on STANDARDISED coordinates, downstream of
+# `RawMomentStandardize` -- so the spin-0 coordinates are slots 0, 1, 2 and the
+# spin-2 pair is 3, 4, NOT the raw layout's (0, 1, 4) / (2, 3).  `e_scale` is the
+# standardiser's shared spin-2 std, which `build_flow` measures; 0.04 is what it
+# comes out at on the bulgedisc training set.
+E_SCALE = 0.04
+LAYER = ShearResponse(jr.key(0), e_scale=E_SCALE)
+Z = jnp.array([0.7, -0.4, 1.1, 1.3, -0.9])
 G = jnp.array([0.04, -0.025])
 
 
-def _rot(m, g, phi):
-    """Rotate the frame by phi: the spin-2 pairs (M1,M2) and g turn by 2*phi."""
-    z = jax.lax.complex(m[2], m[3]) * jnp.exp(2j * phi)
-    w = jax.lax.complex(g[0], g[1]) * jnp.exp(2j * phi)
-    return (jnp.stack([m[0], m[1], z.real, z.imag, m[4]]),
-            jnp.stack([w.real, w.imag]))
+def _rot(z, g, phi):
+    """Rotate the frame by phi: the spin-2 pair (z3, z4) and g turn by 2*phi."""
+    w = jax.lax.complex(z[3], z[4]) * jnp.exp(2j * phi)
+    v = jax.lax.complex(g[0], g[1]) * jnp.exp(2j * phi)
+    return (jnp.stack([z[0], z[1], z[2], w.real, w.imag]),
+            jnp.stack([v.real, v.imag]))
+
+
+def _rot_raw(m, g, phi):
+    """The same rotation on RAW moments, where the spin-2 pair is (M1, M2) =
+    slots 2, 3 and Mc is slot 4 -- the layout `test_flow_isotropy` needs,
+    because it feeds the whole flow rather than the layer."""
+    w = jax.lax.complex(m[2], m[3]) * jnp.exp(2j * phi)
+    v = jax.lax.complex(g[0], g[1]) * jnp.exp(2j * phi)
+    return (jnp.stack([m[0], m[1], w.real, w.imag, m[4]]),
+            jnp.stack([v.real, v.imag]))
 
 
 def test_rotation_equivariance():
     for phi in np.linspace(0.0, np.pi, 7):
-        mr, gr = _rot(M, G, phi)
-        lhs = LAYER.unshear(mr, gr)
-        rhs = _rot(LAYER.unshear(M, G), G, phi)[0]
-        assert jnp.max(jnp.abs(lhs - rhs) / jnp.abs(rhs)) < 1e-12, phi
+        zr, gr = _rot(Z, G, phi)
+        lhs = LAYER.unshear(zr, gr)
+        rhs = _rot(LAYER.unshear(Z, G), G, phi)[0]
+        assert jnp.max(jnp.abs(lhs - rhs)) < 1e-12, phi
 
 
 def test_parity_equivariance():
-    # y -> -y flips M2 and g2; Mf, Mr, M1 and Mc are all parity even.
-    flip_m = lambda v: v.at[3].set(-v[3])
+    # y -> -y flips the second spin-2 component and g2; slots 0, 1, 2 are even.
+    flip_z = lambda v: v.at[4].set(-v[4])
     flip_g = lambda v: v.at[1].set(-v[1])
-    lhs = LAYER.unshear(flip_m(M), flip_g(G))
-    rhs = flip_m(LAYER.unshear(M, G))
-    assert jnp.max(jnp.abs(lhs - rhs) / jnp.abs(rhs)) < 1e-12
+    lhs = LAYER.unshear(flip_z(Z), flip_g(G))
+    rhs = flip_z(LAYER.unshear(Z, G))
+    assert jnp.max(jnp.abs(lhs - rhs)) < 1e-12
 
 
-def test_flux_homogeneity():
-    """Moments are linear in the image, so the whole map must be degree-1
-    homogeneous and the response coefficients flux-blind."""
-    for lam in (1e-3, 1.0, 3e2):
-        lhs = LAYER.unshear(lam * M, G)
-        rhs = lam * LAYER.unshear(M, G)
-        assert jnp.max(jnp.abs(lhs - rhs) / jnp.abs(rhs)) < 1e-12, lam
+def test_flux_blindness():
+    """Moments are linear in the image, so the response is flux-blind.
+
+    In raw moments that read as degree-1 homogeneity.  In standardised
+    coordinates flux is a single additive coordinate -- z0 = log10 Mf, shifted
+    and scaled -- so the same statement becomes TRANSLATION COVARIANCE along
+    z0: shifting it must shift the output's z0 by the same amount and leave
+    every other slot alone.  `_invariants` never reads z0, which is what makes
+    this hold at any parameter values.
+    """
+    for d in (-3.0, 0.0, 2.5):
+        lhs = LAYER.unshear(Z.at[0].add(d), G)
+        rhs = LAYER.unshear(Z, G).at[0].add(d)
+        assert jnp.max(jnp.abs(lhs - rhs)) < 1e-12, d
 
 
 def test_bijection_round_trip():
@@ -68,39 +91,59 @@ def test_bijection_round_trip():
     The log-dets cancel exactly at every g regardless, because both directions
     evaluate the same 5x5 Jacobian at the same point.
     """
-    assert jnp.max(jnp.abs(LAYER.shear(M, jnp.zeros(2)) - M)) == 0.0
+    assert jnp.max(jnp.abs(LAYER.shear(Z, jnp.zeros(2)) - Z)) == 0.0
 
     res = {}
     for gmag in (0.0, 0.01, 0.02, 0.05, 0.1, 0.2):
         g = jnp.array([gmag, -0.6 * gmag])
-        y, ld_i = LAYER.inverse_and_log_det(M, g)
+        y, ld_i = LAYER.inverse_and_log_det(Z, g)
         back, ld_t = LAYER.transform_and_log_det(y, g)
-        res[gmag] = float(jnp.max(jnp.abs(back / M - 1.0)))
+        # z is standardised and passes through zero, so an ABSOLUTE residual is
+        # the meaningful one here; the raw version could divide by M.
+        res[gmag] = float(jnp.max(jnp.abs(back - Z)))
         assert abs(float(ld_i + ld_t)) < 1e-10, gmag
 
     assert res[0.0] == 0.0
-    # Measured 2.8e-7 / 2.2e-6 / 3.4e-5 / 2.7e-4 / 2.2e-3; bound at ~3x.
-    assert res[0.01] < 1e-6, res
-    assert res[0.02] < 7e-6, res
-    assert res[0.2] < 7e-3, res
+    # Measured 1.2e-7 / 9.9e-7 / 1.6e-5 / 1.3e-4 / 1.1e-3; bound at ~3x.
+    assert res[0.01] < 4e-7, res
+    assert res[0.02] < 3e-6, res
+    assert res[0.2] < 3.5e-3, res
     for lo, hi in ((0.01, 0.02), (0.05, 0.1)):
         assert 6.0 < res[hi] / res[lo] < 11.0, (lo, hi, res)   # cubic: x8
 
 
 def test_identity_at_zero_shear():
-    y, ld = LAYER.inverse_and_log_det(M, jnp.zeros(2))
-    assert jnp.max(jnp.abs(y - M)) == 0.0 and float(ld) == 0.0
+    y, ld = LAYER.inverse_and_log_det(Z, jnp.zeros(2))
+    assert jnp.max(jnp.abs(y - Z)) == 0.0 and float(ld) == 0.0
 
 
 def test_derivatives_match_finite_differences():
-    """dm_dg reports what the map actually does, in bfd's column layout."""
-    q, r = dm_dg(LAYER, M)
-    h = 1e-4
-    f = lambda g: LAYER.shear(M, jnp.array(g, dtype=float))
+    """dm_dg returns dm/dg -- RAW moments -- via the chart's change of variables.
+
+    The layer responds in standardised coordinates, so its bare g-derivative is
+    dz/dg.  `dm_dg` composes the chart on both sides to recover the physical
+    dm/dg that bfd tabulates, and this pins that composition: autodiff of the
+    composite against finite differences of the same composite, to second order.
+    Getting only the first order right would still pass a Jacobian-factor
+    conversion, which is why the second-order check is here.
+
+    That conversion is not cosmetic -- `shear.train` regresses against `dm_dg`
+    with deriv_weight = 1e4, so it is the dominant term in the loss.
+    """
+    from models.bijections import RawMomentStandardize
+
+    chart = RawMomentStandardize(mean=jnp.array([4.35, 0.95, 1.05, 0.0, 0.0]),
+                                 std=jnp.array([0.35, 0.75, 0.60, 0.04, 0.04]))
+    m = jnp.array([1.0e4, 2.0e4, 1.0e3, -444.0, 4.2e4])
+    q, r = dm_dg(LAYER, m, chart)
+
+    f = lambda g: chart.inverse(
+        LAYER.shear(chart.transform(m), jnp.array(g, dtype=float)))
+    h = 1e-5
     fd1 = [(f([h, 0]) - f([-h, 0])) / (2 * h), (f([0, h]) - f([0, -h])) / (2 * h)]
-    assert jnp.max(jnp.abs(jnp.stack(fd1) - q) / jnp.abs(q)) < 1e-6
+    assert jnp.max(jnp.abs(jnp.stack(fd1) - q) / jnp.abs(q)) < 1e-5
     fd11 = (f([h, 0]) - 2 * f([0, 0]) + f([-h, 0])) / h**2
-    assert jnp.max(jnp.abs(fd11 - r[0]) / jnp.abs(r[0])) < 1e-4
+    assert jnp.max(jnp.abs(fd11 - r[0]) / jnp.abs(r[0])) < 1e-3
 
 
 def test_flow_isotropy():
@@ -136,7 +179,7 @@ def test_flow_isotropy():
     m = jnp.array([1.0e4, Mr0, 0.05 * Mr0, -0.0222 * Mr0, 2.1 * Mr0])
     ref = flow.log_prob(m, condition=G)
     for phi in np.linspace(0.0, np.pi, 5):
-        mr_, gr_ = _rot(m, G, phi)
+        mr_, gr_ = _rot_raw(m, G, phi)
         assert abs(float(flow.log_prob(mr_, condition=gr_) - ref)) < 1e-8, phi
 
 

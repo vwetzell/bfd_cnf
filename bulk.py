@@ -126,14 +126,35 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
         bulk.append(Permute(jnp.array(_SPIN0_PERMS[i % len(_SPIN0_PERMS)] + [3, 4])))
 
     # Chain.transform runs in list order and maps data -> base, so the
-    # data-adjacent layers come first; Invert flips it for sampling.  Centroid
-    # is generatively last, hence first in this list.
+    # data-adjacent layer comes first; Invert flips it for sampling.
+    #
+    # `raw2standard` is FIRST.  It is the fixed reparametrisation that brings raw
+    # moments into a shape the flow can learn -- unbounded, roughly Gaussian --
+    # and it is where the chart's point-source ceilings live.  Putting it at the
+    # data boundary means the chart is enforced exactly ONCE, and no map
+    # downstream of it can push a point off-chart.  Under the previous ordering
+    # the conditional layers acted on raw moments BEFORE the chart, so a draw
+    # that `bias.log_conv_is` had passed as in-domain could still be carried
+    # across a ceiling by the shear layer -- a g-DEPENDENT seam.  That is gone by
+    # construction here.
+    #
+    # After it, generative order still reads base -> bulk -> shear(g) ->
+    # centroid(Sigma_X) -> data, so centroid is generatively last and hence
+    # first among the conditional layers in this data -> base list.
+    #
+    # The cost: the conditional layers now respond in z, not in raw moments, so
+    # their coefficients are no longer directly comparable to bfd's dm/dg.  See
+    # models/shear.py's header.
+    #
     # With both on, the chain carries one condition vector for the pair:
     # [g1, g2, C00, C01, C11].  Shear reads the first two, centroid the last three.
     cond = 5 if (shear and centroid) else None
-    head = ([CentroidMarginalize(k_centroid, cond_dim=cond or 3)] if centroid else []) + \
-           ([ShearResponse(k_shear, cond_dim=cond or 2)] if shear else [])
-    bijection = Invert(Chain([*head, raw2standard, *bulk]).merge_chains())
+    head = ([CentroidMarginalize(k_centroid, cond_dim=cond or 3,
+                                 mean=t.mean(0), std=t.std(0))]
+            if centroid else []) + \
+           ([ShearResponse(k_shear, cond_dim=cond or 2,
+                           e_scale=float(t.std(0)[3]))] if shear else [])
+    bijection = Invert(Chain([raw2standard, *head, *bulk]).merge_chains())
     base = non_trainable(MultivariateNormal(jnp.zeros(5), jnp.eye(5)))
     return Transformed(base, bijection)
 

@@ -219,7 +219,7 @@ def kernel_draws(cov, n, samples, seed):
     return np.concatenate([half, -half], axis=1)
 
 
-def log_conv_is(flow, m_i, draws, log_wt, g):
+def log_conv_is(flow, m_i, draws, log_wt, g, ok=None):
     """log (1/S) sum_s exp(log_wt_s) P(draws_s | g) -- the general importance-
     sampled estimator of the convolution P(M_i|g) = INT dm P(m|g) L(M_i - m),
     the continuum limit of the paper's sum over templates, eq. (38).
@@ -244,8 +244,19 @@ def log_conv_is(flow, m_i, draws, log_wt, g):
     # ceiling is the half that matters here: the kernel is wide enough that a
     # well-resolved target still puts draws past it, and before the chart was
     # bounded the flow answered those with a positive density.
-    ok = in_domain(draws)
-    dummy = safe_point(m_i)
+    if ok is None:
+        # `draws` are RAW moments and `flow` still carries the chart, so the
+        # domain test belongs right here.
+        ok = in_domain(draws)
+        dummy = safe_point(m_i)
+    else:
+        # `draws` have already been through the peel, so they are STANDARDISED
+        # coordinates and `in_domain` -- which reads Mf, Mr, Mc -- is meaningless
+        # on them.  The caller tested the raw draw before peeling and hands the
+        # answer down.  The stand-in only has to be finite: it is masked out of
+        # the logsumexp below and exists solely so the flow is never evaluated
+        # at a NaN, whose gradient would poison the whole target.
+        dummy = jnp.zeros_like(draws[0])
     lp = flow.log_prob(jnp.where(ok[:, None], draws, dummy), condition=g)
     return (jax.nn.logsumexp(jnp.where(ok, lp + log_wt, -jnp.inf))
             - jnp.log(draws.shape[0]))
@@ -390,14 +401,19 @@ def split_centroid(flow):
     The peel is exact, not an approximation; see `centroid_transform`.
     """
     bij = flow.bijection.bijection.bijections
-    if not isinstance(bij[0], CentroidMarginalize):
+    # data -> base order is [raw2standard, centroid, shear, *bulk]; the chart is
+    # always first now, so the centroid layer is at index 1 when it is present.
+    if len(bij) < 2 or not isinstance(bij[1], CentroidMarginalize):
         return flow, None
-    rest = Invert(Chain(list(bij[1:])).merge_chains())
-    return Transformed(flow.base_dist, rest), bij[0]
+    rest = Invert(Chain(list(bij[2:])).merge_chains())
+    # Both halves of the peel are g-independent -- the chart is a fixed
+    # reparametrisation and the centroid layer reads only Sigma_X -- so the pair
+    # can be hoisted together and their log-dets summed.
+    return Transformed(flow.base_dist, rest), (bij[0], bij[1])
 
 
 @eqx.filter_jit
-def _centroid_apply(layer, x, cond):
+def _centroid_apply(peel, x, cond):
     """vmapped centroid transform + log-det, jitted ONCE at module level.
 
     Building the `eqx.filter_jit` wrapper inside `centroid_transform` instead
@@ -406,7 +422,14 @@ def _centroid_apply(layer, x, cond):
     step.  Equinox splits `layer` into its arrays and its structure, so retracing
     happens only if the structure or the shapes change, not when weights do.
     """
-    return jax.vmap(layer.transform_and_log_det)(x, cond)
+    chart, layer = peel
+
+    def one(xi, ci):
+        z, ld0 = chart.transform_and_log_det(xi)
+        y, ld1 = layer.transform_and_log_det(z, ci)
+        return y, ld0 + ld1
+
+    return jax.vmap(one)(x, cond)
 
 
 @eqx.filter_jit
@@ -467,7 +490,7 @@ def _mixture_chunk(flow, m_i, kern, cond0, key, L, log_diag, log_alpha, log_1ma,
     return x, jnp.where(jnp.isfinite(log_wt), log_wt, -jnp.inf)
 
 
-def centroid_transform(layer, x, sigma_x, batch=200_000, to_host=True):
+def centroid_transform(peel, x, sigma_x, batch=200_000, to_host=True):
     """Apply the centroid layer to `x`, returning (transformed, log-det).
 
     `x` is (..., 5) and `sigma_x` broadcasts against its leading axes.  The
@@ -487,6 +510,7 @@ def centroid_transform(layer, x, sigma_x, batch=200_000, to_host=True):
     shp = x.shape[:-1]
     xf = jnp.asarray(x, dtype=jnp.float32).reshape(-1, 5)
     sj = jnp.asarray(sigma_x, dtype=jnp.float32)
+    layer = peel[1]
     # The layer keeps the chain's condition width even after being peeled off,
     # and reads Sigma_X as the LAST three entries -- so pad the shear slots.
     if layer.cond_shape[0] > 3:
@@ -497,7 +521,7 @@ def centroid_transform(layer, x, sigma_x, batch=200_000, to_host=True):
 
     z_out, ld_out = [], []
     for i in range(0, xf.shape[0], batch):
-        z, ld = _centroid_apply(layer, xf[i:i + batch], sf[i:i + batch])
+        z, ld = _centroid_apply(peel, xf[i:i + batch], sf[i:i + batch])
         z_out.append(z)
         ld_out.append(ld)
     z = jnp.concatenate(z_out).reshape(shp + (5,))
@@ -715,9 +739,9 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
     # transformed draws would apply the layer a second time.
     flow_g, layer = split_centroid(flow)
 
-    def one(m_i, draws_i, log_wt_i, sigma_x_i):
+    def one(m_i, draws_i, log_wt_i, sigma_x_i, ok_i):
         f = lambda g: log_conv_is(flow_g, m_i, draws_i, log_wt_i,
-                                  condition(g, sigma_x_i))
+                                  condition(g, sigma_x_i), ok_i)
         # One forward-over-reverse pass per g direction yields the value, the
         # gradient AND a column of the Hessian.  Calling f, jax.grad(f) and
         # jax.hessian(f) separately -- as this did -- evaluates the flow three
@@ -762,6 +786,11 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
                 seed + 7919 * c + 104729 * (i // batch),
                 batch=len(m_b), sigma_x=sx_b if proposal is None else psx_b)
             lw = jnp.asarray(lw, dtype=jnp.float32)
+            # Test the domain on the RAW draw, while it still means something:
+            # once the peel has run, the draw is in standardised coordinates and
+            # the chart's ceilings are behind it.  With no peel, `log_conv_is`
+            # does this itself on the same quantity.
+            ok_raw = in_domain(jnp.asarray(d))
             if layer is not None:
                 # Stay on device: the transformed draws go straight back into a
                 # jitted function, so a host round-trip here is pure loss.
@@ -771,7 +800,8 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
                 d = jnp.asarray(d, dtype=jnp.float32)
             f, df, d2f = batched(
                 m_z, d, lw,
-                None if sx_b is None else jnp.asarray(sx_b, dtype=jnp.float32))
+                None if sx_b is None else jnp.asarray(sx_b, dtype=jnp.float32),
+                ok_raw)
             f = np.asarray(f, dtype=np.float64)
             df = np.asarray(df, dtype=np.float64)
             d2f = np.asarray(d2f, dtype=np.float64)

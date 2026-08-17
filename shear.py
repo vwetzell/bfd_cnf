@@ -72,7 +72,7 @@ from flowjax.bijections import Chain, Invert
 from flowjax.distributions import Transformed
 
 import bulk
-from models.shear import dm_dg
+from models.shear import ShearResponse, dm_dg
 
 # Second-order in g is the model (paper sec. 5.5), so training over a range wider
 # than any real shear costs nothing and pins the quadratic term down properly.
@@ -163,7 +163,7 @@ def band_weight(m, k, edge=BAND, width=0.08):
     return jnp.asarray(w / w.mean())
 
 
-def _velocity_mse(layer, m, q_true, r_true, score=None, wt=None):
+def _velocity_mse(layer, chart, m, q_true, r_true, score=None, wt=None):
     """L2 distance between the layer's transport velocity and the templates'
     own shear derivatives, normalised by `_scale` so it is
     dimensionless, flux-blind, and weighs every galaxy equally.  Its minimiser
@@ -177,7 +177,7 @@ def _velocity_mse(layer, m, q_true, r_true, score=None, wt=None):
     Q1's error and cancel to 1.8, a cancellation nothing in the loss enforces.
     Zero unless a score is supplied.
     """
-    q, r = jax.vmap(dm_dg, in_axes=(None, 0))(layer, m)
+    q, r = jax.vmap(dm_dg, in_axes=(None, 0, None))(layer, m, chart)
     s = _scale(m)[:, None, :]
     w = 1.0 if wt is None else wt[:, None, None]
     mse = (jnp.mean(w * ((q - q_true) / s) ** 2)
@@ -246,7 +246,8 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
         def loss_fn(p):
             model = eqx.combine(p, static)
             nll = -jnp.mean(model.log_prob(x, condition=g))
-            mse, first = _velocity_mse(_shear_layer(model), m[idx], q[idx],
+            mse, first = _velocity_mse(_shear_layer(model), _chart(model),
+                                       m[idx], q[idx],
                                        r_tgt[idx],
                                        None if score is None else score[idx],
                                        None if wt is None else wt[idx])
@@ -274,7 +275,20 @@ def val_nll(flow, data, key, n=20000):
 
 
 def _shear_layer(flow):
-    """The ShearResponse sitting data-adjacent inside the built flow."""
+    """The ShearResponse inside the built flow.
+
+    The chain is [raw2standard, shear, *bulk] data -> base (or
+    [raw2standard, centroid, shear, *bulk] with the centroid layer), so the
+    chart is index 0 and the shear layer follows it.
+    """
+    for b in flow.bijection.bijection.bijections:
+        if isinstance(b, ShearResponse):
+            return b
+    raise ValueError("no ShearResponse in this flow")
+
+
+def _chart(flow):
+    """The RawMomentStandardize, which `dm_dg` needs to convert dz/dg to dm/dg."""
     return flow.bijection.bijection.bijections[0]
 
 
@@ -287,8 +301,8 @@ def check(flow, data, n=4000, labels=None):
     which `response_scatter` measures independently.
     """
     m, q_true, r_true = (jnp.asarray(a[:n]) for a in data)
-    layer = _shear_layer(flow)
-    q, r = jax.vmap(dm_dg, in_axes=(None, 0))(layer, m)
+    layer, chart = _shear_layer(flow), _chart(flow)
+    q, r = jax.vmap(dm_dg, in_axes=(None, 0, None))(layer, m, chart)
     s = _scale(m)[:, None, :]
     groups = [("", slice(None))]
     if labels is not None:
