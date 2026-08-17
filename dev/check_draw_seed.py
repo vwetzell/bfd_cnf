@@ -36,6 +36,45 @@ Two things come out that nothing else in this investigation can give.
 
     python dev/check_draw_seed.py dev/pqr_control_deep_dsA.npz \\
                                   dev/pqr_control_deep_dsB.npz
+
+ANSWER (2026-08-17), deep centroid control, S = 32768, alpha 0.5, 20000 targets,
+draw seeds 107 and 500, everything else identical:
+
+    m1, seed A                      +0.00522
+    m1, seed B                      +0.00450
+    DRAW-realisation sigma           0.00051     (1 dof)
+    sum Cov_MC(qhat)_11 / sum j_11  +0.00263
+    m1, averaged, uncorrected       +0.00486
+    m1, Cov_MC added back to R      +0.00223 +/- 0.00161   (1.4 sigma)
+
+So **about half the centroid control's bias is this one estimator artifact**,
+and what is left is not significantly different from zero.
+
+Three things to keep straight before quoting that.
+
+1. The runs REPRODUCE.  +0.0052 and +0.0045 land inside the historical cluster
+   at this operating point (+0.0053, +0.0055, +0.0058, +0.0060, +0.0070), and
+   the HUMP matches too (-0.0363, -0.0420 against -0.0364..-0.0407).  The
+   "+0.0070" quoted throughout HANDOFF.md as THE anchor is the high member of
+   that cluster; the mean of all seven is ~+0.0056.  Quote that instead.
+2. The draw-realisation sigma is SMALL, 0.0005 against the target bootstrap's
+   0.0017.  That worry is closed: the bootstrap does dominate after all, even
+   though it could never have shown so by itself.
+3. The correction is NOT a universal fix and must not be applied blind.  It
+   removes only the `(B/A)^2` term; the other O(1/S) terms are still there, and
+   applying this one alone to the moment-space control (which reads -0.0002)
+   would take it to -0.0028, i.e. away from the zero it is known to converge to.
+   The correct reading is that the estimator carries SEVERAL O(1/S) terms of
+   order 0.003 with opposing signs, and +0.006 sits inside that budget.
+
+Consistency check that does NOT fully work, reported rather than buried: scaling
+the information identity (`check_info_identity.py`) from S = 8192 to 32768
+predicts a Var_MC three times smaller than the direct two-seed measurement here
+(identity moved 0.0566 -> 0.0524, where a clean 1/S term of this size would have
+moved it ~0.016).  The two-seed number is the trustworthy one -- it is a direct
+measurement, not a difference of two large numbers -- but the mismatch says the
+O(1/S) structure is not a single clean 1/S term, which is the same conclusion as
+point 3 from a different direction.
 """
 import sys
 

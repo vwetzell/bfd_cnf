@@ -1221,17 +1221,62 @@ alpha g^2 is excluded at ~10 sigma by the g-scan -- but it is the first
 quantitative statement of what the centroid layer does to the estimator's
 conditioning, and it costs nothing to compute on any saved PQR.
 
-**The measurement this points at, now running.**  `--draw-seed` added to
-`check_selfconsistency_noisy.py` (until now `--seed` moved the targets too, so
-two runs could never differ in draws alone).  Two deep centroid controls at
-S = 32768, identical but for the draw seed, feed `dev/check_draw_seed.py`, which
-returns (a) the draw-realisation sigma every number in this file is missing and
-(b) a **bias-corrected m1**, adding `Cov_MC(qhat) = (1/2)(qhat_A - qhat_B)^2`
-back into R.  Corrected ~ 0 means the +0.006 is this term after all and the
-"same in both paths" reading above was measured on the wrong runs; corrected
-still ~ +0.006 means it is not, and the candidate list is empty with the
-pruning argument saying it has to be O(1/S) regardless.  Logs:
-`logs_control_drawseed.txt`.
+**The measurement this points at -- DONE, and it takes half the bias.**
+`--draw-seed` added to `check_selfconsistency_noisy.py` (until now `--seed` moved
+the targets too, so two runs could never differ in draws alone).  Two deep
+centroid controls at S = 32768, alpha 0.5, 20000 targets, seeds 107 and 500,
+identical in everything else (`logs_control_drawseed.txt`,
+`dev/check_draw_seed.py`):
+
+| | |
+|---|---|
+| m1, seed A | +0.00522 |
+| m1, seed B | +0.00450 |
+| **draw-realisation sigma** | **0.00051** (1 dof) |
+| `sum Cov_MC(qhat)_11 / sum j_11` | **+0.00263** |
+| m1, averaged, uncorrected | +0.00486 |
+| **m1, `Cov_MC` added back to R** | **+0.00223 +/- 0.00161** (1.4 sigma) |
+
+**About half the centroid control's bias is the `(B/A)^2` artifact, and the
+remainder is not significantly different from zero.**
+
+Three things to keep straight before quoting that.
+
+1. **The runs reproduce, and the anchor everyone has been quoting was a high
+   draw.**  +0.0052 and +0.0045 land inside the historical cluster at this
+   operating point -- +0.0053 (`niter12_S32k`), +0.0055 and +0.0060
+   (`merge_test`), +0.0058 (`a05_S131k`), +0.0070 -- and the HUMP matches too
+   (-0.0363, -0.0420 against -0.0364..-0.0407).  The **+0.0070 used as THE
+   number throughout this file is the high member of a seven-run cluster whose
+   mean is ~+0.0056.**  Quote +0.0056.
+2. **The draw-realisation sigma is small**, 0.0005 against the target
+   bootstrap's 0.0017.  That worry is closed -- the bootstrap does dominate --
+   but note it could never have shown that by itself.
+3. **The correction is not a universal fix and must not be applied blind.**  It
+   removes only the `(B/A)^2` term.  Applied alone to the moment-space control
+   (which reads -0.0002) it would give -0.0028, i.e. away from the zero that
+   path is known to converge to.  The right reading is that the estimator
+   carries SEVERAL O(1/S) terms of order 0.003 with opposing signs, and +0.006
+   sits inside that budget.
+
+**A consistency check that does not fully work, reported rather than buried:**
+scaling the information identity from S = 8192 to 32768 predicts a `Var_MC`
+three times smaller than the direct two-seed measurement (the identity moved
++0.0566 -> +0.0524, where a clean 1/S term of this size would have moved it
+~0.016).  The two-seed number is the trustworthy one -- a direct measurement
+rather than a difference of two large numbers -- but the mismatch independently
+says the O(1/S) structure is not a single clean 1/S term.
+
+**So the honest status of the centroid +0.006 is no longer "unexplained".**  It
+is: ~+0.0056 at the operating point, of which +0.0026 is a named and now
+directly measured estimator artifact, leaving +0.0022 +/- 0.0016 -- inside an
+O(1/S) error budget of about +/-0.003 per term that had never been quantified.
+**The consequence for the rest of this file is larger than the consequence for
+this thread: at S = 32768 the machinery cannot resolve a multiplicative bias
+below ~0.003, so every conclusion here resting on a difference smaller than that
+needs re-reading.**  The way forward is to reduce the estimator's O(1/S) error
+-- more draws, or a Rao-Blackwellised `R` that does not square an MC estimate --
+not to look for an eleventh mechanism.
 
 ---
 
