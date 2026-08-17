@@ -99,10 +99,16 @@ def main():
                         "(B/A)^2, the square of an MC estimate) and so biases m1 "
                         "LOW by sum Var_MC(Qhat) / sum j -- flat in g, "
                         "a pure response-scale error.  See bias.pqr_streamed's "
-                        "`crossfit`, which removes it. It is also the only way to "
+                        "`jackknife`, which removes it. It is also the only way to "
                         "get a DRAW-realisation error bar: the bootstrap "
                         "everywhere in HANDOFF.md resamples TARGETS and leaves "
                         "every target's draws untouched, so it cannot see this.")
+    p.add_argument("--jackknife", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="delete-one jackknife over chunks in `pqr_streamed`, "
+                        "which removes the estimator's leading O(1/S) bias. ON "
+                        "is the current default; --no-jackknife reproduces every "
+                        "number taken before it existed.")
     p.add_argument("--nbin", type=int, default=8)
     p.add_argument("--save-pqr", default=None,
                    help="write the control PQR (+ its size axis) here, "
@@ -163,12 +169,13 @@ def main():
     dseed = a.seed + 100 if a.draw_seed is None else a.draw_seed
     if a.draw_seed is not None:
         print(f"draw seed: {dseed} (targets and noise unchanged)")
+    print(f"jackknife: {a.jackknife}")
 
     qr = {}
     for k, M in (("plus", Mp), ("minus", Mm)):
         q, r = bias.pqr_streamed(flow, jnp.asarray(M), cov, a.samples, a.alpha,
                                  dseed, sigma_x=sigma_x, chunk=a.chunk,
-                                 batch=a.batch)
+                                 batch=a.batch, jackknife=a.jackknife)
         qr[k] = (np.asarray(q, np.float64), np.asarray(r, np.float64))
         print(f"  {k} arm done")
 
