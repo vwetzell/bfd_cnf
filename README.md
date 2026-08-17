@@ -19,7 +19,8 @@ it one arrow at a time against the simulated catalogs from
 ## Phase 1 — the bulk (here now)
 
 `bulk.py` trains only the unconditional part: the `RawMomentStandardize`
-coordinate change into `[log10 Mf, Mr/Mf, Mc/Mr, M1/Mr, M2/Mr]` followed by
+coordinate change into `[log10 Mf, logit(Mr/Mf/r*), logit(Mc/Mr/rc*), M1/Mr,
+M2/Mr]` — both size-like ratios carry a hard point-source ceiling — followed by
 eight `EquivariantAutoregressiveLayer` steps.  The three spin-0 coordinates come
 first and the spin-2 pair last; the permutation between layers cycles through
 all six orderings of the spin-0 slots so none is permanently the head of the
@@ -35,7 +36,7 @@ python bulk.py corner --data ../bfd_cnf_imsims/data/moments.fits
 ```
 
 `plots/bulk_corner.png` overlays the flow on the sims in the four flow
-coordinates, with the point-source (`Mr/Mf = 3.976`) reference marked — above
+coordinates, with the point-source (`Mr/Mf = 3.692575`) reference marked — above
 that line a source is unresolved and carries no shape information.
 
 ## Phase 2 — shear conditioning (here now)
@@ -389,6 +390,12 @@ bias.py               m and c on the targets, noiseless or integrated under C_M
 models/shear.py       the ShearResponse layer
 models/centroid.py    the CentroidMarginalize layer
 models/bijections.py  the bulk layers
+dev/                  one-off diagnostics; each script's docstring says what it
+                      answered and what the answer was
+HANDOFF.md            the dated investigation log
+NOISY_BINNING_BIAS.md why binning a noisy m1 profile on the target's LATENT
+                      Mr/Mf biases it even under a perfect density -- read this
+                      before believing any binned noisy profile in HANDOFF.md
 ```
 
 ## Note on precision
