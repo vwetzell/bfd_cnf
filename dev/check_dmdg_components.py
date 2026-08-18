@@ -144,6 +144,7 @@ import numpy as np
 
 sys.path.insert(0, ".")
 
+import bias                                          # noqa: E402
 import bulk                                          # noqa: E402
 import shear as shear_top                            # noqa: E402
 from models.shear import dm_dg                       # noqa: E402
@@ -187,15 +188,16 @@ def main():
     p.add_argument("--flow", default="flows/shear_cfo.eqx")
     p.add_argument("--data", default="../bfd_cnf_imsims/data/moments.fits")
     p.add_argument("-n", type=int, default=20000)
-    p.add_argument("--size-window", type=float, nargs=2, default=None,
+    p.add_argument("--size-window", type=float, nargs=2, default=bias.SIZE_WINDOW,
                    metavar=("LO", "HI"),
                    help="keep only templates with LO <= Mr/Mf <= HI. The real "
                         "analysis sets a size window on TARGETS, so the response "
                         "outside it is never used; 2.2 has been the lower bound. "
                         "This restricts the COMPARISON only -- it does not cut "
                         "the training set, which is a separate decision.")
-    p.add_argument("--flux-window", type=float, nargs=2, default=None,
-                   metavar=("LO", "HI"), help="same, on log10 Mf.")
+    p.add_argument("--flux-window", type=float, nargs=2,
+                   default=bias.FLUX_WINDOW, metavar=("LO", "HI"),
+                   help="same, on Mf itself (not log10).")
     a = p.parse_args()
 
     m, q_true, r_true = (np.asarray(x[:a.n], np.float64)
@@ -221,7 +223,7 @@ def main():
     if a.size_window:
         keep &= (r_mf >= a.size_window[0]) & (r_mf <= a.size_window[1])
     if a.flux_window:
-        keep &= (lgf >= a.flux_window[0]) & (lgf <= a.flux_window[1])
+        keep &= (m[:, 0] >= a.flux_window[0]) & (m[:, 0] <= a.flux_window[1])
     if a.size_window or a.flux_window:
         print(f"  WINDOW keeps {keep.sum()} of {len(m)} ({keep.mean():.1%})")
         m, q, r, q_true, r_true, s = (x[keep] for x in

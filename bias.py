@@ -127,6 +127,21 @@ jax.config.update("jax_default_matmul_precision", "highest")
 
 # Catalogs, as (label, filename stem), per population.  The +/- pair share a
 # seed and so are the same galaxies; the g=0 run is the same galaxies again.
+# The target selection the real analysis applies, recorded here so it is not
+# re-invented per script.  A size window in Mr/Mf and a flux window in Mf, as
+# on sky.  These are NOT yet wired into `main` -- eq. (40)/(46)'s selection
+# terms are owed before a cut may be applied to a bias measurement -- but they
+# are what `dev/check_dmdg_components.py` restricts its comparison to, since
+# the response outside the window is never used.
+#
+# Measured on bulgedisc: the size window keeps 76.4% (4.9% below 2.2, 18.7%
+# above 3.5) and the flux window 94.9% standalone but only 3.1% more inside the
+# size window -- the two are largely redundant, because the faint galaxies are
+# mostly the small-Mr/Mf ones already cut (median Mf 2548 below Mr/Mf = 2.2
+# against 5202 above).  Both together keep 74.1%.
+SIZE_WINDOW = (2.2, 3.5)          # Mr/Mf
+FLUX_WINDOW = (2500.0, 50000.0)   # Mf
+
 CATALOGS = {
     "bulgedisc": {"plus": "targets_g1p02_1M", "minus": "targets_g1m02_1M",
                   "zero": "targets_g0_1M"},
