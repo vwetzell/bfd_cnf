@@ -209,7 +209,20 @@ def _scale(m):
     return jnp.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1], m[:, 4]], axis=-1)
 
 
-def _shift_mse(layer, chart, m0, target, sigma_x):
+def shift_norms(m0, target):
+    """RMS of each moment's shift, in `_scale` units -- see `shear.partial_norms`.
+
+    The same imbalance, worse: the measured copy-mean shift runs 4e-3 to 1.2e-2
+    fractionally on Mf, Mr and Mc but ~1e-5 on M1 and M2, a factor of a
+    thousand, so a plain mean over the five weighs the spin-2 pair at 1e-6 of
+    the total and leaves it unsupervised.  The spin-2 part is the whole point of
+    the layer -- it is the ellipticity amplification that reads out as
+    multiplicative bias.
+    """
+    return jnp.sqrt(jnp.mean((target / _scale(m0)) ** 2, axis=0))     # (5,)
+
+
+def _shift_mse(layer, chart, m0, target, sigma_x, norms=None):
     """L2 between the layer's shift and the catalog's weighted copy mean shift.
 
     The direct analogue of `shear._velocity_mse`, and needed for the same reason:
@@ -224,11 +237,12 @@ def _shift_mse(layer, chart, m0, target, sigma_x):
     """
     pred = jax.vmap(dm_dsigma, in_axes=(None, 0, None, None))(
         layer, m0, sigma_x, chart)
-    return jnp.mean(((pred - target) / _scale(m0)) ** 2)
+    n = 1.0 if norms is None else norms
+    return jnp.mean(((pred - target) / _scale(m0) / n) ** 2)
 
 
 def train(flow, sampler, sigma_x, shift_target, key, steps=4000, batch=1024,
-          lr=3e-3, shift_weight=0.0):
+          lr=3e-3, shift_weight=1e4):
     """Likelihood only by default -- see `shear.train` for the reasoning.
 
     The specific worry here, from `_shift_mse`'s own docstring: the
@@ -242,6 +256,7 @@ def train(flow, sampler, sigma_x, shift_target, key, steps=4000, batch=1024,
     sx = jnp.asarray(sigma_x, dtype=jnp.float32)
     m_gal = jnp.asarray(shift_target[0], dtype=jnp.float32)
     d_gal = jnp.asarray(shift_target[1], dtype=jnp.float32)
+    norms = shift_norms(m_gal, d_gal)
     opt = optax.chain(optax.clip_by_global_norm(1.0),
                       optax.adam(optax.cosine_decay_schedule(lr, steps)))
     params, static = eqx.partition(flow, _trainable(flow))
@@ -271,7 +286,7 @@ def train(flow, sampler, sigma_x, shift_target, key, steps=4000, batch=1024,
             if not shift_weight:
                 return nll, (nll, jnp.zeros(()), 1.0 - jnp.mean(ok))
             mse = _shift_mse(_centroid_layer(model), _chart(model),
-                             m_gal[gi], d_gal[gi], sx)
+                             m_gal[gi], d_gal[gi], sx, norms)
             return nll + shift_weight * mse, (nll, mse, 1.0 - jnp.mean(ok))
 
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -356,7 +371,7 @@ def main():
                    help="shear checkpoint to warm-start bulk+shear from")
     p.add_argument("--steps", type=int, default=4000)
     p.add_argument("--batch", type=int, default=1024)
-    p.add_argument("--shift-weight", type=float, default=0.0,
+    p.add_argument("--shift-weight", type=float, default=1e4,
                    help="weight on the supervised shift MSE; 0 trains on the "
                         "likelihood alone, which the 1e-3 signal is too small for")
     p.add_argument("--sigma-scale", type=float, default=1.0,

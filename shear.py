@@ -76,7 +76,7 @@ from models.shear import ShearResponse, dm_dg
 
 # Second-order in g is the model (paper sec. 5.5), so training over a range wider
 # than any real shear costs nothing and pins the quadratic term down properly.
-G_MAX = 0.15
+G_MAX = 0.02          # the operating point of the bias measurement
 
 
 def load(path):
@@ -166,7 +166,34 @@ def band_weight(m, k, edge=BAND, width=0.08):
     return jnp.asarray(w / w.mean())
 
 
-def _velocity_mse(layer, chart, m, q_true, r_true, score=None, wt=None):
+def partial_norms(m, q_true, r_true):
+    """RMS of each individual partial, in `_scale` units, over the training set.
+
+    Ten first-order partials d m_i / d g_a and fifteen second-order ones, and
+    they differ enormously in size: d M1/d g1 has RMS 0.367 while d M1/d g2 has
+    0.0134, a factor of 27, i.e. 750 in the squared error a plain mean over the
+    array weighs them by.  The small ones were therefore effectively
+    unsupervised -- measured, the off-diagonal spin-2 partial sat at 38.6%
+    residual against a 1.43% Var[Q|m] floor while the diagonal was at 1.9%.
+
+    Dividing each partial by its own RMS makes the loss the mean of ten (and
+    fifteen) equally weighted `residual / RMS truth` terms -- exactly the
+    quantity `dev/check_dmdg_components.py` reports, rather than something the
+    largest partial dominates.
+
+    Note what this trades away: a partial that is mostly Var[Q|m] scatter is now
+    weighted as heavily as one that is fully determined by m, so capacity goes
+    to chasing noise there.  The off-diagonal spin-2 has a 1.43% floor and the
+    g1g2 cross terms have no measured floor at all, so that is worth watching.
+    """
+    s = _scale(m)[:, None, :]
+    nq = jnp.sqrt(jnp.mean((q_true / s) ** 2, axis=0))          # (2, 5)
+    nr = jnp.sqrt(jnp.mean((r_true / s) ** 2, axis=0))          # (3, 5)
+    return nq, nr
+
+
+def _velocity_mse(layer, chart, m, q_true, r_true, norms=None,
+                  score=None, wt=None):
     """L2 distance between the layer's transport velocity and the templates'
     own shear derivatives, normalised by `_scale` so it is
     dimensionless, flux-blind, and weighs every galaxy equally.  Its minimiser
@@ -183,8 +210,9 @@ def _velocity_mse(layer, chart, m, q_true, r_true, score=None, wt=None):
     q, r = jax.vmap(dm_dg, in_axes=(None, 0, None))(layer, m, chart)
     s = _scale(m)[:, None, :]
     w = 1.0 if wt is None else wt[:, None, None]
-    mse = (jnp.mean(w * ((q - q_true) / s) ** 2)
-           + jnp.mean(w * ((r - r_true) / s) ** 2))
+    nq, nr = (1.0, 1.0) if norms is None else norms
+    mse = (jnp.mean(w * ((q - q_true) / s / nq) ** 2)
+           + jnp.mean(w * ((r - r_true) / s / nr) ** 2))
     if score is None:
         return mse, jnp.zeros(())
     # q is (batch, shear, moment); the score contracts the moment index.
@@ -212,7 +240,7 @@ def bulk_score(flow, m, chunk=10000):
 
 
 def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
-          deriv_weight=0.0, varq=0.0, score_weight=0.0, band=1.0, g_max=G_MAX):
+          deriv_weight=1e4, varq=0.0, score_weight=0.0, band=1.0, g_max=G_MAX):
     """Likelihood only by default.
 
     `deriv_weight` used to be 1e4, regressing the layer's response against bfd's
@@ -256,6 +284,8 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
         import varq as varq_mod
         r_tgt = r + varq * varq_mod.target_offset(flow, m, q)
         print(f"added {varq:g} x the Var[Q|m] offset to the second-order target")
+    # One set of per-partial normalisers for the whole run, from the truth.
+    norms = partial_norms(m, q, r_tgt)
     opt = optax.chain(optax.clip_by_global_norm(1.0),
                       optax.adam(optax.cosine_decay_schedule(lr, steps)))
     params, static = eqx.partition(flow, _trainable(flow, bulk_frozen))
@@ -281,8 +311,7 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
                 # rather than being computed and multiplied by zero.
                 return nll, (nll, jnp.zeros(()), jnp.zeros(()))
             mse, first = _velocity_mse(_shear_layer(model), _chart(model),
-                                       m[idx], q[idx],
-                                       r_tgt[idx],
+                                       m[idx], q[idx], r_tgt[idx], norms,
                                        None if score is None else score[idx],
                                        None if wt is None else wt[idx])
             return (nll + deriv_weight * mse + score_weight * first,
@@ -548,7 +577,7 @@ def main():
                    help="shear-stage learning rate. It has never been tuned "
                         "UPWARD, and it moved the old noiseless metric 5x -- "
                         "more than every architectural axis combined.")
-    p.add_argument("--deriv-weight", type=float, default=0.0,
+    p.add_argument("--deriv-weight", type=float, default=1e4,
                    help="weight on the velocity-matching term relative to the NLL")
     p.add_argument("--varq", type=float, default=0.0,
                    help="scale on the Var[Q|m] offset to the second-order "
