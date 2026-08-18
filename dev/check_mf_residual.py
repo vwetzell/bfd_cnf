@@ -54,6 +54,51 @@ ANSWER (2026-08-17), per-partial-supervised flow, inside the target window.
    flux-blindness thread for good.  Concentrated at LOW k = Mc Mf/Mr^2, which is
    correlated with high Mr/Mf and probably the same galaxies.
 
+2b. AND THE CAUSE IS THE LOSS WEIGHT, measured end to end.  The layer's Mf
+   coefficient a0 (dlogMf = a0 Re(ebar g), extractable from both sides) is
+   SYSTEMATICALLY too large, and the bias grows monotonically with size:
+
+       Mr/Mf <   a0 truth  a0 layer     bias   rms err   sd(truth)
+         2.883     1.4361    1.4288   +0.0009    0.0905     0.1478
+         3.132     1.6859    1.6929   +0.0248    0.0881     0.0922
+         3.270     1.8228    1.9127   +0.1000    0.1265     0.0740
+         3.361     1.9096    2.1055   +0.2022    0.2035     0.0580
+         3.430     1.9674    2.2503   +0.2865    0.2830     0.0525
+         3.500     2.0145    2.3904   +0.3788    0.3792     0.0506
+
+   In the top bin bias and rms err are EQUAL to three digits, so the error there
+   is essentially pure systematic -- the coefficient is 19% too large -- and it
+   is 7.5x the entire spread of the true coefficient in that bin.  This CORRECTS
+   item 1: the global decomposition called it scatter because it used one global
+   slope, and a size-DEPENDENT systematic looks like scatter to a single number.
+
+   Why the supervision allows it:
+
+       Mr/Mf <   median |e|   RMS response   share of loss   share of resid
+         2.880       0.0709         0.0904          39.4%             7.5%
+         3.130       0.0468         0.0713          24.5%             5.3%
+         3.271       0.0354         0.0565          15.4%            11.6%
+         3.361       0.0275         0.0458          10.1%            22.5%
+         3.430       0.0222         0.0378           6.9%            27.5%
+         3.500       0.0159         0.0279           3.8%            25.7%
+
+   Galaxies get rounder toward the point-source limit (|e| falls 4.5x), the Mf
+   response is a0 Re(ebar g) and so carries that |e|, and `_velocity_mse` weighs
+   each template by its squared true response -- so the loss share collapses 10x
+   and the point-source end receives 3.8% of the supervision while carrying
+   25.7% of the residual at the TIGHTEST floor.
+
+   This is the same imbalance as the between-partial one fixed in 49ae184, one
+   level down: within a partial, across the population.  Dividing by `_scale`
+   makes residuals fractional per moment and does nothing about |e|.
+
+   THE FIX THE STRUCTURE SUGGESTS: supervise the COEFFICIENT a0, not the
+   response.  a0 is what the coefficient network emits, is smooth, is tightly
+   determined (sd 0.05 at the ceiling), and carries no |e| -- so the weighting
+   problem disappears rather than being patched.  `shear._spin0_a` and
+   `_spin2_AB` already extract these, which is why `response_scatter`'s floors
+   are |e|-free and fall toward the ceiling while the fit worsens.
+
 3. NOT TRADED AGAINST THE OTHER MOMENTS.  Residual correlations: Mf-Mr +0.146,
    Mf-Mc +0.128, Mf-M1 +0.005, Mf-M2 +0.007.  The "one 3x3 s0 shared across the
    spin-0 block, so Mf absorbs the compromise" story was the first explanation
