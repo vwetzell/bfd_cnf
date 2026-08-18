@@ -1,0 +1,163 @@
+"""Per-partial-derivative comparison of the layer's dm/dg against bfd's.
+
+`shear.check` reports `RMS residual / RMS truth` after averaging over the target
+axis AND the g axis, so it collapses the ten partials d m_i / d g_a into five
+numbers and cannot see direction-specific error.  It also gives one number per
+moment with no reference, which is uninterpretable on its own: `shear.py
+scatter` measures a Var[Q|m] FLOOR of 2.09% (Mf), 20.98% (Mr), 33.38% (Mc) and
+1.43% (spin-2), so a 27% residual on Mr is at the information limit while a 27%
+residual on Mf is 13x above it.
+
+This splits g1 from g2 and decomposes each partial into the two things that
+matter separately:
+
+    pred  =  slope * truth  +  scatter
+
+  * `slope`, the regression through the origin <pred.truth>/<truth^2>.  A
+    deterministic transport can only carry E[dm/dg | m], so it SHOULD shrink the
+    response toward its conditional mean -- but a slope far from 1 is a
+    systematic error, not the floor.
+  * `1 - corr^2`, the share of the response the layer does not explain at all.
+    This is what should approach the Var[Q|m] floor if the fit is as good as the
+    moments allow.
+
+Splitting them matters because `RMS resid / RMS truth` mixes the two:
+    (resid/truth)^2 = (1 - slope)^2 + scatter^2/truth^2
+so a fit that is perfectly calibrated but noisy and one that is quiet but
+systematically half the right size can report the same number.
+
+An indexing self-check runs first.  bfd's response is spin-2, so d Mf/d g1 must
+correlate with e1 and d Mf/d g2 with e2; if the (2, 5) axes were transposed or
+the moment order differed, that correlation would land in the wrong place.
+
+    python dev/check_dmdg_components.py --flow flows/shear_cfo.eqx
+
+ANSWER (2026-08-17), chart-first ordering, 20000 bulgedisc templates.
+
+INDEXING VERIFIED, so `dm_dg`'s chart composition is doing the right thing:
+corr(dMf/dg1, e1) = +0.960 against corr(dMf/dg1, e2) = -0.012, and the mirror
+for g2 -- clean spin-2 structure on bfd's truth, no transpose, no moment-order
+mismatch.  Independently, four of five collapsed columns land at their Var[Q|m]
+floors; a broken change of variables could not produce that pattern.
+
+`shear.check` HIDES THE LARGEST DEFECT.  M1's two partials differ by 27x in
+magnitude, and averaging over g buries the small one:
+
+    d M1/d g1 (diagonal)      RMS truth 0.3669   resid  1.9%   floor 1.4%
+    d M1/d g2 (off-diagonal)  RMS truth 0.0134   resid 38.6%   floor 1.4%
+    collapsed (what check prints)                resid  2.30%
+
+So the off-diagonal spin-2 response is 27x above its floor and invisible in the
+reported number.
+
+Mf AMPLIFIES: slope 1.197.  A deterministic transport carries E[Q|m], whose
+variance is SMALLER than Q's, so slope <= 1 is forced.  Mr (0.895), Mc (0.731)
+and the diagonal spin-2 (0.999) all obey it; Mf does not, and no conditional-mean
+argument produces amplification.  A real defect, in the one column the chain
+reorder moved off its floor.
+
+THE NLL DOES CONVERGE TO WHAT IT IS TRAINED ON -- for the component that carries
+the signal.  With the supervision off:
+
+    d M1/d g1  slope 1.002  corr 0.997  resid  7.6%    RMS truth 0.367
+    d Mf/d g   slope 0.563  corr 0.684  resid   74%    RMS truth 0.056
+    d Mr/d g   slope 0.320  corr 0.502  resid   87%    RMS truth 0.083
+    d Mc/d g   slope 0.114  corr 0.280  resid   97%    RMS truth 0.102
+
+The dominant spin-2 response comes out essentially exact; only the spin-0
+components, 3.5-6.5x smaller in the data, fail.  "The response is not
+identifiable from the likelihood" was too broad a reading of the collapsed
+numbers.
+
+Separate open thread: the g1g2 CROSS second derivatives are uniformly poor
+(slope 0.67-0.90, resid 43-55%) while the g1g1 and g2g2 diagonals are fine
+(2.1%, 6.2%, 11.5%).  No Var[R|m] floor has been measured, so there is no
+reference for how bad that actually is.
+"""
+import argparse
+import sys
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import jax.random as jr
+import numpy as np
+
+sys.path.insert(0, ".")
+
+import bulk                                          # noqa: E402
+import shear as shear_top                            # noqa: E402
+from models.shear import dm_dg                       # noqa: E402
+
+LAB = ["Mf", "Mr", "M1", "M2", "Mc"]
+# `shear.py scatter` on the bulgedisc training set, for reference.
+FLOOR = {"Mf": 0.0209, "Mr": 0.2098, "Mc": 0.3338, "M1": 0.0143, "M2": 0.0143}
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--flow", default="flows/shear_cfo.eqx")
+    p.add_argument("--data", default="../bfd_cnf_imsims/data/moments.fits")
+    p.add_argument("-n", type=int, default=20000)
+    a = p.parse_args()
+
+    m, q_true, r_true = (np.asarray(x[:a.n], np.float64)
+                         for x in shear_top.load(a.data))
+    flow = bulk.build_flow(jr.key(0), shear_top.load(a.data)[0], shear=True)
+    flow = eqx.tree_deserialise_leaves(a.flow, flow)
+    layer, chart = shear_top._shear_layer(flow), shear_top._chart(flow)
+
+    q, r = jax.vmap(dm_dg, in_axes=(None, 0, None))(
+        layer, jnp.asarray(m, jnp.float32), chart)
+    q = np.asarray(q, np.float64)                     # (n, 2, 5)
+    r = np.asarray(r, np.float64)                     # (n, 3, 5)
+    s = np.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1], m[:, 4]], -1)
+
+    print(f"{a.flow}: {len(m)} templates, q {q.shape}, truth {q_true.shape}")
+
+    # ---- indexing self-check: the response is spin-2, so dMf/dg1 ~ e1.
+    e1, e2 = m[:, 2] / m[:, 1], m[:, 3] / m[:, 1]
+    print("\nindexing check -- bfd truth only, no flow involved:")
+    for ai, an in ((0, "g1"), (1, "g2")):
+        c1 = np.corrcoef(q_true[:, ai, 0] / s[:, 0], e1)[0, 1]
+        c2 = np.corrcoef(q_true[:, ai, 0] / s[:, 0], e2)[0, 1]
+        print(f"  corr(dMf/d{an}, e1) = {c1:+.3f}   corr(dMf/d{an}, e2) = {c2:+.3f}"
+              f"   {'OK' if abs(c1 if ai == 0 else c2) > abs(c2 if ai == 0 else c1) else '<-- SWAPPED?'}")
+
+    def table(name, pred, truth, comps, first_order=True):
+        print(f"\n=== {name} ===")
+        print(f"  {'':10s} {'RMS truth/s':>12s} {'slope':>8s} {'corr':>7s} "
+              f"{'unexpl':>8s} {'floor':>7s} {'resid/truth':>12s}")
+        for ai, an in enumerate(comps):
+            for i, lab in enumerate(LAB):
+                t = truth[:, ai, i] / s[:, i]
+                p_ = pred[:, ai, i] / s[:, i]
+                tt = np.mean(t * t)
+                slope = np.mean(p_ * t) / tt
+                corr = np.mean(p_ * t) / np.sqrt(np.mean(p_ * p_) * tt)
+                unexpl = np.sqrt(max(0.0, 1.0 - corr ** 2))
+                resid = np.sqrt(np.mean((p_ - t) ** 2) / tt)
+                # The floor is FIRST ORDER only -- `shear.py scatter` measures
+                # Var[Q|m], not Var[R|m] -- so it is not a reference for the
+                # second-order block and is neither printed nor flagged there.
+                fl = FLOOR.get(lab, np.nan) if first_order else np.nan
+                flag = ("" if not first_order or resid < 1.6 * fl
+                        else "   <-- above floor")
+                print(f"  {an+' '+lab:10s} {np.sqrt(tt):12.4g} {slope:8.3f} "
+                      f"{corr:7.3f} {unexpl:8.1%} "
+                      f"{(f'{fl:7.1%}' if first_order else '      -')} "
+                      f"{resid:12.1%}{flag}")
+
+    table("dm/dg, per partial", q, q_true, ["g1", "g2"])
+    table("d2m/dg2, per partial", r, r_true, ["g1g1", "g1g2", "g2g2"],
+          first_order=False)
+    print("\n  slope   : <pred.truth>/<truth^2>; 1 = right size, <1 = shrunk.")
+    print("            A transport carries E[Q|m], which has LESS variance than")
+    print("            Q, so slope <= 1 is forced.  Above 1 is a real defect.")
+    print("  unexpl  : sqrt(1-corr^2), the share not explained at all")
+    print("  floor   : Var[Q|m] from `shear.py scatter` (first order only)")
+    print("  resid   : what `shear.check` prints, but split by g component")
+
+
+if __name__ == "__main__":
+    main()

@@ -228,7 +228,16 @@ def _shift_mse(layer, chart, m0, target, sigma_x):
 
 
 def train(flow, sampler, sigma_x, shift_target, key, steps=4000, batch=1024,
-          lr=3e-3, shift_weight=1e4):
+          lr=3e-3, shift_weight=0.0):
+    """Likelihood only by default -- see `shear.train` for the reasoning.
+
+    The specific worry here, from `_shift_mse`'s own docstring: the
+    marginalisation moves the moments by ~1e-3 fractionally, which is worth far
+    less likelihood than the batch noise on a 1024-galaxy NLL.  If that holds,
+    the signal never surfaces and the fix is a bigger `batch`, not more `steps`
+    -- it is a variance floor, not a convergence rate.  Measure before assuming
+    either way.
+    """
     cond = condition(sigma_x, batch)
     sx = jnp.asarray(sigma_x, dtype=jnp.float32)
     m_gal = jnp.asarray(shift_target[0], dtype=jnp.float32)
@@ -259,6 +268,8 @@ def train(flow, sampler, sigma_x, shift_target, key, steps=4000, batch=1024,
             lp = model.log_prob(jnp.where(ok[:, None], x, safe_point(x)),
                                 condition=cond)
             nll = -jnp.sum(jnp.where(ok, lp, 0.0)) / jnp.maximum(jnp.sum(ok), 1)
+            if not shift_weight:
+                return nll, (nll, jnp.zeros(()), 1.0 - jnp.mean(ok))
             mse = _shift_mse(_centroid_layer(model), _chart(model),
                              m_gal[gi], d_gal[gi], sx)
             return nll + shift_weight * mse, (nll, mse, 1.0 - jnp.mean(ok))
@@ -345,7 +356,7 @@ def main():
                    help="shear checkpoint to warm-start bulk+shear from")
     p.add_argument("--steps", type=int, default=4000)
     p.add_argument("--batch", type=int, default=1024)
-    p.add_argument("--shift-weight", type=float, default=1e4,
+    p.add_argument("--shift-weight", type=float, default=0.0,
                    help="weight on the supervised shift MSE; 0 trains on the "
                         "likelihood alone, which the 1e-3 signal is too small for")
     p.add_argument("--sigma-scale", type=float, default=1.0,

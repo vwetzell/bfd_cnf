@@ -212,7 +212,30 @@ def bulk_score(flow, m, chunk=10000):
 
 
 def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
-          deriv_weight=1e4, varq=0.0, score_weight=0.0, band=1.0):
+          deriv_weight=0.0, varq=0.0, score_weight=0.0, band=1.0):
+    """Likelihood only by default.
+
+    `deriv_weight` used to be 1e4, regressing the layer's response against bfd's
+    exact per-template dm/dg.  Turned OFF on 2026-08-17 for two reasons.
+
+    First, it kept being wrong in ways nothing caught.  The chain reorder broke
+    it silently -- the layer responds in standardised coordinates and the target
+    is in raw moments, so for one commit the loss compared incommensurate
+    quantities at weight 1e4 and no test failed.  `dm_dsigma` had the identical
+    bug.  A term that dominates the loss and cannot be checked by the suite is a
+    liability whatever it buys.
+
+    Second, and more useful: while the layer is FITTED to bfd's dm/dg, the
+    `check` comparison against bfd's dm/dg is not a validation of anything --
+    it is a training diagnostic.  With this off it becomes an independent
+    held-out test of whether the layer learned the right response from the
+    density alone.
+
+    The cost is convergence.  The g dependence is worth ~0.3 nats/galaxy against
+    a ~35 nat total, so on the NLL alone the signal is a small part of a noisy
+    objective.  Note the failure mode if it does not converge: that is a
+    VARIANCE floor, not a rate, so the knob is `batch`, not `steps`.
+    """
     m, q, r = (jnp.asarray(a) for a in data)
     wt = band_weight(data[0], band) if band != 1.0 else None
     score = None
@@ -251,6 +274,12 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
         def loss_fn(p):
             model = eqx.combine(p, static)
             nll = -jnp.mean(model.log_prob(x, condition=g))
+            if not (deriv_weight or score_weight):
+                # Guarded outside the traced branch, as bulk.train does with its
+                # score term: with the supervision off, `dm_dg` -- and with it
+                # the chart composition -- is not part of training at all,
+                # rather than being computed and multiplied by zero.
+                return nll, (nll, jnp.zeros(()), jnp.zeros(()))
             mse, first = _velocity_mse(_shear_layer(model), _chart(model),
                                        m[idx], q[idx],
                                        r_tgt[idx],
@@ -501,11 +530,17 @@ def main():
     p.add_argument("--init", default="flows/bulk.eqx",
                    help="bulk checkpoint to warm-start from (train only)")
     p.add_argument("--steps", type=int, default=6000)
+    p.add_argument("--batch", type=int, default=1024,
+                   help="templates per step (antithetic: batch//2 templates, "
+                        "each at +g and -g). With the response supervision off "
+                        "the g signal is a small part of a noisy NLL, and that "
+                        "is a VARIANCE floor -- 4x the steps moves nothing, so "
+                        "this is the knob that matters.")
     p.add_argument("--lr", type=float, default=3e-3,
                    help="shear-stage learning rate. It has never been tuned "
                         "UPWARD, and it moved the old noiseless metric 5x -- "
                         "more than every architectural axis combined.")
-    p.add_argument("--deriv-weight", type=float, default=1e4,
+    p.add_argument("--deriv-weight", type=float, default=0.0,
                    help="weight on the velocity-matching term relative to the NLL")
     p.add_argument("--varq", type=float, default=0.0,
                    help="scale on the Var[Q|m] offset to the second-order "
@@ -560,7 +595,8 @@ def main():
                 lambda f: [f.bijection.bijection.bijections[i] for i in keep],
                 flow, list(bulk_only.bijection.bijection.bijections))
             print(f"warm started bulk from {a.init}")
-        flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps, lr=a.lr,
+        flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps,
+                     batch=a.batch, lr=a.lr,
                      deriv_weight=a.deriv_weight, varq=a.varq,
                      score_weight=a.score_weight, band=a.band)
         print(f"val nll {val_nll(flow, val_set, jr.key(99)):.4f}")
