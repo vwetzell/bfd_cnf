@@ -65,8 +65,13 @@ def test_support_closes_at_the_mc_ceiling():
     z = jnp.zeros((5, 5)).at[:, 2].set(jnp.array([0.0, 5.0, 10.0, 50.0, 1e4]))
     x, _ = jax.vmap(b.inverse_and_log_det)(z)
     c = np.asarray(x[:, 4] / x[:, 1])
-    # Same saturation argument as slot 1's version above.
-    assert (c <= POINT_SOURCE_MC).all(), c
+    # Same saturation argument as slot 1's version above, plus one float32
+    # rounding ulp: once the sigmoid saturates the product is POINT_SOURCE_MC
+    # exactly in real arithmetic, and float32 rounds 6.662089 to 6.6620893.
+    # Without the tolerance this test passes ONLY when another test file has
+    # already switched jax to x64 -- it was doing exactly that, via
+    # tests/test_centroid.py, and failed when run on its own.
+    assert (c <= POINT_SOURCE_MC * (1 + 1e-6)).all(), c
     assert in_domain(x[:3]).all()
 
 
@@ -104,3 +109,37 @@ def test_build_flow_rejects_out_of_domain_training_data():
     m[3, 1] = POINT_SOURCE * m[3, 0] * 1.01
     with pytest.raises(ValueError, match="point-source ceiling"):
         bulk.build_flow(jr.key(0), m)
+
+
+def test_point_source_constants_match_the_weight_function():
+    """POINT_SOURCE and POINT_SOURCE_MC recomputed from bfd's actual weight.
+
+    Both are properties of the weight function -- a point source has
+    Itilde/T = 1, so its moments ARE the pure weight moments and the ceilings
+    are sum(W k^2)/sum(W) and sum(W k^4)/sum(W k^2).  Their own comments say
+    they must be recomputed whenever the weight changes, and record that
+    POINT_SOURCE was once silently stale by 1.7% -- which put the real support
+    boundary at a finite logit and handed the flow an interior cliff to learn.
+
+    `set_k` demands both axes reach kmax, so this needs a genuine 2-D grid.
+    """
+    from bfd.weightfunction import KBlackmanHarris
+
+    # imsims is a sibling checkout and is not installed; the suite only found it
+    # before because tests/test_truth.py imports `truth`, which puts it on the
+    # path as a side effect.  Do it here so this test stands on its own.
+    sys.path.insert(0, "../bfd_cnf_imsims")
+    from imsims import sim
+
+    w = KBlackmanHarris(weightSigma=sim.WEIGHT_SIGMA)
+    ax = np.linspace(-1.01 * w.kmax, 1.01 * w.kmax, 1501)
+    kx, ky = np.meshgrid(ax, ax, indexing="ij")
+    w.set_k(kx, ky)
+    kr2 = (kx ** 2 + ky ** 2).ravel()
+    W = np.zeros(kr2.shape)
+    W[np.asarray(w.mask_flat)] = np.asarray(w.w_mask)
+
+    ps = (W * kr2).sum() / W.sum()
+    ps_mc = (W * kr2 ** 2).sum() / (W * kr2).sum()
+    assert abs(ps / POINT_SOURCE - 1) < 1e-4, (ps, POINT_SOURCE)
+    assert abs(ps_mc / POINT_SOURCE_MC - 1) < 1e-4, (ps_mc, POINT_SOURCE_MC)
