@@ -92,12 +92,25 @@ ANSWER (2026-08-17), per-partial-supervised flow, inside the target window.
    level down: within a partial, across the population.  Dividing by `_scale`
    makes residuals fractional per moment and does nothing about |e|.
 
-   THE FIX THE STRUCTURE SUGGESTS: supervise the COEFFICIENT a0, not the
-   response.  a0 is what the coefficient network emits, is smooth, is tightly
-   determined (sd 0.05 at the ceiling), and carries no |e| -- so the weighting
-   problem disappears rather than being patched.  `shear._spin0_a` and
-   `_spin2_AB` already extract these, which is why `response_scatter`'s floors
-   are |e|-free and fall toward the ceiling while the fit worsens.
+   TESTED, AND THE WEIGHT IS NOT THE CAUSE.  `shear.partial_norms(nbin=20)`
+   normalises each partial within Mr/Mf bins, which for Mf is exactly
+   coefficient supervision with a locally-normalised |e|^2 weight.  It equalises
+   the loss as designed -- the dMf/dg share per size bin went
+
+       45.2 / 26.4 / 14.5 / 8.5 / 4.1 / 1.3  ->  16.8 / 16.6 / 16.6 / 16.8 / 16.7 / 16.5
+
+   a 35x imbalance flattened -- and the a0 bias DID NOT MOVE: +0.3723 in the top
+   bin against +0.3788 before, with every other bin equally unchanged.  It also
+   cost the diagonal spin-2 (3.07% -> 6.51%), so `nbin` defaults back to 1.
+
+   So the point-source-end coefficient error is NOT a supervision-weight
+   problem.  The layer is not failing there because it is under-asked; asking 35
+   times harder changes nothing.  That leaves structure or optimisation, and the
+   obvious structural suspects do not fit either: a0_layer is proportional to
+   s0[0,0] alone at first order (p2 and p3 have vanishing g-derivative at g=0),
+   the required s0[0,0] is ~2.4 against a _COEFF_MAX of 12 so nothing saturates,
+   and the coefficient net's inputs (z0, z1, z2, q) carry the same information
+   as the (r, k, q) that `response_scatter` fits to a 0.92% floor in that bin.
 
 3. NOT TRADED AGAINST THE OTHER MOMENTS.  Residual correlations: Mf-Mr +0.146,
    Mf-Mc +0.128, Mf-M1 +0.005, Mf-M2 +0.007.  The "one 3x3 s0 shared across the

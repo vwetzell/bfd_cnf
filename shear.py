@@ -166,30 +166,66 @@ def band_weight(m, k, edge=BAND, width=0.08):
     return jnp.asarray(w / w.mean())
 
 
-def partial_norms(m, q_true, r_true):
-    """RMS of each individual partial, in `_scale` units, over the training set.
+def partial_norms(m, q_true, r_true, nbin=1):
+    """Per-template, per-partial RMS of the truth, binned in Mr/Mf.
 
-    Ten first-order partials d m_i / d g_a and fifteen second-order ones, and
-    they differ enormously in size: d M1/d g1 has RMS 0.367 while d M1/d g2 has
-    0.0134, a factor of 27, i.e. 750 in the squared error a plain mean over the
-    array weighs them by.  The small ones were therefore effectively
-    unsupervised -- measured, the off-diagonal spin-2 partial sat at 38.6%
-    residual against a 1.43% Var[Q|m] floor while the diagonal was at 1.9%.
+    Two imbalances, one mechanism, fixed in one place.
 
-    Dividing each partial by its own RMS makes the loss the mean of ten (and
-    fifteen) equally weighted `residual / RMS truth` terms -- exactly the
-    quantity `dev/check_dmdg_components.py` reports, rather than something the
-    largest partial dominates.
+    BETWEEN PARTIALS: d M1/d g1 has RMS 0.367 and d M1/d g2 has 0.0134, so a
+    plain mean over the (2, 5) array weighs them 750:1 and the small partials go
+    unsupervised.
 
-    Note what this trades away: a partial that is mostly Var[Q|m] scatter is now
-    weighted as heavily as one that is fully determined by m, so capacity goes
-    to chasing noise there.  The off-diagonal spin-2 has a 1.43% floor and the
-    g1g2 cross terms have no measured floor at all, so that is worth watching.
+    ACROSS THE POPULATION, which a single global normaliser per partial does not
+    touch: the spin-0 response is `dX/dg = X a_X Re(ebar g)`, so the residual
+    carries a factor of |e| -- and |e| falls 4.5x toward the point-source limit
+    because nearly unresolved galaxies are nearly round.  Weighting by the
+    squared response therefore hands the point-source end 3.8% of the loss
+    against 39.4% for the diffuse end.  Measured consequence: the Mf coefficient
+    a0 came out 19% too large at the ceiling, an error 7.5x the entire spread of
+    the true coefficient there, in the bin with the TIGHTEST Var[Q|m] floor.
+
+    TESTED AND NULL, which is why `nbin` defaults to 1 (one global normaliser
+    per partial, i.e. the between-partial fix only).  Binning in Mr/Mf DOES
+    equalise the loss -- measured, the dMf/dg share per size bin went from
+    45.2 / 26.4 / 14.5 / 8.5 / 4.1 / 1.3 percent to a flat 16.5-16.8 -- and the
+    a0 bias did not move at all: +0.3723 in the top bin against +0.3788 before.
+    So the point-source-end coefficient error is NOT a supervision-weight
+    problem; the layer is not failing there because it is under-asked.  It also
+    cost the diagonal spin-2 (3.07% -> 6.51%), so the default stays global.
+
+    The reasoning that motivated it, kept because the measurement is the useful
+    part: normalising within Mr/Mf bins would fix the second imbalance without
+    breaking the first.
+    Note what is deliberately KEPT: inside a bin the |e|^2 weighting survives,
+    and it should -- a round galaxy has no first-order spin-0 response, so it
+    genuinely says nothing about a_X (`_spin0_a`: the coefficient inverts out
+    with |e|^2 as its natural weight).  What was wrong was comparing bins, not
+    comparing galaxies within one.
+
+    Equivalently: for Mf the scale IS the moment, so the residual-space loss is
+    `sum_b (a_layer - a_true)^2 |e_b|^2` -- coefficient supervision weighted by
+    |e|^2.  This makes that weight local rather than global.
     """
-    s = _scale(m)[:, None, :]
-    nq = jnp.sqrt(jnp.mean((q_true / s) ** 2, axis=0))          # (2, 5)
-    nr = jnp.sqrt(jnp.mean((r_true / s) ** 2, axis=0))          # (3, 5)
-    return nq, nr
+    m, q_true, r_true = (np.asarray(x, np.float64) for x in (m, q_true, r_true))
+    s = np.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1], m[:, 4]], -1)[:, None, :]
+    tq, tr = q_true / s, r_true / s
+    r = m[:, 1] / m[:, 0]
+    ed = np.quantile(r, np.linspace(0.0, 1.0, nbin + 1))
+    idx = np.clip(np.searchsorted(ed[1:-1], r, side="right"), 0, nbin - 1)
+    nq = np.empty_like(tq)
+    nr = np.empty_like(tr)
+    for b in range(nbin):
+        sel = idx == b
+        if not sel.any():
+            continue
+        nq[sel] = np.sqrt(np.mean(tq[sel] ** 2, axis=0))
+        nr[sel] = np.sqrt(np.mean(tr[sel] ** 2, axis=0))
+    # A partial that is identically zero in some bin would divide by zero; fall
+    # back to its global RMS there rather than inventing a weight.
+    gq, gr = np.sqrt(np.mean(tq ** 2, 0)), np.sqrt(np.mean(tr ** 2, 0))
+    nq = np.where(nq > 1e-12 * gq, nq, gq)
+    nr = np.where(nr > 1e-12 * gr, nr, gr)
+    return jnp.asarray(nq), jnp.asarray(nr)
 
 
 def _velocity_mse(layer, chart, m, q_true, r_true, norms=None,
@@ -311,7 +347,8 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
                 # rather than being computed and multiplied by zero.
                 return nll, (nll, jnp.zeros(()), jnp.zeros(()))
             mse, first = _velocity_mse(_shear_layer(model), _chart(model),
-                                       m[idx], q[idx], r_tgt[idx], norms,
+                                       m[idx], q[idx], r_tgt[idx],
+                                       (norms[0][idx], norms[1][idx]),
                                        None if score is None else score[idx],
                                        None if wt is None else wt[idx])
             return (nll + deriv_weight * mse + score_weight * first,
