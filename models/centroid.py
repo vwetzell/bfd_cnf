@@ -229,15 +229,15 @@ def _tensor(z, sigma_x, mean, std):
 
 
 class _Coeffs(eqx.Module):
-    """(a, b, q) -> the nine real response coefficients, bounded by _COEFF_MAX."""
+    """(f, a, b, q) -> the nine response coefficients, bounded by _COEFF_MAX."""
 
     net: CoeffNet
 
     def __init__(self, key, nn_width, nn_depth, activation):
-        self.net = CoeffNet(key, 3, N_COEFFS, nn_width, nn_depth, activation)
+        self.net = CoeffNet(key, 4, N_COEFFS, nn_width, nn_depth, activation)
 
-    def __call__(self, a, b, q):
-        u = jnp.stack([a, b, (q - _Q_LOC) / _Q_SCALE])
+    def __call__(self, f, a, b, q):
+        u = jnp.stack([f, a, b, (q - _Q_LOC) / _Q_SCALE])
         return _COEFF_MAX * jnp.tanh(self.net(u) / _COEFF_MAX)
 
 
@@ -321,8 +321,8 @@ class CentroidMarginalize(AbstractBijection):
         the chain.
         """
         sigma_x = condition[-3:]
-        a, b, q, _ = _invariants(x)
-        return response(self.coeffs(a, b, q), x, sigma_x,
+        f, a, b, q, _ = _invariants(x)
+        return response(self.coeffs(f, a, b, q), x, sigma_x,
                         unwrap(self.mean), unwrap(self.std))
 
     def marginalize(self, y, sigma_x):

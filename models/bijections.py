@@ -709,7 +709,7 @@ class Spin0AutoregressiveLayer(AbstractBijection):
     Transforms components 0, 1, 2 of the input vector with an affine
     autoregressive map:
 
-    * ``z[0] = x[0] * exp(-s0)`` — unconditional scale.
+    * ``z[0] = (x[0] - loc0) * exp(-s0)`` — unconditional affine.
     * ``z[1] = (x[1] - loc1(z[0])) * exp(-s1(z[0]))`` — conditioned on z[0].
     * ``z[2] = (x[2] - loc2(z[0], z[1])) * exp(-s2(z[0], z[1]))``.
 
@@ -729,12 +729,19 @@ class Spin0AutoregressiveLayer(AbstractBijection):
         Activation function for the scale network.
     """
 
+    loc0: jax.Array
     log_scale0: jax.Array
     net_ls1: CoeffNet
     net_ls2: CoeffNet
 
     def __init__(self, key, nn_width, nn_depth, activation):
         k1, k2 = jr.split(key, 2)
+        # The head of the autoregression gets a free LOCATION as well as a
+        # scale, which is what makes this an affine MAF step rather than a
+        # scale-only one.  Without it the head coordinate could be stretched but
+        # never re-centred -- and which coordinate is the head rotates with the
+        # permutation, so the deficit followed whichever one was in slot 0.
+        self.loc0 = jnp.zeros(())
         self.log_scale0 = jnp.zeros(())
         self.net_ls1 = CoeffNet(k1, 1, 2, nn_width, nn_depth, activation)
         self.net_ls2 = CoeffNet(k2, 2, 2, nn_width, nn_depth, activation)
@@ -753,7 +760,7 @@ class Spin0AutoregressiveLayer(AbstractBijection):
 
     def transform_and_log_det(self, x, condition=None):
         ls0 = _bounded_log_scale(self.log_scale0)
-        z0 = x[0] * jnp.exp(-ls0)
+        z0 = (x[0] - self.loc0) * jnp.exp(-ls0)
         loc1, ls1 = self._loc_scale(self.net_ls1, [z0])
         z1 = (x[1] - loc1) * jnp.exp(-ls1)
         loc2, ls2 = self._loc_scale(self.net_ls2, [z0, z1])
@@ -763,7 +770,7 @@ class Spin0AutoregressiveLayer(AbstractBijection):
 
     def inverse_and_log_det(self, y, condition=None):
         ls0 = _bounded_log_scale(self.log_scale0)
-        x0 = y[0] * jnp.exp(ls0)
+        x0 = y[0] * jnp.exp(ls0) + self.loc0
         loc1, ls1 = self._loc_scale(self.net_ls1, [y[0]])
         x1 = y[1] * jnp.exp(ls1) + loc1
         loc2, ls2 = self._loc_scale(self.net_ls2, [y[0], y[1]])

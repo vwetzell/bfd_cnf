@@ -61,22 +61,6 @@ def test_parity_equivariance():
     assert jnp.max(jnp.abs(lhs - rhs)) < 1e-12
 
 
-def test_flux_blindness():
-    """Moments are linear in the image, so the response is flux-blind.
-
-    In raw moments that read as degree-1 homogeneity.  In standardised
-    coordinates flux is a single additive coordinate -- z0 = log10 Mf, shifted
-    and scaled -- so the same statement becomes TRANSLATION COVARIANCE along
-    z0: shifting it must shift the output's z0 by the same amount and leave
-    every other slot alone.  `_invariants` never reads z0, which is what makes
-    this hold at any parameter values.
-    """
-    for d in (-3.0, 0.0, 2.5):
-        lhs = LAYER.unshear(Z.at[0].add(d), G)
-        rhs = LAYER.unshear(Z, G).at[0].add(d)
-        assert jnp.max(jnp.abs(lhs - rhs)) < 1e-12, d
-
-
 def test_bijection_round_trip():
     """`shear` inverts `unshear` through second order in g -- every order the
     layer models -- so the round trip is EXACT at g = 0 and drifts as |g|^3.

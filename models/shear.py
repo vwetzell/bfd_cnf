@@ -37,21 +37,33 @@ d(M1,M2)/dg at fixed [Mr/Mf, |e|^2] is 8.1%, and adding Mc drops it to 2.0%
 parity-symmetric, so every coefficient above is REAL.  (Equivalently: the
 parity-odd partners Im(e*g) etc. are forbidden.)
 
-**Flux.**  Moments are linear in the image, so scaling a galaxy's flux scales
-both its moments and their shear derivatives by the same factor.  The fourteen
-coefficients therefore depend on the three dimensionless invariants
+**Flux.**  Moments are linear in the image, so scaling ONE galaxy's flux scales
+both its moments and their shear derivatives by the same factor.  That is exact
+and is not in question.
 
-    r = Mr/Mf   (size)     k = Mc Mf/Mr^2  (concentration)     q = |e|^2  (shape)
+What used to be inferred from it -- that the coefficients must therefore be
+flux-blind, and that `_Coeffs` taking three scale-free inputs was "not a
+modelling choice" -- does NOT follow, and the flux input was restored on
+2026-08-17.  This layer models `E[dm/dg | m]`, a conditional mean over the
+population at fixed m.  Two galaxies sharing (r, k, q) at different fluxes are
+not rescalings of one another; they are different galaxies that happen to share
+three invariants.  Their AVERAGE response is flux-independent only if the
+morphology mix at fixed (r, k, q) does not vary with flux -- a property of the
+population, not a theorem, and false on real sky, where brighter galaxies are
+systematically nearer and of a different type mix.  The old "verified exact to
+six digits over a 1000x flux range" check passes trivially on a simulation that
+draws flux independently of morphology, so it never tested the assumption it
+was cited for.
 
-The concentration enters as the dimensionless k = Mc Mf/Mr^2 rather than the
-flow coordinate Mc/Mr, purely for conditioning: Mc/Mr correlates with Mr/Mf at
-0.999, so the two would hand the network a nearly degenerate pair and bury the
-information Mc actually adds.  k is the part of Mc that Mr/Mf does not predict,
-and it is exactly 1/2 for a point source under any weight function.
+The coefficients now depend on the flux coordinate z0 as well as the three
+scale-free invariants -- in standardised coordinates,
 
-and on NOTHING else -- verified exact to six digits over a 1000x flux range.
-That is why `_Coeffs` is a 3-input network: the inputs are the complete set of
-flux-blind spin-0 invariants, not a modelling choice.
+    z0 (flux)   z1 (size)   z2 (concentration)   q = |e|^2 (shape)
+
+which is what `_invariants` returns and what makes `_Coeffs` a 4-input network.
+Nothing forces the network to USE z0; if the response really is flux-blind on a
+given population it can learn to ignore it, which is the weaker and honest
+version of the old claim.
 
 What the layer is NOT
 ---------------------
@@ -128,16 +140,26 @@ N_COEFFS = 14
 
 
 def _invariants(z):
-    """(a, b, q) and the complex shape e, from the STANDARDISED z.
+    """(f, a, b, q) and the complex shape e, from the STANDARDISED z.
 
-    `a = z1` and `b = z2` are monotone functions of Mr/Mf and Mc/Mr, so they
-    carry exactly the size and concentration information the raw (r, k) pair
-    did; `q = |e|^2` is the same shape invariant.  Flux (z0) is deliberately
-    absent: moments are linear in the image, so the response coefficients are
-    flux-blind, and that was true in raw space for the same reason.
+    `a = z1` and `b = z2` are monotone functions of Mr/Mf and Mc/Mr, carrying
+    the size and concentration information the raw (r, k) pair did; `q = |e|^2`
+    is the same shape invariant.  `f = z0` is the FLUX, and it is now an input.
+
+    It used to be excluded on the grounds that moments are linear in the image,
+    so a rescaled galaxy has a rescaled response and the coefficients must be
+    flux-blind.  That argument is exact FOR ONE GALAXY RESCALED -- but this
+    layer models `E[dm/dg | m]`, a conditional mean over the population at fixed
+    m, and two galaxies sharing (a, b, q) at different fluxes are not rescalings
+    of one another.  Their average response is flux-independent only if the
+    morphology mix at fixed (a, b, q) does not vary with flux, which is a
+    property of the population, not a theorem -- and false on real sky, where
+    brighter galaxies are systematically nearer and of different type.  The
+    "verified exact over a 1000x flux range" check passes trivially on a sim
+    that draws flux independently of morphology.
     """
     e = jax.lax.complex(z[3], z[4])
-    return z[1], z[2], (e * jnp.conj(e)).real, e
+    return z[0], z[1], z[2], (e * jnp.conj(e)).real, e
 
 
 class _Coeffs(eqx.Module):
@@ -146,10 +168,10 @@ class _Coeffs(eqx.Module):
     net: CoeffNet
 
     def __init__(self, key, nn_width, nn_depth, activation):
-        self.net = CoeffNet(key, 3, N_COEFFS, nn_width, nn_depth, activation)
+        self.net = CoeffNet(key, 4, N_COEFFS, nn_width, nn_depth, activation)
 
-    def __call__(self, a, b, q):
-        u = jnp.stack([a, b, (q - _Q_LOC) / _Q_SCALE])
+    def __call__(self, f, a, b, q):
+        u = jnp.stack([f, a, b, (q - _Q_LOC) / _Q_SCALE])
         return _COEFF_MAX * jnp.tanh(self.net(u) / _COEFF_MAX)
 
 
@@ -223,8 +245,8 @@ class ShearResponse(AbstractBijection):
         Reads g as the FIRST two entries of `condition` -- see `cond_dim`.
         """
         g = condition[:2]
-        a, b, q, _ = _invariants(x)
-        return response(self.coeffs(a, b, q), x, g, unwrap(self.e_scale))
+        f, a, b, q, _ = _invariants(x)
+        return response(self.coeffs(f, a, b, q), x, g, unwrap(self.e_scale))
 
     def shear(self, y, condition):
         """Invert `unshear` in closed form, by inverting its g-series.

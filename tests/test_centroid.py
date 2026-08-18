@@ -170,7 +170,7 @@ def test_response_is_first_order_in_sigma_x():
     in Sigma_X, so the leading response must be too.  Checked by halving Sigma_X
     and asking that the shift halves.
     """
-    coeffs = LAYER.coeffs(Z[1], Z[2], Z[3] ** 2 + Z[4] ** 2)
+    coeffs = LAYER.coeffs(Z[0], Z[1], Z[2], Z[3] ** 2 + Z[4] ** 2)
     big = response(coeffs, Z, SIGMA_X * 1e-3, MEAN, STD) - Z
     small = response(coeffs, Z, SIGMA_X * 5e-4, MEAN, STD) - Z
     ratio = np.asarray(big / jnp.where(jnp.abs(small) > 0, small, jnp.inf))
