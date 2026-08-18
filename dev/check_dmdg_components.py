@@ -69,6 +69,36 @@ components, 3.5-6.5x smaller in the data, fail.  "The response is not
 identifiable from the likelihood" was too broad a reading of the collapsed
 numbers.
 
+WHY the NLL misses spin-0, measured on bfd's truth alone (no flow):
+
+    partial        mean          RMS       mean/RMS   corr(e1)
+    dMf/dg1     +2.3e-04     5.64e-02       0.004      +0.960
+    dMr/dg1     +2.6e-04     8.40e-02       0.003      +0.837
+    dMc/dg1     +2.4e-04     1.03e-01       0.002      +0.643
+    dM1/dg1     -2.9e-01     3.66e-01      -0.780      -0.003
+
+The population MEAN of every spin-0 partial is ~0.3% of its RMS -- the spin-0
+response is odd in e (it enters through p1 = Re(e* g)), so over an isotropic
+population it averages away.  The spin-2 diagonal has mean/RMS = -0.78, a
+coherent shift.  So the population DENSITY feels spin-2 at O(g) and spin-0 only
+at O(g^2), while at fixed m the ellipticity is fixed and E[dm/dg | m] is very
+much nonzero (corr 0.64-0.96 with e).  That is the whole gap: the likelihood
+sees the population, the supervision sees the template.
+
+Confirmed by the g_max ladder (NLL only; `shear.py train --g-max`), where the
+share explained rises monotonically for exactly the starved components:
+
+    corr        g_max 0.15    0.40    0.80
+    dMf/dg1        0.706     0.788   0.859
+    dMr/dg1        0.520     0.594   0.712
+    dMc/dg1        0.311     0.406   0.628
+    dM1/dg1        0.997     0.997   0.997   (saturated -- the control)
+
+but NOT a usable fix: slopes peak near g_max 0.4 and collapse by 0.8 (Mf 0.587
+-> 0.599 -> 0.274), and the off-diagonal spin-2 slope goes NEGATIVE there.
+`lens()` is a second-order Taylor model, so |g| = 0.8 is far outside the regime
+where the training data are lensing at all.
+
 Separate open thread: the g1g2 CROSS second derivatives are uniformly poor
 (slope 0.67-0.90, resid 43-55%) while the g1g1 and g2g2 diagonals are fine
 (2.1%, 6.2%, 11.5%).  No Var[R|m] floor has been measured, so there is no

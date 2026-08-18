@@ -212,7 +212,7 @@ def bulk_score(flow, m, chunk=10000):
 
 
 def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
-          deriv_weight=0.0, varq=0.0, score_weight=0.0, band=1.0):
+          deriv_weight=0.0, varq=0.0, score_weight=0.0, band=1.0, g_max=G_MAX):
     """Likelihood only by default.
 
     `deriv_weight` used to be 1e4, regressing the layer's response against bfd's
@@ -266,7 +266,7 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
         # Antithetic pairing: the SAME template at +g and -g.  The population
         # scatter, which is what swamps the shear signal, is common to the pair
         # and cancels in the gradient; only the g dependence survives.
-        half = sample_g(gkey, idx.shape[0] // 2)
+        half = sample_g(gkey, idx.shape[0] // 2, g_max)
         g = jnp.concatenate([half, -half])
         two = lambda a: jnp.concatenate([a[idx], a[idx]])[: g.shape[0]]
         x = lens(two(m), two(q), two(r), g)
@@ -530,6 +530,14 @@ def main():
     p.add_argument("--init", default="flows/bulk.eqx",
                    help="bulk checkpoint to warm-start from (train only)")
     p.add_argument("--steps", type=int, default=6000)
+    p.add_argument("--g-max", type=float, default=G_MAX,
+                   help="training shear disc radius. The spin-0 response is "
+                        "odd in e, so it averages out of the population density "
+                        "at O(g) and only shows up at O(g^2); the spin-2 "
+                        "response is coherent and shows at O(g). Raising this "
+                        "grows the spin-0 signal as g^2 against the spin-2 g, "
+                        "which is the test of whether that is why NLL-only "
+                        "training recovers spin-2 and not spin-0.")
     p.add_argument("--batch", type=int, default=1024,
                    help="templates per step (antithetic: batch//2 templates, "
                         "each at +g and -g). With the response supervision off "
@@ -596,7 +604,7 @@ def main():
                 flow, list(bulk_only.bijection.bijection.bijections))
             print(f"warm started bulk from {a.init}")
         flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps,
-                     batch=a.batch, lr=a.lr,
+                     batch=a.batch, lr=a.lr, g_max=a.g_max,
                      deriv_weight=a.deriv_weight, varq=a.varq,
                      score_weight=a.score_weight, band=a.band)
         print(f"val nll {val_nll(flow, val_set, jr.key(99)):.4f}")
