@@ -127,9 +127,9 @@ jax.config.update("jax_default_matmul_precision", "highest")
 
 # Catalogs, as (label, filename stem), per population.  The +/- pair share a
 # seed and so are the same galaxies; the g=0 run is the same galaxies again.
-# The target selection window lives in bulk.py -- shear.py's band_weight
-# needs it too and cannot import bias.py without a cycle -- and is re-exported
-# here under its established name.
+# The target selection window lives in bulk.py -- it cannot live here because
+# shear.py needs it too and cannot import bias.py without a cycle -- and is
+# re-exported here under its established name.
 SIZE_WINDOW, FLUX_WINDOW = bulk.SIZE_WINDOW, bulk.FLUX_WINDOW
 
 CATALOGS = {
@@ -1365,7 +1365,7 @@ def main():
                         "what eq. (40) literally is (a sum over G) and is exact "
                         "to the catalog's sampling; 'flow' integrates the "
                         "fitted prior instead, which is what you would have to "
-                        "do on real data but currently runs P_s 4% high.")
+                        "do on real data but currently runs P_s 4%% high.")
     p.add_argument("--proposal-flow", default=None,
                    help="DANGEROUS unless it EQUALS --flow: at alpha < 1 the "
                         "weights carry P_eval/q_proposal, and wherever the "
