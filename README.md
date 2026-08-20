@@ -131,14 +131,51 @@ On noiseless targets, which is where this measurement is currently sharpest:
 ```
 python bias.py --flow flows/shear.eqx        # 1M bulge + disc, g1 = +/-0.02
 
-  m1 = +0.00128 +/- 0.00016
-  c1 = +4.26e-05 +/- 1.1e-04   c2 = +3.16e-05 +/- 1.1e-04
+  m1 = -0.060 +/- 0.010
 ```
 
-The residual `m1` is about what the two known systematics predict together: the
-`Var[Q|m]` floor of the deterministic transport (~4e-4, the table above) and the
-estimator's own truncation at `O(g^2)` (~4e-4 at `g = 0.02`).  Getting there
-took one real fix on the flow's side — `RawMomentStandardize` was standardising
+**That number is the converged one, and it used to read `+0.00128`.**  The
+difference is not a regression: `bulk.py train`'s old 4000-step default left the
+bulk flow visibly unconverged, and the amount it was unconverged by was setting
+the answer —
+
+| bulk steps | val nll | window mass vs catalog | noiseless `m1` |
+|---|---|---|---|
+| 4000 | 40.4405 | +3.70% | -0.0126 |
+| 20000 | 40.4199 | +1.70% | -0.0227 |
+| 60000 | 40.4070 | +0.83% | -0.0428 |
+| 150000 | — | +0.61% | -0.0600 |
+
+Both columns are monotone, so any intermediate step count is a choice about
+which error to hide; only the converged end is a property of the *method*.  The
+shear layer, by contrast, is already converged at its own default (6000 / 20000
+/ 60000 steps on a converged bulk give -0.064 / -0.056 / -0.067).  `retrain.sh`
+now trains the bulk for 150000 steps (~21 min a flow against ~40 s) and the old
+flows are kept in `flows/pre_convergence/`.  **Every `m1` quoted in this repo or
+in `HANDOFF.md` from before 2026-08-19 is an undertrained-model number.**
+
+Rebuild scatter on the converged chain is `sd ~ 0.010` across five independent
+rebuilds, far above any single run's bootstrap error — quote `-0.07 +/- 0.01`
+and do not read a difference below ~0.02 between two chains.
+
+What is left at -0.06 is **the spin-0 shear response**, by elimination: shear
+steps, template count, derivative weight and likelihood overfitting are all flat
+(see `retrain.sh` and the memory trail), while `dm/dg` against bfd's exact
+derivatives is 17% (Mf), 28% (Mr) and 46% (Mc) against 2.6% for spin-2, and 100x
+more supervision weight moves those by 0.07 percentage points.
+`dev/check_a0_representable.py` then removes the flow entirely and fits the same
+coefficient with the same net, inputs and bound to 0.002 — against +0.38 in
+flow — so it is the **joint optimisation**, not capacity, conditioning or the
+choice of inputs.  That is the open architectural thread.
+
+Note the contrast with the noisy, windowed measurement below, which is
+consistent with zero on the *same flows*: a noiseless run is a point evaluation
+and reads the density's fine structure directly, where the `C_M` integral
+averages over it.  Which of those two is the honest statement of the method's
+accuracy is not settled — see "What is not measured" at the end.
+
+An older fix worth keeping in view, from when this number was small enough for
+it to matter: `RawMomentStandardize` was standardising
 `M1/Mr` and `M2/Mr` with independent per-coordinate mean and scale, which is the
 one place in the stack that could give the prior a preferred direction on the
 sky, and a prior with a preferred direction reads out as additive shear.
@@ -195,25 +232,33 @@ not work; it needs a proposal that knows where the prior is — which is what th
 paper's k-d tree does when it keeps only templates within `chi^2 < sigma_max^2`
 of the target (sec. 3.2).
 
-That tail is what dominates the first measurement (`bias_bulgedisc_noisy.txt`,
-20k targets, `S = 1024`, median ESS 134):
+That tail is what dominated the first measurements at `S = 1024`, which could
+say nothing sharper than `+/-1%`.  `S = 8192` is now the working setting and the
+per-target error is no longer what limits the answer; see the end-to-end numbers
+below.
+
+**One bug lived in this path for a long time and deserves to be findable.**
+`pqr_streamed` passed its domain mask `ok_raw` into `log_conv_is`
+unconditionally.  With no centroid peel the draws are still *raw* moments, but
+that branch stands masked rows in at `jnp.zeros` — a valid standardised
+coordinate, an invalid raw moment (`Mf = 0` → `log10(0)`).  The `where` hides it
+from the value and `0 * inf` NaNs the **gradient**, so every chunk of any target
+with even one off-chart draw was marked bad: 15.7% of bulgedisc silently got
+`Q = R = 0`.  Those targets sit at the chart edge, so the survivors were a
+latent-selected sub-ensemble, and the "+0.013 noisy hump" that several
+`HANDOFF.md` sections chase was that selection, not the flow's density:
 
 ```
-  m1 = -0.00504 +/- 0.00883        # noiseless, same flow: +0.00128 +/- 0.00016
-  c1 = +1.09e-03 +/- 1.2e-03   c2 = +5.43e-04 +/- 1.3e-03
+  control    +0.0159 +/- 0.0015 (3196 dead)  ->  +0.0003 +/- 0.0178 (0 dead)
+  bulgedisc  +0.0131 +/- 0.0015              ->  +0.0008 +/- 0.0020
 ```
 
-Per target the error bar is ~8x the noiseless one, and it is not spread evenly —
-the middle flux quintiles carry `+/- 0.03` to `+/- 0.04` while the faintest
-carries `+/- 0.002`.  That is not shape noise (the +/-g pairing removes it, and
-both catalogs share a noise realization and share their kernel draws); it is a
-handful of targets whose `Phat` rests on one or two draws, so their `Q/P`
-is arbitrary and their weight in eq. (45) is not.  The paper describes the same
-failure for template sums in sec. 2.5 — "a target ... dominated by a single
-template that is many sigma away ... giving spuriously large influence in the
-final lensing estimator" — and its answer is the same prior-aware proposal.
-So `m1` here is consistent with zero, but only because it cannot yet say
-anything sharper than +/-1%.
+Only the **no-centroid streamed** path was affected (`--pop bulgedisc`,
+`gauss2`, controls without `--centroid`); the image-noise path peels first, so
+zeros is a legitimate stand-in there, and the non-streamed `pqr` path was never
+affected.  The tell is the `N targets had no draw with any weight` line reading
+above ~0.  **Any noisy number in `HANDOFF.md` taken through `pqr_streamed`
+without `--centroid` is suspect — re-measure before reasoning from it.**
 
 ## Phase 3 — centroid marginalisation (here now)
 
@@ -376,9 +421,89 @@ What is *not* removable: the centroid layer's log-det.  It looks like
 by **18 nats** across a chunk — kernel draws at depth reach the poorly resolved
 region where `T` is large — and dropping it moves `R` by 7.9%.
 
-Still not handled: selection — `bias.py` cuts on nothing, so `P(s|g) = 1` and the
-non-detection terms of eq. (45)–(46) are legitimately absent.  Bin or cut on a
-*noisy* flux and they stop being.
+## Phase 4 — selection (here now)
+
+A real analysis does not use every detection: it cuts, on flux and on size, and
+the paper's eq. (40) and (45)–(46) are what makes such a cut unbiased.  Those
+terms are now implemented — `window_prob`, `selection_terms`, and an `ns=`
+argument threaded through `ghat`/`bias`/`bootstrap`:
+
+```
+python bias.py --flow flows/centroid.eqx --pop bulgedisc_noisy --samples 8192 \
+    --chunk 4096 --window-size 2.2 3.2 --window-flux 2500 50000
+python -m tests.test_selection      # synthetic, no flow, no FITS, seconds
+```
+
+`window_prob` is eq. (30)'s `INT_{M in S} dM L(M - M^G)`: the probability a
+galaxy's *noisy* moments land in the window, which is what the estimator needs
+because it never sees the non-selected galaxies' own `M`.  The ratio cut
+`s0 < Mr'/Mf' < s1` is recast as two linear constraints and integrated by a 1-D
+Gauss–Legendre quadrature over the flux direction — exact, not approximate,
+whenever the flux window has a non-negative floor (0 disagreements against the
+literal ratio cut in 2e6 noise draws; guarded, since it genuinely fails for an
+unbounded flux window where `Mf'` can go negative).  `selection_terms` then
+differentiates `P(s|g) = E_{m ~ P(.|g)}[F(m)]` twice at `g = 0`.
+
+Two factors of eq. (30)/(38)/(40) are deliberately absent: `|J(M)|` is a
+function of `M` alone, so it cancels exactly out of every `Q_i`, `R_i` (those
+are `g`-derivatives at fixed `M_i`), and `L(X^G)`'s grid sum is what the
+centroid layer already carries.  That was checked, not asserted: pushing the
+true template population through `window_prob` gives `P_s = 0.3033` against the
+noisy catalog's own measured selection fraction of `0.3016`.
+
+Measured on `bulgedisc_noisy`, 40k targets, `S = 8192`, window
+`2.2 < Mr/Mf < 3.2` and `2500 < Mf < 50000`:
+
+```
+  no window                                 -0.0021 +/- 0.0034
+  cut on each arm's own M, uncorrected      +0.0354 +/- 0.0009
+  cut on each arm's own M, + eq.(45)/(46)   -0.0054 +/- 0.0036
+  cut on the g = 0 twin, uncorrected        +0.0171 +/- 0.0009
+  cut on the g = 0 twin, + eq.(45)/(46)     -0.0230 +/- 0.0009   <- WORSE
+```
+
+**The correction is only valid for a cut on the target's own observed
+moments.**  There, eq. (29) leaves `P_i` untouched and the whole error is the
+missing non-selection term.  A cut on the `g = 0` twin restricts which
+*galaxies* are in the sample, so the prior itself is wrong, and applying the
+boundary correction over-corrects by about as much as it helps.
+
+The correction is carried almost entirely by `R_s`: `Q_s` is exactly zero by
+isotropy for a spin-0 window (`P_s` can only depend on `|g|^2`), measured
+`+3e-4 +/- 6e-4`, and forcing it to zero moves `m1` by less than `1e-5`.
+`R_s = 0.79·I`, isotropic to 0.9% — a free correctness check the code does not
+enforce, so watch it.  `Q_s_err` says whether the draw count was enough.
+
+`--window-terms` chooses where those terms come from: `templates` (default)
+lenses the training catalog by its own exact `dm/dg`, which is what eq. (40)
+literally is; `flow` integrates the fitted prior instead, which is what you
+would have to do on real data.  The gap between them is a direct measure of the
+flow's density error at the window edge, and it is currently **+4.1%** — the
+flow puts `P_s = 0.3157` and `R_s = 0.794·I` against truth's `0.3033` and
+`0.763·I`, one coherent normalisation error.  It costs `0.002` in `m1`.
+
+Reproduced on the converged chain with two independent training seeds, same
+targets and noise realisation, whole chain rebuilt: corrected windowed `m1` of
+`+0.00007 +/- 0.00360` and `+0.00214 +/- 0.00347`.  Two chains differing by
+0.0021 against a combined error of ~0.005 makes that a property of the
+**method**, not of one training run.
+
+## What is not measured
+
+* **The Poisson / sky branch**, eq. (53)–(55).  Everything here is the
+  postage-stamp branch, with `N_ns` counted; one galaxy per stamp, already
+  detected.
+* **Varying `C_M` or `Sigma_X` across the catalog.**  The formalism allows it
+  and `bias.py` reads `Sigma_X` per row, but `selection_terms` assumes one
+  `C_M` for the whole measurement, as these catalogs have.
+* **Magnification** (paper sec. 6.4) — the packed output is `PqrNoMu`.
+* **Multi-exposure / multi-band** (sec. 6.2).
+* **Why the noiseless and noisy numbers disagree by 0.06 on the same flows.**
+  Plausibly the `C_M` integral averaging over fine density structure that a
+  point evaluation reads directly, but nobody has demonstrated it.  Until
+  someone does, the honest statement is that the method's accuracy is bracketed
+  by the two, not that it is the smaller.  The cheap experiment is a
+  `--noise-scale` ladder on fixed targets, watching `m1` walk from -0.06 to ~0.
 
 ## Layout
 
@@ -386,17 +511,26 @@ non-detection terms of eq. (45)–(46) are legitimately absent.  Bin or cut on a
 bulk.py               phase-1 build / train / corner plot
 shear.py              phase-2 train / check / scatter / shear-derivative plot
 centroid.py           phase-3 train / check, and the CopySampler
-bias.py               m and c on the targets, noiseless or integrated under C_M
+bias.py               m and c on the targets, noiseless or integrated under
+                      C_M, with eq. (40)/(45)-(46)'s selection terms
 models/shear.py       the ShearResponse layer
 models/centroid.py    the CentroidMarginalize layer
 models/bijections.py  the bulk layers
 dev/                  one-off diagnostics; each script's docstring says what it
                       answered and what the answer was
+tests/                pytest; the whole suite is ~7 min on one GPU
 HANDOFF.md            the dated investigation log
 NOISY_BINNING_BIAS.md why binning a noisy m1 profile on the target's LATENT
                       Mr/Mf biases it even under a perfect density -- read this
                       before believing any binned noisy profile in HANDOFF.md
 ```
+
+Two standing warnings about the older half of that log, both established
+2026-08-19 and both large enough to invert conclusions: every `m1` from before
+that date is an **undertrained-bulk** number (see above), and every noisy number
+taken through `pqr_streamed` without `--centroid` is a **NaN-gradient** number
+(see above).  `NOISY_BINNING_BIAS.md` is the third: binning on a latent quantity
+biases the per-bin `m1` even under a perfect prior.
 
 ## Note on precision
 

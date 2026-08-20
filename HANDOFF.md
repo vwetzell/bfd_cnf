@@ -7,6 +7,13 @@ measurement that motivated it: what does m1 look like along the resolution
 axis now, and it turns out the answer is more interesting than "the ramp is
 gone."
 
+> **Read the 2026-08-19 section at the bottom first.**  Two findings there
+> supersede large parts of what follows: every m1 below was measured on an
+> **undertrained bulk**, and every noisy number taken through `pqr_streamed`
+> without `--centroid` was measured through a **NaN gradient** that silently
+> dropped 16% of targets.  The "broad hump" and "resolution-edge bias" threads
+> are the second of those, not physics.
+
 ---
 
 ## Where things stand
@@ -1568,3 +1575,102 @@ calling this understood well enough to act on -- the point-source tail is
 already known to behave differently once kernel MC and the centroid layer
 are in the loop (memory: ess-starvation-is-the-resolution-edge).
 ```
+
+---
+
+## 2026-08-19: two findings that supersede much of the log above
+
+Written at the end of the 08-18/08-19 sessions, whose detail lives in the git
+log (`159918b` back to `16ece5c`) rather than here.  Both of these are large
+enough to invert earlier conclusions, so they go at the front of anyone's
+reading order.
+
+### 1. The bulk was undertrained, and that was setting the answer
+
+`bulk.py train`'s 4000-step default — used by `retrain.sh` and by every flow
+ever measured in this file — leaves the bulk visibly unconverged:
+
+    bulk steps   val nll   window mass vs catalog   noiseless m1
+          4000   40.4405                   +3.70%        -0.0126
+         20000   40.4199                   +1.70%        -0.0227
+         60000   40.4070                   +0.83%        -0.0428
+        150000         -                   +0.61%        -0.0600
+
+Both columns monotone.  The shear layer is *already* converged at its own
+default (6000/20000/60000 steps on a converged bulk: -0.064/-0.056/-0.067), so
+this is the bulk alone.  An undertrained bulk was partially cancelling the
+shear layer's spin-0 response error against its own smoothness; converging it
+removes the cancellation and the response error reads out in full.
+
+**So `m1 = -0.06 +/- 0.01` (noiseless, bulgedisc) is this pipeline's honest
+number, and every m1 above in this file is an undertrained-model number.**
+Rebuild scatter across five converged rebuilds is sd 0.010 — do not read a
+difference below ~0.02 between two chains.
+
+By elimination the residual is **the spin-0 shear response**: shear steps,
+template count (25k/50k/90k), derivative weight (1e4/1e5/1e6) and likelihood
+overfitting are all flat, while `dm/dg` against bfd's exact derivatives is 17%
+(Mf), 28% (Mr), 46% (Mc) against 2.6% for spin-2, and 100x more supervision
+weight moves them by 0.07 percentage points.  `dev/check_a0_representable.py`
+fits the same coefficient standalone — same net, inputs, bound — to 0.002
+against +0.38 in flow, so capacity, conditioning and inputs are all cleared and
+what is left is the joint optimisation.  That is the open architectural thread.
+
+### 2. The noisy "hump" was a NaN gradient, not the flow's density
+
+`pqr_streamed` passed `ok_raw` into `log_conv_is` unconditionally.  With no
+centroid peel the draws are still raw moments, but that branch stands masked
+rows in at `jnp.zeros` — a valid standardised coordinate, an invalid raw moment
+(`Mf = 0` -> `log10(0)`).  The `where` hides it from the value; `0 * inf` NaNs
+the **gradient**.  Every chunk of any target with even one off-chart draw was
+marked bad, so 15.7% of bulgedisc silently got `Q = R = 0` — and those targets
+sit at the chart edge, making the survivors a latent-selected sub-ensemble.
+
+    control    +0.0159 +/- 0.0015 (3196 dead)  ->  +0.0003 +/- 0.0178 (0 dead)
+    bulgedisc  +0.0131 +/- 0.0015              ->  +0.0008 +/- 0.0020
+
+One line (`ok_raw = ... if layer is not None else None`).  Only the
+**no-centroid streamed** path was affected (`--pop bulgedisc`, `gauss2`,
+controls without `--centroid`); the image-noise path peels first and the
+non-streamed `pqr` path was never affected — which is why the single-chunk run
+always read -0.0024 while the streamed one read +0.013.
+
+**This supersedes the "broad hump", "resolution bias is the bulk density" and
+"resolution-edge bias is real" threads above.**  The tell is the
+`N targets had no draw with any weight` line reading above ~0.  Any noisy
+number in this file taken through `pqr_streamed` without `--centroid` needs
+re-measuring before it is reasoned from.
+
+Related and equally superseding, for the *binned* profiles: the m1-vs-M1/M2
+parabola is not a bias at all.  BFD's estimator is consistent only for the
+ensemble whose prior it uses, so binning on a latent quantity produces per-bin
+structure under a perfect prior — verified identical in the exact-prior control
+(+0.314), in gauss2 whose population m1 is +0.003 (+0.197), and unchanged by
+the fix above.  See `NOISY_BINNING_BIAS.md`.
+
+### And the thing that is now measurable: selection
+
+Eq. (40)/(45)-(46) are implemented (`window_prob`, `selection_terms`,
+`--window-size`/`--window-flux`), so a target window can finally be applied to
+a bias measurement.  Numbers, caveats and the "own observed M only" rule are in
+README.md's phase-4 section rather than here, since they are the current state
+rather than an investigation.
+
+### Open, in the order I would take them
+
+1. **Why do noiseless (-0.06) and noisy-windowed (~0.00) disagree on the same
+   flows?**  Plausibly the `C_M` integral averaging over fine density structure
+   a point evaluation reads directly — but undemonstrated, and until it is
+   demonstrated the method's accuracy is bracketed by the two rather than equal
+   to the smaller.  Cheapest probe: a `--noise-scale` ladder on fixed targets,
+   watching m1 walk from -0.06 toward 0.
+2. **The spin-0 response, jointly.**  Finding 1 says this is the architecture,
+   and `check_a0_representable.py` says the representation is not the limit —
+   so the target is the joint optimisation (trunk sharing was cleared in
+   `4d5a9a1`; only the joint fit itself is left).
+3. **The flow's +4.1% window mass** against the templates' — one coherent
+   normalisation error at the window edge, currently worth 0.002 in m1 and the
+   only place `--window-terms flow` and `templates` disagree.
+4. Question 1 of the old list (attribute the multi-lobe shape to bulgedisc's
+   structural parameters) is **still open but much less urgent**: most of what
+   it was chasing turned out to be findings 1 and 2 above.
