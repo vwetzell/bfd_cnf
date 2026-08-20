@@ -22,6 +22,15 @@ Per-template values carry Var[Q|m] scatter and blow up as |e| -> 0 (the 1/|e|^2)
 so they are smoothed by a weighted polynomial regression on the four invariants
 (z0, z1, z2, q=|e|^2) that the network itself sees, weight |e|^2.  The fitted
 function is then differentiated w.r.t. z to give the physical steepness.
+
+DO NOT TRUST THIS SCRIPT'S NUMBERS (2026-08-20).  The weighted polynomial
+smoothing below underfits badly: it reports the physical |d coeff / dz| as
+0.00 (p99 0.01-0.02) for every coefficient, while a ratio-of-sums binned
+estimate of the very same conditional mean gives ~15 for a_Mr and shows the
+coefficient itself running from 1.4 to 40 across z1 deciles.  The design matrix
+carries q^3 terms with q up to 85 and is then weighted by q again, so a handful
+of extreme-ellipticity rows determine the fit.  Its |a1| p99 = 6.4 is what
+sized `_COEFF_MAX`, and it is wrong -- see `dev/flexibility_audit.py`.
 """
 import sys; sys.path.insert(0, ".")
 import equinox as eqx, jax, jax.numpy as jnp, jax.random as jr, numpy as np

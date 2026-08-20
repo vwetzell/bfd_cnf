@@ -105,31 +105,39 @@ from paramax import non_trainable, unwrap
 from .bijections import CoeffNet
 
 # Coefficients are bounded so the map stays a diffeomorphism for any g the
-# network might see.  The true values span roughly [-2, 7], so 12 constrains
-# nothing real.
+# network might see.
 #
-# That claim was CHECKED on 2026-08-20 rather than inherited, because the
-# constant predates 16ece5c moving the chart to standardised coordinates and
-# looked stale.  It is not.  `response` is linear in the coefficients and only
-# five matter at first order, so bfd's exact per-template dm/dg inverts for them
-# (round-trip validated to 2.3%), and the conditional mean the layer actually
-# represents has |a1| p99 = 6.4 -- comfortably inside 12.  Clipping at 12
-# destroys 0.94% of the first-order response.
+# THE BOUND IS MIS-SIZED FOR THIS CHART, measured 2026-08-20 by
+# `dev/flexibility_audit.py` and the tables in its docstring.  12 was sized on
+# the pre-16ece5c RAW parameterisation, where the true spin-0 coefficients
+# really do span [-2, 7] -- inverting bfd's dm/dg as dX/dg = X c_X Re(ebar.g)
+# gives c_Mf 0.98 -> 2.11, c_Mr 0.84 -> 3.63, c_Mc 0.16 -> 4.74 across the whole
+# population.  But 16ece5c moved the layer BEHIND the chart, and z1 =
+# standardised logit(Mr/(r* Mf)) has a Jacobian that diverges at the
+# point-source ceiling.  The identical physics, expressed in z, needs
 #
-# THE TRAP, recorded because it cost a full paired experiment: the PER-TEMPLATE
-# coefficients look completely different -- |a1| p99 = 122.6, and clipping at 12
-# appears to destroy 31% of the response.  That is an artifact.  a_i =
-# (dz_i/dg . e)/(e_scale |e|^2) is the conditional mean plus Var[Q|m] noise
-# divided by |e|^2, and that noise diverges exactly where |e| is small, which is
-# also where the response a*Re(ebar.g) vanishes and the coefficient is
-# unidentified.  Size this bound from the SMOOTHED coefficient function, never
-# from per-template values.
+#     |a_Mr| median 32, p99 253, above 12 for 76.5% of templates
+#     |a_Mc| median 28, p99 257, above 12 for 70.5%
 #
-# Raising it to 100 was tried and is worse, 5 seeds paired at g_max=0.10:
-# spin-2 alpha falls 0.95 -> 0.44 and the seed spread triples (Mf sd 0.77 ->
-# 2.29).  The bound is load-bearing: it caps the unidentified small-|e|
-# direction, and the coefficient net is smooth in q, so letting that direction
-# wander corrupts the resolved population too.
+# so the bound forbids the true first-order response over three quarters of the
+# resolution axis, and the trained network duly sits pinned at it: 61% of
+# templates for a_Mr, 53% for a_Mc, 50-74% for p2_Mc, mu and nu.
+#
+# The claim this comment used to make -- "|a1| p99 = 6.4, comfortably inside 12,
+# clipping destroys 0.94% of the response" -- came from
+# `dev/physical_steepness.py`, whose weighted polynomial smoothing underfits (it
+# also reports the physical steepness as 0.00, against ~15 from a binned
+# estimate of the same quantity).  Ratio-of-sums conditional means, which cannot
+# underfit, are what the numbers above use.
+#
+# Raising the bound is NOT the fix on its own: `dev/combined_test.py` paired 5
+# seeds at 12 against 100 and spin-2 alpha fell 0.95 -> 0.44 with triple the
+# seed spread, because a larger bound also unleashes the small-|e| direction
+# where a_i = (dz_i/dg . e)/(e_scale |e|^2) is pure Var[Q|m] noise.  Size the
+# bound from the SMOOTHED coefficient, never per-template.  The fix that makes
+# both ends honest is to stop asking the network for a divergent function:
+# multiply its spin-0 output by the chart's own analytic Jacobian factor, so it
+# fits the O(1) raw coefficient and 12 constrains nothing real again.
 _COEFF_MAX = 12.0
 
 # This layer now acts on the STANDARDISED coordinates
