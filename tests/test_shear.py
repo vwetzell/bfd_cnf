@@ -116,16 +116,26 @@ def test_derivatives_match_finite_differences():
     """
     from models.bijections import RawMomentStandardize
 
-    chart = RawMomentStandardize(mean=jnp.array([4.35, 0.95, 1.05, 0.0, 0.0]),
-                                 std=jnp.array([0.35, 0.75, 0.60, 0.04, 0.04]))
+    mean = jnp.array([4.35, 0.95, 1.05, 0.0, 0.0])
+    std = jnp.array([0.35, 0.75, 0.60, 0.04, 0.04])
+    chart = RawMomentStandardize(mean=mean, std=std)
+    # The layer reads the chart's spin-0 mean and std for its own Jacobian
+    # factor, so hand it the SAME chart -- a mismatched pair is still a valid
+    # bijection and would still pass, but it would not be the configuration
+    # `build_flow` produces.
+    layer = ShearResponse(jr.key(0), e_scale=E_SCALE,
+                          chart_loc=mean[:3], chart_scale=std[:3])
     m = jnp.array([1.0e4, 2.0e4, 1.0e3, -444.0, 4.2e4])
-    q, r = dm_dg(LAYER, m, chart)
+    q, r = dm_dg(layer, m, chart)
 
     f = lambda g: chart.inverse(
-        LAYER.shear(chart.transform(m), jnp.array(g, dtype=float)))
+        layer.shear(chart.transform(m), jnp.array(g, dtype=float)))
     h = 1e-5
     fd1 = [(f([h, 0]) - f([-h, 0])) / (2 * h), (f([0, h]) - f([0, -h])) / (2 * h)]
     assert jnp.max(jnp.abs(jnp.stack(fd1) - q) / jnp.abs(q)) < 1e-5
+    # A second difference of moments ~1e4 cancels to ~1e-16 * 1e4 / h^2, so h
+    # cannot be as small as the first-order check's.
+    h = 1e-3
     fd11 = (f([h, 0]) - 2 * f([0, 0]) + f([-h, 0])) / h**2
     assert jnp.max(jnp.abs(fd11 - r[0]) / jnp.abs(r[0])) < 1e-3
 
@@ -313,3 +323,50 @@ def test_coeff_input_whitening():
     plain = _Coeffs(jr.key(0), 16, 1, jax.nn.silu)
     assert jnp.array_equal(unwrap(plain.u_mean), jnp.zeros(4))
     assert jnp.array_equal(unwrap(plain.u_white), jnp.eye(4))
+
+
+def test_chart_spin0_jacobian():
+    """`_chart_spin0_jac` IS the chart's Jacobian along the pure spin-0 directions.
+
+    That is the whole content of the reparameterisation: the network emits raw
+    response coefficients `c_X` in `dX/dg = X c_X Re(ebar.g)`, and this matrix
+    carries them into z.  If it drifts from the chart -- a changed logit, a
+    changed ceiling -- the layer's coefficients silently stop meaning what
+    `models/shear.py` says they mean, so pin it against autodiff of the chart
+    itself rather than against the algebra it was derived from.
+    """
+    import numpy as np
+    import bulk
+    from models.shear import _chart_spin0_jac
+    from paramax import unwrap
+
+    rng = np.random.default_rng(1)
+    n = 2000
+    mf = 10 ** rng.uniform(3.2, 4.2, n)
+    mr = mf * rng.uniform(2.0, 3.5, n)
+    mc = mr * rng.uniform(2.0, 6.0, n)
+    e = rng.normal(0, 0.05, (n, 2))
+    m = np.stack([mf, mr, e[:, 0] * mr, e[:, 1] * mr, mc], axis=-1)
+
+    flow = bulk.build_flow(jr.key(0), m, layers=2, shear=True)
+    layer = [b for b in flow.bijection.bijection.bijections
+             if type(b).__name__ == "ShearResponse"][0]
+    chart = flow.bijection.bijection.bijections[0]
+    loc, scale = unwrap(layer.chart_loc), unwrap(layer.chart_scale)
+
+    def dz_dlogX(mi):
+        """dz_{0,1,2} / d(log Mf, log Mr, log Mc), at fixed M1/Mr and M2/Mr."""
+        def f(t):
+            s = jnp.exp(t)
+            return chart.transform(jnp.stack([mi[0] * s[0], mi[1] * s[1],
+                                              mi[2] * s[1], mi[3] * s[1],
+                                              mi[4] * s[2]]))[:3]
+        return jax.jacfwd(f)(jnp.zeros(3))
+
+    mj = jnp.asarray(m[:50])
+    exact = jax.vmap(dz_dlogX)(mj)
+    ours = jax.vmap(lambda mi: _chart_spin0_jac(chart.transform(mi), loc, scale))(mj)
+    # chart_loc/chart_scale are held in float32, like every other frozen chart
+    # statistic in the layer, so this is float32 round-off and not a mismatch.
+    rel = jnp.max(jnp.abs(exact - ours) / jnp.abs(exact).max())
+    assert rel < 1e-6, rel

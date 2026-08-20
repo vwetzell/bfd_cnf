@@ -224,7 +224,8 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
             if centroid else []) + \
            ([ShearResponse(k_shear, cond_dim=cond or 2,
                            e_scale=float(t.std(0)[3]),
-                           u_mean=_u_stats[0], u_white=_u_stats[1])]
+                           u_mean=_u_stats[0], u_white=_u_stats[1],
+                           chart_loc=t.mean(0)[:3], chart_scale=t.std(0)[:3])]
             if shear else [])
     bijection = Invert(Chain([raw2standard, *head, *bulk]).merge_chains())
     base = non_trainable(MultivariateNormal(jnp.zeros(5), jnp.eye(5)))

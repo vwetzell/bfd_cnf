@@ -134,10 +134,13 @@ from .bijections import CoeffNet
 # seeds at 12 against 100 and spin-2 alpha fell 0.95 -> 0.44 with triple the
 # seed spread, because a larger bound also unleashes the small-|e| direction
 # where a_i = (dz_i/dg . e)/(e_scale |e|^2) is pure Var[Q|m] noise.  Size the
-# bound from the SMOOTHED coefficient, never per-template.  The fix that makes
-# both ends honest is to stop asking the network for a divergent function:
-# multiply its spin-0 output by the chart's own analytic Jacobian factor, so it
-# fits the O(1) raw coefficient and 12 constrains nothing real again.
+# bound from the SMOOTHED coefficient, never per-template.
+#
+# FIXED by not asking the network for a divergent function at all: its spin-0
+# outputs are the RAW coefficients now and `_chart_spin0_jac` supplies the
+# chart's Jacobian analytically, so 12 is back to bounding a quantity whose
+# physical range is [-2, 7].  The paragraphs above are kept because the trap is
+# easy to walk back into -- read them before touching this constant.
 _COEFF_MAX = 12.0
 
 # This layer now acts on the STANDARDISED coordinates
@@ -155,9 +158,12 @@ _COEFF_MAX = 12.0
 #     That removes a g-dependent seam: `bias.log_conv_is` masks draws with
 #     `in_domain` before the flow runs, and under the old ordering the chart saw
 #     the POST-shear moment while the mask saw the pre-shear one.
-#   * what is lost: the coefficients are no longer directly comparable to bfd's
-#     dm/dg, because they are responses of z rather than of m.  `dm_dg` below
-#     returns dz/dg now; converting needs the standardiser's Jacobian.
+#   * what was lost and then recovered: for a while the coefficients were
+#     responses of z rather than of m, so they stopped being comparable to
+#     bfd's dm/dg -- and worse, z1's diverging logit Jacobian made them
+#     divergent too.  The spin-0 nine are raw coefficients again, with that
+#     Jacobian applied analytically by `_chart_spin0_jac`.  `dm_dg` below still
+#     returns the layer's dm/dg by composing the chart on both sides.
 #
 # The spin structure survives the change untouched, which is what makes it
 # cheap: `RawMomentStandardize` keeps the three spin-0 coordinates in slots
@@ -168,6 +174,52 @@ _COEFF_MAX = 12.0
 _Q_LOC, _Q_SCALE = 2.0, 2.0
 
 N_COEFFS = 14
+
+# The chart's spin-0 Jacobian is applied ANALYTICALLY, so the network's spin-0
+# outputs are raw-moment response coefficients again.
+#
+# Since 16ece5c the layer acts on z, and z1 = (logit(Mr/(r* Mf)) - mu)/sd has a
+# Jacobian that diverges at the point-source ceiling.  Writing the raw response
+# as dX/dg = X c_X Re(ebar.g) for X in (Mf, Mr, Mc) and pushing it through the
+# chart gives
+#
+#     dz0/dg = c_Mf / (sd0 ln10)               . p1
+#     dz1/dg = (c_Mr - c_Mf) / (sd1 (1 - u))   . p1,   u = Mr/(r* Mf)
+#     dz2/dg = (c_Mc - c_Mr) / (sd2 (1 - v))   . p1,   v = Mc/(rc* Mr)
+#
+# i.e. M = D L with L the difference matrix and D the diagonal above.  Asking
+# the network for the left-hand side is what broke the layer: measured on the
+# bulgedisc catalog the physical c stay inside [-2, 7] (c_Mf 0.98 -> 2.11, c_Mr
+# 0.84 -> 3.63, c_Mc 0.16 -> 4.74) while the same physics in z needs |a_Mr|
+# median 32 and p99 253, above `_COEFF_MAX` for 76.5% of templates -- so the
+# bound forbade the true response over three quarters of the resolution axis,
+# and the fitted net sat pinned at it for 61% of them.  It also made the target
+# STEEP: a_Mr climbs 0.84 -> 61 along z1 where c_Mr climbs 0.84 -> 3.63, and
+# that steepness is what buys the unphysical log-det
+# (`dev/flexibility_audit.py`: even part 0.509 nats against a physical 0.00033).
+#
+# `M` is lower triangular with nonzero diagonal, so this is a change of
+# coordinates on coefficient space -- nothing representable is lost, the target
+# function is just O(1) and flat now.  Its (-1, +1) rows also decorrelate z1 and
+# z2, which the whitening in `_Coeffs` could only partly fix: those two are
+# correlated at 0.997, and it was their DIFFERENCE that carried the physics.
+#
+# u -> 1 is a real divergence of the coordinate, not an artifact, but a draw can
+# land arbitrarily close to the ceiling where the population never goes, so the
+# logit is clipped.  6.9 is u = 0.999; the bulgedisc catalog tops out at 0.975.
+_LOGIT_MAX = 6.9
+
+
+def _chart_spin0_jac(z, loc, scale):
+    """dz_i/d(raw log X) for the three spin-0 slots: the M above, shape (3, 3)."""
+    # 1/(1 - u) = 1 + exp(logit u), and slots 1 and 2 carry logit u, logit v.
+    logit = jnp.clip(scale[1:3] * z[1:3] + loc[1:3], -_LOGIT_MAX, _LOGIT_MAX)
+    d1, d2 = (1.0 + jnp.exp(logit)) / scale[1:3]
+    d0 = 1.0 / (scale[0] * jnp.log(10.0))
+    zero = jnp.zeros_like(d0)
+    return jnp.stack([jnp.stack([d0, zero, zero]),
+                      jnp.stack([-d1, d1, zero]),
+                      jnp.stack([zero, -d2, d2])])
 
 
 def _invariants(z):
@@ -258,11 +310,17 @@ class _Coeffs(eqx.Module):
         return x * jax.lax.rsqrt(1.0 + (x / _COEFF_MAX) ** 2)
 
 
-def response(coeffs, z, g, e_scale):
+def response(coeffs, z, g, e_scale, chart_loc, chart_scale):
     """The equivariant second-order response of `z` to `g`; the layer's core map.
 
-    `coeffs` is the 14-vector [a, b, c] x [z0, z1, z2] followed by
+    `coeffs` is the 14-vector [a, b, c] x [Mf, Mr, Mc] followed by
     [A, B, mu, nu, rho], evaluated at `z`'s invariants.
+
+    The spin-0 nine are RAW response coefficients -- `a` is the c_X of
+    dX/dg = X c_X Re(ebar.g) -- and `_chart_spin0_jac` carries them into z.
+    Asking the network for the chart-space coefficients directly is what pinned
+    it against `_COEFF_MAX` over three quarters of the population; see the
+    comment there.
 
     Both blocks are ADDITIVE.  In raw moment space the spin-0 block had to be
     multiplicative-with-an-exponential to keep Mf, Mr and Mc positive; z is
@@ -288,7 +346,8 @@ def response(coeffs, z, g, e_scale):
     p2 = (gc * gcc).real
     p3 = (ec * ec * gc * gc).real
 
-    spin0 = z[:3] + s0 @ jnp.stack([p1, p2, p3])
+    spin0 = z[:3] + (_chart_spin0_jac(z, chart_loc, chart_scale)
+                     @ (s0 @ jnp.stack([p1, p2, p3])))
     de = (A * gc + B * e * e * gcc + mu * ec * gc * gc
           + nu * e * p2 + rho * e * e * e * gcc * gcc) / e_scale
     # SLOT LAYOUT: `RawMomentStandardize` groups the three spin-0 coordinates in
@@ -313,12 +372,23 @@ class ShearResponse(AbstractBijection):
     coeffs: _Coeffs
     # The standardiser's spin-2 std, FROZEN -- see `response`.
     e_scale: jax.Array = eqx.field(default=None)
+    # Its mean and std for the three spin-0 slots, FROZEN for the same reason
+    # and used the same way: `_chart_spin0_jac` needs them to recover u and v.
+    chart_loc: jax.Array = eqx.field(default=None)
+    chart_scale: jax.Array = eqx.field(default=None)
 
     def __init__(self, key, nn_width=128, nn_depth=3, activation=jnn.silu,
-                 cond_dim=2, e_scale=1.0, u_mean=None, u_white=None):
+                 cond_dim=2, e_scale=1.0, u_mean=None, u_white=None,
+                 chart_loc=None, chart_scale=None):
         self.coeffs = _Coeffs(key, nn_width, nn_depth, activation,
                               u_mean=u_mean, u_white=u_white)
         self.e_scale = non_trainable(jnp.asarray(e_scale))
+        # Defaults match `RawMomentStandardize`'s own (mean 0, std 1), so an
+        # ad-hoc layer stays consistent with an ad-hoc chart.
+        self.chart_loc = non_trainable(
+            jnp.zeros(3) if chart_loc is None else jnp.asarray(chart_loc, jnp.float32))
+        self.chart_scale = non_trainable(
+            jnp.ones(3) if chart_scale is None else jnp.asarray(chart_scale, jnp.float32))
         # (2,) alone, or (5,) = [g1, g2, C00, C01, C11] when chained with the
         # centroid layer, which reads the other three.
         self.cond_shape = (cond_dim,)
@@ -330,7 +400,8 @@ class ShearResponse(AbstractBijection):
         """
         g = condition[:2]
         f, a, b, q, _ = _invariants(x)
-        return response(self.coeffs(f, a, b, q), x, g, unwrap(self.e_scale))
+        return response(self.coeffs(f, a, b, q), x, g, unwrap(self.e_scale),
+                        unwrap(self.chart_loc), unwrap(self.chart_scale))
 
     def shear(self, y, condition):
         """Invert `unshear` in closed form, by inverting its g-series.

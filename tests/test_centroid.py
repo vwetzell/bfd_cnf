@@ -225,7 +225,18 @@ def test_peeling_the_layer_off_is_exact_and_g_independent():
     m = np.array([[57026.8, 135254.4, -9006.5, -8736.6, 658762.5],
                   [12000.0, 40000.0, 900.0, -1500.0, 190000.0]])
     sx = np.tile(np.asarray(SIGMA_X), (2, 1))
-    flow = bulk.build_flow(jr.key(0), m, shear=True, centroid=True)
+    # Standardise against a POPULATION, not against these two rows.  Two rows
+    # give slot 2 a std of 0.045 against a realistic ~0.6, and the shear layer's
+    # chart Jacobian carries a 1/std -- so a degenerate chart makes the response
+    # ~13x too large and the f32 seam in `centroid_transform` blows past the
+    # tolerance below.  Nothing here is testing the standardisation.
+    rng = np.random.default_rng(0)
+    mf = 10 ** rng.uniform(3.5, 4.5, 500)
+    mr = mf * rng.uniform(2.0, 3.4, 500)
+    pop = np.stack([mf, mr, mr * rng.normal(0, 0.05, 500),
+                    mr * rng.normal(0, 0.05, 500),
+                    mr * rng.uniform(2.0, 6.0, 500)], axis=-1)
+    flow = bulk.build_flow(jr.key(0), pop, shear=True, centroid=True)
     rest, layer = split_centroid(flow)
     assert layer is not None
 
