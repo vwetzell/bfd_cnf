@@ -19,6 +19,37 @@ fixed steps -- a single run cannot tell these arms apart.
     baseline (old parameterisation, dev/gmax_sweep.py):
         even 0.49544 +/- 0.12672
         alpha  Mf 1.00   Mr 0.55   M1 0.87   M2 0.87   Mc 0.45
+
+RESULT (3 seeds, 96k steps each)
+
+    seed   val nll       odd      even     Mf     Mr     M1     M2     Mc
+    phys            -0.00079   0.00033   1.00   1.00   1.00   1.00   1.00
+       1   40.3934   0.00046   0.02031   1.48   0.66   1.03   1.04   0.06
+       2   40.3944   0.00027   0.02411   1.65   0.81   1.03   1.03   0.17
+       3   40.3917   0.00087   0.02327   1.70   0.81   1.04   1.04   0.15
+
+    even  0.02257 +/- 0.00163   against  0.49544 +/- 0.12672
+
+The leak is 22x smaller and its seed spread 78x smaller, and the bound stopped
+binding: a_Mr and a_Mc are pinned for 0.00% of templates where they were pinned
+for 61% and 53%.  Spin-2 came along for the ride, 0.87 -> 1.04.
+
+Two things this did NOT fix.
+
+Mf and Mc got worse (1.00 -> 1.61, 0.45 -> 0.13) and the fitted coefficient
+functions are still the wrong shape -- fitted c_Mf runs -7.0 -> +0.6 along z1
+where the truth wants a flat -1.0 -> -2.1, and c_Mc changes sign.  The layer is
+no longer PREVENTED from representing the spin-0 response; the likelihood still
+does not identify it, which is [[nll-learns-spin2-not-spin0]] and a separate
+problem.
+
+The network is still far steeper than it needs to be: median |dc/dz| 20-80,
+against physical raw-coefficient slopes of ~0.25 (c_Mf) to ~0.6 (c_Mr).  That
+residual steepness is the remaining 0.022 of leak, and bounding it is the next
+change, not this one.
+
+Val nll rose 40.11 -> 40.39.  Expected: 0.47 nats of the old arm's likelihood
+was the volume collapse itself, and this arm does not take it.
 """
 import sys; sys.path.insert(0, ".")
 import equinox as eqx, jax, jax.numpy as jnp, jax.random as jr, numpy as np
