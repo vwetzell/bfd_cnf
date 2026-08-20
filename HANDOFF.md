@@ -1674,3 +1674,88 @@ rather than an investigation.
 4. Question 1 of the old list (attribute the multi-lobe shape to bulgedisc's
    structural parameters) is **still open but much less urgent**: most of what
    it was chasing turned out to be findings 1 and 2 above.
+
+---
+
+## 2026-08-20: the 200k noisy measurement, and the guard that was set for 40k
+
+The point of the run was precision: 199,969 targets (the whole
+`bulgedisc_noisy` catalog, 12 dropped for non-converged recentring) against the
+40k the selection-terms result was measured on, `S = 8192`, `--chunk 4096`,
+window `2.2 < Mr/Mf < 3.2` and `2500 < Mf < 50000`, `flows/centroid.eqx`.
+Median ESS 816, 2.6% of targets below ESS 10.  It produced a precision result
+and a systematic one, and the systematic one comes first.
+
+### `sane_targets`' 1000x threshold is calibrated for a 40k sample
+
+At 200k the population's own tail reaches the guard: **max/median `|Q1|` is
+1028** and `|R11|` is 1040, so the worst target sits exactly at the threshold
+that was meant to be far above anything real.  (The earlier note that
+"max/median is 13 for Q and 70 for R, so 1000x has never fired" was measured on
+40k, where that tail is simply not sampled.)  The consequence is that the
+shipped guard admits ~14 targets that then dominate the ensemble sums:
+
+    guard      kept      unwindowed m1        windowed + eq.(45)/(46)
+     1000x   199969   -0.01939 +/- 0.00554     +0.01900 +/- 0.00645
+      300x   199963   -0.01392 +/- 0.00208     +0.01280 +/- 0.00182
+      100x   199955   -0.01003 +/- 0.00120     +0.01280 +/- 0.00171
+       30x   199939   -0.00975 +/- 0.00089     +0.01281 +/- 0.00176
+       10x   199861   -0.00997 +/- 0.00069     +0.01285 +/- 0.00164
+        5x   199566   -0.00915 +/- 0.00066            --
+
+Everything from 100x down is one number; 1000x is a different number with a 5x
+wider error bar, both of which are 14 targets out of 200000 (7e-5).  The 14 are
+what the paper's sec. 2.5 describes -- 13 of them sit at `Mr/Mf` 3.6-3.8, i.e.
+at and past the point-source ceiling where a noisy moment can land but a latent
+one cannot, and one is a single 1.7e6 flux outlier against a population median
+of ~5e3.
+
+**The default is NOT changed in this commit.**  Dropping targets is a selection
+and the threshold is a science judgment, not a bug fix; what is established
+here is only that 1000x is not a safe place to leave it, and that the answer is
+flat over two decades below it.
+
+### The numbers, at the 100x guard
+
+    unwindowed                 m1 = -0.0100 +/- 0.0012
+    windowed, uncorrected      m1 = +0.0523 +/- 0.0005
+    windowed + eq.(45)/(46)    m1 = +0.0128 +/- 0.0017
+
+and the prefix walk is stable, so this is converged in target count rather than
+still moving:
+
+    first  20000   m1 = -0.01302 +/- 0.00377
+    first  40000   m1 = -0.01560 +/- 0.00353
+    first  80000   m1 = -0.01130 +/- 0.00211
+    first 120000   m1 = -0.01098 +/- 0.00168
+    first 160000   m1 = -0.01017 +/- 0.00140
+    all   199955   m1 = -0.01003 +/- 0.00120
+
+`P_s = 0.3033`, `R_s = 0.763 I` isotropic to 0.3% (off-diagonal 2.3e-3 against
+a diagonal of 0.763), `Q_s` consistent with zero as isotropy requires.  The
+selection correction is doing real work -- it moves the windowed number by
+-0.040 -- and +0.0128 is what is left after it.
+
+### This does not reproduce the 40k result, and the difference is the flow
+
+The selection-terms session measured `-0.0021 +/- 0.0034` unwindowed and
+`+0.00007`/`+0.00214` windowed-corrected on two chains.  Those were on the
+**same targets** (row 0 of both saved PQR files is the same galaxy) but a
+**different flow**: `dev/e2e/pqr_noisy_40k.npz` was written at 08:30 on
+2026-08-19 and `flows/centroid.eqx` was retrained at 15:34 that afternoon, and
+the per-target `Q1` between the two differs by a median of **50%**.  So the
+comparison is not like for like, and the earlier "windowed corrected is
+consistent with zero" is not evidence about the flow now on disk.
+
+**So the honest current statement is `m1 ~ -1%` unwindowed and `+1.3%` windowed
+on the converged chain, both many sigma from zero, not the `|m1| <~ 4e-3` this
+repo has been quoting.**  The two disagree in SIGN, which is itself a lead: the
+window keeps 30% of targets and the correction moves m1 by 0.04, so whatever is
+wrong is not uniform across the population.
+
+### What that changes about the noiseless/noisy gap
+
+The gap is now smaller and differently shaped than the open question above
+assumed: noiseless -0.06, noisy unwindowed -0.010, noisy windowed +0.013.  A
+`--noise-scale` ladder is still the right probe, but it is now interpolating
+between -0.06 and -0.010 rather than between -0.06 and 0.
