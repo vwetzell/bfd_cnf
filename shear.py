@@ -20,37 +20,6 @@ templates that share m carry different (Q, R), those samples land in different
 places and the flow learns the resulting spread.  Low-S/N target validation
 comes later.
 
-Why the analytic derivatives also enter the loss
-------------------------------------------------
-Pure likelihood is correct but statistically starved: the whole g dependence is
-worth ~0.3 nats/galaxy against a ~35 nat total, and it is carried almost
-entirely by the spin-2 moments, so the flux/size response and every second
-derivative are barely identified (measured: 40-70% error, versus 0.1-1% when
-fitted to the derivatives directly).
-
-The resolution is that the two signals estimate the SAME object.  The density
-P(m|g) evolves by the continuity equation, so the transport velocity a flow
-layer needs is exactly
-
-    v(m) = E[ dm/dg | m ],
-
-the response averaged over whatever hidden structure galaxies sharing m have.
-An L2 fit of the layer's velocity to the per-galaxy dm/dg converges to that
-conditional mean -- it does NOT assume the response is a function of m.  So the
-derivative term is a low-variance estimator of the very transport the likelihood
-is trying to find, and adding it costs no generality at first order.
-
-At second order they do differ: the g^2 term of the density feels both E[R|m]
-and the *spread* Var[Q|m], and a deterministic transport can only supply the
-first.  The resulting multiplicative bias is ~Var[Q|m]/E[Q|m]^2, and note that
-it does NOT shrink with the shear -- the missing term and the term it competes
-with in R are both O(g^2), so the ratio is the same at g = 0.02 as at 0.1.
-Measured on a bulge+disc population, the spin-2 response scatter at fixed
-[Mr/Mf, |e|^2] is 8.1% (m ~ 7e-3, well over the 1e-3 target); adding Mc to the
-moment vector drops it to 2.0% (m ~ 4e-4).  That is why Mc is modelled.  What
-is left would need a stochastic layer; keeping the likelihood term in the loss
-is what will expose it when the sims get richer.
-
 Usage:
     python shear.py train  --data ../bfd_cnf_imsims/data/moments.fits
     python shear.py derivs --data ../bfd_cnf_imsims/data/moments.fits
@@ -68,8 +37,6 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import optax
-from flowjax.bijections import Chain, Invert
-from flowjax.distributions import Transformed
 
 import bulk
 from models.shear import ShearResponse, dm_dg
@@ -77,6 +44,9 @@ from models.shear import ShearResponse, dm_dg
 # Second-order in g is the model (paper sec. 5.5), so training over a range wider
 # than any real shear costs nothing and pins the quadratic term down properly.
 G_MAX = 0.02          # the operating point of the bias measurement
+
+# Training steps fused into one `lax.scan` per dispatch; also the print interval.
+REPORT = 500
 
 
 def load(path):
@@ -114,6 +84,26 @@ def sample_g(key, n, g_max=G_MAX):
     return jnp.stack([rad * jnp.cos(ang), rad * jnp.sin(ang)], axis=-1)
 
 
+def _antithetic(idx, gkey, g_max):
+    """`(g, take)` for one antithetic batch over the templates `idx`.
+
+    Template `take[k]` appears twice: at `+g[k]` and, `len(idx)` rows later, at
+    `-g[k]`.  That pairing is the whole point -- the population scatter is what
+    swamps the shear signal, it is common to the two rows of a pair, and it
+    cancels in the gradient, leaving only the g dependence.
+
+    Was inlined in `train`'s `step` and WRONG from at least 2026-08 until
+    2026-08-20: it drew `idx.shape[0] // 2` shears, which made `g` half the
+    length of the duplicated template list, so the trailing `[: g.shape[0]]`
+    sliced the second copy off again.  The duplication was a no-op, `+g` and
+    `-g` landed on DIFFERENT templates, no scatter cancelled, and the effective
+    batch was half what `--batch` asked for.  `tests/test_shear.py::
+    test_antithetic_pairing` is what stops it coming back.
+    """
+    g_half = sample_g(gkey, idx.shape[0], g_max)
+    return jnp.concatenate([g_half, -g_half]), jnp.concatenate([idx, idx])
+
+
 def _trainable(flow, bulk_frozen):
     """Filter spec selecting what the optimiser may move.
 
@@ -139,163 +129,9 @@ def _scale(m):
     return jnp.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1], m[:, 4]], axis=-1)
 
 
-def band_weight(m, k):
-    """Per-galaxy weights that upweight the analysis window by `k`.
-
-    The response supervision is a REGRESSION against bfd's exact per-galaxy
-    `dm_dg`, so reweighting it is free of the objection that would sink a
-    reweighted NLL: it moves where the fit is accurate, not what it converges
-    to.  The density term is deliberately left unweighted.
-
-    Was a smooth sigmoid centred on a hand-picked Mr/Mf edge (3.4, tuned to
-    "where the response fit starts failing").  Replaced by membership in
-    `bulk.SIZE_WINDOW`/`bulk.FLUX_WINDOW` -- the window the real analysis
-    already applies downstream (`dev/check_dmdg_components.py` restricts its
-    comparison to it), since the response outside it is never used.  No
-    reason to upweight a differently-shaped region than the one that matters.
-
-    NOT an inverse-density weight.  The window is ~74% of the population, not
-    a sparse tail, so equalising the Mr/Mf histogram would DE-weight it.
-
-    Renormalised to mean 1 so `deriv_weight` and `score_weight` keep their
-    meaning.
-    """
-    m = np.asarray(m, dtype=np.float64)
-    r = m[:, 1] / m[:, 0]
-    inside = ((r >= bulk.SIZE_WINDOW[0]) & (r <= bulk.SIZE_WINDOW[1])
-              & (m[:, 0] >= bulk.FLUX_WINDOW[0]) & (m[:, 0] <= bulk.FLUX_WINDOW[1]))
-    w = np.where(inside, k, 1.0)
-    return jnp.asarray(w / w.mean())
-
-
-def partial_norms(m, q_true, r_true, nbin=1):
-    """Per-template, per-partial RMS of the truth, binned in Mr/Mf.
-
-    Two imbalances, one mechanism, fixed in one place.
-
-    BETWEEN PARTIALS: d M1/d g1 has RMS 0.367 and d M1/d g2 has 0.0134, so a
-    plain mean over the (2, 5) array weighs them 750:1 and the small partials go
-    unsupervised.
-
-    ACROSS THE POPULATION, which a single global normaliser per partial does not
-    touch: the spin-0 response is `dX/dg = X a_X Re(ebar g)`, so the residual
-    carries a factor of |e| -- and |e| falls 4.5x toward the point-source limit
-    because nearly unresolved galaxies are nearly round.  Weighting by the
-    squared response therefore hands the point-source end 3.8% of the loss
-    against 39.4% for the diffuse end.  Measured consequence: the Mf coefficient
-    a0 came out 19% too large at the ceiling, an error 7.5x the entire spread of
-    the true coefficient there, in the bin with the TIGHTEST Var[Q|m] floor.
-
-    TESTED AND NULL, which is why `nbin` defaults to 1 (one global normaliser
-    per partial, i.e. the between-partial fix only).  Binning in Mr/Mf DOES
-    equalise the loss -- measured, the dMf/dg share per size bin went from
-    45.2 / 26.4 / 14.5 / 8.5 / 4.1 / 1.3 percent to a flat 16.5-16.8 -- and the
-    a0 bias did not move at all: +0.3723 in the top bin against +0.3788 before.
-    So the point-source-end coefficient error is NOT a supervision-weight
-    problem; the layer is not failing there because it is under-asked.  It also
-    cost the diagonal spin-2 (3.07% -> 6.51%), so the default stays global.
-
-    The reasoning that motivated it, kept because the measurement is the useful
-    part: normalising within Mr/Mf bins would fix the second imbalance without
-    breaking the first.
-    Note what is deliberately KEPT: inside a bin the |e|^2 weighting survives,
-    and it should -- a round galaxy has no first-order spin-0 response, so it
-    genuinely says nothing about a_X (`_spin0_a`: the coefficient inverts out
-    with |e|^2 as its natural weight).  What was wrong was comparing bins, not
-    comparing galaxies within one.
-
-    Equivalently: for Mf the scale IS the moment, so the residual-space loss is
-    `sum_b (a_layer - a_true)^2 |e_b|^2` -- coefficient supervision weighted by
-    |e|^2.  This makes that weight local rather than global.
-    """
-    m, q_true, r_true = (np.asarray(x, np.float64) for x in (m, q_true, r_true))
-    s = np.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1], m[:, 4]], -1)[:, None, :]
-    tq, tr = q_true / s, r_true / s
-    r = m[:, 1] / m[:, 0]
-    ed = np.quantile(r, np.linspace(0.0, 1.0, nbin + 1))
-    idx = np.clip(np.searchsorted(ed[1:-1], r, side="right"), 0, nbin - 1)
-    nq = np.empty_like(tq)
-    nr = np.empty_like(tr)
-    for b in range(nbin):
-        sel = idx == b
-        if not sel.any():
-            continue
-        nq[sel] = np.sqrt(np.mean(tq[sel] ** 2, axis=0))
-        nr[sel] = np.sqrt(np.mean(tr[sel] ** 2, axis=0))
-    # A partial that is identically zero in some bin would divide by zero; fall
-    # back to its global RMS there rather than inventing a weight.
-    gq, gr = np.sqrt(np.mean(tq ** 2, 0)), np.sqrt(np.mean(tr ** 2, 0))
-    nq = np.where(nq > 1e-12 * gq, nq, gq)
-    nr = np.where(nr > 1e-12 * gr, nr, gr)
-    return jnp.asarray(nq), jnp.asarray(nr)
-
-
-def _velocity_mse(layer, chart, m, q_true, r_true, norms=None,
-                  score=None, wt=None):
-    """L2 distance between the layer's transport velocity and the templates'
-    own shear derivatives, normalised by `_scale` so it is
-    dimensionless, flux-blind, and weighs every galaxy equally.  Its minimiser
-    is E[dm/dg | m] -- see the module docstring.
-
-    Returns `(mse, first)`.  `first` is the same first-order residual contracted
-    with the FROZEN bulk's score, which is the combination that actually reaches
-    the bias: Q = score . u + div u, so a component with a small response but a
-    large score matters to Q while `_scale` -- which divides by the response --
-    barely weighs it.  Measured, the Mr and Mc columns each contribute ~15 to
-    Q1's error and cancel to 1.8, a cancellation nothing in the loss enforces.
-    Zero unless a score is supplied.
-    """
-    q, r = jax.vmap(dm_dg, in_axes=(None, 0, None))(layer, m, chart)
-    s = _scale(m)[:, None, :]
-    w = 1.0 if wt is None else wt[:, None, None]
-    nq, nr = (1.0, 1.0) if norms is None else norms
-    mse = (jnp.mean(w * ((q - q_true) / s / nq) ** 2)
-           + jnp.mean(w * ((r - r_true) / s / nr) ** 2))
-    if score is None:
-        return mse, jnp.zeros(())
-    # q is (batch, shear, moment); the score contracts the moment index.
-    w2 = 1.0 if wt is None else wt[:, None]
-    return mse, jnp.mean(w2 * jnp.einsum("bm,bam->ba", score, q - q_true) ** 2)
-
-
-def bulk_of(flow):
-    """The g-independent density behind the shear layer, whose score drives Q.
-
-    Data -> base order is [raw2standard, shear, *bulk], so what has to come out
-    is the SHEAR layer -- and the chart, which is now in front of it, has to
-    stay.  Dropping by type rather than by position, since the position moved.
-    """
-    keep = [b for b in flow.bijection.bijection.bijections
-            if not isinstance(b, ShearResponse)]
-    return Transformed(flow.base_dist,
-                       Invert(Chain(keep).merge_chains()))
-
-
-def bulk_score(flow, m, chunk=10000):
-    """grad log p_bulk at each m, from the frozen bulk (constant during training)."""
-    g = eqx.filter_jit(jax.vmap(jax.grad(bulk_of(flow).log_prob)))
-    return jnp.concatenate([g(m[i:i + chunk]) for i in range(0, len(m), chunk)])
-
-
 def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
-          deriv_weight=1e4, varq=0.0, score_weight=0.0, band=1.0, g_max=G_MAX):
-    """Likelihood only by default.
-
-    `deriv_weight` used to be 1e4, regressing the layer's response against bfd's
-    exact per-template dm/dg.  Turned OFF on 2026-08-17 for two reasons.
-
-    First, it kept being wrong in ways nothing caught.  The chain reorder broke
-    it silently -- the layer responds in standardised coordinates and the target
-    is in raw moments, so for one commit the loss compared incommensurate
-    quantities at weight 1e4 and no test failed.  `dm_dsigma` had the identical
-    bug.  A term that dominates the loss and cannot be checked by the suite is a
-    liability whatever it buys.
-
-    Second, and more useful: while the layer is FITTED to bfd's dm/dg, the
-    `check` comparison against bfd's dm/dg is not a validation of anything --
-    it is a training diagnostic.  With this off it becomes an independent
-    held-out test of whether the layer learned the right response from the
-    density alone.
+          g_max=G_MAX):
+    """Likelihood only: the g dependence is learned from P(m|g) alone.
 
     The cost is convergence.  The g dependence is worth ~0.3 nats/galaxy against
     a ~35 nat total, so on the NLL alone the signal is a small part of a noisy
@@ -303,70 +139,43 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
     VARIANCE floor, not a rate, so the knob is `batch`, not `steps`.
     """
     m, q, r = (jnp.asarray(a) for a in data)
-    wt = band_weight(data[0], band) if band != 1.0 else None
-    score = None
-    if score_weight:
-        if not bulk_frozen:
-            raise ValueError("the score term uses the frozen bulk's score, "
-                             "which would otherwise move under the optimiser")
-        score = bulk_score(flow, m)
-    # The velocity term's target and the LENSED MOMENTS are different objects.
-    # `lens` must keep the exact physical d2m_dg2 -- those moments are what the
-    # templates really have -- while the velocity term is fitted to E[R_t|m]
-    # plus the Var[Q|m] offset (varq.py).  Only the latter moves.
-    r_tgt = r
-    if varq:
-        if not bulk_frozen:
-            raise ValueError("the Var[Q|m] offset is built from the frozen "
-                             "bulk's score, so the bulk must be frozen")
-        import varq as varq_mod
-        r_tgt = r + varq * varq_mod.target_offset(flow, m, q)
-        print(f"added {varq:g} x the Var[Q|m] offset to the second-order target")
-    # One set of per-partial normalisers for the whole run, from the truth.
-    norms = partial_norms(m, q, r_tgt)
     opt = optax.chain(optax.clip_by_global_norm(1.0),
                       optax.adam(optax.cosine_decay_schedule(lr, steps)))
     params, static = eqx.partition(flow, _trainable(flow, bulk_frozen))
     state = opt.init(params)
 
-    @eqx.filter_jit
-    def step(params, state, idx, gkey):
-        # Antithetic pairing: the SAME template at +g and -g.  The population
-        # scatter, which is what swamps the shear signal, is common to the pair
-        # and cancels in the gradient; only the g dependence survives.
-        half = sample_g(gkey, idx.shape[0] // 2, g_max)
-        g = jnp.concatenate([half, -half])
-        two = lambda a: jnp.concatenate([a[idx], a[idx]])[: g.shape[0]]
-        x = lens(two(m), two(q), two(r), g)
+    def one(carry, _):
+        params, state, key = carry
+        key, sk, gk = jr.split(key, 3)
+        idx = jr.randint(sk, (batch // 2,), 0, m.shape[0])
+        g, take = _antithetic(idx, gk, g_max)
+        x = lens(m[take], q[take], r[take], g)
 
         def loss_fn(p):
             model = eqx.combine(p, static)
-            nll = -jnp.mean(model.log_prob(x, condition=g))
-            if not (deriv_weight or score_weight):
-                # Guarded outside the traced branch, as bulk.train does with its
-                # score term: with the supervision off, `dm_dg` -- and with it
-                # the chart composition -- is not part of training at all,
-                # rather than being computed and multiplied by zero.
-                return nll, (nll, jnp.zeros(()), jnp.zeros(()))
-            mse, first = _velocity_mse(_shear_layer(model), _chart(model),
-                                       m[idx], q[idx], r_tgt[idx],
-                                       (norms[0][idx], norms[1][idx]),
-                                       None if score is None else score[idx],
-                                       None if wt is None else wt[idx])
-            return (nll + deriv_weight * mse + score_weight * first,
-                    (nll, mse, first))
+            return -jnp.mean(model.log_prob(x, condition=g))
 
-        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, state = opt.update(grads, state, params)
-        return eqx.apply_updates(params, updates), state, aux
+        return (eqx.apply_updates(params, updates), state, key), loss
 
-    for i in range(steps):
-        key, sk, gk = jr.split(key, 3)
-        params, state, (nll, mse, first) = step(
-            params, state, jr.randint(sk, (batch // 2,), 0, m.shape[0]), gk)
-        if i % 500 == 0 or i == steps - 1:
-            print(f"step {i:5d}  nll {nll:.4f}  velocity mse {mse:.3e}"
-                  f"  score term {first:.3e}")
+    # One `lax.scan` per REPORT steps rather than one dispatch per step.  A
+    # batch-1024 pass through this flow is ~1e8 FLOPs -- microseconds of real
+    # compute -- against ~10 ms of Python dispatch and kernel-launch latency per
+    # step, which held the GPU at 33-43% SM.  Scanning moves the whole inner
+    # loop inside one jit, so the launches happen once per chunk instead of once
+    # per step.  The RNG stream is unchanged: same `jr.split(key, 3)` in the same
+    # order, so this is a speed change and not a numerical one.
+    @eqx.filter_jit
+    def run(params, state, key, n):
+        return jax.lax.scan(one, (params, state, key), None, length=n)
+
+    done = 0
+    while done < steps:
+        n = min(REPORT, steps - done)
+        (params, state, key), losses = run(params, state, key, n)
+        done += n
+        print(f"step {done - 1:6d}  nll {float(losses[-1]):.4f}", flush=True)
     return eqx.combine(params, static)
 
 
@@ -616,20 +425,6 @@ def main():
                    help="shear-stage learning rate. It has never been tuned "
                         "UPWARD, and it moved the old noiseless metric 5x -- "
                         "more than every architectural axis combined.")
-    p.add_argument("--deriv-weight", type=float, default=1e4,
-                   help="weight on the velocity-matching term relative to the NLL")
-    p.add_argument("--varq", type=float, default=0.0,
-                   help="scale on the Var[Q|m] offset to the second-order "
-                        "target (0 = off, 1 = the derived value)")
-    p.add_argument("--band", type=float, default=1.0,
-                   help="upweight the derivative supervision inside "
-                        "bulk.SIZE_WINDOW/FLUX_WINDOW by this factor -- the "
-                        "window every noisy target's convolution integrates "
-                        "through, and where the reachable response error is "
-                        "4-6x larger (the NLL stays unweighted). 1.0 = off")
-    p.add_argument("--score-weight", type=float, default=0.0,
-                   help="weight on the score-contracted first-order residual "
-                        "(the combination that reaches Q); 0 = off")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log10mf", type=float, default=3.6)
     p.add_argument("--mrmf", type=float, default=3.3)
@@ -672,9 +467,7 @@ def main():
                 flow, list(bulk_only.bijection.bijection.bijections))
             print(f"warm started bulk from {a.init}")
         flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps,
-                     batch=a.batch, lr=a.lr, g_max=a.g_max,
-                     deriv_weight=a.deriv_weight, varq=a.varq,
-                     score_weight=a.score_weight, band=a.band)
+                     batch=a.batch, lr=a.lr, g_max=a.g_max)
         print(f"val nll {val_nll(flow, val_set, jr.key(99)):.4f}")
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")

@@ -358,9 +358,9 @@ def dm_dsigma(layer, m, sigma_x, chart):
 
     `chart` is NOT optional, for the same reason as `models/shear.dm_dg`: the
     layer marginalises in STANDARDISED coordinates now, so its bare shift is in
-    z.  Composing the chart on both sides converts it.  And this is not just a
-    diagnostic -- `centroid.train` regresses against it with
-    `shift_weight = 1e4`, so feeding raw moments to a z-space layer would train
-    the layer against an incommensurate target, silently.
+    z.  Composing the chart on both sides converts it.  `centroid.check`
+    compares against it as a held-out diagnostic, since training is now pure
+    NLL; feeding raw moments to a z-space layer would compare incommensurate
+    quantities, silently.
     """
     return chart.inverse(layer.marginalize(chart.transform(m), sigma_x)) - m

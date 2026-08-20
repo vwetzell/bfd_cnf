@@ -111,8 +111,8 @@ def test_derivatives_match_finite_differences():
     Getting only the first order right would still pass a Jacobian-factor
     conversion, which is why the second-order check is here.
 
-    That conversion is not cosmetic -- `shear.train` regresses against `dm_dg`
-    with deriv_weight = 1e4, so it is the dominant term in the loss.
+    That conversion is not cosmetic -- `shear.check` compares against `dm_dg`
+    as an independent held-out diagnostic of the trained layer's response.
     """
     from models.bijections import RawMomentStandardize
 
@@ -173,3 +173,143 @@ if __name__ == "__main__":
             fn()
             print(f"  {name} ok")
     print("ok")
+
+
+def test_antithetic_pairing():
+    """`_antithetic` pairs the SAME template at +g and -g, at the full batch.
+
+    Both halves of this failed silently for months: the shears were drawn at
+    half length, so the duplicated template list was truncated back down and
+    the +g / -g arms landed on different templates.  No scatter cancelled and
+    `--batch` delivered half its rows.  Neither shows up in a loss curve --
+    `val nll` is fine either way -- so only an explicit check catches it.
+    """
+    from shear import _antithetic
+
+    idx = jnp.arange(8)
+    g, take = _antithetic(idx, jr.key(0), 0.02)
+    n = idx.shape[0]
+
+    # Full batch: 2n rows out for n templates in, not n.
+    assert take.shape[0] == 2 * n, take.shape
+    assert g.shape[0] == 2 * n, g.shape
+
+    # The pairing itself: row k and row k + n are one template at +/- one shear.
+    assert jnp.array_equal(take[:n], take[n:]), (take[:n], take[n:])
+    assert jnp.allclose(g[:n], -g[n:]), (g[:n], g[n:])
+
+    # And the pair really does cancel: the batch mean shear is exactly zero.
+    assert jnp.max(jnp.abs(g.mean(0))) < 1e-7, g.mean(0)
+
+
+def test_scan_preserves_rng_stream():
+    """Fusing the training loop into `lax.scan` must not change what is trained on.
+
+    `train` runs its steps inside one `lax.scan` per REPORT steps rather than one
+    jit dispatch per step (7x faster: the flow is ~1e8 FLOPs per step against
+    ~8ms of dispatch latency).  The risk in that change is the RNG: keys used to
+    be split in Python between dispatches and are now split inside the scan
+    carry.  This pins that the two orderings draw the identical templates and
+    shears, so the speedup cannot silently become a different experiment.
+    """
+    from shear import _antithetic
+
+    batch, n, steps = 1024, 90000, 40
+
+    key = jr.key(1)
+    loop_idx, loop_g = [], []
+    for _ in range(steps):
+        key, sk, gk = jr.split(key, 3)
+        idx = jr.randint(sk, (batch // 2,), 0, n)
+        g, _ = _antithetic(idx, gk, 0.02)
+        loop_idx.append(idx)
+        loop_g.append(g)
+
+    def one(k, _):
+        k, sk, gk = jr.split(k, 3)
+        idx = jr.randint(sk, (batch // 2,), 0, n)
+        g, _ = _antithetic(idx, gk, 0.02)
+        return k, (idx, g)
+
+    _, (scan_idx, scan_g) = jax.lax.scan(one, jr.key(1), None, length=steps)
+
+    assert jnp.array_equal(jnp.stack(loop_idx), scan_idx)
+    assert jnp.array_equal(jnp.stack(loop_g), scan_g)
+
+
+def test_coefficient_bound_does_not_kill_gradients():
+    """The response-coefficient bound must saturate WITHOUT severing the gradient.
+
+    It used to be `C*tanh(net/C)`, whose derivative `sech^2(net/C)` dies
+    exponentially -- a saturated coefficient got no gradient and could never
+    recover, so training was a one-way ratchet that progressively killed
+    coefficients (median attenuation 3.5e-9 and 63% of coefficients dead by
+    768k steps).  The rational form bounds identically but decays as (C/x)^3.
+
+    Pins all three properties that matter: the bound still holds, the small-
+    signal behaviour is unchanged (unit slope at 0, so it is a drop-in), and a
+    deeply saturated coefficient still receives usable gradient.
+    """
+    from models.shear import _COEFF_MAX, _Coeffs
+
+    C = _COEFF_MAX
+    f = lambda x: x * jax.lax.rsqrt(1.0 + (x / C) ** 2)
+    g = jax.grad(f)
+
+    assert abs(float(g(0.0)) - 1.0) < 1e-6          # drop-in near the origin
+    for k in (1, 5, 10, 50):                        # bound holds everywhere
+        assert abs(float(f(k * C))) < C
+    # the point of the change: still alive far into saturation, where tanh is not
+    assert float(g(10.0 * C)) > 1e-4
+    assert float(g(10.0 * C)) > 1e4 * float(1 / jnp.cosh(jnp.array(10.0)) ** 2)
+
+    # and the real module agrees with the closed form it is meant to implement
+    c = _Coeffs(jr.key(0), 32, 2, jax.nn.silu)
+    out = c(3.8, 0.5, 1.9, 2.0)
+    assert out.shape == (14,)
+    assert jnp.all(jnp.abs(out) < C)
+
+
+def test_coeff_input_whitening():
+    """`bulk.build_flow` must hand the coefficient net WHITENED inputs.
+
+    The four inputs are badly conditioned as they stand: on the bulgedisc
+    catalog `a` (size) and `b` (concentration) correlate at 0.997 and the
+    covariance condition number is ~2600, while `(q-2)/2` has std 2.76 rather
+    than the 1.0 its chi^2(2) derivation assumes.  Adam cannot fix input
+    correlation, so this is a plausible source of the spin-0 seed spread.
+
+    Pins that the stored statistics genuinely whiten what the net sees, and
+    that the identity default is a true no-op for callers that supply none.
+    """
+    import bulk
+    from paramax import unwrap
+    from models.shear import _Coeffs, _invariants, _Q_LOC, _Q_SCALE
+
+    rng = np.random.default_rng(0)
+    n = 4000
+    mf = 10 ** rng.uniform(3.2, 4.2, n)
+    mr = mf * rng.uniform(2.0, 3.5, n)
+    mc = mr * rng.uniform(2.0, 6.0, n)
+    e = rng.normal(0, 0.05, (n, 2))
+    m = np.stack([mf, mr, e[:, 0] * mr, e[:, 1] * mr, mc], axis=-1)
+
+    flow = bulk.build_flow(jr.key(0), m, layers=2, shear=True)
+    layer = [b for b in flow.bijection.bijection.bijections
+             if type(b).__name__ == "ShearResponse"][0]
+    chart = flow.bijection.bijection.bijections[0]
+
+    z = jax.vmap(chart.transform)(jnp.asarray(m))
+    mu, W = unwrap(layer.coeffs.u_mean), unwrap(layer.coeffs.u_white)
+    u = jax.vmap(lambda zi: W @ (jnp.stack(
+        [_invariants(zi)[0], _invariants(zi)[1], _invariants(zi)[2],
+         (_invariants(zi)[3] - _Q_LOC) / _Q_SCALE]) - mu))(z)
+
+    cov = jnp.cov(u.T)
+    assert float(jnp.linalg.cond(cov)) < 3.0, float(jnp.linalg.cond(cov))
+    assert jnp.max(jnp.abs(u.mean(0))) < 0.05, u.mean(0)
+
+    # identity default really is a no-op
+    plain = _Coeffs(jr.key(0), 16, 1, jax.nn.silu)
+    assert jnp.array_equal(unwrap(plain.u_mean), jnp.zeros(4))
+    assert jnp.array_equal(unwrap(plain.u_white), jnp.eye(4))

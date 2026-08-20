@@ -199,64 +199,10 @@ def condition(sigma_x, batch, g=(0.0, 0.0)):
     return jnp.tile(row, (batch, 1))
 
 
-def _scale(m):
-    """Per-moment normalisation [Mf, Mr, Mr, Mr, Mc], as in `shear._scale`.
-
-    Each moment is divided by its own magnitude so residuals are fractional and
-    flux-blind -- except the spin-2 pair, divided by Mr because M1 and M2 pass
-    through zero.
-    """
-    return jnp.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1], m[:, 4]], axis=-1)
-
-
-def shift_norms(m0, target):
-    """RMS of each moment's shift, in `_scale` units -- see `shear.partial_norms`.
-
-    The same imbalance, worse: the measured copy-mean shift runs 4e-3 to 1.2e-2
-    fractionally on Mf, Mr and Mc but ~1e-5 on M1 and M2, a factor of a
-    thousand, so a plain mean over the five weighs the spin-2 pair at 1e-6 of
-    the total and leaves it unsupervised.  The spin-2 part is the whole point of
-    the layer -- it is the ellipticity amplification that reads out as
-    multiplicative bias.
-    """
-    return jnp.sqrt(jnp.mean((target / _scale(m0)) ** 2, axis=0))     # (5,)
-
-
-def _shift_mse(layer, chart, m0, target, sigma_x, norms=None):
-    """L2 between the layer's shift and the catalog's weighted copy mean shift.
-
-    The direct analogue of `shear._velocity_mse`, and needed for the same reason:
-    the marginalisation moves the moments by ~1e-3 fractionally, which is worth
-    far less likelihood than the batch noise on a 1024-galaxy NLL, so on the NLL
-    alone the signal never surfaces.  Here the supervision is exact rather than
-    approximate -- the weighted copy mean IS eq. (36)'s first moment, computed
-    from the catalog with no model in between.
-
-    Its minimiser is E[shift | m], which is all a deterministic transport can
-    carry anyway; the rest is the `Var[.|m]` floor.
-    """
-    pred = jax.vmap(dm_dsigma, in_axes=(None, 0, None, None))(
-        layer, m0, sigma_x, chart)
-    n = 1.0 if norms is None else norms
-    return jnp.mean(((pred - target) / _scale(m0) / n) ** 2)
-
-
-def train(flow, sampler, sigma_x, shift_target, key, steps=4000, batch=1024,
-          lr=3e-3, shift_weight=1e4):
-    """Likelihood only by default -- see `shear.train` for the reasoning.
-
-    The specific worry here, from `_shift_mse`'s own docstring: the
-    marginalisation moves the moments by ~1e-3 fractionally, which is worth far
-    less likelihood than the batch noise on a 1024-galaxy NLL.  If that holds,
-    the signal never surfaces and the fix is a bigger `batch`, not more `steps`
-    -- it is a variance floor, not a convergence rate.  Measure before assuming
-    either way.
-    """
+def train(flow, sampler, sigma_x, key, steps=4000, batch=1024,
+          lr=3e-3):
+    """Likelihood only -- see `shear.train` for the reasoning."""
     cond = condition(sigma_x, batch)
-    sx = jnp.asarray(sigma_x, dtype=jnp.float32)
-    m_gal = jnp.asarray(shift_target[0], dtype=jnp.float32)
-    d_gal = jnp.asarray(shift_target[1], dtype=jnp.float32)
-    norms = shift_norms(m_gal, d_gal)
     opt = optax.chain(optax.clip_by_global_norm(1.0),
                       optax.adam(optax.cosine_decay_schedule(lr, steps)))
     params, static = eqx.partition(flow, _trainable(flow))
@@ -264,7 +210,7 @@ def train(flow, sampler, sigma_x, shift_target, key, steps=4000, batch=1024,
     rng = np.random.default_rng(int(jr.randint(key, (), 0, 2**30)))
 
     @eqx.filter_jit
-    def step(params, state, x, gi):
+    def step(params, state, x):
         def loss_fn(p):
             model = eqx.combine(p, static)
             # The chart is now the FIRST thing applied, so nothing downstream
@@ -283,28 +229,22 @@ def train(flow, sampler, sigma_x, shift_target, key, steps=4000, batch=1024,
             lp = model.log_prob(jnp.where(ok[:, None], x, safe_point(x)),
                                 condition=cond)
             nll = -jnp.sum(jnp.where(ok, lp, 0.0)) / jnp.maximum(jnp.sum(ok), 1)
-            if not shift_weight:
-                return nll, (nll, jnp.zeros(()), 1.0 - jnp.mean(ok))
-            mse = _shift_mse(_centroid_layer(model), _chart(model),
-                             m_gal[gi], d_gal[gi], sx, norms)
-            return nll + shift_weight * mse, (nll, mse, 1.0 - jnp.mean(ok))
+            return nll, (nll, 1.0 - jnp.mean(ok))
 
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, state = opt.update(grads, state, params)
         return eqx.apply_updates(params, updates), state, aux
 
     for i in range(steps):
-        x, gi = sampler.draw(rng, batch)
-        params, state, (nll, mse, off) = step(params, state, jnp.asarray(x),
-                                              jnp.asarray(gi))
+        x, _ = sampler.draw(rng, batch)
+        params, state, (nll, off) = step(params, state, jnp.asarray(x))
         # `off` is the fraction of copies the layer maps out of the chart, and
         # it is the diagnostic for the guard above: those copies contribute no
         # gradient, so nothing stops the layer pushing MORE of them out.  It
         # measured ~1e-4 and flat at the deep depth; a rising trend means the
         # map needs bounding rather than masking (see models/centroid.py).
         if i % 250 == 0 or i == steps - 1:
-            print(f"step {i:5d}  nll {nll:.4f}  shift mse {mse:.3e}  "
-                  f"off-chart {off:.2e}")
+            print(f"step {i:5d}  nll {nll:.4f}  off-chart {off:.2e}")
     return eqx.combine(params, static)
 
 
@@ -371,9 +311,6 @@ def main():
                    help="shear checkpoint to warm-start bulk+shear from")
     p.add_argument("--steps", type=int, default=4000)
     p.add_argument("--batch", type=int, default=1024)
-    p.add_argument("--shift-weight", type=float, default=1e4,
-                   help="weight on the supervised shift MSE; 0 trains on the "
-                        "likelihood alone, which the 1e-3 signal is too small for")
     p.add_argument("--sigma-scale", type=float, default=1.0,
                    help="rescale Sigma_X by this factor squared; the catalog "
                         "grid is valid over roughly [1/1.4, 1.4]")
@@ -419,13 +356,8 @@ def main():
                            f.bijection.bijection.bijections[1].std),
                 flow, (non_trainable(pb[0].mean), non_trainable(pb[0].std)))
             print(f"warm started bulk + shear from {a.init}")
-        # Indexed by galaxy ROW, so `CopySampler.draw`'s ids address it directly.
-        target, keep = weighted_copy_mean(copies, galaxies, sigma_x)
-        shift = np.zeros_like(m_train)
-        shift[keep] = target - m_train[keep]
-        flow = train(flow, sampler, sigma_x, (m_train, shift),
-                     jr.key(a.seed + 1), steps=a.steps, batch=a.batch,
-                     shift_weight=a.shift_weight)
+        flow = train(flow, sampler, sigma_x,
+                     jr.key(a.seed + 1), steps=a.steps, batch=a.batch)
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")
     else:

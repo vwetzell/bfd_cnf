@@ -97,6 +97,7 @@ LABEL_FONTSIZE, TICK_LABELSIZE = 34, 24
 # Mc/Mr ceiling, the identical point-source argument one moment order up --
 # see models.bijections.POINT_SOURCE_MC.
 from models.bijections import POINT_SOURCE, POINT_SOURCE_MC  # noqa: E402,F401
+from models.shear import _Q_LOC, _Q_SCALE  # noqa: E402
 
 # The target selection the real analysis applies, recorded here (not in
 # bias.py, which shear.py cannot import without a cycle) so it is not
@@ -104,8 +105,7 @@ from models.bijections import POINT_SOURCE, POINT_SOURCE_MC  # noqa: E402,F401
 # on sky.  These are NOT yet wired into `bias.main` -- eq. (40)/(46)'s
 # selection terms are owed before a cut may be applied to a bias measurement
 # -- but they are what `dev/check_dmdg_components.py` restricts its
-# comparison to and what `shear.band_weight` upweights, since the response
-# outside the window is never used.
+# comparison to, since the response outside the window is never used.
 #
 # Measured on bulgedisc: the size window keeps 76.4% (4.9% below 2.2, 18.7%
 # above 3.5) and the flux window 94.9% standalone but only 3.1% more inside the
@@ -133,6 +133,22 @@ def to_coords(m):
     return np.stack([np.log10(m[:, 0]), np.log(u) - np.log1p(-u),
                      np.log(v) - np.log1p(-v), m[:, 2] / m[:, 1], m[:, 3] / m[:, 1]],
                     axis=-1)
+
+
+def coeff_stats(t):
+    """(mean, W) whitening the ShearResponse coefficient net's four inputs.
+
+    `t` is the chart output for the training set.  The net sees
+    `[z0, z1, z2, (|e|^2 - 2)/2]` in STANDARDISED coordinates, so reproduce that
+    here and return the mean and inverse Cholesky factor of its covariance.
+    See `models.shear._Coeffs.__call__` for why: those inputs have condition
+    number ~2600 as they stand, with z1 and z2 correlated at 0.997.
+    """
+    z = (t - t.mean(0)) / t.std(0)
+    q = z[:, 3] ** 2 + z[:, 4] ** 2
+    u = np.stack([z[:, 0], z[:, 1], z[:, 2], (q - _Q_LOC) / _Q_SCALE], axis=-1)
+    cov = np.cov(u.T) + 1e-8 * np.eye(4)
+    return u.mean(0), np.linalg.inv(np.linalg.cholesky(cov))
 
 
 def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH,
@@ -164,6 +180,7 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
             "measurements they need a deconvolving objective, not this one.")
     t = to_coords(m_train)
     raw2standard = RawMomentStandardize(mean=t.mean(0), std=t.std(0))
+    _u_stats = coeff_stats(t)
 
     key, k_shear, k_centroid = jr.split(key, 3)
     keys = jr.split(key, layers)
@@ -206,91 +223,15 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
                                  mean=t.mean(0), std=t.std(0))]
             if centroid else []) + \
            ([ShearResponse(k_shear, cond_dim=cond or 2,
-                           e_scale=float(t.std(0)[3]))] if shear else [])
+                           e_scale=float(t.std(0)[3]),
+                           u_mean=_u_stats[0], u_white=_u_stats[1])]
+            if shear else [])
     bijection = Invert(Chain([raw2standard, *head, *bulk]).merge_chains())
     base = non_trainable(MultivariateNormal(jnp.zeros(5), jnp.eye(5)))
     return Transformed(base, bijection)
 
 
-def z_of(flow):
-    """The same density in the flow's standardized coordinates z = T(m).
-
-    Data -> base order is [chart, *bulk] (`build_flow`'s comment on
-    `flow.bijection.bijection.bijections`), so peeling off `bijections[0]`
-    -- the `RawMomentStandardize` chart -- leaves exactly the bulk chain
-    acting on z instead of m.  This is `shear.bulk_of` one layer further in:
-    that function peels the shear layer to expose the bulk at g = 0, this one
-    peels the chart to expose the bulk in the coordinates it actually models.
-    """
-    bij = flow.bijection.bijection.bijections
-    return Transformed(flow.base_dist,
-                       Invert(Chain(list(bij[1:])).merge_chains()))
-
-
-def _hyvarinen(log_prob, z, coords=(0, 1, 2, 3, 4)):
-    """sum_j E[ 0.5 (d_j log p)^2 + d_jj log p ] over `coords`, rows of `z`.
-
-    This is the (implicit) Hyvarinen score-matching objective: its expectation
-    over the TRUE data density equals, up to an additive constant the model
-    cannot move, 0.5 E[|grad log p_model - grad log p_true|^2] -- so minimising
-    it fits the model's SCORE without ever needing the true density's score.
-    `log_prob` maps a single (5,) point to a scalar; `z` is (n, 5).
-
-    It is summed over coordinates and the integration by parts that produces it
-    is done one coordinate at a time, so a SUBSET of `coords` is still a
-    consistent objective -- for those partials of the score, and only those.
-    That subsetting is the point rather than an economy: on this population the
-    full sum is dominated by `Mc/Mr` (about -8600 of -10200, because Mc is
-    nearly determined by the other moments so its conditional is razor thin),
-    which would spend the whole term on a direction the shear estimator never
-    looks along.  See `SCORE_COORDS`.
-
-    Each coordinate costs one Hessian-vector product (`jvp` of `grad` along a
-    basis vector), not a full Hessian: with the default `coords` that is the
-    same work, but at one coordinate it is ~5x cheaper, which is the difference
-    between a 20 minute training run and an 11 hour one.
-    """
-    def per_row(z_i):
-        def one(j):
-            e = jnp.zeros(z.shape[-1]).at[j].set(1.0)
-            g, hv = jax.jvp(jax.grad(log_prob), (z_i,), (e,))
-            return 0.5 * g[j] ** 2 + hv[j]
-        return sum(one(j) for j in coords)
-
-    return jnp.mean(jax.vmap(per_row)(z))
-
-
-# The resolution direction, logit(Mr/Mf).  The ramp that motivates this whole
-# term lives in Mr/Mf, and the convolution that carries it reaches through the
-# 3.5-3.976 band of exactly this coordinate; the other four either dominate the
-# objective for irrelevant reasons (Mc/Mr, above) or are already small.
-SCORE_COORDS = (1,)
-
-
-def score_match(flow, m, coords=SCORE_COORDS):
-    """The bulk's score-matching term at raw moments `m` ((n, 5) array).
-
-    Maximum likelihood constrains p but not grad log p, yet the downstream
-    estimator only ever touches the SCORE -- `Q = grad log p . u + div u` --
-    so this term is what actually supervises the quantity that reaches the
-    bias (mirrors `shear.py`'s `_velocity_mse` first-order score term one
-    stage upstream).
-
-    Evaluated in the chart's standardized coordinates z = T(m), not raw
-    moment space: raw scores are ~1e-4 and the term would underflow float32.
-    `z` is wrapped in `stop_gradient` -- the chart's mean/std are trainable
-    (`bulk.train` partitions on `eqx.is_inexact_array`), so without this the
-    optimiser could shrink the term by moving the data's coordinates instead
-    of by fixing the score, which is not the objective.
-    """
-    chart = flow.bijection.bijection.bijections[0]
-    z, _ = jax.vmap(chart.transform_and_log_det)(m)
-    z = jax.lax.stop_gradient(z)
-    return _hyvarinen(z_of(flow).log_prob, z, coords)
-
-
-def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, score_weight=0.0,
-          score_coords=SCORE_COORDS):
+def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3):
     # The power-law flux gives log10(Mf) a long tail, so an outlier batch can blow
     # the NLL up mid-training and never recover -- clip, then decay the step size.
     opt = optax.chain(optax.clip_by_global_norm(1.0),
@@ -299,40 +240,20 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, score_weight=0.0,
     state = opt.init(params)
     data = jnp.asarray(m_train)
 
-    # Guarded outside the jit so the score term is never traced, let alone
-    # computed, when it is off -- the default path stays bit-identical to
-    # what it was before this option existed.
-    if score_weight:
-        @eqx.filter_jit
-        def step(params, state, idx):
-            def loss_fn(p):
-                model = eqx.combine(p, static)
-                x = data[idx]
-                nll = -jnp.mean(model.log_prob(x))
-                score = score_match(model, x, score_coords)
-                return nll + score_weight * score, (nll, score)
-            (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-            updates, state = opt.update(grads, state, params)
-            return eqx.apply_updates(params, updates), state, aux
-    else:
-        @eqx.filter_jit
-        def step(params, state, idx):
-            def nll(p):
-                return -jnp.mean(eqx.combine(p, static).log_prob(data[idx]))
-            loss, grads = jax.value_and_grad(nll)(params)
-            updates, state = opt.update(grads, state, params)
-            return eqx.apply_updates(params, updates), state, loss
+    @eqx.filter_jit
+    def step(params, state, idx):
+        def nll(p):
+            return -jnp.mean(eqx.combine(p, static).log_prob(data[idx]))
+        loss, grads = jax.value_and_grad(nll)(params)
+        updates, state = opt.update(grads, state, params)
+        return eqx.apply_updates(params, updates), state, loss
 
     for i in range(steps):
         key, sk = jr.split(key)
         idx = jr.randint(sk, (batch,), 0, data.shape[0])
-        params, state, aux = step(params, state, idx)
+        params, state, loss = step(params, state, idx)
         if i % 500 == 0 or i == steps - 1:
-            if score_weight:
-                nll, score = aux
-                print(f"step {i:5d}  nll {nll:.4f}  score {score:.4f}")
-            else:
-                print(f"step {i:5d}  nll {aux:.4f}")
+            print(f"step {i:5d}  nll {loss:.4f}")
     return eqx.combine(params, static)
 
 
@@ -347,16 +268,6 @@ def main():
     p.add_argument("--data", default="../bfd_cnf_imsims/data/moments.fits")
     p.add_argument("--flow", default="flows/bulk.eqx")
     p.add_argument("--steps", type=int, default=4000)
-    p.add_argument("--score-weight", type=float, default=0.0,
-                   help="weight on the Hyvarinen score-matching term, which "
-                        "supervises grad log p directly -- the quantity the "
-                        "downstream estimator actually uses; 0 = off. The term "
-                        "is ~-1500 against an NLL of ~41, so useful weights "
-                        "are 1e-3 and below")
-    p.add_argument("--score-coords", default=",".join(map(str, SCORE_COORDS)),
-                   help="standardized coordinates the score term supervises, "
-                        "comma separated: 0 log10(Mf), 1 logit(Mr/Mf), "
-                        "2 Mc/Mr, 3-4 the spin-2 pair")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default="plots/bulk_corner.png")
     a = p.parse_args()
@@ -368,9 +279,7 @@ def main():
     flow = build_flow(k_build, m_train)
 
     if a.mode == "train":
-        flow = train(flow, m_train, k_train, steps=a.steps,
-                     score_weight=a.score_weight,
-                     score_coords=tuple(int(c) for c in a.score_coords.split(",")))
+        flow = train(flow, m_train, k_train, steps=a.steps)
         print(f"val nll {-jnp.mean(flow.log_prob(jnp.asarray(m_val))):.4f}")
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")

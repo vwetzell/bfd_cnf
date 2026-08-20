@@ -105,8 +105,31 @@ from paramax import non_trainable, unwrap
 from .bijections import CoeffNet
 
 # Coefficients are bounded so the map stays a diffeomorphism for any g the
-# network might see.  The true values span roughly [-2, 7] (see the ranges
-# printed by tests/test_shear.py), so 12 constrains nothing real.
+# network might see.  The true values span roughly [-2, 7], so 12 constrains
+# nothing real.
+#
+# That claim was CHECKED on 2026-08-20 rather than inherited, because the
+# constant predates 16ece5c moving the chart to standardised coordinates and
+# looked stale.  It is not.  `response` is linear in the coefficients and only
+# five matter at first order, so bfd's exact per-template dm/dg inverts for them
+# (round-trip validated to 2.3%), and the conditional mean the layer actually
+# represents has |a1| p99 = 6.4 -- comfortably inside 12.  Clipping at 12
+# destroys 0.94% of the first-order response.
+#
+# THE TRAP, recorded because it cost a full paired experiment: the PER-TEMPLATE
+# coefficients look completely different -- |a1| p99 = 122.6, and clipping at 12
+# appears to destroy 31% of the response.  That is an artifact.  a_i =
+# (dz_i/dg . e)/(e_scale |e|^2) is the conditional mean plus Var[Q|m] noise
+# divided by |e|^2, and that noise diverges exactly where |e| is small, which is
+# also where the response a*Re(ebar.g) vanishes and the coefficient is
+# unidentified.  Size this bound from the SMOOTHED coefficient function, never
+# from per-template values.
+#
+# Raising it to 100 was tried and is worse, 5 seeds paired at g_max=0.10:
+# spin-2 alpha falls 0.95 -> 0.44 and the seed spread triples (Mf sd 0.77 ->
+# 2.29).  The bound is load-bearing: it caps the unidentified small-|e|
+# direction, and the coefficient net is smooth in q, so letting that direction
+# wander corrupts the resolved population too.
 _COEFF_MAX = 12.0
 
 # This layer now acts on the STANDARDISED coordinates
@@ -163,16 +186,68 @@ def _invariants(z):
 
 
 class _Coeffs(eqx.Module):
-    """(r, k, q) -> the fourteen real response coefficients, bounded by _COEFF_MAX."""
+    """(r, k, q) -> the fourteen real response coefficients, bounded by _COEFF_MAX.
+
+    The bound is RATIONAL, not `tanh`, and that is the whole point.  Both squash
+    to +/-_COEFF_MAX and both have unit slope at the origin, so they are
+    interchangeable for any coefficient in the normal range -- they differ only
+    once the pre-activation runs deep into saturation, and there `tanh` is a
+    gradient trap.  Its derivative `sech^2(net/C)` decays EXPONENTIALLY, so a
+    saturated coefficient receives no gradient and can never come back: training
+    is a one-way ratchet that progressively kills coefficients.
+
+    Measured on 2026-08-20 (pure-NLL training, `dev/spin0_gradient_snr.py` and
+    the attenuation scan beside it): the median coefficient's gradient
+    attenuation `sech^2(net/C)` fell 0.996 -> 0.837 -> 3.2e-4 -> 3.5e-9 at
+    6k -> 96k -> 400k -> 768k steps, with 63% of coefficients below 0.01 by the
+    end.  That is the "runaway": the surviving coefficients compensate while the
+    dead ones are frozen at the bound.  It also explains the batch dependence
+    (more progress per step saturates sooner) and why the SUPERVISED flow never
+    dies (`frac < 1e-4` is 0.000 -- the regression term keeps pulling
+    coefficients back into the live range).  The signal itself was never
+    missing: the NLL pins the spin-0 scale to sigma ~0.03 with a gradient SNR of
+    ~36 at the point training converged to.
+
+    `x / sqrt(1 + (x/C)^2)` decays only as `(C/x)^3`, so at ten times into
+    saturation a coefficient still gets ~1e-3 of its gradient rather than 8e-9
+    and can recover.  Same form as `models/centroid.py`'s `_EXP_MAX`
+    saturation, and analytic everywhere -- `C*x/(C+|x|)` would bound just as
+    well but has a discontinuous second derivative at the origin.
+    """
 
     net: CoeffNet
+    u_mean: jax.Array
+    u_white: jax.Array
 
-    def __init__(self, key, nn_width, nn_depth, activation):
+    def __init__(self, key, nn_width, nn_depth, activation,
+                 u_mean=None, u_white=None):
         self.net = CoeffNet(key, 4, N_COEFFS, nn_width, nn_depth, activation)
+        # Identity default keeps this a no-op for callers that do not supply
+        # statistics (tests, ad-hoc layers); `bulk.build_flow` always does.
+        self.u_mean = non_trainable(
+            jnp.zeros(4) if u_mean is None else jnp.asarray(u_mean, jnp.float32))
+        self.u_white = non_trainable(
+            jnp.eye(4) if u_white is None else jnp.asarray(u_white, jnp.float32))
 
     def __call__(self, f, a, b, q):
+        # WHITENED, not merely per-slot standardised.  Measured on the bulgedisc
+        # training catalog: `a` (size) and `b` (concentration) correlate at
+        # 0.997, and the covariance eigenvalues span 3.0e-3 to 8.25 -- condition
+        # number 2625.  `(q - 2)/2` is not standardised either: the chi^2(2)
+        # argument behind `_Q_SCALE` assumes Gaussian spin-2 slots, but real
+        # ellipticities are heavy-tailed, giving std 2.761, skew 8.4 and a max
+        # of 85.6.  Adam's diagonal preconditioner fixes per-parameter SCALE but
+        # not input CORRELATION, which lands in the weight-space Hessian, so the
+        # near-degenerate direction leaves the fit poorly determined along it --
+        # the suspected cause of the seed-to-seed spread in the spin-0 response
+        # (sd 0.54 in Mf at fixed steps, against 7e-4 in val nll).
+        # The transform is the training set's own mean and inverse Cholesky
+        # factor, held non-trainable: a data-determined constant of exactly the
+        # same kind as `RawMomentStandardize`'s mean/std, not a hyperparameter.
         u = jnp.stack([f, a, b, (q - _Q_LOC) / _Q_SCALE])
-        return _COEFF_MAX * jnp.tanh(self.net(u) / _COEFF_MAX)
+        u = unwrap(self.u_white) @ (u - unwrap(self.u_mean))
+        x = self.net(u)
+        return x * jax.lax.rsqrt(1.0 + (x / _COEFF_MAX) ** 2)
 
 
 def response(coeffs, z, g, e_scale):
@@ -232,8 +307,9 @@ class ShearResponse(AbstractBijection):
     e_scale: jax.Array = eqx.field(default=None)
 
     def __init__(self, key, nn_width=128, nn_depth=3, activation=jnn.silu,
-                 cond_dim=2, e_scale=1.0):
-        self.coeffs = _Coeffs(key, nn_width, nn_depth, activation)
+                 cond_dim=2, e_scale=1.0, u_mean=None, u_white=None):
+        self.coeffs = _Coeffs(key, nn_width, nn_depth, activation,
+                              u_mean=u_mean, u_white=u_white)
         self.e_scale = non_trainable(jnp.asarray(e_scale))
         # (2,) alone, or (5,) = [g1, g2, C00, C01, C11] when chained with the
         # centroid layer, which reads the other three.
@@ -303,11 +379,10 @@ def dm_dg(layer, m, chart):
     g-derivatives of that composite gets the second order right too (a bare
     Jacobian factor would miss the chart's own curvature term).
 
-    This is not only a diagnostic: `shear.train` regresses against it with
-    `deriv_weight = 1e4`, so it is the dominant term in the loss and the model's
-    one piece of external ground truth.  Feeding the layer raw moments here
-    after the reordering would compare z-derivatives against raw truth and train
-    the layer to fit noise.
+    `shear.check` compares against it as the model's one piece of external
+    ground truth -- an independent held-out test, since training is now pure
+    NLL.  Feeding the layer raw moments here after the reordering would
+    compare z-derivatives against raw truth, silently.
     """
     f = lambda g: chart.inverse(layer.shear(chart.transform(m), g))
     g0 = jnp.zeros(2)
