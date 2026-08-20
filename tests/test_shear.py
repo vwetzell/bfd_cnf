@@ -370,3 +370,33 @@ def test_chart_spin0_jacobian():
     # statistic in the layer, so this is float32 round-off and not a mismatch.
     rel = jnp.max(jnp.abs(exact - ours) / jnp.abs(exact).max())
     assert rel < 1e-6, rel
+
+
+def test_e_scale_is_the_charts_effective_spin2_std():
+    """`e_scale` must be the std z3 and z4 are ACTUALLY divided by.
+
+    `RawMomentStandardize._effective` symmetrises the spin-2 pair -- that is
+    what keeps the chart isotropic -- so slot 3's own std is not it.  Passing
+    the wrong one scales every physical-unit quantity in `response` by the
+    ratio, which was 0.67% on the bulgedisc training set: small, absorbable by
+    training, and silently wrong in every comparison against bfd.
+    """
+    import numpy as np
+    import bulk
+    from paramax import unwrap
+
+    rng = np.random.default_rng(2)
+    n = 3000
+    mf = 10 ** rng.uniform(3.2, 4.2, n)
+    mr = mf * rng.uniform(2.0, 3.5, n)
+    # Deliberately anisotropic sample: the two spin-2 stds differ, so a layer
+    # that took slot 3's own std would fail here and pass on a symmetric one.
+    m = np.stack([mf, mr, mr * rng.normal(0, 0.06, n), mr * rng.normal(0, 0.03, n),
+                  mr * rng.uniform(2.0, 6.0, n)], axis=-1)
+
+    flow = bulk.build_flow(jr.key(0), m, layers=2, shear=True)
+    layer = [b for b in flow.bijection.bijection.bijections
+             if type(b).__name__ == "ShearResponse"][0]
+    chart = flow.bijection.bijection.bijections[0]
+    want = float(chart._effective()[1][3])
+    assert abs(float(unwrap(layer.e_scale)) - want) < 1e-9 * want

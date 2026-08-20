@@ -223,7 +223,17 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
                                  mean=t.mean(0), std=t.std(0))]
             if centroid else []) + \
            ([ShearResponse(k_shear, cond_dim=cond or 2,
-                           e_scale=float(t.std(0)[3]),
+                           # The chart's EFFECTIVE spin-2 std, not slot 3's own.
+                           # `RawMomentStandardize._effective` symmetrises the
+                           # pair to sqrt((s3^2 + s4^2)/2) -- that is what z3
+                           # and z4 are actually divided by, so anything else
+                           # here makes `response`'s "physical units" wrong by
+                           # the ratio.  It was `t.std(0)[3]`, which is 0.67%
+                           # off on bulgedisc and 1.8% off on a 1000-row
+                           # subsample; `dev/reparam_paired.py`'s constant-
+                           # coefficient check is what turned it up.
+                           e_scale=float(np.sqrt(
+                               0.5 * (t.std(0)[3] ** 2 + t.std(0)[4] ** 2))),
                            u_mean=_u_stats[0], u_white=_u_stats[1],
                            chart_loc=t.mean(0)[:3], chart_scale=t.std(0)[:3])]
             if shear else [])
