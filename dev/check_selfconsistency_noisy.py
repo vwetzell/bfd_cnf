@@ -204,7 +204,8 @@ def main():
         # catalog rows, so its size axis cannot be recovered from a catalog the
         # way `check_noisy_size_profile` recovers the real run's.
         np.savez_compressed(a.save_pqr, plus_q=qp, plus_r=rp, minus_q=qm,
-                            minus_r=rm, y=y, x=np.log10(m0[:, 0]), keep=fin)
+                            minus_r=rm, y=y, x=np.log10(m0[:, 0]), keep=fin,
+                            moments=m0)
         print(f"  wrote {a.save_pqr}")
 
     ed = np.quantile(y[fin], np.linspace(0, 1, a.nbin + 1))

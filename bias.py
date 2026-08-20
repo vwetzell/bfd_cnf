@@ -127,20 +127,10 @@ jax.config.update("jax_default_matmul_precision", "highest")
 
 # Catalogs, as (label, filename stem), per population.  The +/- pair share a
 # seed and so are the same galaxies; the g=0 run is the same galaxies again.
-# The target selection the real analysis applies, recorded here so it is not
-# re-invented per script.  A size window in Mr/Mf and a flux window in Mf, as
-# on sky.  These are NOT yet wired into `main` -- eq. (40)/(46)'s selection
-# terms are owed before a cut may be applied to a bias measurement -- but they
-# are what `dev/check_dmdg_components.py` restricts its comparison to, since
-# the response outside the window is never used.
-#
-# Measured on bulgedisc: the size window keeps 76.4% (4.9% below 2.2, 18.7%
-# above 3.5) and the flux window 94.9% standalone but only 3.1% more inside the
-# size window -- the two are largely redundant, because the faint galaxies are
-# mostly the small-Mr/Mf ones already cut (median Mf 2548 below Mr/Mf = 2.2
-# against 5202 above).  Both together keep 74.1%.
-SIZE_WINDOW = (2.2, 3.5)          # Mr/Mf
-FLUX_WINDOW = (2500.0, 50000.0)   # Mf
+# The target selection window lives in bulk.py -- shear.py's band_weight
+# needs it too and cannot import bias.py without a cycle -- and is re-exported
+# here under its established name.
+SIZE_WINDOW, FLUX_WINDOW = bulk.SIZE_WINDOW, bulk.FLUX_WINDOW
 
 CATALOGS = {
     "bulgedisc": {"plus": "targets_g1p02_1M", "minus": "targets_g1m02_1M",
@@ -592,6 +582,48 @@ def pqr(flow, m, draws=None, log_wt=None, batch=20000, sigma_x=None):
     return _over_targets(one, (m, draws, log_wt, sigma_x), batch)
 
 
+def pqr_full(flow, m, draws=None, log_wt=None, batch=20000, sigma_x=None, ok=None):
+    """Per-target (log P, d logP/dg, d2 logP/dg2) at g = 0, as float64.
+
+    Same convolution as `pqr` (noiseless without `draws`/`log_wt`, else the
+    C_M integral), but also returns the value.  `pqr` doesn't, because nothing
+    upstream of it needs it: `ghat`/`bias` only ever sum Q and R.  It exists
+    for `write_logpqr.py` -- bfd's packed PQR (`bfd.pqr.packPqr`) has a P slot
+    alongside Q and R, and here it is log P, NOT bfd's own raw P (see that
+    module's docstring: `bfd.pqr.logPqr` converts a RAW packed p,q,r to a log
+    one by dividing by p; ours is already log, so never round-trip it through
+    that function -- there is no finite p to divide by, `log P` is O(-40) so
+    `p = exp(log P)` is float32 noise, which is exactly why this project
+    differentiates `log P` directly instead of forming P, Q, R separately).
+
+    One extra forward pass over `pqr`'s jvp trick (value_and_grad already
+    computes the value for free), so this is not the streamed one -- no
+    streaming, or the merge's known chunk-Hessian fragility applies here too;
+    see `pqr_streamed`'s docstring and this session's own grounding of it.
+
+    `ok`, if given, is the domain mask computed on `draws` BEFORE any centroid
+    peel (`in_domain(draws_raw)`), same as `pqr_streamed` threads through --
+    `pqr` itself does not accept this and instead lets `log_conv_is` recompute
+    `in_domain` on whatever it is handed, which is wrong once the caller has
+    already peeled `draws` to standardised coordinates (see that function's
+    docstring).  Measured harmless in practice (HANDOFF.md's `_mixture_chunk`
+    finding: the affected draws carry ~0 weight) but there is no reason to
+    reintroduce it here.
+    """
+    zero = jnp.zeros(2)
+
+    def one(m_i, draws_i, log_wt_i, sigma_x_i, ok_i):
+        cond = lambda g: condition(g, sigma_x_i)
+        f = (lambda g: flow.log_prob(m_i, condition=cond(g))) if draws is None else (
+            lambda g: log_conv_is(flow, m_i, draws_i, log_wt_i, cond(g), ok_i))
+        vg = jax.value_and_grad(f)
+        (val, df), (_, h0) = jax.jvp(vg, (zero,), (jnp.array([1.0, 0.0]),))
+        _, (_, h1) = jax.jvp(vg, (zero,), (jnp.array([0.0, 1.0]),))
+        return val, df, jnp.stack([h0, h1], axis=-1)
+
+    return _over_targets(one, (m, draws, log_wt, sigma_x, ok), batch)
+
+
 def _merge_init(n):
     """Running state for the chunk merge.
 
@@ -805,7 +837,15 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
             # once the peel has run, the draw is in standardised coordinates and
             # the chart's ceilings are behind it.  With no peel, `log_conv_is`
             # does this itself on the same quantity.
-            ok_raw = in_domain(jnp.asarray(d))
+            # ... and hand it down ONLY when the peel has run.  With no peel
+            # `draws` are still raw, and `log_conv_is`'s `ok is not None` branch
+            # stands bad rows in at ZERO -- a valid standardised coordinate but
+            # not a valid raw moment (Mf = 0 -> log10(0)).  The `where` masks it
+            # out of the value and 0 * inf NaNs the GRADIENT, killing every
+            # target with even one off-chart draw (16% of bulgedisc).  `ok=None`
+            # makes log_conv_is recompute the same mask with `safe_point` as the
+            # stand-in, which is the whole reason that function exists.
+            ok_raw = in_domain(jnp.asarray(d)) if layer is not None else None
             if layer is not None:
                 # Stay on device: the transformed draws go straight back into a
                 # jitted function, so a host round-trip here is pure loss.
@@ -881,20 +921,264 @@ def ess(flow, m, draws, log_wt, batch=20000, sigma_x=None):
     return _over_targets(one, (m, draws, log_wt, sigma_x), batch)
 
 
-def ghat(q, r, sel=None):
-    """The BFD ensemble shear estimate over the selected targets."""
+_GL_NODES, _GL_WEIGHTS = np.polynomial.legendre.leggauss(64)
+
+
+def window_mask(m, size, flux):
+    """Boolean mask of the rows of `m` (n, 5) inside the target window:
+    `size[0] < Mr/Mf < size[1]` and `flux[0] < Mf < flux[1]`.
+
+    This is the HARD version of the cut -- membership by the target's own
+    (noisy) moments, exactly what a real analysis applies.  `window_prob`
+    is its soft, pre-measurement counterpart: the probability a galaxy's
+    NOISY moments would land here, needed by eq. (45)-(46) because the
+    estimator never gets to see the non-selected galaxies' own M.
+    """
+    m = np.asarray(m)
+    r = m[:, 1] / m[:, 0]
+    return (r > size[0]) & (r < size[1]) & (m[:, 0] > flux[0]) & (m[:, 0] < flux[1])
+
+
+def window_prob(m, cov, size, flux, nodes=64):
+    """F(m) = Pr[m + n lands in the window], n ~ N(0, cov[:2, :2]).
+
+    This is eq. (30)'s `INT_{M in S} dM L(M - M^G)`, with the paper's `|J(M)|`
+    weight and `L(X^G)` detection factor dropped -- see `selection_terms` for
+    why that is right here and how it was checked.
+
+    Only the (Mf, Mr) 2x2 block of `cov` enters: the window is a cut on those
+    two moments alone.  The size cut `size[0] < Mr'/Mf' < size[1]` is
+    equivalent to the two LINEAR constraints `size[0] Mf' < Mr' < size[1] Mf'`
+    when `Mf' > 0`, and conditioning on `Mf' = Mf + sf t` reduces it to a
+    single Gaussian CDF difference in the residual of Mr' after regressing out
+    Mf' -- a 1-D Gauss-Legendre quadrature over `t` handles the flux cut and
+    the correlation together.
+
+    That equivalence is EXACT, not approximate, whenever `flux[0] >= 0`: `t` is
+    integrated only over the flux window, so `Mf' >= flux[0]` identically
+    (where the clip below bites, it bites only on the side already inside the
+    window).  Checked at 2e6 noise draws on real catalog rows: zero
+    disagreements with the literal ratio cut.  It FAILS for an unbounded flux
+    window, where a faint `Mf` can be pushed negative and the ratio flips sign
+    against the linear form -- hence the guard.
+
+    Clipped at t in [-8, 8]: `norm.pdf` is negligible past there and the
+    window's flux boundary has stopped moving `F` to float32 precision, so
+    the zero gradient beyond the clip is the right answer, not lost signal.
+    Returns 0 (not NaN) wherever the flux window is empty at that `Mf`
+    (`t1 <= t0`), and `+/-inf` window bounds work directly: `clip` absorbs an
+    infinite flux bound and `norm.cdf(+/-inf)` absorbs an infinite size one.
+    """
+    if np.isfinite(size).any() and not flux[0] >= 0.0:
+        raise ValueError(
+            f"a finite Mr/Mf window ({size}) needs a flux floor >= 0, got "
+            f"flux={flux}: the ratio cut is linearised as size*Mf' vs Mr', "
+            f"which inverts once Mf' can go negative.  Pass --window-flux with "
+            f"a non-negative lower bound.")
+    if nodes == 64:
+        x, w = _GL_NODES, _GL_WEIGHTS
+    else:
+        x, w = np.polynomial.legendre.leggauss(nodes)
+    x = jnp.asarray(x)
+    w = jnp.asarray(w)
+
+    Mf = m[..., 0]
+    Mr = m[..., 1]
+    sf = jnp.sqrt(cov[0, 0])
+    sr = jnp.sqrt(cov[1, 1])
+    rho = cov[0, 1] / (sf * sr)
+    sc = sr * jnp.sqrt(1.0 - rho ** 2)
+
+    t0 = jnp.clip((flux[0] - Mf) / sf, -8.0, 8.0)
+    t1 = jnp.clip((flux[1] - Mf) / sf, -8.0, 8.0)
+
+    u = 0.5 * (t1 + t0)[..., None] + 0.5 * (t1 - t0)[..., None] * x
+    Mfp = Mf[..., None] + sf * u
+    mur = Mr[..., None] + rho * sr * u
+
+    def lin(coef):
+        # `coef * Mfp` is a genuine 0 * inf trap in the GRADIENT when `coef`
+        # is +/-inf (unlike the flux side's `flux[k] - Mf`, this is a
+        # PRODUCT, so autodiff's product rule multiplies an infinite
+        # derivative by pdf(+/-inf) = 0 downstream).  An infinite size bound
+        # truly does not move with Mfp, so its gradient IS zero, not
+        # indeterminate; skip the arithmetic entirely and say so, the same
+        # guard `mixture_draws` applies to `log(alpha)` at the 0/1 endpoints.
+        if np.isneginf(coef):
+            return jnp.full_like(mur, -jnp.inf)
+        if np.isposinf(coef):
+            return jnp.full_like(mur, jnp.inf)
+        return (coef * Mfp - mur) / sc
+
+    a, b = lin(size[0]), lin(size[1])
+    integrand = jax.scipy.stats.norm.pdf(u) * (
+        jax.scipy.stats.norm.cdf(b) - jax.scipy.stats.norm.cdf(a))
+    F = 0.5 * (t1 - t0) * jnp.sum(w * integrand, axis=-1)
+    return jnp.where(t1 <= t0, 0.0, F)
+
+
+def selection_terms(draw, z, cov, size, flux, batch=16384):
+    """(P_s, Q_s, R_s, Q_s_err) -- eq. (40)'s selection probability and its
+    first two shear derivatives at g = 0, as float64 (), (2,), (2, 2), (2,).
+
+    `P(s|g) = E_{m ~ P(.|g)}[F(m)]` (paper eq. 40): draw `m` from the prior at
+    shear `g` and ask for the probability its noisy measurement lands in the
+    window.  `draw(g, z_chunk)` supplies the prior draws -- typically the
+    flow's base -> data map -- and `z` a fixed base sample large enough to
+    resolve `P_s` and its derivatives to the precision the ensemble sums need;
+    `Q_s_err` says whether it was.
+
+    Two factors of the paper's eq. (30)/(38)/(40) are absent, deliberately.
+    `|J(M)|`, the Jacobian of the positional moments, is a function of `M`
+    alone (eq. 23, and eq. 25's note that it is independent of `X`), so it
+    cancels exactly out of every `Q_i`, `R_i` -- those are g-derivatives at
+    FIXED `M_i`.  `L(X^G)`, the detection factor, and its `Delta^2 u` sum are
+    what the centroid layer already carries (eq. 36).  What is left is: every
+    stamp holds one already-detected galaxy, the flow is the density of that
+    detected population, and the only selection is this window -- so `P(s|g)`
+    is just "does a random detected galaxy's noisy M land in S".
+
+    That is an assumption, and it was checked rather than asserted: pushing the
+    TRUE template population (`moments.fits`, with bfd's exact `dm_dg`) through
+    `window_prob` gives `P_s = 0.3033` against the noisy catalog's own measured
+    selection fraction of `0.3016` -- 0.6%.  If the dropped factors mattered
+    they would show up there.  Two things the same check does NOT cover: this
+    is the postage-stamp branch (eq. 45-46, `N_ns` counted), not the Poisson
+    sky branch (eq. 53-55, `n Omega P_s`), and it assumes one `C_M` and one
+    `Sigma_X` for the whole catalog, as these catalogs have.
+
+    By isotropy `Q_s` is exactly zero for a spin-0 window -- `P_s` can only
+    depend on `|g|^2` -- so the correction is carried entirely by `R_s`, and a
+    `Q_s` significantly above `Q_s_err` means something is wrong (an
+    anisotropic window, or an anisotropy in the prior).  Measured both ways it
+    is consistent with zero at 1 sigma, and forcing it to zero moves `m1` by
+    less than 1e-5.
+
+    One forward-over-reverse `jax.jvp` pass per shear direction, exactly the
+    idiom `pqr_full`/`pqr_streamed` use, rather than `jax.hessian` -- calling
+    value, grad and hessian separately would evaluate `draw` three times over.
+    Chunks are accumulated as a weighted mean (weighted by chunk size, so an
+    unequal last chunk is handled correctly) and promoted to float64 on the
+    host before accumulating, as `_over_targets` does.
+    """
+    zero = jnp.zeros(2)
+    cov = jnp.asarray(cov)
+
+    def one_chunk(z_chunk):
+        f = lambda g: jnp.mean(window_prob(draw(g, z_chunk), cov, size, flux))
+        vg = jax.value_and_grad(f)
+        (val, dq), (_, h0) = jax.jvp(vg, (zero,), (jnp.array([1.0, 0.0]),))
+        _, (_, h1) = jax.jvp(vg, (zero,), (jnp.array([0.0, 1.0]),))
+        return val, dq, jnp.stack([h0, h1], axis=-1)
+
+    chunked = eqx.filter_jit(one_chunk)
+    n = len(z)
+    ps_acc, qs_acc, rs_acc, w_acc = 0.0, np.zeros(2), np.zeros((2, 2)), 0
+    qs_chunks = []
+    for i in range(0, n, batch):
+        z_chunk = jnp.asarray(z[i:i + batch])
+        nb = z_chunk.shape[0]
+        val, dq, d2q = chunked(z_chunk)
+        val = float(np.asarray(val, dtype=np.float64))
+        dq = np.asarray(dq, dtype=np.float64)
+        d2q = np.asarray(d2q, dtype=np.float64)
+        ps_acc += val * nb
+        qs_acc += dq * nb
+        rs_acc += d2q * nb
+        w_acc += nb
+        qs_chunks.append(dq)
+
+    ps, qs, rs = ps_acc / w_acc, qs_acc / w_acc, rs_acc / w_acc
+    qs_stack = np.stack(qs_chunks)
+    # Standard error of the mean from the chunk-to-chunk scatter -- the same
+    # quantity `pqr_streamed`'s per-chunk merge is diagnosing, just for this
+    # one number.  Single chunk: no scatter to measure, so 0 rather than NaN.
+    qs_err = (qs_stack.std(axis=0, ddof=1) / np.sqrt(len(qs_stack))
+             if len(qs_stack) > 1 else np.zeros(2))
+    return np.float64(ps), qs, rs, qs_err
+
+
+def sane_targets(qr, factor=1000.0):
+    """`(finite, sane)` masks over the targets of a `{label: (Q, R)}` dict.
+
+    A single non-finite target, or one whose |Q| or |R| is many orders of
+    magnitude above the rest, takes out the whole eq. (45)-(46) sum -- and both
+    sums are over EVERY catalog, so a target bad in one arm is dropped from all
+    of them and the +/- pairing stays aligned galaxy for galaxy.
+
+    The magnitude cut catches flow density-curvature spikes: a handful of fully
+    `in_domain` targets (median |R| ~1e2) where the flow's local Hessian blows
+    up to |R| ~1e6-1e9, a normalising-flow generalisation artifact in a
+    sparsely-trained pocket, not a support-boundary effect.  Measured: dropping
+    the worst 5 of 200000 in one quintile took `ghat[0]` on a g = 0 null test
+    from +8.7e-3 to -3.6e-4.  With `pqr_streamed`'s merge guard, non-finite
+    entries should not arise; this is the net under it.
+
+    `Q` IS GUARDED TOO, and was not until 2026-08-19.  eq. (45)'s numerator is a
+    sum of `Q/P`, so a spiking Q is exactly as fatal as a spiking R -- and it
+    happened: an unwindowed noisy run returned `m1 = 2.8e18` off a single target
+    the |R|-only guard let through.  A healthy population has max/median ~13 for
+    |Q| and ~70 for |R|, so `factor = 1000` fires on pathology and nothing else.
+
+    The median is taken over the finite rows of ALL arms pooled, so the
+    threshold is one number for the whole measurement rather than one per arm --
+    an arm cannot set a looser bar for itself by being worse.
+    """
+    n = len(qr["plus"][0])
+    finite = np.ones(n, dtype=bool)
+    for q, r in qr.values():
+        finite &= np.isfinite(q).all(1) & np.isfinite(r).reshape(n, -1).all(1)
+    sane = finite.copy()
+    for j in (0, 1):                                    # Q, then R
+        v = [np.linalg.norm(np.asarray(x[j]).reshape(n, -1), axis=1)
+             for x in qr.values()]
+        med = np.median(np.concatenate([x[finite] for x in v]))
+        for x in v:
+            sane &= x < factor * med
+    return finite, sane
+
+
+def ghat(q, r, sel=None, ns=None):
+    """The BFD ensemble shear estimate over the selected targets.
+
+    `ns`, if given, is the tuple `(n_ns, P_s, Q_s, R_s)` from `selection_terms`
+    -- `n_ns` the count of targets that fell OUTSIDE the window -- and applies
+    eq. (45)-(46)'s non-selection term, which stands in for the sum the
+    excluded targets would have contributed had they been seen.
+    """
     if sel is not None:
         q, r = q[sel], r[sel]
-    return -np.linalg.solve(r.sum(0), q.sum(0))
+    if ns is None:
+        return -np.linalg.solve(r.sum(0), q.sum(0))
+    n_ns, ps, qs, rs = ns
+    Q = q.sum(0) - n_ns * qs / (1 - ps)
+    R = -r.sum(0) + n_ns * (np.outer(qs, qs) / (1 - ps) ** 2 + rs / (1 - ps))
+    return np.linalg.solve(R, Q)
 
 
-def bias(qp, rp, qm, rm, g=0.02, sel=None):
-    """(m1, c1, c2) from the +g/-g pair."""
-    gp, gm = ghat(qp, rp, sel), ghat(qm, rm, sel)
+def _split_per_arm(x):
+    """`x` -> (plus, minus).  A `(plus, minus)` tuple is per-arm; anything
+    else (None, an ndarray, or a valid `ns` 4-tuple `(n_ns, P_s, Q_s, R_s)`)
+    is shared by both arms.  Unambiguous because a genuine per-arm `ns` value
+    is itself a 4-tuple, never length 2."""
+    return x if isinstance(x, tuple) and len(x) == 2 else (x, x)
+
+
+def bias(qp, rp, qm, rm, g=0.02, sel=None, ns=None):
+    """(m1, c1, c2) from the +g/-g pair.
+
+    `sel` and `ns` may each be a single value used for both arms, or a
+    `(plus, minus)` tuple -- the selection is on each arm's OWN observed
+    moments, so the two genuinely differ.  See `_split_per_arm` for the
+    disambiguation rule.
+    """
+    sel_p, sel_m = _split_per_arm(sel)
+    ns_p, ns_m = _split_per_arm(ns)
+    gp, gm = ghat(qp, rp, sel_p, ns_p), ghat(qm, rm, sel_m, ns_m)
     return (gp[0] - gm[0]) / (2 * g) - 1, *(0.5 * (gp + gm))
 
 
-def save_pqr(path, qr, flux):
+def save_pqr(path, qr, truth, obs):
     """Write per-target Q and R so two runs can be differenced later.
 
     The point is the PAIRING.  Two runs over the same galaxies, the same noise
@@ -902,10 +1186,19 @@ def save_pqr(path, qr, flux):
     difference in m1 is far better determined than either run's own bootstrap
     error -- the population scatter that dominates both cancels.  Recovering
     that needs the per-target values, which are otherwise summed away.
+
+    `truth` is the clean unsheared [Mf, Mr, M1, M2, Mc] (`compare` still reads
+    just the flux column, kept under its old key for that).  `obs` is
+    `{"plus": ..., "minus": ...}`, each arm's own OBSERVED (n, 5) moments --
+    written so a selection window can be re-applied offline without rerunning
+    the flow, keyed `obs_plus`/`obs_minus`.
     """
+    truth = np.asarray(truth)
     cols = {f"{k}_{n}": v for k, (q, r) in qr.items()
             for n, v in (("q", q), ("r", r))}
-    np.savez_compressed(path, flux=flux, **cols)
+    np.savez_compressed(path, flux=truth[:, 0], moments=truth,
+                        obs_plus=np.asarray(obs["plus"]),
+                        obs_minus=np.asarray(obs["minus"]), **cols)
     print(f"wrote {path}")
 
 
@@ -953,13 +1246,44 @@ def compare(path_a, path_b, g=0.02, n=200, seed=0, labels=("A", "B")):
         row(f"Mf q{i + 1}", (flux >= edges[i]) & (flux <= edges[i + 1]))
 
 
-def bootstrap(qp, rp, qm, rm, g=0.02, n=200, seed=0, sel=None):
+def bootstrap(qp, rp, qm, rm, g=0.02, n=200, seed=0, sel=None, ns=None):
     """Paired bootstrap over galaxies: the same resampled index into BOTH
-    catalogs, so the shape noise that the +/- pairing cancels stays cancelled."""
+    catalogs, so the shape noise that the +/- pairing cancels stays cancelled.
+
+    `sel`/`ns` follow `bias`'s per-arm convention (`_split_per_arm`).  Without
+    `ns` there is no N_ns to move, so the pool is exactly the selected subset,
+    resampled to its own size -- today's behaviour, kept bit-for-bit.  WITH
+    `ns`, N_ns is a COUNT over the resample, not a fixed number, so the index
+    is drawn over ALL targets and each arm's own mask (and so its N_ns) is
+    recomputed on every draw -- that is what puts the correction's own
+    sampling noise into the returned error, rather than treating it as exact.
+    """
     rng = np.random.default_rng(seed)
-    idx0 = np.arange(len(qp)) if sel is None else np.flatnonzero(sel)
-    out = [bias(qp[i], rp[i], qm[i], rm[i], g)
-           for i in (rng.choice(idx0, len(idx0)) for _ in range(n))]
+    sel_p, sel_m = _split_per_arm(sel)
+    ns_p, ns_m = _split_per_arm(ns)
+
+    if ns_p is None and ns_m is None:
+        pool_sel = sel_p if sel_p is not None else sel_m
+        idx0 = np.arange(len(qp)) if pool_sel is None else np.flatnonzero(pool_sel)
+        out = [bias(qp[i], rp[i], qm[i], rm[i], g)
+               for i in (rng.choice(idx0, len(idx0)) for _ in range(n))]
+        return np.std(np.array(out), axis=0)
+
+    def arm_resample(sel_a, ns_a, idx):
+        if sel_a is None:
+            return sel_a, ns_a
+        sel_i = np.asarray(sel_a)[idx]
+        ns_i = ns_a if ns_a is None else (int((~sel_i).sum()),) + tuple(ns_a[1:])
+        return sel_i, ns_i
+
+    n_all = len(qp)
+    out = []
+    for _ in range(n):
+        idx = rng.choice(n_all, n_all)
+        sel_pi, ns_pi = arm_resample(sel_p, ns_p, idx)
+        sel_mi, ns_mi = arm_resample(sel_m, ns_m, idx)
+        out.append(bias(qp[idx], rp[idx], qm[idx], rm[idx], g,
+                        sel=(sel_pi, sel_mi), ns=(ns_pi, ns_mi)))
     return np.std(np.array(out), axis=0)
 
 
@@ -1022,6 +1346,26 @@ def main():
     p.add_argument("--n-targets", type=int, default=None,
                    help="use only the first N targets (the integration is "
                         "`samples` flow evaluations per target)")
+    p.add_argument("--window-size", type=float, nargs=2, default=None,
+                   metavar=("LO", "HI"),
+                   help="target selection window in Mr/Mf (paper eq. 40/45-46 "
+                        "applied to make the cut unbiased). Needs --samples > "
+                        "0: at --samples 0 the observed M IS the latent, F "
+                        "collapses to a hard indicator and the correction is a "
+                        "different, harder calculation, out of scope here. "
+                        "Unset while --window-flux is given defaults to "
+                        "(-inf, inf).")
+    p.add_argument("--window-flux", type=float, nargs=2, default=None,
+                   metavar=("LO", "HI"),
+                   help="target selection window in Mf; see --window-size.")
+    p.add_argument("--window-terms", choices=["templates", "flow"],
+                   default="templates",
+                   help="where eq. (40)'s P_s, Q_s, R_s come from. 'templates' "
+                        "lenses --train-data by its own exact dm/dg, which is "
+                        "what eq. (40) literally is (a sum over G) and is exact "
+                        "to the catalog's sampling; 'flow' integrates the "
+                        "fitted prior instead, which is what you would have to "
+                        "do on real data but currently runs P_s 4% high.")
     p.add_argument("--proposal-flow", default=None,
                    help="DANGEROUS unless it EQUALS --flow: at alpha < 1 the "
                         "weights carry P_eval/q_proposal, and wherever the "
@@ -1043,6 +1387,13 @@ def main():
         compare(*a.compare, a.g, a.boot, a.seed,
                 labels=[s.split("/")[-1][:10] for s in a.compare])
         return
+
+    if (a.window_size is not None or a.window_flux is not None) and not a.samples:
+        raise SystemExit(
+            "--window-size/--window-flux need noisy targets (--samples > 0): "
+            "at --samples 0 the observed M IS the latent, F collapses to a "
+            "hard indicator and eq. (40)/(45)-(46)'s correction becomes a "
+            "different, harder calculation that is out of scope here.")
 
     cat = CATALOGS[a.pop]
     path = lambda v: f"{a.data_dir}/{v}.fits"
@@ -1202,10 +1553,12 @@ def main():
         d_e, w_e = mixture_draws(draw_flow, m_raw["zero"][:n_e], cov, chunk,
                                  a.alpha, a.noise_seed + 1000, sigma_x=None
                                  if draw_sigma_x is None else draw_sigma_x[:n_e])
-        if layer is not None:
-            d_e, ld_e = centroid_transform(layer, d_e, sigma_x[:n_e])
-            w_e = w_e + ld_e
-        e = ess(flow_g, m["zero"][:n_e], d_e, w_e, 4 * batch,
+        # NOT through the peel.  `ess` tests `in_domain` and stands bad rows in
+        # at `safe_point`, both of which read RAW moments; on peeled draws they
+        # are nonsense and the reported median came out NaN.  The peel is exact,
+        # so the full flow on raw draws is the same number, computed where the
+        # domain test means something.
+        e = ess(flow, m_raw["zero"][:n_e], d_e, w_e, 4 * batch,
                 None if sigma_x is None else sigma_x[:n_e])
         scale = a.samples / chunk
         print(f"integrating under C_M with {a.samples} draws/target "
@@ -1226,30 +1579,13 @@ def main():
         qr = {k: pqr(flow_g, v, None if draws is None else draws[k],
                      None if log_wt is None else log_wt[k], batch, sigma_x)
               for k, v in m.items()}
-    # A single non-finite target, or one with |R| many orders of magnitude
-    # above the rest, takes out the whole eq. (45)-(46) sum -- so drop both
-    # kinds from ALL catalogs together and keep the +/- pairing aligned.  The
-    # magnitude cut catches flow density-curvature spikes: a handful of fully
-    # in_domain targets (median |R| ~1e2) where the flow's local Hessian
-    # blows up to |R| ~1e6-1e9, a normalising-flow generalisation artifact in
-    # a sparsely-trained pocket, not a support-boundary effect.  Measured:
-    # dropping the worst 5 of 200000 in one quintile took ghat[0] on a g=0
-    # null test from +8.7e-3 to -3.6e-4.  With the `pqr_streamed` merge guard
-    # non-finite entries should not arise; this is the net under it.
-    finite = np.ones(len(qr["plus"][0]), dtype=bool)
-    for q, r in qr.values():
-        finite &= np.isfinite(q).all(1) & np.isfinite(r).reshape(len(r), -1).all(1)
-    rnorm = {k: np.linalg.norm(r.reshape(len(r), -1), axis=1) for k, (q, r) in qr.items()}
-    med = np.median(np.concatenate([rn[finite] for rn in rnorm.values()]))
-    sane = finite.copy()
-    for rn in rnorm.values():
-        sane &= rn < 1000 * med
+    finite, sane = sane_targets(qr)
     if not finite.all():
         print(f"  dropping {int((~finite).sum())} targets with a non-finite "
               f"Q or R ({(~finite).mean():.1e})")
     if (finite & ~sane).any():
         n = int((finite & ~sane).sum())
-        print(f"  dropping {n} targets with |R| > 1000x the population "
+        print(f"  dropping {n} targets with |Q| or |R| > 1000x the population "
               f"median ({n / len(finite):.1e}); a flow density-curvature "
               f"spike, not a domain effect")
     if not sane.all():
@@ -1258,9 +1594,71 @@ def main():
 
     qp, rp = qr["plus"]
     qm, rm = qr["minus"]
+    # `m_raw` is the pre-peel, raw-moment copy and is NOT itself filtered by
+    # `sane` (see its own comment above) -- filter it here, wherever it is
+    # used as "each arm's own observed moments".
+    obs = {"plus": m_raw["plus"][sane], "minus": m_raw["minus"][sane]}
 
     if a.save_pqr:
-        save_pqr(a.save_pqr, qr, truth[:, 0])
+        save_pqr(a.save_pqr, qr, truth, obs)
+
+    if a.window_size is not None or a.window_flux is not None:
+        size = tuple(a.window_size) if a.window_size is not None else (-np.inf, np.inf)
+        flux = tuple(a.window_flux) if a.window_flux is not None else (-np.inf, np.inf)
+
+        sp = window_mask(obs["plus"], size, flux)
+        sm = window_mask(obs["minus"], size, flux)
+        print(f"\nwindow: size {size} (Mr/Mf), flux {flux} (Mf)")
+        print(f"  plus:  {int(sp.sum())}/{len(sp)} targets kept")
+        print(f"  minus: {int(sm.sum())}/{len(sm)} targets kept")
+
+        # P_s, Q_s, R_s are a property of the MODEL (the flow's prior at
+        # g = 0), not of which arm's catalog is being corrected, so one
+        # `selection_terms` call serves both arms -- only N_ns (a property of
+        # each arm's own data) differs between them.
+        if a.window_terms == "templates":
+            # eq. (40) is a sum over TEMPLATES G, not an integral over a fitted
+            # prior, and the catalog carries bfd's exact dm/dg -- so take the
+            # paper at its word and lens the templates directly.  That is the
+            # whole justification: it is what the equation says, and it is exact
+            # to the template set's own sampling rather than to a fit of it.
+            # `z` is row indices here; `selection_terms` only slices it and
+            # hands it to `draw`, so no special case is needed.
+            #
+            # The 'flow' branch is the honest alternative -- it is what you must
+            # do if the flow is to REPLACE the template sum, which is this
+            # project's premise -- and the gap between the two is a direct
+            # measure of the flow's density error near the window edge, worth
+            # watching for its own sake.
+            tm, tdm, td2m = (jnp.asarray(v, jnp.float32)
+                             for v in shear.load(train_data))
+            draw = lambda g, idx: shear.lens(
+                tm[idx], tdm[idx], td2m[idx], jnp.broadcast_to(g, (len(idx), 2)))
+            z = np.arange(len(tm))
+        else:
+            sx1 = (None if sigma_x is None
+                   else jnp.asarray(sigma_x[0], dtype=jnp.float32))
+            draw = lambda g, zz: jax.vmap(
+                lambda z1: flow.bijection.transform(z1, condition(g, sx1)))(zz)
+            z = flow.base_dist.sample(jr.key(a.seed + 31), (262144,))
+        ps, qs, rs, qs_err = selection_terms(draw, z, cov, size, flux)
+        print(f"  selection terms from the {a.window_terms}")
+        print(f"  P_s = {ps:.4f}   Q_s = ({qs[0]:+.3e}, {qs[1]:+.3e})   "
+              f"Q_s_err = ({qs_err[0]:.1e}, {qs_err[1]:.1e})")
+
+        ns_p = (int((~sp).sum()), ps, qs, rs)
+        ns_m = (int((~sm).sum()), ps, qs, rs)
+
+        m1w, c1w, c2w = bias(qp, rp, qm, rm, a.g, sel=(sp, sm))
+        dm1w, dc1w, dc2w = bootstrap(qp, rp, qm, rm, a.g, a.boot, a.seed, sel=(sp, sm))
+        print(f"  windowed, uncorrected: m1 = {m1w:+.5f} +/- {dm1w:.5f}   "
+              f"c1 = {c1w:+.2e} +/- {dc1w:.1e}   c2 = {c2w:+.2e} +/- {dc2w:.1e}")
+
+        m1c, c1c, c2c = bias(qp, rp, qm, rm, a.g, sel=(sp, sm), ns=(ns_p, ns_m))
+        dm1c, dc1c, dc2c = bootstrap(qp, rp, qm, rm, a.g, a.boot, a.seed,
+                                     sel=(sp, sm), ns=(ns_p, ns_m))
+        print(f"  windowed, corrected:   m1 = {m1c:+.5f} +/- {dm1c:.5f}   "
+              f"c1 = {c1c:+.2e} +/- {dc1c:.1e}   c2 = {c2c:+.2e} +/- {dc2c:.1e}")
 
     m1, c1, c2 = bias(qp, rp, qm, rm, a.g)
     dm1, dc1, dc2 = bootstrap(qp, rp, qm, rm, a.g, a.boot, a.seed)

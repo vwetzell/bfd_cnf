@@ -82,14 +82,17 @@ def symmetrise(m, key):
 def trainable(flow):
     """Everything past the data-adjacent layers and the standardisation: the bulk.
 
-    Data -> base the chain is [centroid?, shear, raw2standard, *bulk], so the
-    bulk starts at 2 or 3 depending on whether the centroid layer is there.
+    Data -> base the chain is [raw2standard, centroid?, shear, *bulk] since
+    16ece5c, so the bulk starts at 2 or 3 depending on whether the centroid
+    layer is there -- but the TEST for it must scan the chain, not look at
+    bijections[0], which is now always the chart.  As written it silently took
+    start = 2 for centroid flows and left the shear layer trainable.
     Freezing both conditional layers is the point: the targets are symmetrised,
     so they carry no information about the g response, and Sigma_X is not being
     re-fit here either.
     """
     bij = flow.bijection.bijection.bijections
-    start = 3 if isinstance(bij[0], CentroidMarginalize) else 2
+    start = 3 if any(isinstance(b, CentroidMarginalize) for b in bij) else 2
     spec = jax.tree.map(lambda _: False, flow)
     return eqx.tree_at(
         lambda f: f.bijection.bijection.bijections[start:], spec,

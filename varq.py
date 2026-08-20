@@ -219,10 +219,15 @@ def bulk_score(flow, m, batch=2000):
     from flowjax.distributions import Transformed
 
     from models.shear import ShearResponse
+    # Located BY TYPE: since 16ece5c the chart is bijections[0] and the
+    # conditional layers follow it, so `bij[0]` is RawMomentStandardize and the
+    # old `assert isinstance(bij[0], ShearResponse)` could never pass.  Same
+    # filter `shear.bulk_of` uses.
     bij = flow.bijection.bijection.bijections
-    assert isinstance(bij[0], ShearResponse), f"expected shear first, got {type(bij[0])}"
+    keep = [b for b in bij if not isinstance(b, ShearResponse)]
+    assert len(keep) < len(bij), "no ShearResponse in the chain"
     bulk_flow = Transformed(flow.base_dist,
-                            Invert(Chain(list(bij[1:])).merge_chains()))
+                            Invert(Chain(keep).merge_chains()))
     g = eqx.filter_jit(jax.vmap(jax.grad(lambda x: bulk_flow.log_prob(x))))
     return jnp.concatenate([g(m[i:i + batch]) for i in range(0, len(m), batch)])
 

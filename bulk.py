@@ -98,6 +98,23 @@ LABEL_FONTSIZE, TICK_LABELSIZE = 34, 24
 # see models.bijections.POINT_SOURCE_MC.
 from models.bijections import POINT_SOURCE, POINT_SOURCE_MC  # noqa: E402,F401
 
+# The target selection the real analysis applies, recorded here (not in
+# bias.py, which shear.py cannot import without a cycle) so it is not
+# re-invented per script.  A size window in Mr/Mf and a flux window in Mf, as
+# on sky.  These are NOT yet wired into `bias.main` -- eq. (40)/(46)'s
+# selection terms are owed before a cut may be applied to a bias measurement
+# -- but they are what `dev/check_dmdg_components.py` restricts its
+# comparison to and what `shear.band_weight` upweights, since the response
+# outside the window is never used.
+#
+# Measured on bulgedisc: the size window keeps 76.4% (4.9% below 2.2, 18.7%
+# above 3.5) and the flux window 94.9% standalone but only 3.1% more inside the
+# size window -- the two are largely redundant, because the faint galaxies are
+# mostly the small-Mr/Mf ones already cut (median Mf 2548 below Mr/Mf = 2.2
+# against 5202 above).  Both together keep 74.1%.
+SIZE_WINDOW = (2.2, 3.5)          # Mr/Mf
+FLUX_WINDOW = (2500.0, 50000.0)   # Mf
+
 
 def load_moments(path):
     """Read the five even moments [Mf, Mr, M1, M2, Mc] from an imsims catalog."""
@@ -123,10 +140,15 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
     """Bulk flow standardised against `m_train`; conditioned on g and/or Sigma_X.
 
     The generative stack is ``base -> bulk -> shear(g) -> centroid(Sigma_X) ->
-    data``.  Both conditional layers act in raw moment space, which is where the
-    physics acts: shear's coefficients are then comparable to bfd's dm/dg, and
-    the centroid layer's to the weighted copy means of an `imsims.copies`
-    catalog.  Centroid comes last because it happens last -- a galaxy is lensed
+    data``, and data -> base the chain is
+    ``[raw2standard, centroid?, shear, *bulk]``.
+
+    Since 16ece5c made the chart data-adjacent the conditional layers act in
+    STANDARDISED coordinates, not raw moment space as this said before.  What
+    keeps their coefficients comparable to the physics -- bfd's dm/dg for
+    shear, the weighted copy means for centroid -- is that the supervision
+    composes the chart back in (`shear.dm_dg(layer, m, chart)`), not the
+    layers' own coordinates.  Centroid comes last because it happens last -- a galaxy is lensed
     on the sky and only then measured about a centroid somebody had to guess.
     """
     # Loud, not silent: slot 1's chart is undefined at or above the ceiling, so

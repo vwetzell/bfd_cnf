@@ -55,13 +55,17 @@ def split_shear(flow):
     """Peel ShearResponse off the front, leaving the g-independent bulk.
 
     Same pattern as `bias.split_centroid`: in data -> base order the chain is
-    [shear, raw2standard, bulk], so the shear layer is `bijections[0]` and
-    everything after it is the density whose SCORE the first term of Q needs.
+    [raw2standard, centroid?, shear, *bulk] since 16ece5c made the chart
+    data-adjacent, so the shear layer is located BY TYPE -- it is no longer
+    `bijections[0]`, and asserting that it was is what made this script die.
+    Everything else is the density whose SCORE the first term of Q needs.
     """
     bij = flow.bijection.bijection.bijections
-    assert isinstance(bij[0], ShearResponse), f"expected shear first, got {type(bij[0])}"
-    rest = Invert(Chain(list(bij[1:])).merge_chains())
-    return Transformed(flow.base_dist, rest), bij[0]
+    shear = [b for b in bij if isinstance(b, ShearResponse)]
+    assert len(shear) == 1, f"expected one ShearResponse, got {len(shear)}"
+    rest = Invert(Chain([b for b in bij
+                         if not isinstance(b, ShearResponse)]).merge_chains())
+    return Transformed(flow.base_dist, rest), shear[0]
 
 
 def q_terms(bulk_flow, layer, m_i):

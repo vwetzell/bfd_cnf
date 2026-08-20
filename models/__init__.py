@@ -10,6 +10,7 @@ from .bijections import (
     SigmaXCouplingLayer,
     EarlyChain,
     new_masked_autoregressive_flow,
+    sigmax_log_scale_stats,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "SigmaXCouplingLayer",
     "EarlyChain",
     "new_masked_autoregressive_flow",
+    "sigmax_log_scale_stats",
 ]

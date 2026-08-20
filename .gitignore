@@ -14,3 +14,7 @@ __pycache__/
 
 # Raw run logs (XLA chatter; the numbers that matter live in the README)
 logs_*.txt
+
+# Run artifacts from the e2e driver (npz/fits are already ignored; these are
+# its logs and status files)
+dev/e2e*/

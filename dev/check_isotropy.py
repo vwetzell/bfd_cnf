@@ -61,10 +61,12 @@ def main():
     flow = bulk.build_flow(jr.key(0), np.asarray(shear_top.load(DATA)[0],
                                                  np.float64)[:n90], shear=True)
     flow = eqx.tree_deserialise_leaves(a.flow, flow)
+    # BY TYPE: the chart is bijections[0] since 16ece5c, so the old
+    # `assert isinstance(bij[0], ShearResponse)` could never pass.
     bij = flow.bijection.bijection.bijections
-    assert isinstance(bij[0], ShearResponse)
-    bulk_flow = Transformed(flow.base_dist,
-                            Invert(Chain(list(bij[1:])).merge_chains()))
+    assert any(isinstance(b, ShearResponse) for b in bij), "no ShearResponse"
+    bulk_flow = Transformed(flow.base_dist, Invert(Chain(
+        [b for b in bij if not isinstance(b, ShearResponse)]).merge_chains()))
     print(f"{a.flow} on {len(m)} galaxies, {len(THETAS)} frame rotations\n")
 
     lp_bulk = eqx.filter_jit(jax.vmap(bulk_flow.log_prob))

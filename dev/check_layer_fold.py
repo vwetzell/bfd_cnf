@@ -44,6 +44,7 @@ import bias                                          # noqa: E402
 import bulk                                          # noqa: E402
 import shear as shear_top                            # noqa: E402
 from models.bijections import in_domain              # noqa: E402
+from models.centroid import CentroidMarginalize      # noqa: E402
 
 DATA = "../bfd_cnf_imsims/data"
 SCALES = [0.0, 0.03, 0.1, 0.3, 1.0, 3.0]
@@ -169,7 +170,10 @@ def main():
     jax.config.update("jax_enable_x64", True)
     arr, static = eqx.partition(flow, eqx.is_inexact_array)
     flow = eqx.combine(jax.tree.map(lambda x: x.astype(jnp.float64), arr), static)
-    layer = flow.bijection.bijection.bijections[0]
+    # BY TYPE: bijections[0] is the chart since 16ece5c, so this SILENTLY
+    # took RawMomentStandardize and called `unmarginalize` on it.
+    layer = next(b for b in flow.bijection.bijection.bijections
+                 if isinstance(b, CentroidMarginalize))
 
     sx0 = np.asarray(fitsio.read(a.cov_from)["cov_odd"][0], dtype=np.float64)
     cov = bias.load_cov(a.cov_from)

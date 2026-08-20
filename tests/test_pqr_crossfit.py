@@ -21,7 +21,8 @@ import pytest
 
 sys.path.insert(0, ".")
 
-from bias import _merge_chunk, _merge_finish, _merge_init, _shares  # noqa: E402
+from bias import (_merge_chunk, _merge_finish, _merge_init, _shares,  # noqa: E402
+                  sane_targets)
 
 S_NOISE = 0.8
 J_TRUE = 1.0 / (1.0 + S_NOISE ** 2)
@@ -193,3 +194,39 @@ def test_the_two_O_1_over_S_biases_are_opposite_and_comparable():
     # cancellation is real and fixing one term alone is not a reliable gain
     assert from_ratio < 0.0 < from_square, (from_ratio, from_square)
     assert 0.25 < abs(from_ratio) / from_square < 4.0, (from_ratio, from_square)
+
+
+# ---------------------------------------------------------------------------
+# `sane_targets`: which targets are allowed into the eq. (45)-(46) sums at all.
+# Same concern as the merge guard above -- one pathological target can dominate
+# an ensemble sum -- applied one level up, per target rather than per chunk.
+
+def _qr(n, seed=0):
+    """A healthy `{label: (Q, R)}` triple of arms: |Q| ~ 1, |R| ~ 1."""
+    rng = np.random.default_rng(seed)
+    return {k: (rng.normal(size=(n, 2)), rng.normal(size=(n, 2, 2)))
+            for k in ("plus", "minus", "zero")}
+
+
+def test_a_healthy_population_drops_nothing():
+    finite, sane = sane_targets(_qr(2000))
+    assert finite.all() and sane.all()
+
+
+@pytest.mark.parametrize("slot", [0, 1])
+def test_a_spike_in_either_Q_or_R_is_dropped(slot):
+    """The regression test for the |Q| hole: before 2026-08-19 only slot 1 was
+    guarded, and a single target with a spiking Q returned m1 = 2.8e18."""
+    qr = _qr(2000)
+    qr["plus"][slot][7] *= 1e6
+    finite, sane = sane_targets(qr)
+    assert finite.all()                      # a spike is finite, just huge
+    assert not sane[7] and sane.sum() == 1999
+
+
+def test_a_non_finite_row_is_dropped_from_every_arm():
+    qr = _qr(2000)
+    qr["minus"][1][11, 0, 0] = np.nan
+    finite, sane = sane_targets(qr)
+    assert not finite[11] and finite.sum() == 1999
+    assert not sane[11]

@@ -1024,6 +1024,19 @@ class ExplicitPolyLast(AbstractBijection):
         return x, lad
 
 
+def sigmax_log_scale_stats(sigma_x):
+    """Mean/std of `log_scale = 0.5 * log det(Sigma_X)`, for `SigmaXCouplingLayer`.
+
+    MUST be computed from the TARGET catalog's own Sigma_X (e.g. bias.py's
+    `cov_odd` column) -- never from the training templates behind
+    `bulk.build_flow`, which are noiseless and so carry no Sigma_X at all. A
+    guessed placeholder here is exactly the kind of stale hardcoded constant
+    `POINT_SOURCE` already burned once.
+    """
+    log_scale = 0.5 * jnp.linalg.slogdet(jnp.asarray(sigma_x))[1]
+    return float(log_scale.mean()), float(log_scale.std())
+
+
 # ---------------------------------------------------------------------------
 # SigmaXCouplingLayer
 # ---------------------------------------------------------------------------
@@ -1058,10 +1071,12 @@ class SigmaXCouplingLayer(AbstractBijection):
     full_cond_dim : int, optional
         Total conditioning dimension (must be 5 for
         ``[g1, g2, log_scale, e1, e2]``).  Default is 5.
-    log_scale_mean : float, optional
-        Prior mean of ``log_scale`` for normalisation.  Default is 12.
-    log_scale_std : float, optional
-        Prior std of ``log_scale`` for normalisation.  Default is 3.
+    log_scale_mean : float
+        Mean of ``log_scale`` for normalisation, from `sigmax_log_scale_stats`
+        applied to the TARGET catalog's Sigma_X -- never a guessed constant.
+    log_scale_std : float
+        Std of ``log_scale`` for normalisation, same source as
+        ``log_scale_mean``.
     e_max : float, optional
         Maximum PSF ellipticity magnitude used to normalise ``e_mag²``.
         Default is 0.1.
@@ -1079,12 +1094,13 @@ class SigmaXCouplingLayer(AbstractBijection):
     def __init__(
         self,
         key,
+        *,
+        log_scale_mean,
+        log_scale_std,
         nn_width=32,
         nn_depth=2,
         activation=jnn.silu,
         full_cond_dim=5,
-        log_scale_mean=12.0,
-        log_scale_std=3.0,
         e_max=0.1,
     ):
         self._cond_dim = full_cond_dim
@@ -1294,8 +1310,11 @@ def new_masked_autoregressive_flow(
     sigmax_cond_dim: int | None = None,
     sigmax_nn_width: int = 32,
     sigmax_nn_depth: int = 2,
-    sigmax_log_scale_mean: float = 2.0 * 5.991464547107982,  # 2*log(400)
-    sigmax_log_scale_std: float = 1.0,
+    # No default: guessing this is exactly the mistake POINT_SOURCE already
+    # made once. Compute it from the TARGET catalog's own Sigma_X via
+    # `sigmax_log_scale_stats`, never from the (noiseless) training templates.
+    sigmax_log_scale_mean: float | None = None,
+    sigmax_log_scale_std: float | None = None,
 ) -> Transformed:
     """Construct a masked autoregressive normalizing flow for BFD galaxy moments.
 
@@ -1345,6 +1364,10 @@ def new_masked_autoregressive_flow(
         Hidden width for the Σ_X coupling network.  Default is 32.
     sigmax_nn_depth : int, optional
         Number of hidden layers for the Σ_X coupling network.  Default is 2.
+    sigmax_log_scale_mean, sigmax_log_scale_std : float
+        Required when ``sigmax_cond_dim`` is set.  From
+        `sigmax_log_scale_stats` applied to the TARGET catalog's Sigma_X, not
+        the (noiseless) training templates.
 
     Returns
     -------
@@ -1355,6 +1378,11 @@ def new_masked_autoregressive_flow(
     _last_width = last_layer_nn_width if last_layer_nn_width is not None else nn_width
     _last_depth = last_layer_nn_depth if last_layer_nn_depth is not None else nn_depth
     use_sigmax = sigmax_cond_dim is not None
+    if use_sigmax and (sigmax_log_scale_mean is None or sigmax_log_scale_std is None):
+        raise ValueError(
+            "sigmax_cond_dim is set but sigmax_log_scale_mean/std were not "
+            "given -- compute them with sigmax_log_scale_stats(target_sigma_x) "
+            "from the TARGET catalog, not the training templates.")
 
     def _make_layer_uncond(layer_key, layer_idx):
         bij_key, _ = jr.split(layer_key)

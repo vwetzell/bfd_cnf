@@ -44,17 +44,45 @@ steps, four times the batch, and the ceiling bin never moves; several are
 slightly worse.  (24k steps DOES help the middle bins, 0.100 -> 0.046, while the
 ceiling degrades -- so the optimiser is trading one against the other.)
 
---joint IS BROKEN, TWICE, AND SHOULD NOT BE TRUSTED.  It was meant to test
-whether sharing a trunk across coefficients is what costs a0 its accuracy, since
-the layer emits fourteen outputs and the working fit above emits one.  Both
-attempts return a CONSTANT ~-1.56 offset in a0 with the shape essentially
-correct (fit spans 0.60 across the size range against truth's 0.59), and a
-weighted mse of 0.22 against 1e-3 for the single-output fit.  A right-shape,
-wrong-offset result is the signature of a bug in the harness, not a finding.
-The first attempt was dominated by ill-determined B (unweighted |max| 5860
-against _COEFF_MAX 12); guarding that changed nothing, so that was not the cause
-either.  The trunk-sharing question remains OPEN and this is not the instrument
-to answer it with.
+--joint IS FIXED, AND TRUNK SHARING IS NOT THE CAUSE (2026-08-19).
+
+THE BUG WAS `@eqx.filter_jit` ON `step`.  Inside the trace the loss read
+4.14e-4 while the IDENTICAL expression, same batch, same parameters, read
+6.35e-1 evaluated outside it -- a factor of 1535.  So the optimiser's reported
+loss was meaningless and the fit never converged where the diagnostic looked,
+which is exactly the "constant offset with the shape right" that three previous
+attempts saw and correctly called a harness bug.  With the decorator removed,
+inside == outside to the digit and the fit converges in 600 steps.  The
+decorator is deliberately NOT restored: this is a one-off diagnostic and
+correctness beats speed.  `shear.py`'s own training does NOT share the defect
+(its printed velocity mse 0.176 against 0.064 implied by the measured dm/dg
+residuals -- same order, differing only by the partial_norms/_scale
+normalisation), so this was local to this script.
+
+TWO OTHER REAL DEFECTS, also fixed: the loss was one scalar over all five
+coefficients with no per-coefficient scale (B took essentially the whole
+gradient), and it normalised by a PER-BATCH weight sum, a ratio of sums whose
+expectation is not the ratio of expectations under a skewed |e|^2 weight.
+
+THE ANSWER.  Symmetry control (`--control same`, all five outputs given
+identical targets and weights) now passes: every column lands within 0.0008.
+And the real five-coefficient fit from ONE shared trunk reaches
+
+    a0_Mf +0.0025   a0_Mr +0.0140   a0_Mc +0.0084   A +0.0001   B +0.1384
+
+with a0(Mf) within 0.004 in EVERY size bin against +0.3788 in-flow at the
+ceiling.  A single trunk fits all five first-order coefficients as well as a
+single-output net fits one.  So capacity, conditioning, the inputs, the
+_COEFF_MAX bound, the supervision weight, the hyperparameters AND trunk sharing
+are all now excluded -- every component of the coefficient network is
+exonerated, and what remains is the JOINT OPTIMISATION itself: the flow reaches
+these coefficients through velocity supervision plus NLL instead of fitting
+them directly.
+
+THE FIX THIS IMPLIES.  This script is now, literally, the pretraining
+procedure: it fits `CoeffNet` to bfd's exact coefficients to <=0.004.  Write the
+fitted `_Coeffs` out and give `shear.py` an `--init-coeffs` that loads and
+freezes (or strongly anchors) it while the density trains.
 
 Checked in passing and NOT a problem: _COEFF_MAX = 12 is adequate.  Unweighted,
 B runs p1 -24.8 to p99 +32.9, which looks alarming -- but B is carried with
@@ -86,6 +114,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--flow", default="flows/shear_cfo.eqx")
     p.add_argument("--data", default="../bfd_cnf_imsims/data/moments.fits")
+    p.add_argument("--control", choices=["same", "weights"], default=None,
+                   help="diagnostic control for --joint: set all five targets "
+                        "to a0 so nothing competes for the trunk. 'same' also "
+                        "sets all five weights to |e|^2 (isolates the "
+                        "multi-output machinery); 'weights' keeps the differing "
+                        "natural weights (adds weight contention only).")
     p.add_argument("--steps", type=int, default=6000)
     p.add_argument("--batch", type=int, default=1024)
     p.add_argument("--lr", type=float, default=3e-3)
@@ -116,6 +150,15 @@ def main():
         # |e|^2 for the spin-0 a_X, 1 for A, |e|^4 for B (`_spin2_AB`).
         tgt = np.stack([a0[:, 0], a0[:, 1], a0[:, 2], A, B], -1)
         wgt = np.stack([e_sq, e_sq, e_sq, np.ones_like(e_sq), e4], -1)
+        if a.control:
+            # All five outputs asked for the SAME thing the single-output fit
+            # nails, so nothing is competing for the trunk's features.  What is
+            # left differing between the two modes is only the per-column
+            # WEIGHT, which is the remaining suspect: |e|^2 concentrates a0 on
+            # the high-|e| tail while A's weight of 1 spreads it over everyone.
+            tgt = np.repeat(a0[:, :1], 5, axis=1)
+            if a.control == "same":
+                wgt = np.repeat(e_sq[:, None], 5, axis=1)
     else:
         tgt = a0[:, :1]
         wgt = e_sq[:, None]
@@ -147,18 +190,33 @@ def main():
     params, static = eqx.partition(net, eqx.is_inexact_array)
     state = opt.init(params)
 
-    @eqx.filter_jit
+    # Per-coefficient RMS of the target, under its own weight.  WITHOUT this the
+    # joint loss was one scalar over all five, so B -- which spans several times
+    # a0's range -- took essentially the whole gradient and a0 came out
+    # right-shape/wrong-offset.  That was the "harness bug" the docstring
+    # suspected, and it is what made --joint untrustworthy: it is the real
+    # loss's `shear.partial_norms` treatment, missing here.  Single-output runs
+    # are unaffected (one column, scale divides out).
+    cscale = jnp.sqrt(jnp.sum(W * Y ** 2, 0) / jnp.sum(W, 0))
+
     def step(params, state, idx):
         def loss(p_):
             f = eqx.combine(p_, static)
             # same bound the layer applies to its coefficients
             pred = _COEFF_MAX * jnp.tanh(jax.vmap(f)(X[idx]) / _COEFF_MAX)
-            return jnp.sum(W[idx] * (pred - Y[idx]) ** 2) / jnp.sum(W[idx])
+            # NOT sum(...)/sum(W[idx]): that is a ratio of per-batch sums,
+            # and W = |e|^2/mean is skewed enough that most batches carry no
+            # high-|e| row, so the denominator swings by orders of magnitude
+            # and E[num/den] != E[num]/E[den] -- a biased gradient.  W is
+            # already normalised to mean 1 per column over the FULL sample, so
+            # a plain batch mean is unbiased for the weighted mean.
+            return jnp.mean(W[idx] * ((pred - Y[idx]) / cscale) ** 2)
         v, g = jax.value_and_grad(loss)(params)
         upd, state = opt.update(g, state, params)
         return eqx.apply_updates(params, upd), state, v
 
     key = jr.key(2)
+    _probe_idx = jr.randint(jr.key(1234), (a.batch,), 0, len(Y))
     for i in range(a.steps):
         key, sk = jr.split(key)
         params, state, v = step(params, state,
@@ -166,9 +224,55 @@ def main():
         if i % 1000 == 0 or i == a.steps - 1:
             print(f"  step {i:5d}  weighted mse {float(v):.5e}")
 
+    # Same batch, two routes: the jitted `step`'s own loss, and the loss
+    # recomputed outside from `eqx.combine(params, static)`.  If these differ,
+    # the optimiser and the diagnostic are not looking at the same parameters.
+    _, _, v_in = step(params, state, _probe_idx)
+    _n = eqx.combine(params, static)
+    _p = _COEFF_MAX * jnp.tanh(jax.vmap(_n)(X[_probe_idx]) / _COEFF_MAX)
+    v_out = float(jnp.mean(W[_probe_idx]
+                           * ((_p - Y[_probe_idx]) / cscale) ** 2))
+    print(f"\n  SAME batch: inside step {float(v_in):.5e}   "
+          f"outside {v_out:.5e}   ratio {v_out / float(v_in):.1f}")
+
     net = eqx.combine(params, static)
-    pred = np.asarray(_COEFF_MAX * jnp.tanh(
-        jax.vmap(net)(X) / _COEFF_MAX), np.float64)[:, 0]
+    pred_all = np.asarray(_COEFF_MAX * jnp.tanh(
+        jax.vmap(net)(X) / _COEFF_MAX), np.float64)
+    # The SAME loss, on the full sample with the final weights.  If this
+    # disagrees with the per-batch value printed during training, the reported
+    # loss is not describing the fit the table shows.
+    full_loss = float(jnp.mean(
+        jnp.asarray(W) * ((jnp.asarray(pred_all, jnp.float32) - Y) / cscale) ** 2))
+    print(f"\n  full-sample loss with final params: {full_loss:.5e}")
+    kk = jr.key(99)
+    bl = []
+    for _ in range(20):
+        kk, s2 = jr.split(kk)
+        j = jr.randint(s2, (a.batch,), 0, len(Y))
+        pb = _COEFF_MAX * jnp.tanh(jax.vmap(net)(X[j]) / _COEFF_MAX)
+        bl.append(float(jnp.mean(W[j] * ((pb - Y[j]) / cscale) ** 2)))
+    print(f"  same loss on 20 random batches: median {np.median(bl):.5e}  "
+          f"min {min(bl):.5e}  max {max(bl):.5e}")
+    print(f"  len(Y) = {len(Y)}   X {X.shape}  Y {Y.shape}  W {W.shape}")
+    # Per-column, so a bad column cannot hide behind the scalar loss.  A column
+    # whose fit is offset but correctly SHAPED is the signature that its
+    # gradient is not reaching the output bias.
+    # The WEIGHTED bias is the one the loss actually minimises.  The unweighted
+    # median is not: W = |e|^2/mean is heavily skewed, so most templates carry
+    # almost no weight and the fit is unconstrained there -- which is how a
+    # weighted mse of 3.5e-4 sat next to a median bias of -1.5, and why five
+    # columns given IDENTICAL targets and weights each drifted somewhere
+    # different.  Report both; only `wbias` is evidence.
+    print(f"\n{'column':>8s} {'tgt med':>10s} {'fit med':>10s} {'bias':>10s} "
+          f"{'wbias':>10s} {'tgt sd':>10s} {'fit sd':>10s}")
+    for c in range(pred_all.shape[1]):
+        wc = np.asarray(W)[:, c]
+        print(f"{['a0_Mf','a0_Mr','a0_Mc','A','B'][c] if a.joint else 'a0_Mf':>8s} "
+              f"{np.median(tgt[:, c]):10.4f} {np.median(pred_all[:, c]):10.4f} "
+              f"{np.median(pred_all[:, c] - tgt[:, c]):+10.4f} "
+              f"{(wc * (pred_all[:, c] - tgt[:, c])).sum() / wc.sum():+10.4f} "
+              f"{tgt[:, c].std():10.4f} {pred_all[:, c].std():10.4f}")
+    pred = pred_all[:, 0]
     tgt = tgt[:, 0]
 
     print("\na0(Mf) bias by size -- isolated fit vs what the flow achieves")

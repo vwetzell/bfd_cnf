@@ -139,30 +139,32 @@ def _scale(m):
     return jnp.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1], m[:, 4]], axis=-1)
 
 
-BAND = 3.4          # where the response fit starts failing
-
-
-def band_weight(m, k, edge=BAND, width=0.08):
-    """Per-galaxy weights that upweight the poorly-fitted resolution band by `k`.
+def band_weight(m, k):
+    """Per-galaxy weights that upweight the analysis window by `k`.
 
     The response supervision is a REGRESSION against bfd's exact per-galaxy
     `dm_dg`, so reweighting it is free of the objection that would sink a
     reweighted NLL: it moves where the fit is accurate, not what it converges
     to.  The density term is deliberately left unweighted.
 
-    NOT an inverse-density weight.  The band is ~45% of the population, not a
-    sparse tail, so equalising the Mr/Mf histogram would DE-weight it.  The
-    reason to upweight it is that the REACHABLE (above the Var[Q|m] floor) part
-    of the response error is 0.14-0.38 rms through the middle octiles and
-    1.16/1.78 in the top two -- the fit is worst exactly where every noisy
-    target's convolution integral has to be evaluated.
+    Was a smooth sigmoid centred on a hand-picked Mr/Mf edge (3.4, tuned to
+    "where the response fit starts failing").  Replaced by membership in
+    `bulk.SIZE_WINDOW`/`bulk.FLUX_WINDOW` -- the window the real analysis
+    already applies downstream (`dev/check_dmdg_components.py` restricts its
+    comparison to it), since the response outside it is never used.  No
+    reason to upweight a differently-shaped region than the one that matters.
 
-    Smooth in `Mr/Mf` rather than a step, so the layer is not asked to learn a
-    discontinuity in its own loss; renormalised to mean 1 so `deriv_weight` and
-    `score_weight` keep their meaning.
+    NOT an inverse-density weight.  The window is ~74% of the population, not
+    a sparse tail, so equalising the Mr/Mf histogram would DE-weight it.
+
+    Renormalised to mean 1 so `deriv_weight` and `score_weight` keep their
+    meaning.
     """
-    r = np.asarray(m[:, 1] / m[:, 0], dtype=np.float64)
-    w = 1.0 + (k - 1.0) / (1.0 + np.exp(-(r - edge) / width))
+    m = np.asarray(m, dtype=np.float64)
+    r = m[:, 1] / m[:, 0]
+    inside = ((r >= bulk.SIZE_WINDOW[0]) & (r <= bulk.SIZE_WINDOW[1])
+              & (m[:, 0] >= bulk.FLUX_WINDOW[0]) & (m[:, 0] <= bulk.FLUX_WINDOW[1]))
+    w = np.where(inside, k, 1.0)
     return jnp.asarray(w / w.mean())
 
 
@@ -620,11 +622,11 @@ def main():
                    help="scale on the Var[Q|m] offset to the second-order "
                         "target (0 = off, 1 = the derived value)")
     p.add_argument("--band", type=float, default=1.0,
-                   help="upweight the derivative supervision above Mr/Mf ~ 3.4 "
-                        "by this factor -- the band every noisy target's "
-                        "convolution integrates through, and where the "
-                        "reachable response error is 4-6x larger (the NLL "
-                        "stays unweighted). 1.0 = off")
+                   help="upweight the derivative supervision inside "
+                        "bulk.SIZE_WINDOW/FLUX_WINDOW by this factor -- the "
+                        "window every noisy target's convolution integrates "
+                        "through, and where the reachable response error is "
+                        "4-6x larger (the NLL stays unweighted). 1.0 = off")
     p.add_argument("--score-weight", type=float, default=0.0,
                    help="weight on the score-contracted first-order residual "
                         "(the combination that reaches Q); 0 = off")
