@@ -20,6 +20,44 @@ Anything compared across processes before that pin is void.
 
 3 seeds x 3 arms x 96k steps, ~3 h.  Physical targets: odd -0.00079, even
 +0.00033, alpha 1.00 on every moment.
+
+RESULT (3 seeds x 3 arms x 96k steps, one process, precision pinned)
+
+ arm   val nll                 even             Mf             Mr        M1        Mc
+   I   40.0518      0.62939 +/-0.13091  -0.97 +/-2.16  -0.60 +/-1.57  1.02  -0.25 +/-0.84
+   D   40.3963      0.03628 +/-0.00785   2.63 +/-0.22   1.85 +/-0.28  0.96   0.87 +/-0.22
+  DL   40.3923      0.02402 +/-0.00343   1.55 +/-0.32   0.76 +/-0.18  1.02   0.14 +/-0.09
+
+ spin-0 coefficients pinned at _COEFF_MAX (Mf, Mr, Mc):
+   I  12.31 / 60.29 / 49.36 %     D  0.89 / 0 / 0 %     DL  0 / 0 / 0 %
+
+The reparameterisation survives its re-measurement: the even log-det falls 26x
+(I -> DL) and the bound stops binding entirely.  Both hold for D as well, so it
+is dividing out the DIVERGENCE that does the work, exactly as designed -- L is
+along for the ride.
+
+L is not free, though.  It costs the Mc response and buys Mf, Mr and spin-2:
+
+    Mc   D 0.87 +/-0.22   vs   DL 0.14 +/-0.09
+    Mf   D 2.63 +/-0.22   vs   DL 1.55 +/-0.32
+    Mr   D 1.85 +/-0.28   vs   DL 0.76 +/-0.18
+
+which is the cumulative-sum mechanism this script was written to test, confirmed:
+with L in place the raw coefficients come back by summing along the chain and Mc,
+last in it, inherits the error in Mf and Mr.  Parameterise the differences
+directly and Mc recovers.  Summed |alpha - 1| still favours DL (1.67 vs 2.65),
+which is why the default is unchanged, but the choice is now a measured
+trade-off rather than an assumption.
+
+What neither arm fixes: the likelihood does not identify the spin-0 response.
+Every arm overshoots Mf by 55-180%.  Arm I gets there by not learning it at all
+-- its Mf scatters -3.76, -0.63, +1.48 across seeds -- which is worth knowing
+because the "Mf 1.00" this project has quoted from `dev/gmax_sweep.py` was the
+mean of a spread that wide, not a value any run achieves.
+
+Arm I also reproduces the old parameterisation's even log-det at 0.629 +/-0.131
+against the 0.495 +/-0.127 in `dev/gmax_sweep.py`, i.e. the old baseline was
+about right; it was the unpinned COMPARISON that was void, not that number.
 """
 import sys; sys.path.insert(0, ".")
 import equinox as eqx, jax, jax.numpy as jnp, jax.random as jr, numpy as np
