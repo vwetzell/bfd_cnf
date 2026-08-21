@@ -39,6 +39,15 @@ import numpy as np
 import optax
 
 import bulk
+
+# XLA picks matmul precision PER PROCESS, and on this flow that is worth ~1
+# nat in the log-densities ([[tf32-breaks-paired-runs]]; `bias.py` has forced
+# this since f1f3c92).  Training left unpinned is worse than imprecise, it is
+# not comparable: two processes at the SAME seed landed at even log-dets of
+# 0.019 and 1.430 -- different basins, not scatter -- which silently voided a
+# paired experiment on 2026-08-20.  Costs ~7%.
+jax.config.update("jax_default_matmul_precision", "highest")
+
 from models.shear import ShearResponse, dm_dg
 
 # Second-order in g is the model (paper sec. 5.5), so training over a range wider

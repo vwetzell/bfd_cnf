@@ -39,6 +39,15 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import optax
+
+# XLA picks matmul precision PER PROCESS, and on this flow that is worth ~1
+# nat in the log-densities ([[tf32-breaks-paired-runs]]; `bias.py` has forced
+# this since f1f3c92).  Training left unpinned is worse than imprecise, it is
+# not comparable: two processes at the SAME seed landed at even log-dets of
+# 0.019 and 1.430 -- different basins, not scatter -- which silently voided a
+# paired experiment on 2026-08-20.  Costs ~7%.
+jax.config.update("jax_default_matmul_precision", "highest")
+
 from flowjax.bijections import Chain, Invert, Permute
 from flowjax.distributions import MultivariateNormal, Transformed
 from paramax import non_trainable
