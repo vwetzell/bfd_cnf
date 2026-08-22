@@ -226,8 +226,33 @@ def train(flow, sampler, sigma_x, key, steps=4000, batch=1024,
             # step deep run at step 144.  So substitute the INPUT and drop those
             # rows from the mean.
             ok = in_domain(x)
-            lp = model.log_prob(jnp.where(ok[:, None], x, safe_point(x)),
-                                condition=cond)
+            x_safe = jnp.where(ok[:, None], x, safe_point(x))
+            lp = model.log_prob(x_safe, condition=cond)
+
+            # A SECOND, independent failure mode: an off-centre copy can carry
+            # every chart coordinate in a perfectly ordinary range (in_domain
+            # true, no coordinate more than a few sigma out) while the
+            # COMBINATION sits off the bulk flow's training manifold in a
+            # direction its autoregressive stack extrapolates catastrophically
+            # -- measured on copies_bulgedisc_deep.fits: one such row's z was
+            # [-1.2, -2.8, -3.3, -0.9, -2.4] (nothing extreme) yet its |z|
+            # after the bulk's 8 layers reached 3e5, and log_prob -4.4e10, on
+            # the very FIRST batch, with the flow's INITIAL (pre-training)
+            # parameters -- so this is not a training instability, it is a
+            # standing numerical cliff in the bulk stack that ordinary
+            # moments.fits batches apparently never sample and copies
+            # (off-centre measurements) sometimes do.  `in_domain` cannot see
+            # it because it is a property of the TRAINED FLOW's response to a
+            # coordinate, not of the raw moments.  A normal row's nll is
+            # O(10-100); flag anything past 1e4 as this same kind of poison
+            # and substitute it the same way `in_domain` violations are, via a
+            # second evaluation so `jnp.where` cannot leak its gradient
+            # (exactly the mechanism the comment above already warns about).
+            sane = jax.lax.stop_gradient(lp > -1e4)
+            ok = ok & sane
+            x_safe = jnp.where(ok[:, None], x_safe, safe_point(x_safe))
+            lp = model.log_prob(x_safe, condition=cond)
+
             nll = -jnp.sum(jnp.where(ok, lp, 0.0)) / jnp.maximum(jnp.sum(ok), 1)
             return nll, (nll, 1.0 - jnp.mean(ok))
 

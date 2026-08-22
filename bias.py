@@ -166,6 +166,30 @@ CATALOGS = {
     # with -- it is there so `check_flow_vs_truth` can be exercised in minutes.
     "gauss2_2k": {"plus": "gauss2_g1p02_2k", "minus": "gauss2_g1m02_2k",
                   "zero": "gauss2_g0_2k"},
+    # gauss2 with image noise at the same noise_sigma=2.73 depth as
+    # bulgedisc_deep, co-elliptical so it carries no bulge/disc misalignment --
+    # the control for whether the Mr/Mf 3.0-3.2 response-scatter floor is
+    # specific to that hidden variable.  Needs centroid flows trained on
+    # copies_gauss2_deep.fits.
+    "gauss2_deep": {"plus": "targets_gauss2_deep_g1p02_200k",
+                    "minus": "targets_gauss2_deep_g1m02_200k",
+                    "zero": "targets_gauss2_deep_g0_200k"},
+}
+
+# The catalog each population's flows were standardised on (RawMomentStandardize
+# is fixed at training time, so `main` has to rebuild the same split) --
+# NOT auto-derived from `--pop`, because a naive fallback silently pointed
+# every non-"sersic" population at bulgedisc's moments.fits (caught when
+# gauss2_deep's selection-term correction came out byte-identical to
+# bulgedisc_deep's).  bulgedisc's noisy/deep variants are the same underlying
+# population as "bulgedisc", just measured with image noise, so they share its
+# noiseless moments.fits.
+TRAIN_DATA = {
+    "bulgedisc": "moments.fits", "bulgedisc_noisy": "moments.fits",
+    "bulgedisc_deep": "moments.fits",
+    "sersic": "moments_sersic.fits",
+    "gauss2": "gauss2_g0_1M.fits", "gauss2_2k": "gauss2_g0_2k.fits",
+    "gauss2_deep": "gauss2_g0_1M.fits",
 }
 
 
@@ -1407,8 +1431,7 @@ def main():
         fitsio.read_header(path(cat["zero"]), ext=1).get("IMGNOISE", False))
     use_centroid = a.centroid if a.centroid is not None else img_noise
 
-    train_data = a.train_data or (
-        f"{a.data_dir}/moments{'_sersic' if a.pop == 'sersic' else ''}.fits")
+    train_data = a.train_data or f"{a.data_dir}/{TRAIN_DATA[a.pop]}"
     # Rebuild exactly as `shear.py train` did -- the flow's RawMomentStandardize
     # is fixed by the training split, so the same 90% has to go in here.  The
     # centroid flow was standardised on the copy catalog's GALAXIES table

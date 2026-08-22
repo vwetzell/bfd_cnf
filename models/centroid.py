@@ -229,7 +229,19 @@ def _tensor(z, sigma_x, mean, std):
 
 
 class _Coeffs(eqx.Module):
-    """(f, a, b, q) -> the nine response coefficients, bounded by _COEFF_MAX."""
+    """(f, a, b, q) -> the nine response coefficients, bounded by _COEFF_MAX.
+
+    Rational bound, not `tanh`: `x / sqrt(1 + (x/C)^2)` has the same +/-C
+    asymptote and unit slope at the origin, but decays as `(C/x)^3` instead of
+    `sech^2` -- exponentially -- so a coefficient driven deep into saturation
+    still gets gradient and can recover, rather than being frozen there for the
+    rest of training.  `models/shear.py`'s `_Coeffs` made the same swap for the
+    same reason (2026-08-20, `dev/spin0_gradient_snr.py`); this layer still had
+    the old tanh form, and a 16k-step retrace on `copies_gauss2_deep.fits`
+    reproduced the identical one-way ratchet -- 0% of D coefficients pinned at
+    step 0, 92% by step 16000 -- which is the trained centroid layer's low-flux
+    ellipticity-response blowup on gauss2 (see HANDOFF.md).
+    """
 
     net: CoeffNet
 
@@ -238,7 +250,8 @@ class _Coeffs(eqx.Module):
 
     def __call__(self, f, a, b, q):
         u = jnp.stack([f, a, b, (q - _Q_LOC) / _Q_SCALE])
-        return _COEFF_MAX * jnp.tanh(self.net(u) / _COEFF_MAX)
+        x = self.net(u)
+        return x * jax.lax.rsqrt(1.0 + (x / _COEFF_MAX) ** 2)
 
 
 def response(coeffs, z, sigma_x, mean, std):

@@ -138,16 +138,57 @@ def _scale(m):
     return jnp.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1], m[:, 4]], axis=-1)
 
 
+def partial_norms(m, q_true, r_true):
+    """Per-partial RMS of the truth: (2, 5) for Q, (3, 5) for R.
+
+    dM1/dg1 has RMS ~0.37 against dM1/dg2's ~0.01 -- a factor ~27, 750x squared
+    -- so an unnormalised mean over the (2, 5)/(3, 5) blocks supervises the ten
+    Q partials and fifteen (three independent, g1g1/g1g2/g2g2) R partials
+    wildly unevenly.  Dividing each by its own RMS over the batch it is
+    measured on makes `train`'s derivative term a mean of equally-weighted
+    residual/RMS pieces, which is exactly what `shear.check` and
+    `dev/check_dmdg_components.py` report.
+    """
+    s = _scale(m)[:, None, :]
+    return (jnp.sqrt(jnp.mean((q_true / s) ** 2, axis=0)),
+            jnp.sqrt(jnp.mean((r_true / s) ** 2, axis=0)))
+
+
 def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
-          g_max=G_MAX):
-    """Likelihood only: the g dependence is learned from P(m|g) alone.
+          g_max=G_MAX, deriv_weight=0.0):
+    """Likelihood only by default: the g dependence is learned from P(m|g) alone.
 
     The cost is convergence.  The g dependence is worth ~0.3 nats/galaxy against
     a ~35 nat total, so on the NLL alone the signal is a small part of a noisy
-    objective.  Note the failure mode if it does not converge: that is a
-    VARIANCE floor, not a rate, so the knob is `batch`, not `steps`.
+    objective.  For the spin-2 (coherent, O(g)) part of the response that is
+    merely slow: NLL alone recovers it (`dev/spin0_selfconsistent_levers.py`,
+    `logs/spin0_levers.log`: M1/M2 alpha 0.96-0.97).  For the spin-0
+    (flux/size/concentration) part it is not a rate, it is a floor: that
+    response is ODD in the shape e, so it cancels in the population density at
+    O(g) and only appears at O(g^2), ~400x weaker than the spin-2 signal at
+    g_max=0.02 (measured Fisher information ~0.011/galaxy).  The same
+    self-consistency control -- target exactly representable, bulk exactly
+    correct, Var[Q|m] = 0 by construction, so every other explanation is
+    excluded -- shows NLL alone recovering Mc at alpha ~ -0.03 (i.e. not at
+    all), and shows every convergence knob failing to fix it: g_max 0.02 -> 0.10
+    (25x more spin-0 signal, by the O(g^2) scaling) makes EVERY coefficient
+    worse, including the previously-fine spin-2 ones; batch 1024 -> 65536 at
+    fixed steps monotonically worsens the dm/dg residual against bfd truth
+    (`logs/batch_probe_fixed/`) while held-out NLL does not move.  So
+    `deriv_weight` is not a fine-tuning knob in the sense the rest of this
+    project forbids one -- there is no value to search for that trades one
+    metric against another.  It regresses the layer's own (dm/dg, d2m/dg2)
+    (`models.shear.dm_dg`) onto bfd's exact per-template derivative, which is
+    never itself fit to anything (an analytic derivative of a known moment
+    integral, `bfd.MomentCalculator.getTemplate`, appendix C) -- the same
+    target NLL alone cannot see because the population density it maximises
+    is, to the precision that matters here, insensitive to it.  `deriv_weight
+    = 1e4` is what makes the term (order 1e-2 to 1) comparable to the ~35 nat
+    NLL; the self-consistency control at that weight recovers every
+    coefficient to alpha = 1.00.
     """
     m, q, r = (jnp.asarray(a) for a in data)
+    nq, nr = partial_norms(m, q, r) if deriv_weight else (None, None)
     opt = optax.chain(optax.clip_by_global_norm(1.0),
                       optax.adam(optax.cosine_decay_schedule(lr, steps)))
     params, static = eqx.partition(flow, _trainable(flow, bulk_frozen))
@@ -162,11 +203,19 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
 
         def loss_fn(p):
             model = eqx.combine(p, static)
-            return -jnp.mean(model.log_prob(x, condition=g))
+            nll = -jnp.mean(model.log_prob(x, condition=g))
+            if not deriv_weight:
+                return nll, nll
+            layer, chart = _shear_layer(model), _chart(model)
+            qq, rr = jax.vmap(dm_dg, in_axes=(None, 0, None))(layer, m[idx], chart)
+            s = _scale(m[idx])[:, None, :]
+            mse = (jnp.mean(((qq - q[idx]) / s / nq) ** 2)
+                   + jnp.mean(((rr - r[idx]) / s / nr) ** 2))
+            return nll + deriv_weight * mse, nll
 
-        loss, grads = jax.value_and_grad(loss_fn)(params)
+        (loss, nll), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, state = opt.update(grads, state, params)
-        return (eqx.apply_updates(params, updates), state, key), loss
+        return (eqx.apply_updates(params, updates), state, key), (loss, nll)
 
     # One `lax.scan` per REPORT steps rather than one dispatch per step.  A
     # batch-1024 pass through this flow is ~1e8 FLOPs -- microseconds of real
@@ -182,9 +231,13 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
     done = 0
     while done < steps:
         n = min(REPORT, steps - done)
-        (params, state, key), losses = run(params, state, key, n)
+        (params, state, key), (losses, nlls) = run(params, state, key, n)
         done += n
-        print(f"step {done - 1:6d}  nll {float(losses[-1]):.4f}", flush=True)
+        if deriv_weight:
+            print(f"step {done - 1:6d}  loss {float(losses[-1]):.4f}  "
+                  f"nll {float(nlls[-1]):.4f}", flush=True)
+        else:
+            print(f"step {done - 1:6d}  nll {float(losses[-1]):.4f}", flush=True)
     return eqx.combine(params, static)
 
 
@@ -434,6 +487,18 @@ def main():
                    help="shear-stage learning rate. It has never been tuned "
                         "UPWARD, and it moved the old noiseless metric 5x -- "
                         "more than every architectural axis combined.")
+    p.add_argument("--deriv-weight", type=float, default=0.0,
+                   help="weight on regressing the layer's own dm/dg, d2m/dg2 "
+                        "onto bfd's exact per-template derivative (never "
+                        "itself fit to anything); 0 = off, pure NLL. Not a "
+                        "value to search: NLL alone provably cannot identify "
+                        "the spin-0 (flux/size/concentration) response at any "
+                        "batch/steps/g_max (dev/spin0_selfconsistent_levers.py, "
+                        "logs/spin0_levers.log, logs/batch_probe_fixed/) "
+                        "because it is O(g^2) against spin-2's O(g) on an "
+                        "isotropic population; 1e4 is what makes the term "
+                        "comparable to the ~35 nat NLL and recovers alpha = "
+                        "1.00 in that self-consistency control.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log10mf", type=float, default=3.6)
     p.add_argument("--mrmf", type=float, default=3.3)
@@ -476,7 +541,8 @@ def main():
                 flow, list(bulk_only.bijection.bijection.bijections))
             print(f"warm started bulk from {a.init}")
         flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps,
-                     batch=a.batch, lr=a.lr, g_max=a.g_max)
+                     batch=a.batch, lr=a.lr, g_max=a.g_max,
+                     deriv_weight=a.deriv_weight)
         print(f"val nll {val_nll(flow, val_set, jr.key(99)):.4f}")
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")

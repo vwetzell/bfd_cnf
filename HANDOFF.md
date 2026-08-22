@@ -1759,3 +1759,429 @@ The gap is now smaller and differently shaped than the open question above
 assumed: noiseless -0.06, noisy unwindowed -0.010, noisy windowed +0.013.  A
 `--noise-scale` ladder is still the right probe, but it is now interpolating
 between -0.06 and -0.010 rather than between -0.06 and 0.
+
+---
+
+## 2026-08-21/22: derivative supervision back on, the Mr/Mf 3.0-3.2 floor, and a gauss2 run that found two new bugs
+
+**Uncommitted at the end of this session** — `bias.py`, `centroid.py`, `shear.py`
+all have local changes; nothing below is on a branch yet.
+
+### NLL alone cannot learn the spin-0 response; `deriv_weight` is back
+
+Re-derived the self-consistency argument from scratch (target exactly
+representable, bulk exactly correct, `Var[Q|m] = 0` by construction): NLL alone
+recovers spin-2 (`alpha` 0.96-0.97) but not spin-0, because spin-0 response is
+odd in `e` and cancels at `O(g)` on an isotropic population, appearing only at
+`O(g^2)`, ~400x weaker than spin-2 at `g_max = 0.02`.  Every convergence knob
+(steps, batch, `g_max`) makes it worse or does nothing.  Restored `shear.py`'s
+`--deriv-weight`, regressing the layer's own `(dm/dg, d2m/dg2)` onto bfd's exact
+per-template derivatives — never itself fit to anything, so this is supervision
+against ground truth, not a second loss term to trade off.  `deriv_weight = 1e4`
+recovers alpha = 1.00 in the self-consistency control; not a value to search.
+
+### A real bug in `centroid.py`, found along the way
+
+Training on `copies_bulgedisc_deep.fits` blew up (nll -> 1e19-1e25 by step
+250-500).  Not a gradient explosion (per-row gradients all finite, max 124.8) —
+the FORWARD `log_prob` on the untrained flow was already -4.4e10 for one
+ordinary-looking copy, and walking it bijection-by-bijection found `|z|`
+cascading 5 -> 195 -> 296954 across the bulk's autoregressive stack (layer 15
+of 16), pre-existing and unrelated to centroid or derivative supervision.
+Fixed with a second `in_domain`-style gate in `step()`: evaluate `log_prob`,
+flag rows with `lp <= -1e4` (`stop_gradient`'d), substitute `safe_point`, and
+re-evaluate before computing the loss. Stable through the full 16000-step run.
+
+### The bulgedisc-deep measurement, corrected
+
+`flows/centroid_derivsup_deep.eqx` (deriv-supervised shear + the centroid fix),
+200k targets at `noise_sigma = 2.73`, `alpha = 0.5`, window `(2.2,3.2)` x
+`(2500,50000)`:
+
+    unwindowed              m1 = -0.02407 +/- 0.00482
+    windowed, uncorrected   m1 = +0.05817 +/- 0.00090
+    windowed, corrected     m1 = -0.00913 +/- 0.00205
+
+Residual m1 is not primarily `Var[Q|m]`: score-contracted first-order error is
+89% reachable, not floor. It is not under-convergence either (6000 -> 36000
+steps moved it negligibly). It concentrates entirely above Mr/Mf ~3.0, flat
+below — see next section.
+
+### The Mr/Mf 3.0-3.2 response-fit floor: real, and it is bulge/disc misalignment
+
+Isolated to **second-order (curvature, R)** spin-2 response specifically — Q
+(first order) is actually *better* in 3.0-3.2 than the 2.4-3.0 control.
+Solved `models/shear.py`'s own `(mu, nu, rho)` ansatz **exactly per galaxy**
+(no population averaging, no training) against bfd's true Hessian:
+
+    per-galaxy exact-fit residual:    control 16.28%    target 27.13%
+
+Sanity check on the same method applied to the (nearly-exact) first-order
+`(A, B)` case gave 1.23% — small, consistent with float32 noise, validating the
+method. Correlated the residual against the population table's hidden
+variables (not visible to the model, which only sees combined moments):
+
+    corr(residual, bulge_frac*(1-bulge_frac))  control 0.50   target 0.43
+    corr(residual, |bulge_e - disc_e|)         control 0.15   target 0.15
+
+Same magnitude in both bins, so it is not that harder galaxies are more common
+in the target bin — the *same* hidden structure produces a bigger curvature
+ambiguity as resolution degrades. Mechanism: a less-resolved galaxy's weight
+function samples fewer independent k-modes before the point-source ceiling, so
+the same bulge/disc asymmetry leaves a bigger blind spot in what the moments
+can see.
+
+**The trained network is already at its achievable ceiling, not 20 points
+short of it.** First read (network 36-47% vs the 27% per-galaxy floor) looked
+like a large reachable gap. It was comparing against the wrong bound: no
+function of the *measured* invariants — however flexible — can beat what a
+single **pooled constant** `(mu, nu, rho)` for the whole bin already achieves,
+because the per-galaxy floor assumes information (which hidden bulge/disc
+split) that is not in the moments. Pooled-constant fit: 32.98%/36.36%
+(control/target) — matching the trained network's 31.5%/36.1% almost exactly.
+Three confirmations that there is no reachable gap left:
+
+- 6000 -> 36000 steps: 31.50/36.08 -> 31.46/35.58 (flat)
+- Flattening the training density across Mr/Mf (equal gradient mass per bin
+  instead of following the population): 31.50/36.08 -> 30.95/37.45 (no
+  improvement, target got slightly worse)
+- Three independent training seeds: 31.50/36.08, 31.91/36.57, 31.40/36.31 —
+  spread under 0.5 points, well inside the pooled-fit floor's own range
+
+### gauss2 control: the mechanism confirmed, cleanly
+
+gauss2 is co-elliptical by construction (bulge and disc share one `e`) — no
+hidden misalignment to leak. The per-galaxy ansatz-fit residual, computed the
+same way, is **0.000% at every Mr/Mf from 2.0 to 3.6**, exact analytically
+(gauss2 carries bfd's *exact* autodiff derivatives, not the DG*DG* columns —
+verified those are fine now too, <0.05% error, contra a stale docstring in
+`imsims/analytic.py`: the Nuttall-coefficient fix already killed the
+moving-boundary bug it describes). Trained a full fresh gauss2 stack
+(`bulk_gauss2_derivsup.eqx` 150k steps, `shear_gauss2_derivsup.eqx`
+`deriv_weight=1e4`, `centroid_gauss2_deep.eqx` 16k steps on a freshly-rendered
+`copies_gauss2_deep.fits`/`targets_gauss2_deep_g*_200k.fits` at the same
+`noise_sigma=2.73`). The trained shear layer's own `dm/dg2` check: M1/M2
+residual 2.64%/2.73% aggregate, against bulgedisc's 31-36% in the same metric.
+Mechanism confirmed.
+
+### But the full noisy gauss2 run surfaced two new, unrelated bugs
+
+**Bug 1 — `bias.py --train-data` silently defaults to bulgedisc's
+`moments.fits`.** `train_data = a.train_data or f"{data_dir}/moments{'_sersic'
+if pop=='sersic' else ''}.fits"` special-cases literally the string "sersic"
+and nothing else. Running `--pop gauss2_deep` without `--train-data` gave a
+selection-term correction byte-identical to the bulgedisc_deep run (P_s, Q_s,
+Q_s_err all matched to displayed precision) because `selection_terms`'
+`--window-terms templates` path lenses whatever `train_data` resolves to.
+Flow evaluation itself is unaffected (`eqx.tree_deserialise_leaves` overwrites
+every array leaf regardless of what dummy data built the tree), but the
+selection correction is silently wrong for any non-bulgedisc, non-sersic
+population. Not fixed in code yet — worked around by passing `--train-data`
+explicitly. **Should be fixed**: derive the default from `a.pop`, or require
+`--train-data` outright when `--pop` isn't "bulgedisc".
+
+**Bug 2 — the trained centroid layer is broken for gauss2 at low flux.**
+Corrected gauss2_deep run, `P_s = 0.6324` (now matches the 65% window fraction
+measured directly on the noiseless catalog), windowed corrected `m1 = +0.06585
++/- 0.00097` — an order of magnitude worse than bulgedisc_deep. Flux-quintile
+breakdown:
+
+    q1  +5.6715 +/- 0.3284   q2  +0.3153   q3  +0.0909   q4  -0.0136   q5  -0.0172
+
+Not outlier-driven — dropping the 50 worst `|R|` targets in q1 only moves it
+5.67 -> 5.30. Diagnosed by ablation:
+
+- Noiseless, no centroid (plain `shear_gauss2_derivsup.eqx` on the 1M noiseless
+  gauss2 catalogs): all quintiles sane, -0.0094 to -0.0248. The trained
+  bulk/shear flow is fine.
+- Noisy, `--no-centroid` (same noisy `gauss2_deep` targets, `alpha=0.5`,
+  `samples=8192`, but the pre-centroid flow): q1 = +0.0318 +/- 0.0057, all
+  quintiles sane. ESS was equally healthy with and without centroid (~630-670
+  median either way), so it is not an integration problem.
+
+So it is the **trained centroid layer specifically**. Likely cause, not yet
+verified: gauss2's population is built by rejection sampling in moment space
+(~30% acceptance, `sample_population_gauss2`), which plausibly leaves the copy
+catalog thin at low flux, giving the centroid layer a poorly-conditioned
+marginalisation there — matches `centroid.py check()`'s own diagnostic, which
+(before the low-flux bug was known) already showed a 20x mismatch between the
+layer's predicted ellipticity response and the catalog's own (+1.70e-1 vs
++8.4e-3).
+
+**Bug/finding 3 — a generic bulk-density blowup at each population's OWN
+support edge, unrelated to bulge/disc misalignment.** Binning the *noiseless*,
+no-centroid `bias()` (not the ansatz-residual metric) by Mr/Mf on the bright
+half of each population:
+
+    gauss2     (max Mr/Mf ~3.588):  2.4-3.0 -0.001   3.0-3.2 -0.017   3.2-3.6 -0.127
+    bulgedisc  (max Mr/Mf ~3.68):   3.0-3.2 -0.002   3.2-3.4 -0.045   3.4-3.6 -0.113   3.6-3.8 -0.408
+
+Same shape in both populations, each one blowing up sharply right at its own
+support ceiling, present with *no* noise, *no* centroid layer, and (for
+gauss2) *no* misalignment. This is a different, larger-scale effect than the
+misalignment-driven second-order floor above — it dominates the raw `bias()`
+number at the extreme tail and looks like the bulk density's known difficulty
+near the `POINT_SOURCE`/`POINT_SOURCE_MC` chart ceiling (`[[mc-mr-ceiling-bound]]`,
+`[[resolution-bias-is-bulk-density]]`), not the response layer at all.
+
+### Open, in the order I would take them
+
+1. **Fix `bias.py --train-data`'s default** — cheap, and it will silently
+   corrupt the next non-bulgedisc selection-term measurement otherwise.
+2. **Find the actual code path behind the centroid layer's low-flux failure**
+   on gauss2 — the rejection-sampling/thin-copies hypothesis is plausible but
+   unverified; check copy density vs flux directly, or retrain centroid with
+   flux-stratified sampling (same trick already tried and shown NOT to help
+   the Mr/Mf floor — worth checking whether it behaves differently here).
+3. **The point-source-ceiling bulk-density blowup** — present in both
+   populations, independent of everything investigated this session. Probably
+   the same open mechanism as `[[resolution-bias-is-bulk-density]]`, just
+   re-surfaced with cleaner evidence (matched shape across two populations).
+
+---
+
+## 2026-08-22 continued: all three open items closed or re-diagnosed
+
+### Item 1 — `bias.py --train-data` is now population-aware
+
+Replaced the `"sersic"`-only special case with an explicit `TRAIN_DATA` dict,
+keyed by every `CATALOGS` population, mapping each to the catalog its flows
+were actually standardised on (`bulgedisc`/`bulgedisc_noisy`/`bulgedisc_deep`
+all share `moments.fits`, since noisy/deep are the same underlying population
+just measured with image noise; `sersic` keeps `moments_sersic.fits`;
+`gauss2`/`gauss2_2k`/`gauss2_deep` all get `gauss2_g0_1M.fits`/`gauss2_g0_2k.fits`
+— there is no `moments_gauss2.fits` on disk, and the zero-shear 1M/2k catalog is
+what a `shear.py train --data ...` for gauss2 would actually have used). All
+four files verified present. No more silent bulgedisc fallback.
+
+### Item 2 — the gauss2 centroid low-flux blowup: NOT thin copies, an old
+tanh gradient-trap left in `models/centroid.py`
+
+**The rejection-sampling/thin-copies hypothesis is refuted.** Measured copy
+count and per-galaxy weight-sum (`CopySampler.total`, the detection
+probability) vs flux directly on `copies_gauss2_deep.fits`: copies are
+**denser** at low flux (median 302/galaxy in the faintest quintile vs 196 in
+the brightest), and the weight-sum/ESS profile is close to identical to
+`copies_bulgedisc_deep.fits`'s (q1 `frac(total<0.9)` 2.8% gauss2 vs 1.8%
+bulgedisc; both populations have the same `min=7` copies at all — a 0.22%
+tail, not a systematic thinness). Whatever breaks gauss2's centroid layer is
+not the copy catalog.
+
+**What it actually is**: re-ran `centroid.check`-style diagnostics per flux
+quintile on the trained `centroid_gauss2_deep.eqx`. The ellipticity-response
+mismatch (layer vs catalog) is 24x at q1 (0.716 vs 0.029) falling to 11x at
+q5 — bad everywhere, worst at low flux, consistent with the HANDOFF q1
+m1 = +5.67. The predicted `|de|` shift **saturates at a hard ceiling** (~0.078
+physical, ~90th-100th percentile all pinned there) — the signature of a
+bounded activation, not a smooth extrapolation error. Evaluating
+`models/centroid.py`'s `_Coeffs` net directly on the trained flow: coefficient
+`D` is saturated (`|D| > 11` of `_COEFF_MAX = 12`) in **79-100% of galaxies at
+every flux quintile**, and `A`/`B` saturate 20-33% at the flux extremes — vs
+bulgedisc's trained layer, where `A`/`B` never saturate and `D` only reaches
+43% in the brightest quintile.
+
+Re-tracing training from a fresh warm start (`dev/spin0_selfconsistent_levers.py`-
+style, snapshotting `|coeff| > 11` fraction every training checkpoint):
+saturation is **0% at step 0 and grows monotonically to step 16000**
+(D: 0%→33%→92%; A: 0%→9%; B: 0%→14%). This is not an initialisation or
+data-density artifact, it is a **training-time runaway**.
+
+`models/centroid.py`'s `_Coeffs.__call__` was still bounding with
+`_COEFF_MAX * jnp.tanh(net(u) / _COEFF_MAX)` — the exact form
+`[[spin0-failure-is-gradient-death]]` diagnosed and replaced in
+`models/shear.py`'s `_Coeffs` on 2026-08-20: `tanh`'s gradient `sech^2(x/C)`
+decays exponentially, so once a coefficient saturates it gets zero gradient
+and can never recover — "a one-way ratchet." `models/shear.py` fixed this with
+the rational bound `x / sqrt(1 + (x/C)^2)` (same asymptote and unit slope at
+the origin, decays only as `(C/x)^3`). **`models/centroid.py` never got the
+same fix.** Applied it (same one-line change, `models/centroid.py` `_Coeffs`).
+Full `tests/test_centroid.py` (11 tests) still passes.
+
+Re-traced training with the fix: saturation growth is sharply reduced and
+plateaus rather than ratcheting away — at step 16000, `D` 39% (vs 92%
+unfixed, still climbing), `A` 6.5% (vs 9%), `B` 5.6% (vs 14%), and D's growth
+visibly flattens after step ~4000 rather than continuing to climb. **Not a
+full fix** (D still saturates in ~40% of galaxies) — plausibly `_COEFF_MAX = 12`
+is itself undersized for gauss2's D coefficient, the same kind of
+under-fitting `[[coeff-bound-per-template-trap]]` found for the shear layer's
+bound. Have not yet done the full `centroid.py train --steps 16000` retrain +
+`bias.py --pop gauss2_deep` remeasurement — that is the natural next step to
+quantify how much of the +5.67 q1 m1 this recovers.
+
+### Item 3 — the support-edge blowup: not a mass leak, the score degrades in
+the sparse tail (same mechanism at a softer edge)
+
+Checked whether the bulk flow's Mr/Mf marginal **leaks mass past each
+population's own empirical max** (the mechanism `[[resolution-bias-is-bulk-density]]`
+found at the hard `POINT_SOURCE` ceiling, before that ceiling was logit-bounded).
+Drew 200k-1M samples from `shear_derivsup.eqx`/`shear_gauss2_derivsup.eqx` at
+g=0: **no leak** — sample max sits at or below the true population max for
+both populations (bulgedisc samples reach 3.6863 vs true 3.6750, 0.0095% of
+mass past it; gauss2 samples don't even reach the true 3.5883 max). Binning
+the marginal density in narrow bins across the top 15% of each population's
+range: ratio of flow density to true density is within a few percent
+everywhere except the last 1-2 bins, where sample counts are single digits.
+**The chart's Mr/Mf and Mc/Mr ceilings are doing their job — this is not the
+old unmodelled-boundary bug.**
+
+What IS wrong: the shear response layer's own **first-order score** (`A =
+d(M1+iM2)/dg1 / Mr`, compared to bfd's exact per-galaxy `dm_dg` column, at
+g=0, no noise, no centroid — same method as `dev/check_shear_response_vs_truth.py`,
+which is stale against the current `dm_dg(layer, m, chart)` signature and
+needed patching to run). Binned in narrow strips approaching each
+population's true Mr/Mf max: fractional error in `A` grows from ~1-2% in the
+mid-range to **-54% in the last 8 galaxies before bulgedisc's true max**
+(monotone: -0.6%, -2.2%, -12%, -18%, -54% over the last five strips, n = 5954,
+81, 68, 43, 25, 8) and to +6.4% by gauss2's much thinner tail (n drops to
+single digits past Mr/Mf 3.48, too few to bin further). **This is not a
+density-mass problem, it is the trained response network extrapolating badly
+over the handful of training galaxies that exist in the last ~1% of each
+population's own support** — `deriv_weight=1e4` derivative supervision is
+active and still leaves this residual, meaning even exact per-galaxy targets
+aren't enough training signal when there are only 8-40 galaxies to fit against.
+Same shape in both populations because it's a generic small-N-near-a-hard-edge
+effect, not specific to bulge/disc misalignment or to gauss2's construction.
+
+**Not yet tried**: oversampling/reweighting the training batch near the edge
+(the equivalent trick was tried for the Mr/Mf 3.0-3.2 misalignment floor and
+did NOT help there — a different mechanism, so worth retesting here
+specifically for the response layer rather than the density).
+
+### The gauss2_deep retrain + remeasurement (done same session)
+
+Backed up the old checkpoint to `flows/pre_tanh_fix/centroid_gauss2_deep.eqx`,
+retrained `centroid.py train --copies copies_gauss2_deep.fits --flow
+flows/centroid_gauss2_deep.eqx --init flows/shear_gauss2_derivsup.eqx --steps
+16000` (matching `retrain.sh`'s bulgedisc convention) with the rational-bound
+fix in place, then re-ran the full 200k-target `bias.py --pop gauss2_deep
+--samples 8192 --alpha 0.5 --chunk 4096 --window-size 2.2 3.2 --window-flux
+2500 50000` (now with the fixed `--train-data` default too, so both bugs are
+addressed in this one number):
+
+    unwindowed              m1 = -0.02133 +/- 0.00050
+    windowed, uncorrected   m1 = +0.00052 +/- 0.00040
+    windowed, corrected     m1 = -0.01598 +/- 0.00079
+
+Against the old, doubly-contaminated +0.06585 +/- 0.00097: sign flips, and the
+faintest-flux catastrophe is gone entirely —
+
+    Mf quintile     m1              (was: q1 +5.67, q2 +0.32)
+       q1        +0.0003 +/- 0.0053
+       q2        -0.0303 +/- 0.0014
+       q3        -0.0270 +/- 0.0009
+       q4        -0.0237 +/- 0.0009
+       q5        -0.0163 +/- 0.0005
+
+q1 (the exact bin that blew up to +5.67) is now consistent with zero. What's
+left is a fairly uniform -0.016 to -0.030 across q2-q5 — a DIFFERENT shape
+than bulgedisc's residual (which concentrates at the high-Mr/Mf tail, not
+spread across flux), consistent with the centroid layer's D coefficient still
+being ~40% saturated even under the rational bound (measured in the training
+re-trace above). Overall magnitude (-0.016 windowed-corrected) is now the same
+order as bulgedisc_deep's -0.00913, not 7x larger and opposite-signed.
+
+**Runtime note**: the first attempt at this `bias.py` run was killed by the
+harness partway through (right at the tail end of the first arm, ~30 min in,
+no traceback, GPU/CPU both idle at the instant checked) — looked like an
+idle-output watchdog on an auto-backgrounded command rather than a crash.
+Confirmed by re-running fully detached (`nohup ... & disown`, polled by PID
+and log file directly rather than the tool's own background-task tracking),
+which completed cleanly end to end (~2 hours for three 200k-target arms at
+`samples=8192`). If a long `bias.py` run needs to survive unattended, detach
+it this way rather than relying on the harness's auto-background promotion.
+
+### The uniform q2-q5 residual: NOT centroid, NOT new — it's `rho` still
+saturating `_COEFF_MAX` in both populations' shear layers
+
+Checked whether the centroid layer's remaining ~40% D-saturation causes the
+residual, by comparing the shear response evaluated at the layer's
+(imperfect) unmarginalized point vs. the catalog's true one: the mismatch is
+**largest in q1 (-4.3%) and smallest in q5 (-0.07%)** — backwards from what
+would be needed to explain a residual that's ~zero in q1 and worst in
+q2-q5. Wrong mechanism.
+
+Ran `bias.py --pop gauss2 --flow flows/shear_gauss2_derivsup.eqx` directly —
+the full 1M-galaxy **noiseless** population, no image noise, no centroid, no
+MC integration at all:
+
+    q1  -0.0094   q2  -0.0120   q3  -0.0142   q4  -0.0155   q5  -0.0248
+
+Same sign, same order of magnitude as the full noisy/windowed/corrected run
+(-0.0163 to -0.0303). **The residual is not introduced by noise integration or
+the centroid layer — it's already there in the plain trained shear response.**
+
+Checked the shear layer's own trained coefficients (`f,a,b,q -> layer.coeffs`)
+for saturation against `_COEFF_MAX = 12`: **`rho` (the second-order spin-2
+curvature coefficient, `coeffs[13]`, the same `[mu, nu, rho]` ansatz from the
+misalignment-floor investigation) is pinned at the bound for ~73% of gauss2
+galaxies, essentially flat across all five flux quintiles (72-74%)** — a much
+better shape match to the flat residual than anything flux-dependent. Checked
+`flows/shear_derivsup.eqx` (bulgedisc) the same way: **its `rho` saturates
+even harder, 78% at q2-q5** (`c6`, a spin-0 coefficient, also saturates
+54-59% there, vs <2% in gauss2). So this is not gauss2-specific — it is a
+**shared defect in the trained shear response**, the same category of issue
+`[[coeff-bound-per-template-trap]]` diagnosed for `a_Mr` on 2026-08-20 (that
+fix, or its supersession by the chart-Jacobian reparameterisation, evidently
+never touched `rho`). It was invisible in bulgedisc's aggregate because the
+larger, already-diagnosed misalignment floor dominates there; gauss2 has zero
+misalignment, so this shared floor shows up nakedly instead of being buried
+under something bigger.
+
+### Why `rho` keeps saturating: confirmed the same un-patched bug as `a_Mr`
+for bulgedisc, but gauss2 has something else on top
+
+Binned `rho` saturation by `a` (=z1, the Mr/Mf-related chart coordinate with
+the divergent logit Jacobian — the same one that broke `a_Mr`):
+
+    bulgedisc  Mr/Mf  0.80-2.92  2.92-3.24  3.24-3.38  3.38-3.49  3.49-3.68
+               sat      2.4%       50.2%      94.8%      98.7%      99.9%
+
+A clean climb from near-zero to total saturation approaching the point-source
+ceiling — the identical signature `dev/flexibility_audit.py` found for
+`a_Mr` before its fix. **`rho` (and by construction `A, B, mu, nu`, which
+share the same unprotected path) has the same chart-divergence bug, just
+never patched** — `_chart_spin0_jac`'s analytic-Jacobian treatment was only
+ever applied to the spin-0 block.
+
+Gauss2 is messier — NOT a pure ceiling effect. Same binning:
+
+    gauss2     Mr/Mf  1.95-2.74  2.74-2.93  2.93-3.08  3.08-3.23  3.23-3.59
+               sat      87.7%      68.1%      63.7%      63.6%      82.6%
+
+U-shaped, and elevated (>60%) even far from any ceiling, unlike bulgedisc's
+near-zero baseline there. Binning by `|e|` instead: bulgedisc's saturation
+tracks it cleanly (94.8% at the roundest quintile down to 22.5% at the most
+elongated — the "dividing a residual by a small e^3" mechanism the `a_Mr` fix
+comment already warned raising the bound would unleash), but gauss2's is
+flat at ~73% regardless of `|e|`. So gauss2 has the same underlying
+vulnerability (no protective Jacobian) PLUS something else keeping it
+elevated basically everywhere in its own (narrower, more homogeneous)
+population — not yet isolated.
+
+### Open, in the order I would take them
+
+1. **Extend the spin-0 chart-Jacobian fix (`_chart_spin0_jac` /
+   `[[chart-jacobian-reparam]]`) to the spin-2 block (`A, B, mu, nu, rho`)** —
+   confirmed root cause for bulgedisc's `rho`, and the natural next step given
+   how directly this mirrors the already-fixed `a_Mr` case. Derive the raw
+   physical (mu, nu, rho) via the same kind of per-galaxy exact solve already
+   done for the misalignment-floor ansatz fit, work out what divergent factor
+   the current z-space parameterisation implicitly carries, and apply it
+   analytically instead of asking the network for the compound quantity.
+2. **Gauss2's extra, non-ceiling elevation in `rho` saturation** — separate
+   from the chart-divergence mechanism above; check whether it's a
+   conditioning/whitening issue (the four `_Coeffs` inputs are whitened as a
+   group, but `rho`'s own natural scale relative to `mu`/`nu`'s isn't treated
+   specially) or a genuine property of gauss2's narrower population.
+2. **`_COEFF_MAX` for `models/centroid.py`'s `_Coeffs`** — D is still ~40%
+   saturated post rational-bound-fix; a smaller, separate lever from the
+   above, for the centroid layer's own residual overshoot (still measurable,
+   just not the driver of the q2-q5 shape).
+3. **The support-edge score degradation** — try training-batch reweighting
+   toward the sparse tail for the shear response layer specifically (not the
+   bulk density, where the equivalent trick already failed for a different
+   floor); if that doesn't move it, this may just be an intrinsic small-N
+   limit worth documenting rather than chasing further.
+3. `dev/check_shear_response_vs_truth.py` is stale (`dm_dg` gained a required
+   `chart` argument on 2026-08-20) — worth a real patch if it's going to keep
+   getting reached for.
