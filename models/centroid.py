@@ -128,7 +128,7 @@ from flowjax.bijections import AbstractBijection
 from paramax import non_trainable, unwrap
 
 from .bijections import POINT_SOURCE, CoeffNet
-from .shear import _invariants
+from .shear import G_MAX, _invariants
 
 # As in models/shear.py: bound the coefficients so the map stays a
 # diffeomorphism for any Sigma_X the network might see.  T itself is ~1e-3, so
@@ -178,6 +178,48 @@ def displacement_covariance(m, sigma_x):
     sx = jnp.array([[sigma_x[0], sigma_x[1]], [sigma_x[1], sigma_x[2]]])
     jinv = jnp.linalg.inv(j)
     return jinv @ sx @ jinv.T
+
+
+def split_condition(condition):
+    """(g, Sigma_X) from a condition vector of either length.
+
+    The chained flow passes ``(5,) = [g1, g2, C00, C01, C11]``; a standalone
+    centroid layer, and `dm_dsigma`, pass a bare ``(3,)`` Sigma_X.  Sigma_X is
+    always the LAST three entries, so only g has to be decided -- and it must be
+    decided on the SHAPE, not by slicing blindly: `condition[:2]` on a (3,)
+    vector would silently hand C00, C01 to the layer as a shear.
+
+    Shapes are static under jit, so this branch costs nothing at run time.
+    """
+    c = jnp.asarray(condition)
+    g = c[..., :2] if c.shape[-1] >= 5 else jnp.zeros_like(c[..., :2])
+    return g, c[..., -3:]
+
+
+def g_invariants(z, g, mean, std):
+    """The two spin-0 invariants of (e, g) the coefficients may depend on.
+
+    The coefficients are SCALARS, so equivariance lets them depend on any spin-0
+    invariant -- and the ones g brings are exactly `p1 = Re(ebar g)` and
+    `p2 = |g|^2`, the same pair `models/shear.py` builds its response from.
+    Letting the coefficients carry them is what makes the marginalisation
+    shear-dependent at fixed moments: expanding e.g. `A(p1, p2) t2` generates
+    `Re(ebar g) t2` and the rest of the g-bearing spin-2 structures with the
+    right symmetry automatically, rather than by hand.
+
+    `e` is the PHYSICAL shape, for the same reason as in `response`: z3, z4 are
+    divided by the spin-2 std (~0.04), so a standardised e would inflate p1 by
+    ~25x and make the two inputs incommensurate.
+
+    Both are normalised by the training shear disc `G_MAX` so they arrive at the
+    network as O(|e|) and O(1) rather than as 1e-3 and 4e-4, which the net could
+    not resolve against its four O(1) inputs.
+    """
+    m = raw_from_standard(z, mean, std)
+    e = jax.lax.complex(m[2] / m[1], m[3] / m[1])
+    gc = jax.lax.complex(g[0], g[1])
+    return ((jnp.conj(e) * gc).real / G_MAX,
+            (gc * jnp.conj(gc)).real / G_MAX**2)
 
 
 def raw_from_standard(z, mean, std):
@@ -246,10 +288,30 @@ class _Coeffs(eqx.Module):
     net: CoeffNet
 
     def __init__(self, key, nn_width, nn_depth, activation):
-        self.net = CoeffNet(key, 4, N_COEFFS, nn_width, nn_depth, activation)
+        net = CoeffNet(key, 6, N_COEFFS, nn_width, nn_depth, activation)
+        # ZERO-INIT the two g columns of the first layer.  `centroid.py train`
+        # runs entirely at g = 0 (the copies are unlensed), so p1 and p2 are
+        # identically zero over the whole training set and their weights receive
+        # exactly zero gradient -- dL/dw = delta * input = 0.  Left at their
+        # random init they would stay there, and `bias.py` differentiates the
+        # flow w.r.t. g to build Q and R, so the layer would contribute an
+        # ARBITRARY untrained g-dependence straight into the measured bias.
+        #
+        # Zeroing them makes the layer exactly g-independent until something
+        # actually trains it in g, at which point the gradient is no longer zero
+        # and they move on their own.  The structure is in place and inert, not
+        # in place and wrong.  Delete these two lines once centroid training
+        # samples g.
+        w = net.layers[0].weight
+        net = eqx.tree_at(lambda n: n.layers[0].weight, net,
+                          w.at[:, 4:].set(0.0))
+        self.net = net
 
-    def __call__(self, f, a, b, q):
-        u = jnp.stack([f, a, b, (q - _Q_LOC) / _Q_SCALE])
+    def __call__(self, f, a, b, q, p1=0.0, p2=0.0):
+        # p1, p2 are `g_invariants`; they default to the unsheared values so a
+        # standalone layer and every g = 0 diagnostic keep working unchanged.
+        u = jnp.stack([f, a, b, (q - _Q_LOC) / _Q_SCALE,
+                       jnp.asarray(p1, f.dtype), jnp.asarray(p2, f.dtype)])
         x = self.net(u)
         return x * jax.lax.rsqrt(1.0 + (x / _COEFF_MAX) ** 2)
 
@@ -328,17 +390,27 @@ class CentroidMarginalize(AbstractBijection):
     def unmarginalize(self, x, condition):
         """Closed form; `transform`'s map, from observed moments back to base.
 
-        Reads Sigma_X as the LAST three entries of `condition`, so the same layer
-        serves a standalone ``(3,)`` condition and the combined ``(5,)`` one
-        ``[g1, g2, C00, C01, C11]`` that a shear-plus-centroid flow passes down
-        the chain.
-        """
-        sigma_x = condition[-3:]
-        f, a, b, q, _ = _invariants(x)
-        return response(self.coeffs(f, a, b, q), x, sigma_x,
-                        unwrap(self.mean), unwrap(self.std))
+        Reads Sigma_X as the LAST three entries of `condition` and g as the
+        first two, so the same layer serves a standalone ``(3,)`` condition and
+        the combined ``(5,)`` one ``[g1, g2, C00, C01, C11]`` that a
+        shear-plus-centroid flow passes down the chain -- see `split_condition`.
 
-    def marginalize(self, y, sigma_x):
+        The marginalisation is a property of the LENSED galaxy: it is sheared on
+        the sky and only then measured about a guessed origin.  Most of that
+        dependence already arrives through `x`, since the layer sits downstream
+        of `ShearResponse` generatively and so is evaluated on lensed moments.
+        What `x` cannot carry is the dependence at FIXED m: this layer models
+        E[marginalisation | m], a conditional mean over profiles, and shear
+        changes which profiles map to a given m.  That is what conditioning the
+        coefficients on g adds.
+        """
+        mean, std = unwrap(self.mean), unwrap(self.std)
+        g, sigma_x = split_condition(condition)
+        f, a, b, q, _ = _invariants(x)
+        p1, p2 = g_invariants(x, g, mean, std)
+        return response(self.coeffs(f, a, b, q, p1, p2), x, sigma_x, mean, std)
+
+    def marginalize(self, y, condition):
         """Invert `unmarginalize` by fixed point: x = y - (U(x) - x).
 
         U is the identity at Sigma_X = 0 and departs from it by O(T) with
@@ -348,7 +420,7 @@ class CentroidMarginalize(AbstractBijection):
         """
         x = y
         for _ in range(self.n_iter):
-            x = y - (self.unmarginalize(x, sigma_x) - x)
+            x = y - (self.unmarginalize(x, condition) - x)
         return x
 
     def transform_and_log_det(self, x, condition=None):

@@ -7,6 +7,7 @@ means the derivation or the code departed from it, not that a fit is poor.  The
 quality of the fit is `centroid.py check`'s job, against the catalog.
 """
 
+import equinox as eqx
 import jax
 
 # These are exact-symmetry checks, so they run in float64.  The layer itself
@@ -20,6 +21,7 @@ import jax.random as jr        # noqa: E402
 import numpy as np             # noqa: E402
 
 from models.bijections import POINT_SOURCE, POINT_SOURCE_MC
+from models.shear import G_MAX
 from models.centroid import (CentroidMarginalize, displacement_covariance,
                              raw_from_standard, response, _tensor)
 
@@ -213,11 +215,19 @@ def test_peeling_the_layer_off_is_exact_and_g_independent():
 
         log p(x|g,S) = log p_rest(centroid(x,S)|g) + log|det d centroid/dx|
 
-    with the second term independent of g.  That is what lets `bias.py` evaluate
+    with the second term independent of g -- which is what let `bias.py` evaluate
     it once and fold it into an importance weight instead of dragging a 5x5
-    jacfwd through a forward-over-reverse Hessian.  Both halves are checked: the
-    identity holds, and the offset it introduces is the SAME at different g --
-    so Q and R (eq. 12-13) are untouched.
+    jacfwd through a forward-over-reverse Hessian.
+
+    THAT NO LONGER HOLDS for a chained layer.  The centroid coefficients are now
+    conditioned on g (`models/centroid.g_invariants`), so the layer's log-det
+    does depend on g and peeling it would evaluate it at g = 0 for every draw,
+    silently discarding exactly the dependence it was given.  `split_centroid`
+    must therefore REFUSE to peel a (5,)-conditioned layer, and must still peel
+    a standalone (3,) one, which never sees a shear.
+
+    The exactness of the peel itself is still checked, on the (3,) layer where
+    it remains valid.
     """
     import bulk
     from bias import centroid_transform, split_centroid
@@ -236,30 +246,80 @@ def test_peeling_the_layer_off_is_exact_and_g_independent():
     pop = np.stack([mf, mr, mr * rng.normal(0, 0.05, 500),
                     mr * rng.normal(0, 0.05, 500),
                     mr * rng.uniform(2.0, 6.0, 500)], axis=-1)
-    flow = bulk.build_flow(jr.key(0), pop, shear=True, centroid=True)
-    rest, layer = split_centroid(flow)
-    assert layer is not None
+
+    # Chained with shear: g-conditioned, so the peel must be declined.
+    chained = bulk.build_flow(jr.key(0), pop, shear=True, centroid=True)
+    rest, layer = split_centroid(chained)
+    assert layer is None, "a g-conditioned centroid layer must not be peeled"
+    assert rest is chained
+
+    # Standalone: no shear layer, (3,) condition, still peelable and still exact.
+    solo = bulk.build_flow(jr.key(0), pop, centroid=True)
+    rest, layer = split_centroid(solo)
+    assert layer is not None, "a (3,)-conditioned layer is still peelable"
 
     z, ld = centroid_transform(layer, m, sx)
-    offsets, fulls = [], []
-    for g in ([0.0, 0.0], [0.03, -0.02]):
-        cond = jnp.tile(jnp.concatenate([jnp.array(g), jnp.asarray(SIGMA_X)]),
-                        (2, 1))
-        full = np.asarray(flow.log_prob(jnp.asarray(m), condition=cond))
-        peeled = np.asarray(rest.log_prob(jnp.asarray(z), condition=cond)) + ld
-        # `centroid_transform` casts to float32 to match the flow it feeds, and
-        # the moments are ~1e5, so the identity is exact only to f32 -- a few
-        # 1e-4 in a log-density of order tens.
-        assert np.abs(full - peeled).max() < 1e-2, (g, full, peeled)
-        offsets.append(full - peeled)
-        fulls.append(full)
+    cond = jnp.tile(jnp.asarray(SIGMA_X), (2, 1))
+    full = np.asarray(solo.log_prob(jnp.asarray(m), condition=cond))
+    peeled = np.asarray(rest.log_prob(jnp.asarray(z), condition=cond)) + ld
+    # `centroid_transform` casts to float32 to match the flow it feeds, and the
+    # moments are ~1e5, so the identity is exact only to f32 -- a few 1e-4 in a
+    # log-density of order tens.
+    assert np.abs(full - peeled).max() < 1e-2, (full, peeled)
 
-    # The claim that matters is not that the offset is constant to machine
-    # precision, but that it carries no SHEAR signal: it must move by far less
-    # than log_prob itself does between the two g, or Q and R would pick it up.
-    d_offset = np.abs(offsets[0] - offsets[1]).max()
-    d_full = np.abs(fulls[0] - fulls[1]).max()
-    assert d_offset < 1e-3 * d_full, (d_offset, d_full)
+
+def test_centroid_layer_depends_on_shear():
+    """The g plumbing reaches the coefficients -- and is inert until trained.
+
+    Two contracts, both easy to break silently:
+
+    1. At INIT the layer must be exactly g-independent.  `centroid.py train`
+       runs at g = 0, so the two g columns of the coefficient net get zero
+       gradient and never move; `_Coeffs` zeroes them precisely so an untrained,
+       arbitrary g-dependence cannot leak into `bias.py`'s Q and R.
+    2. Once those weights are NOT zero, the shift must actually move with g.
+       Otherwise `split_condition` is handing the layer g = 0, or the g
+       invariants are arriving too small to matter, and the layer is
+       "conditioned on shear" in name only.
+    """
+    import bulk
+    from models.centroid import split_condition
+
+    # The splitter must not mistake Sigma_X for a shear.
+    g3, s3 = split_condition(jnp.asarray(SIGMA_X))
+    assert np.allclose(np.asarray(g3), 0.0)
+    g5, s5 = split_condition(jnp.concatenate([jnp.array([0.03, -0.02]),
+                                              jnp.asarray(SIGMA_X)]))
+    assert np.allclose(np.asarray(g5), [0.03, -0.02])
+    assert np.allclose(np.asarray(s3), np.asarray(s5))
+
+    rng = np.random.default_rng(0)
+    mf = 10 ** rng.uniform(3.5, 4.5, 500)
+    mr = mf * rng.uniform(2.0, 3.4, 500)
+    pop = np.stack([mf, mr, mr * rng.normal(0, 0.05, 500),
+                    mr * rng.normal(0, 0.05, 500),
+                    mr * rng.uniform(2.0, 6.0, 500)], axis=-1)
+    flow = bulk.build_flow(jr.key(0), pop, shear=True, centroid=True)
+    chart, layer = (flow.bijection.bijection.bijections[0],
+                    flow.bijection.bijection.bijections[1])
+    z = jax.vmap(chart.transform)(jnp.asarray(pop[:200]))
+
+    def swing(lay):
+        shift = lambda g: np.asarray(jax.vmap(lay.unmarginalize)(
+            z, jnp.tile(jnp.concatenate([jnp.asarray(g), jnp.asarray(SIGMA_X)]),
+                        (len(z), 1))) - z)
+        s0 = shift([0.0, 0.0])
+        d = shift([G_MAX, 0.0]) - shift([-G_MAX, 0.0])
+        return np.abs(d).max() / np.abs(s0).max()
+
+    assert swing(layer) == 0.0, "an untrained layer must carry no g-dependence"
+
+    # Give the g columns some weight and the dependence must appear.
+    w = layer.coeffs.net.layers[0].weight
+    woken = eqx.tree_at(lambda l: l.coeffs.net.layers[0].weight, layer,
+                        w.at[:, 4:].set(0.3))
+    rel = swing(woken)
+    assert 1e-4 < rel < 1.0, rel
 
 
 def test_sampler_is_the_weighted_distribution():
@@ -294,7 +354,7 @@ def test_sampler_is_the_weighted_distribution():
                              .log_weights(copies, sigma_x)))
     sampler = CopySampler(copies, sigma_x)
 
-    drawn, _ = sampler.draw(np.random.default_rng(1), 400000)
+    drawn, _, _, _ = sampler.draw(np.random.default_rng(1), 400000)
     counts = np.bincount(drawn[:, 0].astype(int), minlength=copies.size)
     # Galaxy by detection probability, then copy by weight, so the two
     # normalisations telescope into one global one.
@@ -306,7 +366,7 @@ def test_sampler_is_the_weighted_distribution():
     # halve one galaxy's copies and its share of the draws must halve too.
     copies["da"][:per_gal] = 0.5
     s2 = CopySampler(copies, sigma_x)
-    d2, _ = s2.draw(np.random.default_rng(2), 400000)
+    d2, _, _, _ = s2.draw(np.random.default_rng(2), 400000)
     share = (d2[:, 0] < per_gal).mean()
     w2 = np.exp(np.asarray(__import__("imsims.copies", fromlist=["x"])
                            .log_weights(copies, sigma_x)))

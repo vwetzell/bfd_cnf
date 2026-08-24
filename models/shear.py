@@ -143,6 +143,12 @@ from .bijections import CoeffNet
 # easy to walk back into -- read them before touching this constant.
 _COEFF_MAX = 12.0
 
+# Radius of the training shear disc, and the operating point of the bias
+# measurement.  It lives here rather than in shear.py because
+# models/centroid.py needs it too, to normalise its g invariants, and a
+# layer must not import the training script.
+G_MAX = 0.02
+
 # This layer now acts on the STANDARDISED coordinates
 #     z = [log10 Mf, logit(Mr/(r* Mf)), logit(Mc/(rc* Mr)), M1/Mr, M2/Mr]
 # minus mean over std, i.e. downstream of `RawMomentStandardize` rather than on
@@ -310,51 +316,40 @@ class _Coeffs(eqx.Module):
         return x * jax.lax.rsqrt(1.0 + (x / _COEFF_MAX) ** 2)
 
 
-def response(coeffs, z, g, e_scale, chart_loc, chart_scale):
-    """The equivariant second-order response of `z` to `g`; the layer's core map.
-
-    `coeffs` is the 14-vector [a, b, c] x [Mf, Mr, Mc] followed by
-    [A, B, mu, nu, rho], evaluated at `z`'s invariants.
-
-    The spin-0 nine are RAW response coefficients -- `a` is the c_X of
-    dX/dg = X c_X Re(ebar.g) -- and `_chart_spin0_jac` carries them into z.
-    Asking the network for the chart-space coefficients directly is what pinned
-    it against `_COEFF_MAX` over three quarters of the population; see the
-    comment there.
-
-    Both blocks are ADDITIVE.  In raw moment space the spin-0 block had to be
-    multiplicative-with-an-exponential to keep Mf, Mr and Mc positive; z is
-    unbounded, so the exponential buys nothing and costs conditioning.  The
-    spin-2 block loses its factor of Mr for the same kind of reason: z3, z4 are
-    already M1/Mr, M2/Mr over the shared spin-2 std, i.e. dimensionless, so the
-    response is a pure shift of the shape vector.
+def project_to_physics(coeffs, z, g, e_scale, chart_loc, chart_scale):
     """
-    s0, A, B, mu, nu, rho = (coeffs[:9].reshape(3, 3), coeffs[9], coeffs[10],
-                             coeffs[11], coeffs[12], coeffs[13])
-    # `e_scale` puts the shape back in PHYSICAL units before the polynomial
-    # runs.  z3, z4 are M1/Mr, M2/Mr divided by the shared spin-2 std (~0.04),
-    # so a standardised |e| runs to ~5 where the physical one stops near 0.5 --
-    # and `response` is cubic in e, so using the standardised value would inflate
-    # the top term by ~(1/0.04)^3 and destroy the meaning of the coefficient
-    # bound.  The response is formed in physical units and divided back out.
-    e = e_scale * jax.lax.complex(z[3], z[4])
-    gc = jax.lax.complex(g[0], g[1])
-    ec, gcc = jnp.conj(e), jnp.conj(gc)
+    Project 14 basis coefficients into the physical Q (5,2) and R (5,2,2) tensors,
+    based on the shift defined in response().
+    """
+    # The shift function that defines the physics
+    def shift_func(g_vec):
+        s0, A, B, mu, nu, rho = (coeffs[:9].reshape(3, 3), coeffs[9], coeffs[10],
+                                 coeffs[11], coeffs[12], coeffs[13])
+        e = e_scale * jax.lax.complex(z[3], z[4])
+        gc = jax.lax.complex(g_vec[0], g_vec[1])
+        ec, gcc = jnp.conj(e), jnp.conj(gc)
+        p1 = (ec * gc).real
+        p2 = (gc * gcc).real
+        p3 = (ec * ec * gc * gc).real
+        spin0 = (_chart_spin0_jac(z, chart_loc, chart_scale)
+                         @ (s0 @ jnp.stack([p1, p2, p3])))
+        de = (A * gc + B * e * e * gcc + mu * ec * gc * gc
+              + nu * e * p2 + rho * e * e * e * gcc * gcc) / e_scale
+        return jnp.concatenate([spin0, jnp.array([de.real, de.imag])])
 
-    # The three spin-0 invariants of (e, g), through second order.
-    p1 = (ec * gc).real
-    p2 = (gc * gcc).real
-    p3 = (ec * ec * gc * gc).real
+    # Q (5, 2)
+    Q = jax.jacfwd(shift_func)(jnp.zeros(2))
+    # R (5, 2, 2)
+    R = jax.hessian(shift_func)(jnp.zeros(2))
+    return Q, R
 
-    spin0 = z[:3] + (_chart_spin0_jac(z, chart_loc, chart_scale)
-                     @ (s0 @ jnp.stack([p1, p2, p3])))
-    de = (A * gc + B * e * e * gcc + mu * ec * gc * gc
-          + nu * e * p2 + rho * e * e * e * gcc * gcc) / e_scale
-    # SLOT LAYOUT: `RawMomentStandardize` groups the three spin-0 coordinates in
-    # slots 0, 1, 2 and the spin-2 pair in 3, 4.  That is NOT the raw layout,
-    # where spin-0 is (Mf, Mr, Mc) = slots 0, 1, 4 and spin-2 is (M1, M2) = 2, 3.
-    return jnp.stack([spin0[0], spin0[1], spin0[2],
-                      z[3] + de.real, z[4] + de.imag])
+
+def response(coeffs, z, g, e_scale, chart_loc, chart_scale):
+    """The equivariant second-order response of `z` to `g`."""
+    Q, R = project_to_physics(coeffs, z, g, e_scale, chart_loc, chart_scale)
+    return z + Q @ g + 0.5 * jnp.einsum("ijk,j,k->i", R, g, g)
+
+
 
 
 class ShearResponse(AbstractBijection):

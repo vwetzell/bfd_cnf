@@ -6,6 +6,8 @@ an untrained layer passes.  Whether the learned coefficients match reality is a
 separate question, answered by `python shear.py validate` against bfd.
 """
 
+import os
+import pytest
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -400,3 +402,33 @@ def test_e_scale_is_the_charts_effective_spin2_std():
     chart = flow.bijection.bijection.bijections[0]
     want = float(chart._effective()[1][3])
     assert abs(float(unwrap(layer.e_scale)) - want) < 1e-9 * want
+
+
+def test_catalog_derivative_layout_is_g_index_first():
+    """`dm_dg` is (n, 2, 5) and `d2m_dg2` is (n, 3, 5) -- G INDEX FIRST.
+
+    This is a trap worth a test because the transposed reshape SUCCEEDS: 2*5
+    and 5*2 are the same number of elements, so `reshape(-1, 5, 2)` silently
+    returns scrambled data and every downstream number is garbage without a
+    single error.  It cost a full round of wrong conclusions about the `rho`
+    coefficient on 2026-08-24.
+
+    Shapes alone do not catch it (a reshape restores whatever shape you asked
+    for), so this also pins the physical signature: the spin-2 response is
+    diagonal, `dM1/dg1` >> `dM1/dg2` and `dM2/dg2` >> `dM2/dg1`, which a
+    transposition swaps.
+    """
+    import numpy as np
+    import shear as shear_mod
+
+    path = "../bfd_cnf_imsims/data/gauss2_g0_1M.fits"
+    if not os.path.exists(path):
+        pytest.skip(f"{path} not present")
+    m, q, r = (a[:20000] for a in shear_mod.load(path))
+    assert q.shape == (len(m), 2, 5), q.shape
+    assert r.shape == (len(m), 3, 5), r.shape
+
+    s = np.stack([m[:, 0], m[:, 1], m[:, 1], m[:, 1], m[:, 4]], -1)[:, None, :]
+    rms = np.sqrt(np.mean((q / s) ** 2, axis=0))
+    assert rms[0, 2] / rms[1, 2] > 10, "dM1/dg1 must dominate dM1/dg2"
+    assert rms[1, 3] / rms[0, 3] > 10, "dM2/dg2 must dominate dM2/dg1"

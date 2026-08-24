@@ -2185,3 +2185,325 @@ population — not yet isolated.
 3. `dev/check_shear_response_vs_truth.py` is stale (`dm_dg` gained a required
    `chart` argument on 2026-08-20) — worth a real patch if it's going to keep
    getting reached for.
+
+---
+
+## 2026-08-22 correction: `rho`'s "chart-divergence bug" diagnosis above is
+wrong; the real mechanism, and a negative experimental result
+
+Item 1 above ("extend the spin-0 chart-Jacobian fix to spin-2, confirmed
+root cause") does not survive scrutiny. Tried it, in a separate clone
+(`../bfd_cnf_rho_polar`, not merged — kept there with its own `EXPERIMENT.md`)
+rather than in this repo.
+
+**The premise was wrong.** z3, z4 (the spin-2 slots `rho` acts through)
+carry no logit and no divergent Jacobian, unlike z1/z2 — so `rho` cannot
+have `a_Mr`'s exact bug. The earlier claim rested on `rho`'s saturation
+tracking Mr/Mf-ceiling proximity in bulgedisc (2.4% → 99.9%), but that
+is a POPULATION correlation (bulgedisc's near-ceiling galaxies happen to
+have smaller `|e|`), not evidence of the same divergent-Jacobian mechanism.
+
+**Tried the fix anyway**: replace `e` with a bounded direction
+`e_dir = e / sqrt(|e|^2 + EPS^2)` in `rho`'s term. A first version applied
+the same substitution to `B, mu, nu` too and was catastrophic (bulgedisc
+noiseless m1 -0.0884 → -0.44) — `B*e^2*gcc` is a real, population-wide
+effect (the reduced-shear term), and forcing its `e` to saturate at unit
+magnitude destroyed its natural `|e|`-proportional scaling; training
+responded by crushing `B` toward zero rather than fit an impossible target.
+The `rho`-only version is clean (saturation 69% → 0%, `A`/`B` unchanged in
+scale) but still makes the actual bias WORSE: m1 -0.0884 → -0.1826 (6000
+steps) → -0.1651 (24000 steps) — not a convergence artifact, since the
+second-order (`d2m/dg2`) M1/M2 residual stayed pinned at ~24.8% regardless
+of step count while the first-order residual kept improving.
+
+**The real mechanism**, found by solving the exact 3x3 `(mu, nu, rho)`
+system per galaxy directly from bfd's own Hessian (no network at all):
+`mu, nu` stay bounded (median 0.4-0.9) at every `|e|`, matching their 0%
+saturation — but **`rho` genuinely needs to be enormous for most of the
+population** (median 64 at `|e|` < 0.01, p99 in the tens of thousands).
+Not an artifact. But that exact solve assumes real coefficients, which is
+only valid as a population average over an isotropic ensemble (the
+equivariance argument); solved per individual galaxy, `rho` comes out with
+a large IMAGINARY part (up to 65% of magnitude at small `|e|`) — meaning a
+single galaxy's true curvature has structure the real-coefficient ansatz
+cannot represent at all, and this non-equivariant residual correlates
+(r ~ 0.17-0.22) with the same bulge/disc misalignment variables
+(`bulge_frac*(1-bulge_frac)`, `|bulge_e - disc_e|`) the Mr/Mf floor
+investigation already used, on top of the dominant effect that `|e|` is
+simply small, amplifying whatever's in the numerator regardless of origin.
+
+So `rho`'s regression target is a population mean of a partly
+non-equivariant, `1/e^3`-amplified per-galaxy quantity — genuinely noisy,
+not a clean signal merely lacking room to be represented. The saturating
+bound functions as an accidental shrinkage estimator against that noise;
+removing it lets training fit the noise more precisely, which is why the
+bias got worse rather than better.
+
+**Revised open items, replacing item 1 above:**
+
+1. Don't re-attempt an `e`-substitution/floor fix for `rho` expecting a
+   better epsilon to solve this — the underlying problem (a noisy, partly
+   non-equivariant target) doesn't depend on where the floor sits.
+2. If `rho`'s noise is genuinely misalignment-correlated, the honest fix
+   may be the same one item 0 already closed out for the Mr/Mf floor: not
+   fixable by architecture or training changes, just a property of the
+   population's hidden structure leaking through the moments. Worth
+   checking whether `rho`'s saturated (bound-pinned) value is actually
+   CLOSE to the population-mean-optimal shrinkage target, or whether there
+   is still headroom a smarter (not merely unbounded) estimator could
+   recover — e.g. an explicit shrinkage/prior on `rho` rather than a hard
+   cap, which is a different structural change than the one tried here.
+3. `A, B` have not been checked for the `a_Mr`-style ceiling-driven
+   divergence the way `rho` was (incorrectly) suspected of — worth a
+   quick pass before assuming they're clean, since they share `rho`'s
+   unprotected (no `_chart_spin0_jac`-equivalent) path.
+
+---
+
+## 2026-08-24: the 6000-step default was the bias; `rho` is retired; the
+centroid layer is now conditioned on shear
+
+Started from `flows/shear_gauss2.eqx` as retrained on 2026-08-23 against the
+`project_to_physics` refactor of `models/shear.py`.
+
+### The refactor is a no-op, and the retrained flow was broken
+
+`project_to_physics` computes Q and R by `jacfwd`/`hessian` of the shift at
+g = 0 and re-forms `z + Q.g + g.R.g/2`.  The shift is exactly quadratic in g, so
+this is the same map: verified over 100 random draws, value identical to 5e-7
+and **Q and R bit-identical** (rel. diff 0.0).  It cannot have changed a result.
+
+What had changed was the training.  That checkpoint measured **m1 = -2.146 +/-
+0.014** on 1M noiseless gauss2 targets -- a sign-flipped estimator -- because
+`shear.py --deriv-weight` defaults to `0.0` and the shear response is invisible
+to the NLL:
+
+| | as retrained | + `--deriv-weight 1e4` | ref. `shear_gauss2_derivsup.eqx` |
+|---|---|---|---|
+| val nll | 42.3999 | 42.4115 | 42.4110 |
+| dm/dg Mf/Mr/M1/M2/Mc | 75/92/9.7/9.8/101% | 4.9/4.5/1.9/1.9/8.5% | 5.0/4.1/1.5/1.5/7.8% |
+| d2m/dg2 | 1622/534/985/1011/272% | 1.0/1.7/2.8/2.9/1.9% | 0.9/1.4/2.6/2.7/1.7% |
+| noiseless m1 | **-2.146** | -0.0185 | -0.0146 |
+
+Val NLL is *lower* on the broken flow.  Old checkpoint kept at
+`flows/nll_only/shear_gauss2.eqx`.
+
+### The residual bias was the 6000-step default
+
+Ladder on gauss2, 1M noiseless targets, `--deriv-weight 1e4`, same
+`bulk_gauss2.eqx` warm start, `--seed 0`:
+
+| steps | val nll | dm/dg Mf/Mr/M1/M2/Mc | d2m/dg2 | noiseless m1 |
+|---|---|---|---|---|
+| 6000 | 42.4115 | 4.90/4.54/1.92/1.94/8.47% | 1.02/1.73/2.80/2.89/1.85% | -0.01846 +/- 0.00075 |
+| 20000 | 42.4114 | 3.30/4.21/1.43/1.44/5.78% | 0.57/0.69/1.91/1.93/0.97% | -0.00789 +/- 0.00016 |
+| 60000 | 42.4112 | 2.70/4.28/1.29/1.31/5.12% | 0.49/0.54/1.42/1.50/0.70% | -0.00138 +/- 0.00015 |
+| 180000 | 42.4112 | 2.49/4.49/1.30/1.33/4.84% | 0.34/0.42/1.35/1.40/0.43% | -0.00419 +/- 0.00014 |
+
+**The response fit and the bias converge at different rates.**  `d2m/dg2` keeps
+halving to 180k while `m1` gets worse -- past ~60k, fitting `dm/dg` better stops
+buying bias.  Three seeds at 60k give -0.00138 / -0.00428 / -0.00277, **mean
+-0.0028, sd 0.0015**, and 180k's -0.00419 is 0.95 sd from that mean.  So m1
+plateaus at 60k and 180k costs 3x for nothing.
+
+Quote gauss2 noiseless as **m1 = -0.0028 +/- 0.0015** (seed sd).  The per-run
+bootstrap (1.5e-4) is 10x too small, and the ladder looked monotone until the
+fourth point arrived.  `flows/shear_gauss2.eqx` is now the 60k seed-0 flow;
+the 6k one is at `flows/nll_only/shear_gauss2_6k.eqx`, and seeds 1/2 and the
+20k/180k rungs are at `flows/shear_gauss2_{60k_s1,60k_s2,20k,180k}.eqx`.
+
+README's "the shear layer converges at its own default (6000/20000/60000 give
+-0.064/-0.056/-0.067)" is a **pure-NLL-era** claim and should be struck.
+
+### `rho` is not the bias, and the 2026-08-22 diagnosis above is wrong
+
+Exact per-galaxy solve of (mu, nu, rho) from bfd's own dm_dg/d2m_dg2
+(`dev/exact_response.py`, self-checked against the catalog's own lensed shape):
+
+* True |rho| is median **3.37** on gauss2 (flat across |eps| quintiles,
+  3.24-3.43) and 5.93 on bulgedisc, against `_COEFF_MAX = 12`.
+* Clipping at 12 fires on 13% / 37% of galaxies and costs **0.48% / 0.44%** of
+  the second-order response, population-weighted.  bulgedisc's median 64.6 at
+  the roundest quintile is real but occurs where `eps^3 ~ 0`, so the term
+  contributes 0.1% there -- 1/|eps|^3 amplification of a numerator already going
+  to zero, not physical amplification.
+* Ablating rho in the trained layer moves d2m/dg2 M1/M2 from 2.93%/3.22% to
+  3.10%/3.39%.  It earns its place and cannot carry a 0.018 bias.
+* **Decisive**: 6k -> 60k took m1 from -0.0185 to -0.0014 while rho saturation
+  went **UP**, 74% -> 96.3% (c_Mc 7.6% -> 84.8%, c_Mr 0% -> 37%,
+  `dev/coeff_saturation.py`).
+
+Saturation is a symptom of weak identifiability -- rho's design column carries
+|eps|^3 where mu/nu carry |eps|, so at |eps| ~ 0.05 its gradient is ~3 orders
+down and Adam walks a nearly-flat direction to the bound at full step size.
+**Do not read a saturation fraction as a bias diagnosis.**  Non-equivariance
+differs by population and both earlier numbers were right: gauss2
+|Im(rho)|/|rho| ~ 1e-7, bulgedisc ~0.36 -- so the "partly non-equivariant
+target" of `rho-polar-fix-tried-and-failed` is a bulgedisc/misalignment
+statement, not a general one.
+
+### Nothing blocks the spin-0 response either
+
+On gauss2 every candidate obstruction is eliminated: the response is parallel
+to eps to **0.0%** per galaxy (bulgedisc 0.4/2.9/5.2%); `shear.py scatter` puts
+the floor at 0.09/0.58/1.07%; required c_X is 1.64/2.29/2.50 against a bound of
+12 with 0.0% saturating; the even log-det is **-0.0012** nats against a physical
++0.0003 (it was 0.509 -- `chart-jacobian-reparam` fixed it, so the NLL is no
+longer buying density with the spin-0 block).
+
+Still open: **`dm/dg` Mr is flat at 4.2-4.5% across the whole 30x step ladder**
+while Mf and Mc keep falling, against a 0.58% floor.  Training time is not what
+limits it.  Response residuals are seed-stable (Mr 4.28/4.36/4.38 over three
+seeds) while m1 scatters by 0.0015, so m1's remaining scatter is the
+density/bulk interaction, not the response layer.
+
+### A layout bug that cost a round of wrong conclusions
+
+`dm_dg` is `(n, 2, 5)` and `d2m_dg2` is `(n, 3, 5)` -- **G INDEX FIRST**.
+`reshape(-1, 5, 2)` SUCCEEDS (2*5 == 5*2) and silently returns transposed data
+with no error, and shapes do not catch it.  This produced a completely wrong
+first version of the rho analysis.  Pinned by
+`tests/test_shear.py::test_catalog_derivative_layout_is_g_index_first`, which
+checks the physical signature (`dM1/dg1` is 37x `dM1/dg2`) rather than shape.
+
+Audited every reader: the live code is clean -- `shear.load`/`shear.lens`,
+`partial_norms`, `check`, `train`, and `bias.py`'s eq. (40) template-lensing all
+use the native layout.  The 13 `dev/` scripts that index `[:, :4]` with
+`(n,4,2)` comments import `bfd_cnf.config`, a package that no longer exists, and
+cannot run.
+
+### Centroid layer: now conditioned on shear
+
+The marginalisation is a property of the LENSED galaxy.  Most of that already
+arrived through the layer's input (it sits downstream of `ShearResponse`
+generatively): measured, the layer's `M1` shift already moved **26.8%** across
++/-0.02, `Mf` 6.7%.  What the input path cannot carry is the dependence at FIXED
+m -- the layer models `E[marg | m]`, and shear changes which profiles map to a
+given m.
+
+* `models/centroid.py`: `split_condition` returns `(g, Sigma_X)` deciding on the
+  vector's LENGTH (`condition[:2]` on a standalone `(3,)` would have handed
+  `C00, C01` to the layer as a shear -- `dm_dsigma` passes exactly that);
+  `g_invariants` builds `p1 = Re(ebar g)`, `p2 = |g|^2` on the physical shape,
+  normalised by `G_MAX`; `_Coeffs` takes them as two extra net inputs (4 -> 6).
+  Coefficients are scalars, so expanding e.g. `A(p1,p2).t2` generates the
+  g-bearing spin-2 structures with the right symmetry automatically --
+  `N_COEFFS` stays 9.
+* The two g columns of the first layer are **zero-initialised**.  A g = 0 run
+  gives them exactly zero gradient (`dL/dw = delta * input = 0`), so at random
+  init they would stay random and `bias.py` would read an arbitrary untrained
+  g-dependence straight into Q and R.  Zeroed, the layer is exactly
+  g-independent until something trains it in g.
+* `bias.py`: `split_centroid` now REFUSES to peel a `(5,)`-conditioned layer --
+  the peel's justification was that the log-det is g-independent, which is now
+  false, and peeling would evaluate the layer at g = 0 and discard the
+  dependence.  A standalone `(3,)` layer is still peeled.  **This costs what the
+  peel bought**: 5 extra JVPs of the coefficient net per draw inside the
+  forward-over-reverse Hessian.  Unmeasured -- drop `--chunk` if a deep run OOMs.
+* `G_MAX` moved from `shear.py` to `models/shear.py` (re-exported), so a layer
+  does not import the training script.
+
+### The copies DO carry their own derivatives -- `copies.py` was discarding them
+
+`makeTemplates` returns a `bfd.Template` per copy whose `even` is
+`(NE=5, NPQR=10)`: moments AND exact shear derivatives.  `copies.py` kept only
+slot `D0`.  A copy is the parent measured about a shifted origin, so the
+parent's derivatives do not transfer -- but the copy's own were there all along,
+at no extra render cost.
+
+* `imsims/copies.py`: `COPY_DTYPE` gains `dm_dg (2,5)` and `d2m_dg2 (3,5)`,
+  extracted exactly as `sim.fill_row` does.  Also gained `--shear G1 G2`, which
+  lenses templates before gridding (unused by the tasks below, but it is the
+  other way to build a sheared copy catalog).
+* Validated on a 60-galaxy render: the copy nearest u = 0 matches its parent's
+  derivatives to 5.9e-6 at |u| = 0.0005 and 1.3e-2 at |u| = 0.018 -- agreement
+  scaling with |u| is the signature of genuine per-copy derivatives.
+* `centroid.py`: `CopySampler.draw` returns them; `train` gains `--g-max`
+  (default `G_MAX`), samples g with antithetic +/-g pairing and lenses each
+  drawn copy by its own derivatives before the NLL, conditioning on that g.  It
+  raises a clear error on a catalog without the columns.
+* Smoke-tested end to end: the g columns went `0.000e+00 -> 3.951e-02` in 60
+  steps and the layer's shift now moves with g.
+
+Full suite 64 passed throughout.
+
+### WHAT IS STALE
+
+* **Every copies catalog on disk** -- no derivative columns.  Must be
+  re-rendered before the centroid layer can be trained with `--g-max > 0`.
+* **Every centroid checkpoint** -- twice over: the coefficient net is 6-input
+  now (`eqx.tree_deserialise_leaves` will raise on the old 4-input weight), and
+  the training objective changed.
+* The `gauss2_deep` numbers below were measured on the **6k** shear flow and on
+  a g = 0 centroid layer; expect them to move a lot.  Last full run, rebuilt
+  chain: unwindowed -0.02661 +/- 0.00058, windowed uncorrected -0.00681,
+  windowed corrected **-0.02311 +/- 0.00079**, P_s = 0.6324.
+* The centroid layer's own defect is untouched by any of the above: its
+  ellipticity response is **4.3x** the catalog's (layer +3.56e-2 vs catalog
+  +8.36e-3) with `Mf`/`Mr` shifts of the WRONG SIGN.  With the shear layer now
+  contributing only ~0.003 to m1, this is likely the dominant term in the deep
+  number rather than a secondary one.
+
+### NEXT SESSION, in order
+
+1. **Re-render the gauss2 deep copies catalog** with the derivative columns.
+   ~3.5 GB (was ~1 GB); 193 GB free at time of writing.
+
+       cd ../bfd_cnf_imsims
+       python -m imsims.copies --n 100000 --seed 0 --pop gauss2 \
+           --noise-sigma 2.73 --out data/copies_gauss2_deep.fits
+
+   Check afterwards that `dm_dg`/`d2m_dg2` are present, finite and nonzero, and
+   that the copy nearest u = 0 matches its `GALAXIES` row.
+
+2. **Retrain the centroid layer with g sampling**, off the converged shear flow.
+
+       python centroid.py train --copies ../bfd_cnf_imsims/data/copies_gauss2_deep.fits \
+           --flow flows/centroid_gauss2_deep.eqx --init flows/shear_gauss2.eqx \
+           --steps 16000
+
+   Confirm the g columns of `coeffs.net.layers[0].weight[:, 4:]` are nonzero
+   afterwards -- if they are still 0 the g path never got gradient and the rest
+   is meaningless.  Watch the `ellipticity response` line in the check: 4.3x is
+   the number to beat.
+
+3. **Measure `gauss2_deep`** on the rebuilt chain.  The peel is now declined, so
+   this is slower and heavier than the ~110 min the last run took; start with
+   `--n-targets 20000` to size it before committing.
+
+       python -u bias.py --flow flows/centroid_gauss2_deep.eqx --pop gauss2_deep \
+           --samples 8192 --alpha 0.5 --chunk 4096 \
+           --window-size 2.2 3.2 --window-flux 2500 50000
+
+4. **Then the open physics**: `dm/dg` Mr flat at 4.2-4.5% across the whole step
+   ladder against a 0.58% floor, and the centroid layer's 4.3x ellipticity
+   response.
+
+Do NOT spend effort on `rho`'s bound or parameterisation, and do not re-run the
+`e_dir` substitution -- see above and `rho-polar-fix-tried-and-failed`.
+
+### One measurement was started and CANCELLED -- worth redoing first
+
+`bias.py --pop gauss2_deep` on the **60k shear flow with the OLD g = 0 centroid
+layer** (`flows/centroid_gauss2_deep.eqx` as retrained off
+`flows/shear_gauss2.eqx`, before the `models/centroid.py` change landed).  It
+was killed part-way through the `minus` arm to free the machine, so there is NO
+result -- do not go looking for one.
+
+It is worth running again as step 0, because it isolates a variable nothing else
+does: what the converged shear layer alone buys at depth, with the centroid
+layer held at its old behaviour, against the 6k chain's windowed-corrected
+-0.02311 +/- 0.00079.  If that alone lands near zero, the centroid layer's 4.3x
+ellipticity-response error is doing less damage than feared and steps 1-3 are
+less urgent than they look.
+
+To run it you need the pre-change layer back, since the checkpoint on disk is a
+4-input net that the current `models/centroid.py` cannot deserialise:
+
+    git stash                     # or check out this commit's parent
+    python -u bias.py --flow flows/centroid_gauss2_deep.eqx --pop gauss2_deep \
+        --samples 8192 --alpha 0.5 --chunk 4096 \
+        --window-size 2.2 3.2 --window-flux 2500 50000
+
+Or skip it and go straight to step 1, accepting that the shear and centroid
+contributions stay entangled.

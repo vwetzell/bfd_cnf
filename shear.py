@@ -48,11 +48,11 @@ import bulk
 # paired experiment on 2026-08-20.  Costs ~7%.
 jax.config.update("jax_default_matmul_precision", "highest")
 
-from models.shear import ShearResponse, dm_dg
+from models.shear import G_MAX, ShearResponse, dm_dg
 
 # Second-order in g is the model (paper sec. 5.5), so training over a range wider
 # than any real shear costs nothing and pins the quadratic term down properly.
-G_MAX = 0.02          # the operating point of the bias measurement
+# Re-exported from models.shear, which is where the layers can see it.
 
 # Training steps fused into one `lax.scan` per dispatch; also the print interval.
 REPORT = 500

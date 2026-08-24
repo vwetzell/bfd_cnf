@@ -434,11 +434,34 @@ def split_centroid(flow):
     # always first now, so the centroid layer is at index 1 when it is present.
     if len(bij) < 2 or not isinstance(bij[1], CentroidMarginalize):
         return flow, None
+    # THE PEEL IS ONLY VALID WHILE THE LAYER IS g-INDEPENDENT.  Since the
+    # centroid layer's coefficients are conditioned on g (models/centroid.py
+    # `g_invariants`), a layer wired for the chained (5,) condition genuinely
+    # depends on g and its log-det is no longer a constant that drops out of
+    # eq. (12-13).  Peeling it would evaluate it at g = 0 for every draw and
+    # silently discard exactly the dependence it was given -- so refuse, and let
+    # the autodiff traverse the layer instead.
+    #
+    # That costs what the peel used to buy: 5 extra JVPs of the coefficient
+    # network per draw inside the forward-over-reverse Hessian.  Drop --chunk if
+    # a deep run runs out of memory.
+    if layer_is_g_conditioned(bij[1]):
+        return flow, None
     rest = Invert(Chain(list(bij[2:])).merge_chains())
-    # Both halves of the peel are g-independent -- the chart is a fixed
-    # reparametrisation and the centroid layer reads only Sigma_X -- so the pair
-    # can be hoisted together and their log-dets summed.
+    # Both halves are g-independent here -- the chart is a fixed
+    # reparametrisation and a (3,)-conditioned centroid layer reads only
+    # Sigma_X -- so the pair can be hoisted together and their log-dets summed.
     return Transformed(flow.base_dist, rest), (bij[0], bij[1])
+
+
+def layer_is_g_conditioned(layer):
+    """Does this centroid layer actually receive g?
+
+    True when it was built for the chained ``(5,) = [g1, g2, C00, C01, C11]``
+    condition.  A standalone ``(3,)`` layer never sees a shear -- `split_condition`
+    hands it g = 0 -- so it stays peelable.
+    """
+    return layer.cond_shape[-1] >= 5
 
 
 @eqx.filter_jit

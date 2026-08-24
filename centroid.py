@@ -65,7 +65,10 @@ import optax
 import bulk
 from paramax import non_trainable
 from models.bijections import in_domain, safe_point
+import shear
 from models.centroid import dm_dsigma
+from models.shear import G_MAX
+from shear import sample_g
 
 # The copy-weight convention lives in imsims and must not be duplicated here: it
 # is the one place the |J| choice of eq. (35) vs (36) is made, and two copies of
@@ -111,6 +114,17 @@ class CopySampler:
     def __init__(self, copies, sigma_x):
         w = np.exp(log_weights(copies, sigma_x))
         self.m = np.ascontiguousarray(copies["moments"], dtype=np.float64)
+        # Each copy's OWN exact shear derivatives, when the catalog carries them.
+        # A copy is the parent measured about a shifted origin, so the parent's
+        # derivatives do NOT transfer -- these have to come from the catalog, and
+        # `imsims.copies` now stores them (bfd's `makeTemplates` computed them all
+        # along; only slot D0 used to be kept).  Without them the layer can only
+        # be trained at g = 0.
+        names = copies.dtype.names
+        self.dm = (np.ascontiguousarray(copies["dm_dg"], dtype=np.float64)
+                   if "dm_dg" in names else None)
+        self.d2m = (np.ascontiguousarray(copies["d2m_dg2"], dtype=np.float64)
+                    if "d2m_dg2" in names else None)
         # One running cumulative sum serves every galaxy: within a group the CDF
         # is just cw shifted by the group's base, so a single searchsorted over
         # the whole array does the per-galaxy draw for the entire batch at once.
@@ -140,8 +154,10 @@ class CopySampler:
     def draw(self, rng, batch):
         """`batch` galaxies drawn by detection probability, one copy each by weight.
 
-        Returns (copy moments, galaxy row indices) -- the second so the caller can
-        line the batch up with per-galaxy quantities.
+        Returns (copy moments, galaxy row indices, dm/dg, d2m/dg2) -- the second
+        so the caller can line the batch up with per-galaxy quantities, and the
+        last two so it can LENS the drawn copies.  The derivatives are None on a
+        catalog rendered before `imsims.copies` began storing them.
         """
         gi = np.searchsorted(self._gal_cdf, rng.random(batch))
         gi = np.clip(gi, 0, len(self.ids) - 1)
@@ -149,7 +165,13 @@ class CopySampler:
         idx = np.searchsorted(self.cw, target, side="left")
         # Guard the group edges against float error in the cumulative sum.
         idx = np.clip(idx, self.starts[gi], self.ends[gi] - 1)
-        return self.m[idx], self.ids[gi]
+        return (self.m[idx], self.ids[gi],
+                None if self.dm is None else self.dm[idx],
+                None if self.d2m is None else self.d2m[idx])
+
+    @property
+    def has_derivatives(self):
+        return self.dm is not None and self.d2m is not None
 
 
 def _centroid_layer(flow):
@@ -186,23 +208,44 @@ def _trainable(flow):
 def condition(sigma_x, batch, g=(0.0, 0.0)):
     """The chain's condition vector [g1, g2, C00, C01, C11], tiled over a batch.
 
-    The copies are unlensed, so training runs at g = 0, where the shear layer is
-    the identity and the composition is bulk -> centroid.  That is the whole
-    content of putting the marginalisation in ONE layer conditioned on Sigma_X
-    alone: it assumes the form of the marginalisation does not itself depend on
-    g.  True to the order that matters here -- shear changes Sigma_u only through
-    the O(g) change in the galaxy's own J -- but it is an assumption, and the
-    place it would be tested is a copy catalog built from lensed templates.
+    Training used to run only at g = 0, because the copies were unlensed and
+    there was nothing to lens them with.  There is now: `imsims.copies` stores
+    each copy's own exact dm/dg and d2m/dg2, so `train` samples g over the shear
+    disc and lenses the drawn copies by their own derivatives, exactly as
+    `shear.train` does with templates.  That is what gives the layer's
+    g-conditioned coefficients (`models/centroid.g_invariants`) a gradient --
+    at g = 0 their inputs are identically zero and they never move.
     """
     row = jnp.concatenate([jnp.asarray(g, dtype=jnp.float32),
                            jnp.asarray(sigma_x, dtype=jnp.float32)])
     return jnp.tile(row, (batch, 1))
 
 
+def condition_batch(sigma_x, g):
+    """Per-row ``[g1, g2, C00, C01, C11]`` for a batch with its own shears."""
+    return jnp.concatenate(
+        [jnp.asarray(g, dtype=jnp.float32),
+         jnp.broadcast_to(jnp.asarray(sigma_x, dtype=jnp.float32),
+                          (len(g), 3))], axis=-1)
+
+
 def train(flow, sampler, sigma_x, key, steps=4000, batch=1024,
-          lr=3e-3):
-    """Likelihood only -- see `shear.train` for the reasoning."""
-    cond = condition(sigma_x, batch)
+          lr=3e-3, g_max=G_MAX):
+    """Likelihood only -- see `shear.train` for the reasoning.
+
+    `g_max` is the radius of the shear disc the copies are lensed over.  It must
+    be > 0 for the layer's g-conditioned coefficients to receive any gradient at
+    all: their inputs are `Re(ebar g)` and `|g|^2`, both identically zero at
+    g = 0, so a g = 0 run leaves them at their (zeroed) initialisation and the
+    layer stays exactly shear-independent.  Set 0 to reproduce the old
+    behaviour, or to train against a catalog with no per-copy derivatives.
+    """
+    if g_max and not sampler.has_derivatives:
+        raise ValueError(
+            "this copies catalog carries no per-copy dm_dg/d2m_dg2, so its "
+            "copies cannot be lensed. Regenerate it with imsims.copies (which "
+            "now stores them), or pass --g-max 0 to train at g = 0 as before.")
+    cond0 = condition(sigma_x, batch)
     opt = optax.chain(optax.clip_by_global_norm(1.0),
                       optax.adam(optax.cosine_decay_schedule(lr, steps)))
     params, static = eqx.partition(flow, _trainable(flow))
@@ -210,7 +253,7 @@ def train(flow, sampler, sigma_x, key, steps=4000, batch=1024,
     rng = np.random.default_rng(int(jr.randint(key, (), 0, 2**30)))
 
     @eqx.filter_jit
-    def step(params, state, x):
+    def step(params, state, x, cond):
         def loss_fn(p):
             model = eqx.combine(p, static)
             # The chart is now the FIRST thing applied, so nothing downstream
@@ -261,8 +304,20 @@ def train(flow, sampler, sigma_x, key, steps=4000, batch=1024,
         return eqx.apply_updates(params, updates), state, aux
 
     for i in range(steps):
-        x, _ = sampler.draw(rng, batch)
-        params, state, (nll, off) = step(params, state, jnp.asarray(x))
+        x, _, dm, d2m = sampler.draw(rng, batch)
+        if g_max:
+            # Antithetic +g/-g, as `shear._antithetic` does: the spin-0 response
+            # is odd in e and cancels at O(g) over an isotropic population, so
+            # pairing the batch removes that cancellation's variance instead of
+            # waiting for it to average out.
+            gk, key = jr.split(key)
+            half = sample_g(gk, batch // 2, g_max)
+            g = jnp.concatenate([half, -half])
+            x = shear.lens(jnp.asarray(x), jnp.asarray(dm), jnp.asarray(d2m), g)
+            cond = condition_batch(sigma_x, g)
+        else:
+            x, cond = jnp.asarray(x), cond0
+        params, state, (nll, off) = step(params, state, x, cond)
         # `off` is the fraction of copies the layer maps out of the chart, and
         # it is the diagnostic for the guard above: those copies contribute no
         # gradient, so nothing stops the layer pushing MORE of them out.  It
@@ -339,6 +394,13 @@ def main():
     p.add_argument("--sigma-scale", type=float, default=1.0,
                    help="rescale Sigma_X by this factor squared; the catalog "
                         "grid is valid over roughly [1/1.4, 1.4]")
+    p.add_argument("--g-max", type=float, default=G_MAX,
+                   help="radius of the shear disc the drawn copies are lensed\n"
+                        "over, using each copy's OWN exact derivatives. Must be\n"
+                        "> 0 for the layer's g-conditioned coefficients to get\n"
+                        "any gradient -- their inputs vanish at g = 0. Set 0 for\n"
+                        "the old g = 0 behaviour, or for a catalog with no\n"
+                        "per-copy derivatives.")
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
 
@@ -382,7 +444,8 @@ def main():
                 flow, (non_trainable(pb[0].mean), non_trainable(pb[0].std)))
             print(f"warm started bulk + shear from {a.init}")
         flow = train(flow, sampler, sigma_x,
-                     jr.key(a.seed + 1), steps=a.steps, batch=a.batch)
+                     jr.key(a.seed + 1), steps=a.steps, batch=a.batch,
+                     g_max=a.g_max)
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")
     else:
