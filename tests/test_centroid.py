@@ -271,16 +271,26 @@ def test_peeling_the_layer_off_is_exact_and_g_independent():
 def test_centroid_layer_depends_on_shear():
     """The g plumbing reaches the coefficients -- and is inert until trained.
 
-    Two contracts, both easy to break silently:
+    Three contracts, all easy to break silently:
 
     1. At INIT the layer must be exactly g-independent.  `centroid.py train`
-       runs at g = 0, so the two g columns of the coefficient net get zero
-       gradient and never move; `_Coeffs` zeroes them precisely so an untrained,
-       arbitrary g-dependence cannot leak into `bias.py`'s Q and R.
+       runs at g = 0, so the slope heads (`_Coeffs`'s last layer, output rows
+       N_COEFFS:) get zero gradient and never move; `_Coeffs` zeroes them
+       precisely so an untrained, arbitrary g-dependence cannot leak into
+       `bias.py`'s Q and R.
     2. Once those weights are NOT zero, the shift must actually move with g.
        Otherwise `split_condition` is handing the layer g = 0, or the g
        invariants are arriving too small to matter, and the layer is
        "conditioned on shear" in name only.
+    3. `d(shift)/dg` must stay BOUNDED no matter how large the raw slope-head
+       weights get.  This is the actual defect that motivated the affine
+       reparameterisation (see `_Coeffs`): a 6-input net free to be nonlinear
+       in p1 could and did develop a ~6000x spread in local g-sensitivity
+       across otherwise-similar galaxies (measured -0.60 vs a typical 1e-4 on
+       `copies_gauss2_deep.fits`), which dominated a deep `bias.py` run
+       (windowed-corrected m1 = -0.163, q1 = -1.20).  `_SLOPE_MAX` caps
+       d(coeff)/dp1 by construction, so this must hold at ANY weight scale,
+       not just a trained one.
     """
     import bulk
     from models.centroid import split_condition
@@ -304,22 +314,39 @@ def test_centroid_layer_depends_on_shear():
                     flow.bijection.bijection.bijections[1])
     z = jax.vmap(chart.transform)(jnp.asarray(pop[:200]))
 
-    def swing(lay):
-        shift = lambda g: np.asarray(jax.vmap(lay.unmarginalize)(
-            z, jnp.tile(jnp.concatenate([jnp.asarray(g), jnp.asarray(SIGMA_X)]),
-                        (len(z), 1))) - z)
-        s0 = shift([0.0, 0.0])
-        d = shift([G_MAX, 0.0]) - shift([-G_MAX, 0.0])
-        return np.abs(d).max() / np.abs(s0).max()
+    def max_dshift_dg(lay):
+        """max_i |d(unmarginalize(z_i, [g1, 0, Sigma_X]))/dg1| at g1 = 0.
 
-    assert swing(layer) == 0.0, "an untrained layer must carry no g-dependence"
+        The analytic derivative, not a finite difference: the true shift is
+        O(T) ~ 1e-3 and a +/-G_MAX secant swallows that in float32 rounding
+        long before a raw-weight sweep leaves the linear regime, which is
+        exactly the failure this test needs to avoid reproducing.
+        """
+        def one(zi):
+            def f(g1):
+                cond = jnp.concatenate([jnp.array([g1, 0.0]),
+                                        jnp.asarray(SIGMA_X)])
+                return lay.unmarginalize(zi, cond)
+            return jax.grad(lambda g1: jnp.sum(f(g1)))(0.0)
+        return float(jnp.max(jnp.abs(jax.vmap(one)(z))))
 
-    # Give the g columns some weight and the dependence must appear.
-    w = layer.coeffs.net.layers[0].weight
-    woken = eqx.tree_at(lambda l: l.coeffs.net.layers[0].weight, layer,
-                        w.at[:, 4:].set(0.3))
-    rel = swing(woken)
-    assert 1e-4 < rel < 1.0, rel
+    assert max_dshift_dg(layer) == 0.0, "an untrained layer must carry no g-dependence"
+
+    # Give the slope heads some weight and the dependence must appear...
+    from models.centroid import N_COEFFS
+    w = layer.coeffs.net.layers[-1].weight
+    woken = eqx.tree_at(lambda l: l.coeffs.net.layers[-1].weight, layer,
+                        w.at[N_COEFFS:].set(0.3))
+    grad_normal = max_dshift_dg(woken)
+    assert 0.0 < grad_normal < 1.0, grad_normal
+
+    # ...but stay bounded even at a wildly larger weight: `_SLOPE_MAX` caps
+    # d(coeff)/dp1 by construction, so a 1000x larger raw weight must NOT
+    # produce anywhere near a 1000x larger gradient.
+    huge = eqx.tree_at(lambda l: l.coeffs.net.layers[-1].weight, layer,
+                       w.at[N_COEFFS:].set(300.0))
+    grad_huge = max_dshift_dg(huge)
+    assert grad_huge < 100 * grad_normal, (grad_normal, grad_huge)
 
 
 def test_sampler_is_the_weighted_distribution():

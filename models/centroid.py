@@ -158,6 +158,40 @@ _EXP_MAX = 0.5
 
 N_COEFFS = 9
 
+# p1 = Re(ebar g)/G_MAX carries a 1/G_MAX = 50x chain-rule factor into
+# d(coeff)/dg, and `response`'s de_z = de_raw/std[3] divides by the spin-2 std
+# (~0.04-0.16) for ANOTHER 6-25x -- so an entirely ordinary coefficient
+# sensitivity to p1 becomes an order-1 sensitivity to g once those two
+# divisions compound (measured 320x on the gauss2_deep flow).  Bounding
+# d(coeff)/dp1 by _SLOPE_MAX, rather than the coefficient itself, is what
+# stops that compounding from blowing up -- see `_Coeffs`.
+#
+# 3.0 (the first value tried) was not tight enough to act as a real
+# constraint: nothing stopped training from driving MOST galaxies' slopes
+# toward it rather than just a spiky few, so d(shift)/dg1 got WORSE across
+# the population (median 0.0012 -> 0.0039, frac > 1e-2 16.5% -> 33%) even
+# though it fixed the mechanism the tail came from.  Swept post-hoc on the
+# trained net (re-bounding its raw output costs nothing -- no retrain per
+# point) on 2000 in-domain `copies_gauss2_deep` targets:
+#
+#   _SLOPE_MAX   max|d(shift)/dg1|   frac > 1e-2   frac > 1e-1
+#        3.0           0.63             0.331         0.042
+#        0.3           0.11             0.103         0.002
+#        0.1           0.038            0.041         0.000
+#        0.03          0.012            0.002         0.000
+#
+# 0.1 cuts the worst case 16x against the original UNCONSTRAINED nonlinear
+# net's 0.60 and clears the >1e-1 tail entirely, while its median (2.9e-4)
+# stays within an order of magnitude of a well-behaved target's typical
+# sensitivity (~1e-4) rather than being forced to exactly zero.
+_SLOPE_MAX = 0.1
+
+
+def _rational_bound(x, c):
+    """`x / sqrt(1 + (x/c)^2)`: |result| < c, unit slope at 0, gradient never
+    dies in saturation -- see `_Coeffs`."""
+    return x * jax.lax.rsqrt(1.0 + (x / c) ** 2)
+
 
 def displacement_covariance(m, sigma_x):
     """Sigma_u = J^-1 Sigma_X J^-T, the covariance of the centroid error.
@@ -271,49 +305,138 @@ def _tensor(z, sigma_x, mean, std):
 
 
 class _Coeffs(eqx.Module):
-    """(f, a, b, q) -> the nine response coefficients, bounded by _COEFF_MAX.
+    """(f, a, b, q) -> nine response coefficients, AFFINE in the shear
+    invariants (p1, p2): `coeff = base(f,a,b,q) + slope1(f,a,b,q)*p1 +
+    slope2(f,a,b,q)*p2`, base bounded by _COEFF_MAX, the slopes by _SLOPE_MAX.
 
-    Rational bound, not `tanh`: `x / sqrt(1 + (x/C)^2)` has the same +/-C
-    asymptote and unit slope at the origin, but decays as `(C/x)^3` instead of
-    `sech^2` -- exponentially -- so a coefficient driven deep into saturation
-    still gets gradient and can recover, rather than being frozen there for the
-    rest of training.  `models/shear.py`'s `_Coeffs` made the same swap for the
-    same reason (2026-08-20, `dev/spin0_gradient_snr.py`); this layer still had
-    the old tanh form, and a 16k-step retrace on `copies_gauss2_deep.fits`
-    reproduced the identical one-way ratchet -- 0% of D coefficients pinned at
-    step 0, 92% by step 16000 -- which is the trained centroid layer's low-flux
-    ellipticity-response blowup on gauss2 (see HANDOFF.md).
+    Not merely a simplification.  A first version let a plain 6-input net
+    (f, a, b, q, p1, p2) learn an arbitrary NONLINEAR dependence on p1, p2.
+    Nothing constrained that dependence to be smooth, and the antithetic
+    +/-g training (`centroid.py train`) sees only two p1 values per galaxy
+    per step -- nowhere near enough to pin down curvature -- so the net was
+    free to fit a much steeper LOCAL slope in some (f,a,b,q) pockets than
+    its typical one, concentrated on faint targets (where |e|, and so
+    |dp1/dg1| = |Re(ebar)|/G_MAX, runs largest): traced on
+    `copies_gauss2_deep.fits`, one galaxy's d(shift)/dg1 measured -0.60
+    against a typical well-behaved target's 1e-4, a ~6000x spread with no
+    physical justification.  It produced a deep `bias.py` run with
+    windowed-corrected m1 = -0.163 (quintile q1 = -1.20), dominated by a
+    handful of such galaxies (see HANDOFF.md, 2026-08-24).
+
+    Root cause: p1 = Re(ebar g)/G_MAX divides by the training disc radius
+    (1/G_MAX = 50x), and `response`'s de_z = de_raw/std[3] divides by the
+    spin-2 std (~0.04-0.16, another 6-25x) -- so an entirely ordinary net
+    sensitivity to p1 (order 1e-2) becomes an order-1-10 sensitivity to g once
+    those two divisions compound (measured 320x here).  Rescaling p1's INPUT
+    scale cannot fix this: it only moves the amplification between "input
+    scale" and "net's required slope" without changing their product.  What
+    has to be bounded is the SLOPE itself, `d(coeff)/dp1`, which the affine
+    form makes an explicit, capped, (f,a,b,q)-only quantity -- CONSTANT in p1,
+    so no curvature is representable at all -- rather than an emergent,
+    uncontrolled net derivative.
+
+    Rational bound, not `tanh`, for the same reason `models/shear.py`'s
+    `_Coeffs` uses it (2026-08-20, `dev/spin0_gradient_snr.py`): `x / sqrt(1 +
+    (x/C)^2)` decays as `(C/x)^3` in saturation rather than `sech^2`'s
+    exponential, so a saturated output still gets gradient and can recover.
+
+    Six of the nine coefficients are further SIGN-CONSTRAINED, not just
+    magnitude-bounded: see the `t0_mask`/`e_mask` step in `__call__`.  NLL
+    training of this layer is a density-match between a deterministic
+    bijective transport and a genuinely stochastic marginalisation (a mixture
+    over centroid offsets, not a point map) -- and that mismatch lets NLL
+    prefer the WRONG SIGN, verified by scanning NLL directly against the
+    trained Mf/t0 coefficient: flipping it to the physically-required sign
+    makes NLL monotonically worse.  Displacing the origin costs Mf, Mr/Mf and
+    Mc/Mr for every copy of every galaxy regardless of shear (a deterministic
+    fact, not a population tendency), so those coefficients don't need NLL to
+    discover their sign -- it's known, and is built in rather than hoped for.
+    Both s0 columns get this treatment, and both signs are the OPPOSITE of
+    the naive first guess -- see `__call__` for why `marginalize` being the
+    inverse of `unmarginalize` flips them: t0's coefficient >= 0 (t0 >= 0
+    always), and (ec*t2).real's coefficient <= 0 (that invariant is <= 0
+    always for isotropic Sigma_X).
     """
 
     net: CoeffNet
 
     def __init__(self, key, nn_width, nn_depth, activation):
-        net = CoeffNet(key, 6, N_COEFFS, nn_width, nn_depth, activation)
-        # ZERO-INIT the two g columns of the first layer.  `centroid.py train`
-        # runs entirely at g = 0 (the copies are unlensed), so p1 and p2 are
-        # identically zero over the whole training set and their weights receive
-        # exactly zero gradient -- dL/dw = delta * input = 0.  Left at their
-        # random init they would stay there, and `bias.py` differentiates the
-        # flow w.r.t. g to build Q and R, so the layer would contribute an
-        # ARBITRARY untrained g-dependence straight into the measured bias.
-        #
-        # Zeroing them makes the layer exactly g-independent until something
-        # actually trains it in g, at which point the gradient is no longer zero
-        # and they move on their own.  The structure is in place and inert, not
-        # in place and wrong.  Delete these two lines once centroid training
-        # samples g.
-        w = net.layers[0].weight
-        net = eqx.tree_at(lambda n: n.layers[0].weight, net,
-                          w.at[:, 4:].set(0.0))
+        net = CoeffNet(key, 4, 3 * N_COEFFS, nn_width, nn_depth, activation)
+        # ZERO-INIT the slope heads (output rows N_COEFFS: onward), so a
+        # freshly initialised layer starts exactly g-independent, same as the
+        # old zero-init did for the (now removed) g input columns -- enforced
+        # on the output side since p1, p2 no longer reach the net as inputs.
+        w, b = net.layers[-1].weight, net.layers[-1].bias
+        net = eqx.tree_at(
+            lambda n: (n.layers[-1].weight, n.layers[-1].bias), net,
+            (w.at[N_COEFFS:].set(0.0), b.at[N_COEFFS:].set(0.0)))
         self.net = net
 
     def __call__(self, f, a, b, q, p1=0.0, p2=0.0):
-        # p1, p2 are `g_invariants`; they default to the unsheared values so a
-        # standalone layer and every g = 0 diagnostic keep working unchanged.
-        u = jnp.stack([f, a, b, (q - _Q_LOC) / _Q_SCALE,
-                       jnp.asarray(p1, f.dtype), jnp.asarray(p2, f.dtype)])
+        # p1, p2 default to the unsheared values so a standalone layer and
+        # every g = 0 diagnostic keep working unchanged.
+        u = jnp.stack([f, a, b, (q - _Q_LOC) / _Q_SCALE])
         x = self.net(u)
-        return x * jax.lax.rsqrt(1.0 + (x / _COEFF_MAX) ** 2)
+        base, s1, s2 = x[:N_COEFFS], x[N_COEFFS:2 * N_COEFFS], x[2 * N_COEFFS:]
+        base = _rational_bound(base, _COEFF_MAX)
+        s1 = _rational_bound(s1, _SLOPE_MAX)
+        s2 = _rational_bound(s2, _SLOPE_MAX)
+        coeff = base + s1 * jnp.asarray(p1, f.dtype) + s2 * jnp.asarray(p2, f.dtype)
+        # Re-bound the SUM: the affine combination can exceed _COEFF_MAX near
+        # the disc edge (large p1, p2), and the Newton fixed point + jacfwd
+        # log-det this feeds want every coefficient bounded, not just `base`.
+        bounded = _rational_bound(coeff, _COEFF_MAX)
+        # The three T0-driven spin-0 coefficients (s0's t0-column: flat
+        # indices 0, 2, 4 of the (3,2) reshape, i.e. z0=Mf, z1=logit(Mr/Mf),
+        # z2=logit(Mc/Mr)) are SIGN-CONSTRAINED to >= 0.  Displacing the
+        # origin costs Mf, Mr/Mf and Mc/Mr for every copy of every galaxy --
+        # a deterministic geometric fact (mind the INVERSE size/concentration
+        # convention -- see this module's header), true regardless of shear --
+        # but that constrains `marginalize` (base -> data), not the quantity
+        # THIS function computes, which feeds `unmarginalize` (data -> base,
+        # `response`'s `shift`).  `marginalize = unmarginalize^-1`, and to
+        # leading order `unmarginalize(x) ~= x + shift(x)` inverts to
+        # `marginalize(y) ~= y - shift(y)` -- ONE SIGN FLIP relative to the
+        # physical requirement.  So `marginalize(x) - x <= 0` (the physical
+        # fact) requires `shift(x) >= 0`, i.e. a POSITIVE t0-coefficient here,
+        # not negative -- easy to get backwards (this module did, once,
+        # 2026-08-24, and shipped a t0<=0 constraint that left the layer's
+        # check() shift positive-signed, unchanged from unconstrained).
+        #
+        # Plain NLL does not know this constraint and gets it wrong on its
+        # own: verified 2026-08-24 by scanning NLL directly against the
+        # trained (unconstrained) Mf/t0 coefficient, which converged to
+        # NEGATIVE -- the sign that makes NLL LOWEST, and monotonically WORSE
+        # moving toward the physically-required positive value.  Not a
+        # training failure more steps would fix: the objective (density-
+        # matching a deterministic transport against a genuinely stochastic
+        # marginalisation) simply does not encode the constraint, so it has
+        # to be structural.
+        #
+        # The other column of s0 -- indices 1, 3, 5, multiplying (ec*t2).real
+        # -- needs the OPPOSITE sign, <= 0, and for the same reason once the
+        # same inversion is tracked through.  For ISOTROPIC Sigma_X (every
+        # population on disk today: "Sigma_X is the same for every galaxy in
+        # the current sims, fixed noise level, circular PSF" -- this module's
+        # Staging section), J shares its principal axes with the galaxy's own
+        # ellipticity e, so t2's phase locks to e's and (ec*t2).real reduces
+        # to a PHASE-INDEPENDENT function of |e| alone -- verified numerically
+        # (any Mr, |e|, phase): it is <= 0 always.  A regression of the
+        # catalog's true `marginalize(x)-x` against both invariants gives a
+        # POSITIVE coefficient on this always-negative term (+5.6 to +14.4 for
+        # Mf/Mr/Mc); after the same sign flip through the inverse relationship
+        # as t0, that means `shift`'s own e-coefficient must be <= 0 -- the
+        # negative of what a first pass at this comment claimed.  (Both
+        # proofs are isotropic-Sigma_X-specific; an elliptical-PSF population
+        # would need rederiving before trusting either sign.)
+        neg = -_rational_bound(jnn.softplus(coeff), _COEFF_MAX)
+        pos = _rational_bound(jnn.softplus(coeff), _COEFF_MAX)
+        idx = jnp.arange(N_COEFFS)
+        t0_mask = (idx == 0) | (idx == 2) | (idx == 4)
+        e_mask = (idx == 1) | (idx == 3) | (idx == 5)
+        out = jnp.where(t0_mask, pos, bounded)
+        out = jnp.where(e_mask, neg, out)
+        return out
 
 
 def response(coeffs, z, sigma_x, mean, std):
