@@ -539,6 +539,10 @@ def main():
             flow = eqx.tree_at(
                 lambda f: [f.bijection.bijection.bijections[i] for i in keep],
                 flow, list(bulk_only.bijection.bijection.bijections))
+            # The graft replaced the CHART too, and `bulk.train` moved its
+            # mean/std -- so the shear layer's frozen copies now describe a
+            # chart that is not there.  See `bulk.sync_chart_constants`.
+            flow = bulk.sync_chart_constants(flow)
             print(f"warm started bulk from {a.init}")
         flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps,
                      batch=a.batch, lr=a.lr, g_max=a.g_max,

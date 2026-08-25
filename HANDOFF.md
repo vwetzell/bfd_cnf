@@ -1,3 +1,10 @@
+> **Read the 2026-08-24 (evening) section at the bottom first.** The centroid
+> layer's g-conditioning had a real sign bug (fixed, committed dc41c8c) that
+> makes every `flows/centroid_*.eqx` checkpoint from earlier today stale, and
+> a still-open, now doubly-confirmed (optimizer-independent AND
+> seed-independent) instability in the shear response near Mr/Mf ~ 3.1 whose
+> exact mechanism is unresolved.
+
 # Handoff: the resolution-axis structure in m1, post window-fix
 
 Written 2026-08-12. The previous handoff (regenerate everything under the
@@ -2507,3 +2514,293 @@ To run it you need the pre-change layer back, since the checkpoint on disk is a
 
 Or skip it and go straight to step 1, accepting that the shear and centroid
 contributions stay entangled.
+
+---
+
+# 2026-08-24 (evening): the centroid sign bug, fixed and committed; the shear
+# response's Mr/Mf ~ 3.1 instability, confirmed real and still unexplained
+
+Continuation of the same day's earlier session (g-conditioning added,
+slope-instability found and fixed with `_SLOPE_MAX`). This picks up
+immediately after that: g-conditioning was confirmed mandatory (real target
+galaxies have unknown centroids; the marginalisation must depend on the
+lensed galaxy), so the fix had to make the sign correct, not remove the
+feature.
+
+## The sign bug, and getting it wrong twice before getting it right
+
+Displacing the origin costs Mf, Mr/Mf and Mc/Mr for **every copy of every
+galaxy**, unconditionally -- verified directly from the copies catalog,
+binned by `|u|`, on five separate galaxies with no exceptions. This is not a
+population tendency NLL might reasonably fail to recover exactly; it is a
+deterministic geometric fact the layer's coefficients should not need
+training to discover the sign of.
+
+Mind the Fourier-space convention the user had to correct me on: Mr/Mf and
+Mc/Mr are **inverse** size and concentration, so "falls" means "larger and
+less concentrated" -- `models/centroid.py`'s own header already had this
+right (`imsims/copies.py`'s copy had drifted to the opposite claim; fixed,
+commit 411a06a in bfd_cnf_imsims).
+
+Scanning NLL directly against the trained (unconstrained) Mf/t0 coefficient
+proved this isn't a training-convergence problem: NLL is monotonically
+**minimised** at the physically wrong sign, and gets worse moving toward the
+correct one. Density-matching a deterministic transport against a genuinely
+stochastic marginalisation (a mixture over centroid offsets, not a point
+map) simply rewards a different answer than the one bias.py needs.
+
+The fix, in `models/centroid.py`'s `_Coeffs.__call__`: both columns of `s0`
+(the T0-column, indices 0/2/4, and the `(ec*t2).real`-column, indices 1/3/5)
+are sign-constrained by construction via `_rational_bound(softplus(...))`
+rather than left free. **Getting the direction of these two constraints
+right took three attempts.** `marginalize = unmarginalize^-1`, and to
+leading order `unmarginalize(x) ~= x + shift(x)` inverts to
+`marginalize(y) ~= y - shift(y)` -- one sign flip relative to the physical
+requirement on `marginalize`'s output, easy to miss and easy to verify
+against (compute `marginalize(x) - x` directly and check its sign, on the
+UNTRAINED layer, before spending a retrain). Both wrong attempts were caught
+by retraining and checking `centroid.py check()`'s per-moment table before
+committing to anything; the fix that shipped was verified this way first
+and is `models/centroid.py`/`tests/test_centroid.py` in commit dc41c8c
+(bfd_cnf) -- read that commit message for the full mechanism.
+
+## Validated at full depth
+
+| | windowed-corrected m1 (200k targets) |
+|---|---|
+| no centroid at all | -0.0103 +/- 0.0027 (20k only) / **-0.00998 +/- 0.00110** (200k) |
+| old g=0 centroid (this morning's baseline) | -0.0285 +/- 0.0029 |
+| broken-sign g-conditioned (this session, superseded) | -0.0317 +/- 0.0031 |
+| **sign-corrected g-conditioned (committed)** | **-0.01005 +/- 0.00170** |
+
+The sign-corrected, slope-stable centroid layer matches the no-centroid
+number almost exactly at the aggregate level, while reshaping the bias
+across Mf quintiles the way a real centroid-uncertainty correction should
+(concentrated at faint flux, vanishing at bright -- q1..q5 with centroid:
+-0.213, -0.086, +0.016, +0.0099, +0.0021; without: +0.038, -0.002, -0.023,
+-0.019, -0.011). The centroid layer is doing real, physically meaningful
+work; the residual ~1% bias lives elsewhere.
+
+`flows/centroid_gauss2_deep.eqx` on disk is this final, correct checkpoint
+(g-conditioned, `_SLOPE_MAX=0.1`, sign-constrained). Every OTHER
+`flows/centroid_*.eqx` on disk (the g=0 baseline, the broken-sign attempts)
+is stale relative to today's `models/centroid.py`.
+
+## The residual ~1% bias: isolated to the shear/bulk response, not fixed
+
+Confirmed (not selection, not centroid) three ways: the unwindowed number
+(no selection cut, `P(s|g)=1` exactly) matches the windowed-corrected one;
+the no-centroid run matches the with-centroid run at the aggregate level;
+both point to the same pre-existing residual in the shear/bulk layers that
+predates this session.
+
+Traced it to a specific, reproducible defect: `shear.py check`'s dm/dg
+residual for Mr, binned by `r = Mr/Mf`, **peaks at r ~ 3.08-3.23 (6.76-6.98%)
+and is smaller on both sides** (0.68% at low r, 4.46-4.61% at high r) --
+NOT a monotonic edge effect, against a genuinely flat, achievable floor of
+~0.5-0.58% everywhere (a flexible offline regression on the exact per-galaxy
+response hits that floor uniformly, including in the bad bin). This
+reproduces across three independently-trained checkpoints at 60k steps
+(`flows/shear_gauss2.eqx`, `_60k_s1`, `_60k_s2`: bin-3 frac_resid 6.76%,
+6.77%, 6.98%) -- **confirmed NOT seed noise** -- and is flat across
+20k/60k/180k steps with identical val NLL throughout -- **confirmed
+converged, not undertrained.**
+
+A physical mechanism was found and is well-supported: `bulge_kwidth/kmax`
+(the compact bulge's characteristic k-space width, divided by the BFD
+weight function's cutoff) crosses 1.0 **exactly** between the same two bins
+that bracket the error peak (0.803 -> 1.072). Since `rho` (bulge/disc size
+ratio) is always < 1 for this population, the bulge is always the first
+component to have its k-space power clipped by the weight function's finite
+support as the galaxy shrinks -- a real regime transition in the moment
+integral, not an artifact.
+
+**What is NOT yet established: the exact computational mechanism by which
+this produces a locally unstable (not just biased) coefficient in the
+trained net.** Five toy reproductions were attempted and NONE of them
+reproduced the specific "peak at r~3.1, fine on both sides" pattern:
+
+  1. A synthetic 1D kink (the "spectral bias" hypothesis) -- refuted, fits
+     everywhere.
+  2. Real 4D inputs (f,a,b,q), real exact `a_Mr` target, direct MSE
+     regression -- refuted, fits everywhere (0.05-0.13%).
+  3. Same, but the actual z-space target the reparameterised net has to
+     learn (`(a_Mr - a_Mf)/(scale*(1-u))`, which itself has a genuine,
+     verified slope explosion from ~2 to >100 across the same r-range) --
+     STILL refuted, fits everywhere (0.15-0.48%).
+  4. Same, with a shared 13-output head (mimicking the real net's 14
+     coefficients competing for hidden-layer capacity) -- refuted, fits
+     everywhere (0.12-0.50%).
+  5. The one remaining structural difference -- fitting the net's output
+     through the REAL `response()`/`project_to_physics` composition,
+     differentiated via `jax.jacfwd`/`jax.hessian` to get Q and R (rather
+     than regressing a precomputed target directly) -- did NOT cleanly
+     reproduce it either; instead it produced a uniform ~95% failure across
+     ALL bins that does not respond to a 10x learning-rate change at all
+     (identical loss trajectory), which is very likely a bug in the toy
+     script rather than a real finding. NOT debugged before the session
+     ended -- see `/tmp/.../scratchpad/toy_nested_autodiff.py` (scratch,
+     not preserved) for the last state; single-galaxy gradient checks there
+     were NOT zero (Q-only grad norm 1.45, Q+R grad norm 662), so the bug is
+     something about the batched/vmapped/jit training loop, not dead
+     gradients outright.
+
+So: the phenomenon is doubly confirmed real (optimiser-independent via a
+from-scratch AND a warm-started full-batch L-BFGS test that could not
+improve on the SGD optimum at all; seed-independent via three trained
+checkpoints), physically grounded (the bulge/kmax crossing), but the actual
+mechanism connecting "the true response has a real transition here" to "the
+trained net is locally unstable, not just imprecise" is not pinned down.
+Every hypothesis tested in isolation (kink-fitting difficulty, target
+steepness, shared-capacity competition) has been directly refuted by a
+controlled toy. Whatever it is, it requires something about the ACTUAL
+training loop's mechanics beyond what a static, direct, single-composition
+regression captures.
+
+## What's stale / what to check first
+
+- `flows/shear_gauss2_purederiv.eqx`, `flows/shear_gauss2_lbfgs.eqx` (never
+  written -- that run was killed), `flows/shear_gauss2_lbfgs_warm.eqx`:
+  scratch checkpoints from this investigation, not meant to replace
+  `flows/shear_gauss2.eqx`. Safe to delete once no longer needed for
+  cross-checking the toy investigation.
+- No code changes came out of the shear-response investigation -- it's
+  diagnosis only, nothing to revert. `models/shear.py` is untouched.
+- The `bulge_kwidth/kmax` check used `kmax ~ 5.2` read off a code comment in
+  `imsims/analytic.py`, not computed exactly from `bfd.KBlackmanHarris`
+  itself -- worth verifying precisely if this thread continues.
+
+# 2026-08-24 (late): the Mr/Mf ~ 3.1 "instability" was a stale chart, and it is
+# fixed
+
+The open thread from the previous section is CLOSED, and it was not a physical
+regime transition, not an optimisation pathology, and not Var[Q|m].  It was a
+bug, in a place nothing had looked: the shear layer's frozen copies of the
+chart's statistics.
+
+## The bug
+
+`RawMomentStandardize.mean` and `.std` are plain `jax.Array` fields, so they
+are TRAINABLE, and `bulk.train` moves them a long way:
+
+| catalog | chart std, fresh from the data | after 150k bulk steps |
+|---|---|---|
+| gauss2 | [0.296, 0.499, 0.475, **0.0402, 0.0402**] | [0.591, 0.509, 0.396, **0.1565, 0.1567**] |
+| bulgedisc | [0.304, 0.946, 0.914, **0.0403, 0.0408**] | [0.463, 0.883, 0.799, **0.1482, 0.1517**] |
+| sersic | [0.332, 0.619, 0.631, **0.0709, 0.0708**] | [0.406, 0.579, 0.549, **0.1651, 0.1648**] |
+
+`ShearResponse` holds its own frozen `chart_loc`, `chart_scale` and `e_scale`,
+set by `bulk.build_flow` from the RAW SAMPLE.  `shear.py --init` then grafts
+every non-shear bijection out of the bulk checkpoint -- **including
+`bijections[0]`, the chart** -- leaving the layer's copies describing a chart
+that is no longer underneath it.  On gauss2 `e_scale` was 3.9x too small.
+
+That is not cosmetic.  `_chart_spin0_jac` reconstructs
+`logit(u) = chart_scale*z1 + chart_loc` to build the 1/(1-u) size Jacobian, and
+`response` reconstructs the physical `e = e_scale*(z3 + i z4)`.  Both come out
+wrong, and the logit one comes out wrong **in a way that varies along z1**,
+which IS Mr/Mf.  Hence a residual peaked on the resolution axis.
+
+`centroid.py` already knew about this failure mode and fixed it -- for its own
+layer only, five lines, with a comment saying exactly why.  The shear layer
+grafted three lines above it was left stale, and `shear.py` never did it at all.
+
+## The measurement
+
+One script, one knob, everything else identical (real flow, real warm start,
+real loss, 20k steps, gauss2), `frac_resid` of dm/dg for Mr by Mr/Mf octile:
+
+| octile | r | as shipped | resynced |
+|---|---|---|---|
+| 0 | 2.04-2.64 | 1.50% | 0.64% |
+| 3 | 2.90-3.01 | 2.71% | 0.71% |
+| 4 | 3.01-3.10 | 4.30% | 0.88% |
+| **5** | **3.10-3.19** | **6.36%** | **0.90%** |
+| 6 | 3.19-3.30 | 4.90% | 0.85% |
+| 7 | 3.30-3.56 | 4.51% | 1.10% |
+
+The peak is gone, the profile is flat, and it sits at the ~0.5-1% floor the
+offline regression said was achievable.  Derivative MSE at 20k steps:
+8.9e-3 -> 4.1e-4, a factor 22.  The as-shipped column reproduces
+`flows/shear_gauss2.eqx`'s own numbers (bin 5: 6.36% here, 6.81% on the 60k
+checkpoint), so the reproduction is faithful.
+
+## What was eliminated, and how
+
+Every one of these was a controlled run in the SAME script, not a proxy toy --
+which is why they succeeded where last session's five toys could not.
+
+1. **The denominator.** `frac_resid`'s denominator (RMS of the true response)
+   rises MONOTONICALLY 0.074 -> 0.116 across the bins; the numerator -- the
+   absolute, loss-relevant error -- is what peaks, 0.00045 -> 0.00696 -> 0.0049.
+   Not a metric artifact.
+2. **NLL competing with the derivative term.** Refuted decisively: the same
+   loop at `nll_weight = 0` gives bin 5 = 6.34% against 6.36% with it on.  The
+   NLL is irrelevant to this residual.  (An earlier read of
+   `flows/shear_gauss2_purederiv.eqx` had already hinted at this, but that
+   checkpoint's provenance was unknown -- the controlled run is what settles it.)
+3. **The inputs.** A plain 3x256 MLP on the same `z` the layer sees, plain MSE,
+   fits the exact normalised dMr/dg to 0.0002 FLAT across all eight octiles --
+   35x better than the trained layer at its peak.  Nothing about moment space
+   is hard.
+4. **The parameterisation.** The real `_Coeffs` + `project_to_physics` +
+   `dm_dg` composition, trained on Mr's Q alone, fits FLAT at 0.02-0.11%.  The
+   14-coefficient bounded equivariant form is not the problem.
+5. **Q vs R competition.** Adding R to that same run costs a factor 3
+   (0.0003 -> 0.0010) and stays MONOTONE.  No hump.
+6. **Var[Q|m].** Measured model-free: local least squares in 120-neighbour
+   patches of z, projecting out the local z-gradient, gives the irreducible
+   response scatter as |dy/drho|_m * sigma(rho|m) = 0.0010 and FLAT.  The
+   trained layer is 7-10x above it in the bad bins.  gauss2's population has
+   `bulge_frac` constant and `bulge_e == disc_e` exactly, so `bulge_ratio` is
+   its only hidden dof; it is 5 free parameters onto 5 moments.
+7. **The `bulge_kwidth/kmax` crossing.** A coincidence.  Nothing needed it.
+
+An HGB (tree) regression from moments DID show a hump at bin 5 while the same
+model from galaxy parameters did not -- that was a red herring: gradient-boosted
+trees approximate this smooth ridge function badly, and the MLP in (3) shows
+the target is perfectly learnable from moments.
+
+## The fix
+
+`bulk.sync_chart_constants(flow)` -- re-points every `ShearResponse` and
+`CentroidMarginalize` frozen copy at `bijections[0]`'s actual mean/std, with
+`e_scale` recomputed as the symmetrised spin-2 std.  Called from `shear.py`
+after its graft and from `centroid.py` in place of its old two-field version.
+Pinned by `tests/test_shear.py::test_sync_chart_constants_follows_a_grafted_chart`.
+
+It meets the bar the user set for a fix: physically interpretable (a layer must
+be told which chart it is behind), not a tunable hyperparameter, nothing to
+search, and population-independent -- the drift is present on all three
+catalogs.
+
+## WHAT IS STALE
+
+**Every `flows/shear_*.eqx` and `flows/centroid_*.eqx` on disk.** All of them
+were trained behind a mis-described chart.  So is every m1 ever measured from
+one, including this morning's centroid validation table (`-0.01005 +/- 0.00170`
+etc.) -- that comparison was internally consistent, so its CONCLUSION about the
+centroid sign fix stands, but the numbers are void.  The bulk checkpoints are
+unaffected (the chart is theirs; it is the graft that goes wrong).
+
+## NEXT SESSION, in order
+
+1. Rerun the chain: `bulk.py train --steps 150000` is unaffected and can be
+   reused; `shear.py train --steps 60000 --deriv-weight 1e4` and
+   `centroid.py train --steps 16000` must be redone for gauss2, bulgedisc and
+   sersic.
+2. Re-measure `shear.py check` and the binned profile -- expect flat.
+3. Re-measure the noisy 200k-target m1 on gauss2.  The residual ~1% was
+   attributed to the shear/bulk response; this was the shear response's defect,
+   so this is the number that says how much of the 1% it was.
+4. Only then reconsider the bulk-density threads, which have not been retested
+   against a correctly-charted shear layer.
+
+## Open design question, deliberately not acted on
+
+Should `RawMomentStandardize.mean/std` be trainable at all?  Everything else in
+the codebase treats them as data-determined constants (`_Coeffs`' whitening
+docstring says so in as many words), the flow has downstream scale freedom
+anyway, and freezing them would make this whole class of bug impossible rather
+than merely fixed.  It would change `bulk.train`'s optimum, so it is a real
+experiment, not a cleanup -- left for the user to call.

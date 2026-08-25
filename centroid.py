@@ -63,7 +63,6 @@ import numpy as np
 import optax
 
 import bulk
-from paramax import non_trainable
 from models.bijections import in_domain, safe_point
 import shear
 from models.centroid import dm_dsigma
@@ -435,13 +434,12 @@ def main():
                                flow, pb[2:])
             flow = eqx.tree_at(lambda f: f.bijection.bijection.bijections[2].coeffs,
                                flow, pb[1].coeffs)
-            # The centroid layer's frozen mean/std must match the chart it now
-            # sits behind -- `bulk.train` moves the chart's, so the copy
-            # `build_flow` made from the raw sample is already stale.
-            flow = eqx.tree_at(
-                lambda f: (f.bijection.bijection.bijections[1].mean,
-                           f.bijection.bijection.bijections[1].std),
-                flow, (non_trainable(pb[0].mean), non_trainable(pb[0].std)))
+            # Both grafted layers' frozen chart copies must match the chart
+            # they now sit behind -- `bulk.train` moves the chart's mean/std,
+            # so what `build_flow` copied from the raw sample is stale.  This
+            # used to fix only the centroid layer; leaving the SHEAR layer
+            # stale was the whole of its dm/dg error peak at Mr/Mf ~ 3.1.
+            flow = bulk.sync_chart_constants(flow)
             print(f"warm started bulk + shear from {a.init}")
         flow = train(flow, sampler, sigma_x,
                      jr.key(a.seed + 1), steps=a.steps, batch=a.batch,

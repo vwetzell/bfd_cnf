@@ -295,6 +295,8 @@ def test_coeff_input_whitening():
     that the identity default is a true no-op for callers that supply none.
     """
     import bulk
+    import equinox as eqx
+    import shear
     from paramax import unwrap
     from models.shear import _Coeffs, _invariants, _Q_LOC, _Q_SCALE
 
@@ -385,6 +387,8 @@ def test_e_scale_is_the_charts_effective_spin2_std():
     """
     import numpy as np
     import bulk
+    import equinox as eqx
+    import shear
     from paramax import unwrap
 
     rng = np.random.default_rng(2)
@@ -432,3 +436,39 @@ def test_catalog_derivative_layout_is_g_index_first():
     rms = np.sqrt(np.mean((q / s) ** 2, axis=0))
     assert rms[0, 2] / rms[1, 2] > 10, "dM1/dg1 must dominate dM1/dg2"
     assert rms[1, 3] / rms[0, 3] > 10, "dM2/dg2 must dominate dM2/dg1"
+
+
+def test_sync_chart_constants_follows_a_grafted_chart():
+    """A warm-start graft replaces the chart; the layer's frozen copies of its
+    statistics must follow it.
+
+    They did not, and that was the whole of the dm/dg error peak at
+    Mr/Mf ~ 3.1: `bulk.train` moves `RawMomentStandardize.mean/std` (on gauss2
+    the spin-2 std by 3.9x), `_chart_spin0_jac` rebuilds logit(u) from the
+    stale copy, and the size Jacobian comes out wrong along exactly that axis.
+    """
+    import bulk
+    import equinox as eqx
+    import shear
+    from paramax import unwrap
+
+    m = np.abs(np.random.default_rng(0).normal(size=(2000, 5))) + 1.0
+    m[:, 1] = m[:, 0] * 3.0
+    m[:, 4] = m[:, 1] * 5.0
+    flow = bulk.build_flow(jr.key(0), m, shear=True)
+
+    # Pretend `bulk.train` moved the chart, as it does.
+    chart = flow.bijection.bijection.bijections[0]
+    moved = eqx.tree_at(lambda c: [c.mean, c.std], chart,
+                        [chart.mean + 0.25, chart.std * 3.9])
+    flow = eqx.tree_at(lambda f: f.bijection.bijection.bijections[0], flow, moved)
+
+    layer = shear._shear_layer(flow)
+    assert not np.allclose(unwrap(layer.chart_scale), np.asarray(moved.std[:3]))
+
+    layer = shear._shear_layer(bulk.sync_chart_constants(flow))
+    assert np.allclose(unwrap(layer.chart_loc), np.asarray(moved.mean[:3]))
+    assert np.allclose(unwrap(layer.chart_scale), np.asarray(moved.std[:3]))
+    assert np.isclose(float(unwrap(layer.e_scale)),
+                      float(np.sqrt(0.5 * (np.asarray(moved.std[3]) ** 2
+                                           + np.asarray(moved.std[4]) ** 2))))

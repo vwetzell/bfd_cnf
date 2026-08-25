@@ -251,6 +251,51 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
     return Transformed(base, bijection)
 
 
+def sync_chart_constants(flow):
+    """Re-point every layer's FROZEN copy of the chart statistics at the chart
+    it is actually sitting behind.  Call this after ANY warm-start graft.
+
+    `build_flow` hands `ShearResponse` and `CentroidMarginalize` a copy of the
+    raw sample's mean/std, but `RawMomentStandardize.mean/std` are TRAINABLE and
+    `bulk.train` moves them -- on gauss2 the spin-2 std went 0.0402 -> 0.1566
+    (3.9x) and log10(Mf)'s 0.296 -> 0.591.  So the moment a `--init` graft drops
+    a trained chart in underneath a freshly built layer, the layer's copy
+    describes a chart that is no longer there.
+
+    For `ShearResponse` that is not cosmetic.  `_chart_spin0_jac` reconstructs
+    logit(u) = chart_scale*z1 + chart_loc to build the 1/(1-u) size Jacobian,
+    and `response` reconstructs the physical e = e_scale*(z3 + i z4); with stale
+    constants both are wrong, in a way that VARIES ALONG z1, i.e. along Mr/Mf.
+    Measured on gauss2 at 20k steps: that mismatch is the entire dm/dg error
+    peak at Mr/Mf ~ 3.1 (bin frac_resid 6.36% -> 0.90%, flat everywhere after),
+    and the derivative MSE improves 22x (8.9e-3 -> 4.1e-4).  It was NOT the
+    NLL competing with the derivative term (identical peak with the NLL weight
+    at 0), not the parameterisation, and not Var[Q|m] (measured floor 0.001,
+    7x below the peak).
+
+    `centroid.py` already did this for its own layer -- the same two lines, for
+    the same reason -- and that is now here instead.
+    """
+    bij = flow.bijection.bijection.bijections
+    chart = bij[0]
+    e_scale = jnp.sqrt(0.5 * (chart.std[3] ** 2 + chart.std[4] ** 2))
+    for i, b in enumerate(bij):
+        if isinstance(b, ShearResponse):
+            flow = eqx.tree_at(
+                lambda f, i=i: [f.bijection.bijection.bijections[i].e_scale,
+                                f.bijection.bijection.bijections[i].chart_loc,
+                                f.bijection.bijection.bijections[i].chart_scale],
+                flow, [non_trainable(e_scale),
+                       non_trainable(chart.mean[:3]),
+                       non_trainable(chart.std[:3])])
+        elif isinstance(b, CentroidMarginalize):
+            flow = eqx.tree_at(
+                lambda f, i=i: [f.bijection.bijection.bijections[i].mean,
+                                f.bijection.bijection.bijections[i].std],
+                flow, [non_trainable(chart.mean), non_trainable(chart.std)])
+    return flow
+
+
 def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3):
     # The power-law flux gives log10(Mf) a long tail, so an outlier batch can blow
     # the NLL up mid-training and never recover -- clip, then decay the step size.
