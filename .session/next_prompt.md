@@ -25,27 +25,38 @@ Where things stand:
   now differ by 0.037: +0.0153 windowed vs -0.0218 unwindowed. ESS is healthy
   (median 638, frac<10 = 0.000), so it is not the importance sampling.
 
-FIRST THING: two runs were left going overnight and should be finished. Read
+- The 2x2 that isolates it has since finished, and it points at the CENTROID
+  layer. gauss2_deep, 20k targets, same targets throughout:
 
-    logs_deep_nocent_shear_gauss2.txt
-    logs_deep_nocent_pre_chartsync_shear_gauss2.txt
+  | shear flow | centroid | windowed, corrected | unwindowed |
+  |---|---|---|---|
+  | pre-fix | off | -0.01084 +/- 0.00268 | -0.00937 +/- 0.00462 |
+  | post-fix | off | -0.00771 +/- 0.00264 | -0.00992 +/- 0.00156 |
+  | pre-fix | on (200k) | -0.01005 +/- 0.00170 | ~ -0.010 |
+  | post-fix | on | +0.01530 +/- 0.00284 | -0.02184 +/- 0.00243 |
 
-(deep, 20k targets, `--no-centroid`, on the post-fix and pre-fix shear flows).
-With the two with-centroid numbers already in the handoff these complete a 2x2
--- (old shear, new shear) x (with centroid, without) -- on the same targets.
-The reference for the no-centroid column is -0.0103 +/- 0.0027. That 2x2 says
-whether the +0.0153 is the shear layer at depth or the centroid layer
-retrained on top of it. If either run died, relaunch it; the exact command is
+  With the centroid layer OFF everything is healthy: the two shear flows agree,
+  the post-fix one is marginally better, and windowed/unwindowed agree in both
+  rows. The blowup and the estimator divergence appear ONLY with the newly
+  retrained centroid layer. So it is not the shear layer, not the chart fix,
+  and NOT the selection terms.
+
+FIRST THING: one control was left running to make the fourth cell exact at 20k
+(the pre-fix with-centroid number above is a 200k run). Read
+
+    logs_deep_cent_pre_chartsync.txt
+
+If it lands near -0.010 like its 200k counterpart, the 2x2 is clean and the
+centroid retrain is confirmed as the sole culprit. If it died, the command is
 in the handoff.
 
-Then the real question, and it is the more interesting one: **why do the
-windowed-corrected and unwindowed estimators now disagree by 0.037 when they
-used to agree?** The selection terms (eq. 40/45-46, `--window-size`/
-`--window-flux`) are valid only for a cut on each arm's own observed M; a
-sharper response layer changes what lands inside the window, so the correction
-is being exercised differently than before. Worth checking whether the
-disagreement tracks the window edges, and whether it survives with the centroid
-layer off.
+Then the real question: **what does `centroid.py train` do wrong on top of a
+sharp shear layer?** Its own check already reports a 4.36x ellipticity response
+against the catalog (3.65e-2 vs 8.36e-3) -- untouched by the chart fix, and
+previously masked by a shear layer that was itself wrong by 4-5% in dm/dg. The
+spin-0 shifts are fine (right sign, 72-86% of catalog). Suspect the spin-2 path.
+Note the centroid layer is g-conditioned and sign-constrained as of dc41c8c;
+that part is validated, do not re-open it.
 
 Working rules, unchanged:
 

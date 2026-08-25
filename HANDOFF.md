@@ -2889,7 +2889,44 @@ shear layer -- it improved the response fit 6x and left the noiseless bias
 where it was.  **Whatever produces +0.0153 at depth enters through the noisy
 path**: the centroid layer, or the C_M integration, or the selection terms.
 
-## RUNNING WHEN THIS WAS WRITTEN -- read these first
+## The 2x2 landed, and it is the CENTROID layer
+
+The paired deep no-centroid runs finished.  All four cells, gauss2_deep,
+20k targets, same targets throughout:
+
+| shear flow | centroid | windowed, corrected | unwindowed |
+|---|---|---|---|
+| pre-fix | off | -0.01084 +/- 0.00268 | -0.00937 +/- 0.00462 |
+| **post-fix** | **off** | **-0.00771 +/- 0.00264** | **-0.00992 +/- 0.00156** |
+| pre-fix | on (200k) | -0.01005 +/- 0.00170 | ~ -0.010 |
+| **post-fix** | **on** | **+0.01530 +/- 0.00284** | **-0.02184 +/- 0.00243** |
+
+With the centroid layer OFF everything is healthy and boring: the two shear
+flows agree with each other (-0.0077 vs -0.0108, well within errors), the
+post-fix one is marginally better, and **windowed and unwindowed agree in both
+rows** (-0.0077 vs -0.0099; -0.0108 vs -0.0094).  ESS identical (633 median,
+115 at 5th pct, frac<10 = 0.000) in both.
+
+So the +0.0153, and the 0.037 estimator divergence with it, appears ONLY in the
+cell with the newly retrained centroid layer.  **It is not the shear layer, not
+the chart fix, and not the selection terms** -- the selection correction behaves
+itself in three of the four cells, on the same targets and the same window.
+
+That relocates the whole thread: the suspect is `centroid.py train` on top of a
+much sharper shear layer.  Its own check already flags a 4.36x ellipticity
+response against the catalog (3.65e-2 vs 8.36e-3), which this fix did not
+touch and which was previously masked by a shear layer wrong by 4-5% in dm/dg.
+
+A fourth-cell control is running to make the comparison exact at 20k (the
+pre-fix with-centroid number above is a 200k run):
+
+    python -u bias.py --flow flows/pre_chartsync/centroid_gauss2_deep.eqx \
+      --pop gauss2_deep --samples 8192 --alpha 0.5 --chunk 4096 \
+      --batch-budget 65536 --n-targets 20000 \
+      --window-size 2.2 3.2 --window-flux 2500 50000 \
+      > logs_deep_cent_pre_chartsync.txt
+
+## The runs that produced the table above
 
 A paired 2x2 completion: deep, 20k targets, `--no-centroid`, on the post-fix
 and pre-fix shear flows, launched with
@@ -2902,13 +2939,9 @@ and pre-fix shear flows, launched with
         > logs_deep_nocent_$o.txt 2>&1
     done
 
-Results land in `logs_deep_nocent_shear_gauss2.txt` and
-`logs_deep_nocent_pre_chartsync_shear_gauss2.txt`.  Together with the two
-with-centroid numbers this is the full 2x2 (old/new shear) x (with/without
-centroid), all at 20k targets, all on the same targets -- which says whether
-the +0.0153 is the shear layer at depth or the centroid layer retrained on top
-of it.  The reference point for the no-centroid column is **-0.0103 +/- 0.0027**
-(20k, pre-fix, from the evening session's table).
+Results are in `logs_deep_nocent_shear_gauss2.txt` and
+`logs_deep_nocent_pre_chartsync_shear_gauss2.txt`, and are the top two rows of
+the table above.
 
 ## Practical notes
 
