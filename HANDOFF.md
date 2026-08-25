@@ -2804,3 +2804,136 @@ docstring says so in as many words), the flow has downstream scale freedom
 anyway, and freezing them would make this whole class of bug impossible rather
 than merely fixed.  It would change `bulk.train`'s optimum, so it is a real
 experiment, not a cleanup -- left for the user to call.
+
+# 2026-08-24 (overnight): the fix is committed and the chain is rebuilt; the
+# response fit improved 6x, the noisy bias did NOT
+
+Continuation of the section above, which found and fixed the stale-chart bug.
+This is what happened when the gauss2 deep chain was rebuilt on top of it.
+
+## Committed
+
+`03e3551` -- `bulk.sync_chart_constants`, called from `shear.py` and
+`centroid.py` after their warm-start grafts, plus
+`tests/test_shear.py::test_sync_chart_constants_follows_a_grafted_chart`.
+Full suite: **65 passed** (6m11s, confirmed twice on a free GPU -- an earlier
+"collection error" was three orphaned pytest processes fighting over the card,
+not a real failure).
+
+The pre-fix checkpoints are preserved at `flows/pre_chartsync/{shear_gauss2,
+centroid_gauss2_deep}.eqx` -- keep them, every paired comparison below needs
+them.
+
+## The rebuild, and what it bought
+
+Same `flows/bulk_gauss2.eqx` warm start as before, so the ONLY difference is
+the chart sync.  `shear.py train --steps 60000 --deriv-weight 1e4 --seed 0`,
+then `centroid.py train --steps 16000`.
+
+`shear.py check`, dm/dg RMS residual / RMS truth:
+
+| | Mf | Mr | M1 | M2 | Mc |
+|---|---|---|---|---|---|
+| dm/dg before | 2.70% | 4.28% | 1.29% | 1.31% | 5.12% |
+| **dm/dg after** | **0.29%** | **0.66%** | **0.32%** | **0.32%** | **0.87%** |
+| d2m/dg2 before | 0.49% | 0.54% | 1.42% | 1.50% | 0.70% |
+| **d2m/dg2 after** | **0.12%** | **0.20%** | **0.25%** | **0.25%** | **0.27%** |
+
+val nll 42.4112 both, to four decimals -- as expected, and one more datum for
+"val NLL cannot rank flows for response-fit quality".
+
+Binned by Mr/Mf octile, Mr's first-order residual: the peak is gone.  Bin 5
+(r 3.10-3.19) 6.81% -> 0.81%, and the whole profile is flat at 0.29-0.87%.
+**The long-open "dm/dg Mr flat at 4.2-4.5% against a 0.58% achievable floor"
+item is closed.**
+
+Centroid layer retrained fine: all three spin-0 shifts negative and 72-86% of
+the catalog's magnitude (Mf -5.09e-3 vs -5.92e-3, Mr -8.24e-3 vs -1.13e-2,
+Mc -1.12e-2 vs -1.59e-2).  Ellipticity response still 4.36x the catalog
+(3.65e-2 vs 8.36e-3) -- unchanged by this fix, still its own open item.
+
+## But the noisy bias got WORSE, and the two estimators stopped agreeing
+
+`bias.py --pop gauss2_deep --samples 8192 --alpha 0.5 --chunk 4096
+--batch-budget 65536 --n-targets 20000 --window-size 2.2 3.2 --window-flux
+2500 50000`:
+
+| | before (200k) | after (20k) |
+|---|---|---|
+| windowed, corrected m1 | -0.01005 +/- 0.00170 | **+0.01530 +/- 0.00284** |
+| unwindowed m1 | ~ -0.010 (matched the windowed) | **-0.02184 +/- 0.00243** |
+
+Two separate problems there.  The magnitude went up, and -- more diagnostic --
+**the windowed-corrected and unwindowed numbers now differ by 0.037**, where
+their agreement used to be one of the three checks that localised the residual
+to the shear/bulk response in the first place.  That divergence is new
+information and is probably the more useful thread.
+
+ESS is healthy and not the cause: 638 median, 110 at the 5th percentile,
+`frac<10 = 0.000`.  Mf quintiles: -0.297 / -0.037 / +0.024 / +0.015 / -0.000
+(q1 +/- 0.0145), so the faint end dominates as usual.
+
+## The shear layer alone is FINE -- better, in fact
+
+Paired noiseless run, 1M targets, `--no-centroid --pop gauss2`, nothing but the
+shear flow swapped:
+
+| shear flow | noiseless m1 |
+|---|---|
+| pre-fix (`flows/pre_chartsync/shear_gauss2.eqx`) | -0.00138 +/- 0.00015 |
+| **post-fix (`flows/shear_gauss2.eqx`)** | **+0.00047 +/- 0.00017** |
+
+Both are inside the 0.0015 seed sd (the 60k three-seed mean is -0.0028 +/-
+0.0015), the new one marginally closer to zero.  So the fix did not damage the
+shear layer -- it improved the response fit 6x and left the noiseless bias
+where it was.  **Whatever produces +0.0153 at depth enters through the noisy
+path**: the centroid layer, or the C_M integration, or the selection terms.
+
+## RUNNING WHEN THIS WAS WRITTEN -- read these first
+
+A paired 2x2 completion: deep, 20k targets, `--no-centroid`, on the post-fix
+and pre-fix shear flows, launched with
+
+    for f in shear_gauss2 pre_chartsync/shear_gauss2; do
+      o=$(echo $f | tr "/" "_")
+      python -u bias.py --flow flows/$f.eqx --no-centroid --pop gauss2_deep \
+        --samples 8192 --alpha 0.5 --chunk 4096 --batch-budget 65536 \
+        --n-targets 20000 --window-size 2.2 3.2 --window-flux 2500 50000 \
+        > logs_deep_nocent_$o.txt 2>&1
+    done
+
+Results land in `logs_deep_nocent_shear_gauss2.txt` and
+`logs_deep_nocent_pre_chartsync_shear_gauss2.txt`.  Together with the two
+with-centroid numbers this is the full 2x2 (old/new shear) x (with/without
+centroid), all at 20k targets, all on the same targets -- which says whether
+the +0.0153 is the shear layer at depth or the centroid layer retrained on top
+of it.  The reference point for the no-centroid column is **-0.0103 +/- 0.0027**
+(20k, pre-fix, from the evening session's table).
+
+## Practical notes
+
+* `--batch-budget 65536` is now REQUIRED for this run.  At the default
+  (131072/chunk = 32 targets x 4096 draws) the first `pqr_streamed` batch asks
+  for 11.72 GiB and OOMs the 16 GB card.  It is pure device chunking -- the
+  streamed accumulation is unchanged, so it does not touch the arithmetic.
+  This is not `--n-targets`-dependent; the 200k run would have hit it too.
+* A 200k-target run was started and killed to get the 20k number sooner.  There
+  is no 200k result on the rebuilt chain yet.  Once the 2x2 is understood, the
+  200k rerun is what turns +0.0153 +/- 0.0028 into a number worth quoting.
+* Recall the working rule: quote gauss2 m1 with the SEED spread (~0.0015-0.002
+  at 60k), not a single run's bootstrap.  +0.0153 vs -0.0100 is a real shift
+  even at that tolerance, but a single seed is a single seed.
+
+## What is stale
+
+All `flows/shear_*.eqx` and `flows/centroid_*.eqx` OTHER than the two gauss2
+ones rebuilt tonight -- bulgedisc and sersic have not been retrained against
+the fix, and their chart drift is the same size (spin-2 std 0.040 -> 0.148 and
+0.071 -> 0.165).  Bulk checkpoints are unaffected.
+
+## Open design question, still not acted on
+
+Should `RawMomentStandardize.mean/std` be trainable at all?  Freezing them
+makes this whole bug class impossible rather than merely fixed, and everything
+else in the codebase already treats them as data-determined constants.  It
+would change `bulk.train`'s optimum, so it is an experiment, not a cleanup.
