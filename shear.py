@@ -541,8 +541,11 @@ def main():
                 flow, list(bulk_only.bijection.bijection.bijections))
             # The graft replaced the CHART too, and `bulk.train` moved its
             # mean/std -- so the shear layer's frozen copies now describe a
-            # chart that is not there.  See `bulk.sync_chart_constants`.
-            flow = bulk.sync_chart_constants(flow)
+            # chart that is not there.  See `bulk.sync_chart_constants`.  Passing
+            # `train_set[0]` also resyncs `coeffs.u_mean/.u_white`, the coefficient
+            # net's whitening stats -- stale by the same mechanism, unfixed until
+            # now (see the docstring).
+            flow = bulk.sync_chart_constants(flow, m_train=train_set[0])
             print(f"warm started bulk from {a.init}")
         flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps,
                      batch=a.batch, lr=a.lr, g_max=a.g_max,

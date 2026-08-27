@@ -472,3 +472,18 @@ def test_sync_chart_constants_follows_a_grafted_chart():
     assert np.isclose(float(unwrap(layer.e_scale)),
                       float(np.sqrt(0.5 * (np.asarray(moved.std[3]) ** 2
                                            + np.asarray(moved.std[4]) ** 2))))
+
+    # Without `m_train` the coefficient net's whitening stats are left as-is
+    # (old behaviour, still relied on by callers that don't have the data
+    # handy) -- with it, they follow the moved chart too.
+    stale = shear._shear_layer(bulk.sync_chart_constants(flow)).coeffs
+    orig = shear._shear_layer(flow).coeffs
+    assert np.allclose(unwrap(stale.u_mean), unwrap(orig.u_mean))
+    assert np.allclose(unwrap(stale.u_white), unwrap(orig.u_white))
+
+    synced = shear._shear_layer(bulk.sync_chart_constants(flow, m_train=m)).coeffs
+    want = bulk.coeff_stats(bulk.to_coords(m),
+                            np.asarray(moved.mean), np.asarray(moved.std))
+    assert not np.allclose(unwrap(synced.u_mean), unwrap(orig.u_mean))
+    assert np.allclose(unwrap(synced.u_mean), want[0], atol=1e-5)
+    assert np.allclose(unwrap(synced.u_white), want[1], atol=1e-5)

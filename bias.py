@@ -428,40 +428,36 @@ def split_centroid(flow):
     the Hessian run out of memory at the batch sizes the shear-only flow used.
 
     The peel is exact, not an approximation; see `centroid_transform`.
+
+    RESTRICTED to a standalone (3,)-conditioned layer, not a chained (5,)
+    one, even though `models/centroid.py`'s `CentroidMarginalize` no longer
+    reads g at all (module docstring, "No shear-conditioning") and so is
+    mathematically safe to peel either way.  Verified empirically NOT safe in
+    practice: peeling a chained layer and reconstructing `rest =
+    Invert(Chain(bij[2:]).merge_chains())` reproduces `flow.log_prob` exactly
+    (matches to float32 roundoff), but `bias.py`'s actual Q/R -- gradient and
+    HESSIAN of log_prob w.r.t. g, computed through `rest` -- come out wrong
+    even with `_transport` forced to a literal identity (m1 ~ -0.66 on
+    `gauss2_deep` where `--no-centroid` gives ~-0.03).  So the bug is in
+    autodiff through the RECONSTRUCTED sub-chain specifically, not in this
+    layer's transport or in log_prob-level peeling -- root cause not yet
+    found (HANDOFF.md, 2026-08-27).  Refusing here costs what it always did:
+    5 extra JVPs of this (now free, coefficient-net-less) layer per draw
+    inside the forward-over-reverse Hessian, no longer using a large network.
     """
     bij = flow.bijection.bijection.bijections
     # data -> base order is [raw2standard, centroid, shear, *bulk]; the chart is
     # always first now, so the centroid layer is at index 1 when it is present.
     if len(bij) < 2 or not isinstance(bij[1], CentroidMarginalize):
         return flow, None
-    # THE PEEL IS ONLY VALID WHILE THE LAYER IS g-INDEPENDENT.  Since the
-    # centroid layer's coefficients are conditioned on g (models/centroid.py
-    # `g_invariants`), a layer wired for the chained (5,) condition genuinely
-    # depends on g and its log-det is no longer a constant that drops out of
-    # eq. (12-13).  Peeling it would evaluate it at g = 0 for every draw and
-    # silently discard exactly the dependence it was given -- so refuse, and let
-    # the autodiff traverse the layer instead.
-    #
-    # That costs what the peel used to buy: 5 extra JVPs of the coefficient
-    # network per draw inside the forward-over-reverse Hessian.  Drop --chunk if
-    # a deep run runs out of memory.
-    if layer_is_g_conditioned(bij[1]):
+    if bij[1].cond_shape[-1] >= 5:
         return flow, None
     rest = Invert(Chain(list(bij[2:])).merge_chains())
     # Both halves are g-independent here -- the chart is a fixed
-    # reparametrisation and a (3,)-conditioned centroid layer reads only
-    # Sigma_X -- so the pair can be hoisted together and their log-dets summed.
+    # reparametrisation and the centroid layer reads only Sigma_X out of
+    # whatever condition width it was built for -- so the pair can be
+    # hoisted together and their log-dets summed.
     return Transformed(flow.base_dist, rest), (bij[0], bij[1])
-
-
-def layer_is_g_conditioned(layer):
-    """Does this centroid layer actually receive g?
-
-    True when it was built for the chained ``(5,) = [g1, g2, C00, C01, C11]``
-    condition.  A standalone ``(3,)`` layer never sees a shear -- `split_condition`
-    hands it g = 0 -- so it stays peelable.
-    """
-    return layer.cond_shape[-1] >= 5
 
 
 @eqx.filter_jit
@@ -1594,23 +1590,42 @@ def main():
     if a.samples:
         # ESS on one chunk's worth of draws, over a slice of targets -- a
         # diagnostic, so it does not need the full sample count.  Report it
-        # scaled to the full S, since ESS grows linearly with draws.
+        # scaled to the full S, since ESS grows linearly with draws.  Stratified
+        # by flux quintile (not just the first n_e rows) so a starved tail
+        # concentrated in one quintile doesn't average out against the rest.
         n_e = min(2000, len(m["zero"]))
-        d_e, w_e = mixture_draws(draw_flow, m_raw["zero"][:n_e], cov, chunk,
+        flux_e = truth[:, 0]
+        edges_e = np.percentile(flux_e, [0, 20, 40, 60, 80, 100])
+        per_q = max(1, n_e // 5)
+        idx = np.concatenate([
+            np.flatnonzero((flux_e >= edges_e[i]) & (flux_e <= edges_e[i + 1]))[:per_q]
+            for i in range(5)])
+        d_e, w_e = mixture_draws(draw_flow, m_raw["zero"][idx], cov, chunk,
                                  a.alpha, a.noise_seed + 1000, sigma_x=None
-                                 if draw_sigma_x is None else draw_sigma_x[:n_e])
+                                 if draw_sigma_x is None else draw_sigma_x[idx])
         # NOT through the peel.  `ess` tests `in_domain` and stands bad rows in
         # at `safe_point`, both of which read RAW moments; on peeled draws they
         # are nonsense and the reported median came out NaN.  The peel is exact,
         # so the full flow on raw draws is the same number, computed where the
         # domain test means something.
-        e = ess(flow, m_raw["zero"][:n_e], d_e, w_e, 4 * batch,
-                None if sigma_x is None else sigma_x[:n_e])
+        e = ess(flow, m_raw["zero"][idx], d_e, w_e, 4 * batch,
+                None if sigma_x is None else sigma_x[idx])
         scale = a.samples / chunk
         print(f"integrating under C_M with {a.samples} draws/target "
               f"(alpha = {a.alpha}): ESS = {np.median(e) * scale:.0f} (median), "
               f"{np.percentile(e, 5) * scale:.0f} (5th pct), "
               f"frac<10 = {float((e * scale < 10).mean()):.3f}")
+        print(f"  {'quintile':>10s}{'median ESS':>12s}{'5th pct':>10s}{'frac<10':>10s}")
+        lo = 0
+        for i in range(5):
+            n_i = min(per_q, ((flux_e >= edges_e[i]) & (flux_e <= edges_e[i + 1])).sum())
+            e_i = e[lo:lo + n_i]
+            lo += n_i
+            if len(e_i) == 0:
+                continue
+            print(f"  {f'q{i + 1}':>10s}{np.median(e_i) * scale:>12.0f}"
+                  f"{np.percentile(e_i, 5) * scale:>10.0f}"
+                  f"{float((e_i * scale < 10).mean()):>10.3f}")
 
     if a.samples and a.samples > chunk:
         qr = {}
@@ -1634,6 +1649,16 @@ def main():
         print(f"  dropping {n} targets with |Q| or |R| > 1000x the population "
               f"median ({n / len(finite):.1e}); a flow density-curvature "
               f"spike, not a domain effect")
+    if not finite.all() or not sane.all():
+        # By flux quintile: are the dropped/outlier targets concentrated in a
+        # few quintiles, or spread evenly?  Binned on the same pre-drop truth
+        # flux as the main quintile table below.
+        edges_diag = np.percentile(truth[:, 0], [0, 20, 40, 60, 80, 100])
+        print(f"  {'quintile':>10s}{'dropped':>10s}{'outlier':>10s}{'total':>10s}")
+        for i in range(5):
+            qsel = (truth[:, 0] >= edges_diag[i]) & (truth[:, 0] <= edges_diag[i + 1])
+            print(f"  {f'q{i + 1}':>10s}{int((qsel & ~finite).sum()):>10d}"
+                  f"{int((qsel & finite & ~sane).sum()):>10d}{int(qsel.sum()):>10d}")
     if not sane.all():
         qr = {k: (q[sane], r[sane]) for k, (q, r) in qr.items()}
         truth = truth[sane]

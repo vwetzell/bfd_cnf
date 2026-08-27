@@ -1,10 +1,13 @@
 """
 centroid.py
 ===========
-Phase 3: learn the centroid-marginalisation conditioning of P(m | g, Sigma_X),
-by likelihood on a catalog of shifted template copies.
+Phase 3, now `check`-only: validate `models.centroid.CentroidMarginalize` (a
+closed-form, zero-parameter transport -- see its module docstring) against a
+catalog of shifted template copies.  `train` is kept only for its warm-start
+graft (loading bulk+shear from `--init`); the centroid layer itself has
+nothing left to fit by likelihood.
 
-The training set is not the galaxies -- it is their *copies*.
+The validation set is not the galaxies -- it is their *copies*.
 `imsims.copies` replicates every template galaxy over a grid of coordinate
 origins u and records the moments m(u) and first moments X(u) of each, which is
 the left-hand side of the paper's eq. (36).  The weight of a copy under a target
@@ -13,8 +16,7 @@ whose first moments have covariance Sigma_X is
     w(u) = d2u . |J(u)| . N(X(u); 0, Sigma_X)
 
 so the marginalised prior is the w-weighted distribution of the m(u).  That is
-what this trains against, and `CentroidMarginalize` is a transport that carries
-the unmarginalised population onto it.
+what `check` compares `CentroidMarginalize`'s analytic transport against.
 
 Why draw rather than weight
 ---------------------------
@@ -232,13 +234,33 @@ def train(flow, sampler, sigma_x, key, steps=4000, batch=1024,
           lr=3e-3, g_max=G_MAX):
     """Likelihood only -- see `shear.train` for the reasoning.
 
-    `g_max` is the radius of the shear disc the copies are lensed over.  It must
-    be > 0 for the layer's g-conditioned coefficients to receive any gradient at
-    all: their inputs are `Re(ebar g)` and `|g|^2`, both identically zero at
-    g = 0, so a g = 0 run leaves them at their (zeroed) initialisation and the
-    layer stays exactly shear-independent.  Set 0 to reproduce the old
-    behaviour, or to train against a catalog with no per-copy derivatives.
+    `models/centroid.py`'s `CentroidMarginalize` is now a closed-form,
+    zero-parameter transport (see its module docstring) -- there is nothing
+    left in the centroid layer for this loop to optimise.  Kept, rather than
+    deleted, because `main()`'s warm-start graft (loading bulk+shear from
+    `--init`) still runs through this function's caller; this just skips the
+    now-pointless gradient loop instead of spending `steps` NLL evaluations
+    on an empty parameter set.
+
+    `g_max` is retired along with the layer's (now nonexistent)
+    shear-conditioned coefficients; kept as an accepted-but-unused argument
+    only so existing call sites do not need to change.
     """
+    # `_trainable`'s boolean spec does not use paramax's documented
+    # `is_leaf=isinstance(..., NonTrainable)` convention, so `mean`/`std`
+    # still show up as nominal leaves of `params` below even though they are
+    # frozen -- `NonTrainable.unwrap()` applies `stop_gradient` internally,
+    # so their gradient (and Adam's update from it) is exactly zero either
+    # way.  Checked here with the CORRECT `is_leaf`, so this guard actually
+    # detects "nothing real to train" instead of never firing.
+    from paramax.wrappers import NonTrainable
+    has_free_params = any(jax.tree.leaves(jax.tree.map(
+        eqx.is_inexact_array, _centroid_layer(flow),
+        is_leaf=lambda x: isinstance(x, NonTrainable))))
+    if not has_free_params:
+        print("centroid layer has no trainable parameters (closed-form "
+              "transport) -- nothing to train.")
+        return flow
     if g_max and not sampler.has_derivatives:
         raise ValueError(
             "this copies catalog carries no per-copy dm_dg/d2m_dg2, so its "
@@ -439,7 +461,14 @@ def main():
             # so what `build_flow` copied from the raw sample is stale.  This
             # used to fix only the centroid layer; leaving the SHEAR layer
             # stale was the whole of its dm/dg error peak at Mr/Mf ~ 3.1.
-            flow = bulk.sync_chart_constants(flow)
+            # It also re-points the centroid layer's own frozen COPY of this
+            # shear layer (`models.centroid.shear_delta_invariants`) at the
+            # just-grafted one -- otherwise it would go on delensing with the
+            # PRE-graft (freshly initialised) shear coefficients instead of
+            # the warm-started ones the chain itself now uses.  Passing `m_train`
+            # also resyncs the shear layer's coefficient-net whitening stats
+            # (`coeffs.u_mean/.u_white`), stale by the same mechanism.
+            flow = bulk.sync_chart_constants(flow, m_train=m_train)
             print(f"warm started bulk + shear from {a.init}")
         flow = train(flow, sampler, sigma_x,
                      jr.key(a.seed + 1), steps=a.steps, batch=a.batch,

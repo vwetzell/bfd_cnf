@@ -144,7 +144,7 @@ def to_coords(m):
                     axis=-1)
 
 
-def coeff_stats(t):
+def coeff_stats(t, mean=None, std=None):
     """(mean, W) whitening the ShearResponse coefficient net's four inputs.
 
     `t` is the chart output for the training set.  The net sees
@@ -152,8 +152,18 @@ def coeff_stats(t):
     here and return the mean and inverse Cholesky factor of its covariance.
     See `models.shear._Coeffs.__call__` for why: those inputs have condition
     number ~2600 as they stand, with z1 and z2 correlated at 0.997.
+
+    `mean`/`std` default to `t`'s own (matching `build_flow`'s freshly
+    initialised chart, whose `RawMomentStandardize.mean/std` ARE `t.mean(0)`/
+    `t.std(0)` at that point).  Pass the chart's TRAINED mean/std instead to
+    recompute against the distribution `_Coeffs` actually sees post-training
+    -- `RawMomentStandardize.mean/std` are trainable and move substantially
+    (see `sync_chart_constants`), so the whitening built here at init goes
+    stale exactly the way `chart_loc`/`chart_scale`/`e_scale` do.
     """
-    z = (t - t.mean(0)) / t.std(0)
+    mean = t.mean(0) if mean is None else np.asarray(mean)
+    std = t.std(0) if std is None else np.asarray(std)
+    z = (t - mean) / std
     q = z[:, 3] ** 2 + z[:, 4] ** 2
     u = np.stack([z[:, 0], z[:, 1], z[:, 2], (q - _Q_LOC) / _Q_SCALE], axis=-1)
     cov = np.cov(u.T) + 1e-8 * np.eye(4)
@@ -191,7 +201,7 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
     raw2standard = RawMomentStandardize(mean=t.mean(0), std=t.std(0))
     _u_stats = coeff_stats(t)
 
-    key, k_shear, k_centroid = jr.split(key, 3)
+    key, k_shear = jr.split(key, 2)
     keys = jr.split(key, layers)
     _incs = _spin0_increments(layers)
     bulk = []
@@ -228,30 +238,30 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
     # With both on, the chain carries one condition vector for the pair:
     # [g1, g2, C00, C01, C11].  Shear reads the first two, centroid the last three.
     cond = 5 if (shear and centroid) else None
-    head = ([CentroidMarginalize(k_centroid, cond_dim=cond or 3,
+    shear_layer = (ShearResponse(
+        k_shear, cond_dim=cond or 2,
+        # The chart's EFFECTIVE spin-2 std, not slot 3's own.
+        # `RawMomentStandardize._effective` symmetrises the pair to
+        # sqrt((s3^2 + s4^2)/2) -- that is what z3 and z4 are actually
+        # divided by, so anything else here makes `response`'s "physical
+        # units" wrong by the ratio.  It was `t.std(0)[3]`, which is 0.67%
+        # off on bulgedisc and 1.8% off on a 1000-row subsample;
+        # `dev/reparam_paired.py`'s constant-coefficient check is what
+        # turned it up.
+        e_scale=float(np.sqrt(0.5 * (t.std(0)[3] ** 2 + t.std(0)[4] ** 2))),
+        u_mean=_u_stats[0], u_white=_u_stats[1],
+        chart_loc=t.mean(0)[:3], chart_scale=t.std(0)[:3])
+        if shear else None)
+    head = ([CentroidMarginalize(cond_dim=cond or 3,
                                  mean=t.mean(0), std=t.std(0))]
             if centroid else []) + \
-           ([ShearResponse(k_shear, cond_dim=cond or 2,
-                           # The chart's EFFECTIVE spin-2 std, not slot 3's own.
-                           # `RawMomentStandardize._effective` symmetrises the
-                           # pair to sqrt((s3^2 + s4^2)/2) -- that is what z3
-                           # and z4 are actually divided by, so anything else
-                           # here makes `response`'s "physical units" wrong by
-                           # the ratio.  It was `t.std(0)[3]`, which is 0.67%
-                           # off on bulgedisc and 1.8% off on a 1000-row
-                           # subsample; `dev/reparam_paired.py`'s constant-
-                           # coefficient check is what turned it up.
-                           e_scale=float(np.sqrt(
-                               0.5 * (t.std(0)[3] ** 2 + t.std(0)[4] ** 2))),
-                           u_mean=_u_stats[0], u_white=_u_stats[1],
-                           chart_loc=t.mean(0)[:3], chart_scale=t.std(0)[:3])]
-            if shear else [])
+           ([shear_layer] if shear else [])
     bijection = Invert(Chain([raw2standard, *head, *bulk]).merge_chains())
     base = non_trainable(MultivariateNormal(jnp.zeros(5), jnp.eye(5)))
     return Transformed(base, bijection)
 
 
-def sync_chart_constants(flow):
+def sync_chart_constants(flow, m_train=None):
     """Re-point every layer's FROZEN copy of the chart statistics at the chart
     it is actually sitting behind.  Call this after ANY warm-start graft.
 
@@ -275,20 +285,43 @@ def sync_chart_constants(flow):
 
     `centroid.py` already did this for its own layer -- the same two lines, for
     the same reason -- and that is now here instead.
+
+    `m_train` (the same raw moments the flow was/will be trained on) additionally
+    resyncs `ShearResponse.coeffs.u_mean/.u_white`, the whitening stats for
+    `_Coeffs`'s four net inputs.  Those are computed once by `coeff_stats` from
+    the chart's PRE-TRAINING statistics and never touched by the loop below,
+    even though `_Coeffs.__call__` whitens live against the chart's current
+    (trained) mean/std -- so left unsynced, the whitening silently reverts to
+    the ill-conditioned state (correlation 0.997, condition number ~2625) it
+    exists to fix, for the entire duration of every `--init` warm start.
+    Omit `m_train` to leave them as-is (matches the old behaviour).
+
+    `CentroidMarginalize` has no coefficients of its own to graft or resync
+    (see its module docstring) -- only its frozen chart `mean`/`std` need
+    fixing here, same as any other layer downstream of the chart.
     """
     bij = flow.bijection.bijection.bijections
     chart = bij[0]
     e_scale = jnp.sqrt(0.5 * (chart.std[3] ** 2 + chart.std[4] ** 2))
+    u_stats = None
+    if m_train is not None:
+        t = to_coords(np.asarray(m_train, dtype=np.float64))
+        u_stats = coeff_stats(t, np.asarray(chart.mean), np.asarray(chart.std))
     for i, b in enumerate(bij):
         if isinstance(b, ShearResponse):
-            flow = eqx.tree_at(
-                lambda f, i=i: [f.bijection.bijection.bijections[i].e_scale,
-                                f.bijection.bijection.bijections[i].chart_loc,
-                                f.bijection.bijection.bijections[i].chart_scale],
-                flow, [non_trainable(e_scale),
-                       non_trainable(chart.mean[:3]),
-                       non_trainable(chart.std[:3])])
-        elif isinstance(b, CentroidMarginalize):
+            getters = [lambda f, i=i: f.bijection.bijection.bijections[i].e_scale,
+                       lambda f, i=i: f.bijection.bijection.bijections[i].chart_loc,
+                       lambda f, i=i: f.bijection.bijection.bijections[i].chart_scale]
+            values = [non_trainable(e_scale), non_trainable(chart.mean[:3]),
+                      non_trainable(chart.std[:3])]
+            if u_stats is not None:
+                getters += [lambda f, i=i: f.bijection.bijection.bijections[i].coeffs.u_mean,
+                            lambda f, i=i: f.bijection.bijection.bijections[i].coeffs.u_white]
+                values += [non_trainable(jnp.asarray(u_stats[0], jnp.float32)),
+                           non_trainable(jnp.asarray(u_stats[1], jnp.float32))]
+            flow = eqx.tree_at(lambda f: [g(f) for g in getters], flow, values)
+    for i, b in enumerate(flow.bijection.bijection.bijections):
+        if isinstance(b, CentroidMarginalize):
             flow = eqx.tree_at(
                 lambda f, i=i: [f.bijection.bijection.bijections[i].mean,
                                 f.bijection.bijection.bijections[i].std],
