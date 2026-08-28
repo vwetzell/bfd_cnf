@@ -773,9 +773,54 @@ def _merge_finish(st, jackknife=True, min_left=0.05):
     return q, r, int((alive & ~ok).sum())
 
 
+def _merge_opg(st):
+    """Per-target cross-fit outer product `q q^T`, as (n, 2, 2).
+
+    The Fisher-scoring alternative to `R` needs `E[q q^T]`, and the obvious
+    `qhat qhat^T` is biased by exactly the Monte-Carlo noise it squares:
+    `E[qhat qhat^T] = q q^T + Var[eps]`, which OVERSTATES the information and
+    shrinks `ghat`.  Measured on `gauss2_deep` as a -3.5% m1 offset that decays
+    like O(1/S) (-0.01187 at S = 8192, -0.00979 at 32768, against a Newton
+    -0.00907).
+
+    Splitting the chunks into two halves and taking the CROSS product removes
+    it outright rather than correcting it: the halves are independent draw
+    sets, so `E[qhat^A qhat^B^T] = q q^T` with no `Var[eps]` term and no fitted
+    constant.  Symmetrised, since only the symmetric part is a metric.
+
+    Each half is renormalised over its own chunks (`_shares` on that subset),
+    so each is the same self-normalised ratio estimator the full sample uses,
+    just at half the draws.  Falls back to the plain `bhat bhat^T` when there
+    is only one chunk, where there is nothing to cross-fit.
+    """
+    la = np.stack(st["la"])
+    b = np.stack(st["b"])
+    k = len(la)
+    a_all, _ = _shares(la)
+    bhat = np.einsum("kn,kna->na", a_all, b)
+    if k < 2:
+        return np.einsum("na,nb->nab", bhat, bhat)
+    h = k // 2
+    qs = []
+    for sl in (slice(0, h), slice(h, k)):
+        a_h, _ = _shares(la[sl])
+        qs.append(np.einsum("kn,kna->na", a_h, b[sl]))
+    qa, qb = qs
+    cross = np.einsum("na,nb->nab", qa, qb)
+    out = 0.5 * (cross + cross.transpose(0, 2, 1))
+    # A target with no weight in one half has an undefined cross term; the
+    # plain square is the only thing left and it is what `ghat` would have
+    # used anyway.
+    bad = ~np.isfinite(out).reshape(len(out), -1).all(1)
+    if bad.any():
+        out[bad] = np.einsum("na,nb->nab", bhat[bad], bhat[bad])
+    return out
+
+
 def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
                  batch=64, chunk=2048, report=None,
-                 proposal=None, proposal_sigma_x=None, jackknife=True):
+                 proposal=None, proposal_sigma_x=None, jackknife=True,
+                 opg=False):
     """Per-target (d logP/dg, d2 logP/dg2) WITHOUT materialising the draws.
 
     `Phat = (1/S) sum_s w_s p(x_s|g)` is a plain sum over samples, and so are its
@@ -851,7 +896,7 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
 
     batched = eqx.filter_jit(jax.vmap(one))
     n_chunks = max(1, samples // chunk)
-    q_out, r_out = [], []
+    q_out, r_out, opg_out = [], [], []
     n_empty = 0
     n_fallback = 0
 
@@ -927,6 +972,8 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
         q_b, r_b, n_fb = _merge_finish(st, jackknife)
         q_out.append(q_b)
         r_out.append(r_b)
+        if opg:
+            opg_out.append(_merge_opg(st))
         n_fallback += n_fb
         n_empty += int((~_shares(np.stack(st["la"]))[1]).sum())
         if report and (i // batch) % report == 0:
@@ -946,6 +993,9 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
         # lower `chunk` so there are more independent draw sets.
         print(f"    {n_fallback} targets kept the plain Q, R "
               f"(one chunk carries the weight)", flush=True)
+    if opg:
+        return (np.concatenate(q_out), np.concatenate(r_out),
+                np.concatenate(opg_out))
     return np.concatenate(q_out), np.concatenate(r_out)
 
 
@@ -1216,21 +1266,57 @@ def sane_targets(qr, factor=1000.0):
     return finite, sane
 
 
-def ghat(q, r, sel=None, ns=None):
+def ghat(q, r, sel=None, ns=None, opg=None):
     """The BFD ensemble shear estimate over the selected targets.
 
     `ns`, if given, is the tuple `(n_ns, P_s, Q_s, R_s)` from `selection_terms`
     -- `n_ns` the count of targets that fell OUTSIDE the window -- and applies
     eq. (45)-(46)'s non-selection term, which stands in for the sum the
     excluded targets would have contributed had they been seen.
+
+    `opg`, if given, is `pqr_streamed(..., opg=True)`'s per-target cross-fit
+    `q q^T`, and switches the observed part of the metric from the Newton step
+    `-SUM r` to Fisher scoring's `SUM q q^T`.  Same likelihood equation, same
+    root, different metric for the step -- and it consumes only `Q`, which
+    survives comparison against BFD's template sum (corr 0.896 on the failing
+    bin) where `R` does not (corr 0.319, and the wrong sign).  It is also
+    positive definite by construction, so the solve cannot invert.
+
+    The SELECTION part is left alone: `Q_s`/`R_s` are exact analytic
+    derivatives of `P(s|g)` over the true templates, not Monte-Carlo
+    estimates, so there is nothing for an outer product to debias.  Only the
+    `-SUM r` term is replaced.
+
+    MEASURED VERDICT (2026-08-28): a large mitigation, NOT a fix, and it
+    carries a defect of its own -- do not adopt it as a default.
+
+      * it rescues the catastrophe: `bulgedisc_deep_v2` unwindowed m1 goes
+        -1.285 (Newton) -> -0.187 (cross-fit OPG), stable over S = 8192 ->
+        32768;
+      * on `gauss2_deep`, where Newton is right, cross-fit OPG agrees with it
+        to 2.4e-4 at S = 32768 (-0.00931 against -0.00907), so the estimator
+        is sound where the model is;
+      * but it does NOT reach zero on `bulgedisc_deep_v2` (-0.19 plateau), and
+      * `SUM q q^T` is far more outlier-dominated than `-SUM r` -- on gauss2
+        the top 1000 of 19976 targets carry 38.7% of `SUM q1^2` against 17.8%
+        of `SUM -R11`, and max/median is 181 against 13.  So its bias GROWS
+        WITH CATALOG SIZE as more extreme `|Q|` enter (-0.0096 at n = 3000,
+        -0.033 at n = 20000 on gauss2).  Suppressing that needs a tightened
+        `|Q|` cut, i.e. exactly the tuned constant this route was chosen to
+        avoid.
+
+    Kept because it is opt-in, inert by default, and the only way to reproduce
+    those numbers.
     """
     if sel is not None:
         q, r = q[sel], r[sel]
+        opg = None if opg is None else opg[sel]
+    obs = -r.sum(0) if opg is None else opg.sum(0)
     if ns is None:
-        return -np.linalg.solve(r.sum(0), q.sum(0))
+        return np.linalg.solve(obs, q.sum(0))
     n_ns, ps, qs, rs = ns
     Q = q.sum(0) - n_ns * qs / (1 - ps)
-    R = -r.sum(0) + n_ns * (np.outer(qs, qs) / (1 - ps) ** 2 + rs / (1 - ps))
+    R = obs + n_ns * (np.outer(qs, qs) / (1 - ps) ** 2 + rs / (1 - ps))
     return np.linalg.solve(R, Q)
 
 
@@ -1242,17 +1328,20 @@ def _split_per_arm(x):
     return x if isinstance(x, tuple) and len(x) == 2 else (x, x)
 
 
-def bias(qp, rp, qm, rm, g=0.02, sel=None, ns=None):
+def bias(qp, rp, qm, rm, g=0.02, sel=None, ns=None, opg=None):
     """(m1, c1, c2) from the +g/-g pair.
 
     `sel` and `ns` may each be a single value used for both arms, or a
     `(plus, minus)` tuple -- the selection is on each arm's OWN observed
     moments, so the two genuinely differ.  See `_split_per_arm` for the
-    disambiguation rule.
+    disambiguation rule.  `opg` is per-arm the same way, and switches the
+    metric to Fisher scoring -- see `ghat`.
     """
     sel_p, sel_m = _split_per_arm(sel)
     ns_p, ns_m = _split_per_arm(ns)
-    gp, gm = ghat(qp, rp, sel_p, ns_p), ghat(qm, rm, sel_m, ns_m)
+    opg_p, opg_m = _split_per_arm(opg)
+    gp = ghat(qp, rp, sel_p, ns_p, opg_p)
+    gm = ghat(qm, rm, sel_m, ns_m, opg_m)
     return (gp[0] - gm[0]) / (2 * g) - 1, *(0.5 * (gp + gm))
 
 

@@ -3057,3 +3057,91 @@ consistently.
 
 - No code change.  Scratchpad: `byflux.py`, `whichslot.py`, `capacity.py`
   (which also writes two bulk checkpoints), and the OPG comparisons.
+
+## 2026-08-28 (cont.): the three OPG caveats, settled -- one pass, one fail,
+one that inherits the failure
+
+Implemented Fisher scoring with a cross-fit outer-product metric
+(`_merge_opg`, `pqr_streamed(opg=True)`, `ghat(..., opg=)`, `bias(..., opg=)`
+-- opt-in, inert by default, 65/65 tests pass) and settled all three open
+caveats.
+
+### 1. Correct specification -- PASSES
+
+Does cross-fit OPG reproduce Newton where Newton is right?  `gauss2_deep`,
+3000 targets, seed 4242:
+
+| S | Newton | OPG plain | OPG cross-fit |
+|---|--------|-----------|---------------|
+| 8192  | -0.00391 | -0.01187 | -0.00964 |
+| 32768 | -0.00907 | -0.00979 | **-0.00931** |
+
+At S = 32768, where both are converged (Newton itself moves 0.005 between the
+two rows, so the 8192 row is not a fair reference), cross-fit OPG agrees with
+Newton to **2.4e-4**.  The -3.5% plain-OPG inflation is gone.  The estimator is
+sound where the model is.
+
+### 2. Does cross-fitting take bulgedisc to zero -- NO
+
+| S | Newton | OPG plain | OPG cross-fit |
+|---|--------|-----------|---------------|
+| 8192  | -1.27183 | -0.22423 | -0.17529 |
+| 32768 | -1.28457 | -0.19192 | **-0.18691** |
+
+It plateaus at about **-0.19**, stable over 4x in S and drifting slightly AWAY
+from zero.  So OPG turns a -128% catastrophe into a -19% bias -- a large
+mitigation, still ~190x an LSST budget.  In hindsight this is what the
+composite comparison predicted: OPG consumes `Q`, and `Q` itself correlates
+only 0.896 with the template sum on the failing bin.
+
+### 3. The selection branch -- threads through, but inherits a worse problem
+
+Mechanically fine: only the `-SUM r` term is replaced, the analytic `Q_s`/`R_s`
+are untouched, and the corrected windowed m1 is window-STABLE under OPG.
+`gauss2_deep`, 20000 targets, S = 8192, flux windows:
+
+| flux_lo | kept | Newton corr | OPG cross corr |
+|---------|------|-------------|----------------|
+| 0    | 1.000 | -0.00483 | -0.03409 |
+| 900  | 0.996 | -0.00340 | -0.03331 |
+| 1200 | 0.987 | -0.00294 | -0.03293 |
+| 1600 | 0.965 | -0.00241 | -0.03177 |
+| 2000 | 0.933 | -0.00221 | -0.03080 |
+
+Spread 0.003 for OPG against Newton's 0.0026 -- equally window-independent.
+But it sits at a **-0.033 offset** on the same population where the n = 3000
+run gave -0.0096.  A bias must not depend on sample size, and this one does.
+
+**Cause, measured:** `SUM q q^T` is far more outlier-dominated than `-SUM r`,
+because it SQUARES `Q`.  On `gauss2_deep` (19976 sane targets):
+
+| | share of `SUM q1^2` | share of `SUM -R11` |
+|---|---|---|
+| top 1 target    | 0.0028 | 0.0005 |
+| top 100         | 0.0849 | 0.0259 |
+| top 1000        | 0.3865 | 0.1778 |
+| max / median    | **181.2** | 13.4 |
+
+So as the catalog grows, more extreme `|Q|` enter, `SUM q q^T` inflates faster
+than `SUM -R`, `ghat` shrinks and m1 goes more negative -- exactly the observed
+-0.0096 (n = 3000) -> -0.033 (n = 20000).  Suppressing it needs a tightened
+`|Q|` guard (`sane_targets`' factor 1000 is nowhere near tight enough for a
+squared metric), i.e. precisely the tuned constant this route existed to avoid.
+
+### Verdict
+
+Cross-fit OPG is a genuine, knob-free mitigation and a sound estimator on a
+correct model, but it is NOT the answer: -0.19 on the target population, and a
+sample-size-dependent bias that can only be closed with a tuned cut.  Recorded
+in `ghat`'s docstring so it is not adopted naively.  The code is kept because it
+is opt-in, inert by default, and the only way to reproduce these numbers.
+
+For comparison, the best measurement on this population remains the flux window
+under the ordinary Newton step: `m1 ~ -0.02 +/- 0.016` for `flux_lo` >= 1600,
+stable to 3000 (2026-08-28 collar entry).
+
+### Artifacts
+
+- `bias.py`: `_merge_opg`, `pqr_streamed(opg=True)`, `ghat(..., opg=)`,
+  `bias(..., opg=)`.  All opt-in; no default behaviour changes.
+- Scratchpad: `opgtest.py`.
