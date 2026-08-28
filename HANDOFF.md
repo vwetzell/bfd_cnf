@@ -2424,3 +2424,131 @@ is the density problem of the previous entry, unchanged.
 - `bias.py`: `selection_terms` drops non-finite draws (the only code change).
 - Scratchpad: the seven-window sweeps for both populations, the `R_s`
   finite-difference validation, and the flow-vs-templates `R_s` comparison.
+
+## 2026-08-28 (cont.): the selection terms ARE a boundary flux -- verified, and
+it makes a flux-windowed measurement on the realistic population work
+
+The user's proposal: the selection terms are a measure of the flux across the
+window boundary, so they should be obtainable without the flow being accurate
+in the extremes that lie outside the window.  Examined critically, then tested.
+It HOLDS, with one direction-dependent caveat, and it CORRECTS an earlier claim
+in this file.
+
+### The structural claim, verified
+
+`P_s(g) = E_{m ~ p_0}[F(m_g(m))]` with `F(m) = Pr[m + n in S]`, so
+`Q_s = E[grad F . dm/dg]` and `R_s = E[grad F . d2m/dg2 + (dm/dg)^T H_F
+(dm/dg)]`.  `F` saturates at 1 deep inside S and 0 deep outside, so `grad F`
+and `H_F` live only within a few `sigma_C` of the boundary.  Measured, by
+decomposing `R_s` into per-template contributions for a flux window at
+`Mf > 1345` (`sigma_Mf = 89.6`):
+
+| \|distance to boundary\| (sigma) | share of R_s |
+|--------------------------------|--------------|
+| 0 - 1   | 0.663 |
+| 1 - 2   | 0.281 |
+| 2 - 3   | 0.052 |
+| 3 - 5   | 0.004 |
+| 5 - 10  | 0.000 |
+| > 10    | -0.000 |
+
+Deep inside and deep outside contribute EXACTLY zero.  99.6% of `R_s` comes
+from within 3 sigma of the boundary.  The selection terms are a boundary flux.
+
+**This corrects the claim in the previous entry that eq. (40) "re-imports the
+faint-end density error" by adding back what the cut galaxies contribute.**  It
+does not: it never integrates the prior over the excluded interior.  That
+statement was wrong.
+
+### What the prior is actually needed for
+
+- `Q_s`, `R_s`: the boundary collar only (above).
+- `P_s`: the window interior plus global normalisation -- NOT boundary-local.
+  Minor: it enters only through `1/(1 - P_s)`, and can be replaced by the
+  measured selected fraction, accurate to `R_s g^2 / 2 ~ 5e-4`.
+- `SUM q`, `SUM r` over the SELECTED targets: each target's convolution reaches
+  a few `sigma_C` around itself, so this needs the prior on
+  **window UNION a ~5 sigma collar**.
+
+Net requirement: the prior must be right on the window plus a collar, and
+nowhere else.  The far tails are genuinely irrelevant.  That is a real
+relaxation of "correct everywhere".
+
+Note this could NOT have explained the previous entry's failing sweep, which
+used `--window-terms templates`: `P_s`, `Q_s`, `R_s` there already came from
+the true noiseless templates with bfd's exact derivatives.  A few-percent error
+in `R_s` moves the worst window's m1 by ~0.03 against a scatter of 6.4.  The
+failure was, and is, `SUM q` / `SUM r` over the selected targets.
+
+### The falsifiable prediction, and it holds in FLUX
+
+Pre-registered from the flux-quintile Fisher ratios (q1/q2 negative below
+`Mf = 1452`, q3 = +1.02 above): with a 5-sigma collar of 448, corrected m1
+should be flat for `flux_lo >~ 1900` and break below it.  20000 targets,
+`--window-terms templates`, no size cut:
+
+| flux_lo | collar (5 sig) | kept | uncorr m1 | corr m1 |
+|---------|----------------|------|-----------|---------|
+| 1200 |  752 | 0.701 | +0.30042 | **+0.35793 +/- 0.038** |
+| 1400 |  952 | 0.611 | +0.00905 | +0.04429 +/- 0.018 |
+| 1600 | 1152 | 0.545 | -0.03662 | -0.00315 +/- 0.015 |
+| 1800 | 1352 | 0.488 | -0.04899 | -0.01825 +/- 0.016 |
+| 2000 | 1552 | 0.446 | -0.05037 | -0.01988 +/- 0.016 |
+| 2200 | 1752 | 0.413 | -0.04691 | -0.01571 +/- 0.018 |
+| 2500 | 2052 | 0.372 | -0.06624 | -0.03429 +/- 0.019 |
+| 3000 | 2552 | 0.318 | -0.06572 | -0.03415 +/- 0.020 |
+
+Stable at about -0.02 from 1600 up, blowing up to +0.36 by 1200.  **This is a
+working measurement on the realistic population: `m1 ~ -0.02 +/- 0.016` keeping
+45-55% of the catalog, against -1.28 unwindowed.**  Control on `gauss2_deep`,
+where the density is good everywhere: corrected m1 = -0.0059 / -0.0040 /
+-0.0035 / -0.0024 / +0.0007 for `flux_lo` 1000 -> 5000 against unwindowed
+-0.00698, i.e. FLAT, while uncorrected drifts -0.0063 -> -0.0109.  The
+correction is what delivers the window-independence.
+
+### It does NOT hold in the SIZE direction, and here is why
+
+Adding the size window `(2.2, 3.5)` to the same flux sweep makes corrected m1
+DIVERGE -- +1.08, +0.91, +1.05, +1.26, +1.57, +1.99, +2.89, +10.15 as `flux_lo`
+goes 1200 -> 3000 -- while UNCORRECTED stays sane at -0.02 to -0.06.
+
+The reason is that the assumption "the window falls a few sigma inside the
+well-modelled region" is not satisfiable in `Mr/Mf` on this population.  The
+collar width against the population's own spread:
+
+| cut direction | 5-sigma collar | population p25-p75 | ratio |
+|---------------|----------------|--------------------|-------|
+| Mf                    | 448   | 2980 (1103-4083) | 0.15 |
+| Mr/Mf at Mf = 4083    | 0.285 | 0.552 | 0.52 |
+| Mr/Mf at Mf = 1770    | 0.661 | 0.552 | **1.20** |
+| Mr/Mf at Mf = 1103    | 1.069 | 0.552 | **1.94** |
+
+At the median flux a 5-sigma collar in `Mr/Mf` is WIDER than the population's
+own interquartile spread, and at the lower quartile it is nearly twice it
+(`sigma(Mr/Mf) = (sigma_Mr/Mf) sqrt(1 - 2 rho k + k^2)`, `k = (Mr/Mf)
+sigma_Mf/sigma_Mr`, `rho = 0.743`).  There is nowhere to put an `Mr/Mf`
+boundary that is a few sigma clear of the badly-modelled region, because a few
+sigma spans the whole population.  In flux the collar is 15% of the
+interquartile range, so the same window is comfortably satisfiable.
+
+(`gauss2` has an equally wide `Mr/Mf` collar -- 0.640 against a p25-p75 spread
+of 0.406 -- and its size window is fine, because a wide collar is harmless when
+there is no badly-modelled region for it to reach into.  The collar width only
+matters relative to the region being avoided.)
+
+### Standing caveats
+
+- The stable region still drifts -0.003 -> -0.034 between `flux_lo` 1600 and
+  3000, larger than the ~0.005 window-dependence the machinery shows on
+  `gauss2`.  So a real residual of a few percent survives even with a clean
+  collar; this is not a null result.
+- Q and R here are S = 8192 (cached).  The windowed samples are bright, where
+  `alpha 0.5` is well converged, but the sweep has not been repeated at 32768.
+- Rows are nested subsets of one target set, so adjacent rows are correlated
+  and the quoted bootstrap errors are not independent between rows.
+
+### Artifacts
+
+- No code change in this entry.
+- Scratchpad: the `R_s` boundary decomposition, the flux-collar sweeps for both
+  populations, and the collar-vs-spread calculation.
