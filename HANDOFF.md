@@ -2723,3 +2723,80 @@ fit.
 - No net code change (the experiment was reverted).
 - Scratchpad: `dropclip.py`, which reports the clip rates and the before/after
   Fisher ratios.
+
+## 2026-08-28 (cont.): the near-ceiling "deficit" is the physical centroid
+marginalisation -- the bulk fit is clean, and that claim is withdrawn
+
+Closing the gap left open above.  The earlier deficit was measured by sampling
+the flow at the REAL Sigma_X and comparing against the NOISELESS catalog, which
+is not apples-to-apples: centroid marginalisation physically lowers Mf, Mr/Mf
+and Mc/Mr, so the marginalised population should hold fewer galaxies near the
+ceilings.  At `Sigma_X = 0` the transport is the identity and the comparison is
+a clean test of the bulk.
+
+Mass per bin, ratio to the catalog, `bulgedisc_v2` (500k samples each):
+
+| v bin | catalog | bulk only | centroid Sigma_X = 0 | centroid Sigma_X real |
+|-------|---------|-----------|----------------------|-----------------------|
+| 0.00-0.80 | 0.19461 | 1.00 | 1.00 | 1.03 |
+| 0.80-0.90 | 0.37956 | 1.00 | 1.00 | 1.03 |
+| 0.90-0.95 | 0.27122 | 1.01 | 1.01 | 1.03 |
+| 0.95-0.98 | 0.13248 | 1.01 | 1.01 | 0.89 |
+| 0.98-0.99 | 0.01869 | 1.00 | 1.00 | 0.51 |
+| 0.99-1.00 | 0.00344 | 0.87 | 0.87 | 0.26 |
+
+and the same for `u` (1.00/1.00/1.01/1.01/0.99/0.86 bulk).
+
+**The bulk fits the ceiling approach essentially perfectly** -- 1.00-1.01 in
+every bin down to 0.98, with only the last bin (0.34% of the catalog, a 5.6
+sigma deficit on 344 galaxies) at 0.86-0.87.  Bulk-only and `Sigma_X = 0` agree
+to the last printed digit, which independently confirms the centroid layer is
+exactly the identity at `Sigma_X = 0`.
+
+**The whole deficit is the centroid marginalisation, and it is physical.**  Mass
+is depleted at the top AND enriched at the bottom (1.02-1.03 in the low bins) --
+conserved and moving downward, exactly the direction the module docstring gives.
+`gauss2` shows the same pattern in its populated bins (u 1.04/0.98/0.90/0.86;
+v 1.13/1.00/0.92/0.74) with a LARGER median shift than `bulgedisc_v2`
+(median v 0.8625 -> 0.8584, i.e. -0.0041, against 0.8851 -> 0.8819, -0.0032).
+Normal behaviour of a working layer.
+
+**The claim "the flow under-populates the last 5% before the ceiling" is
+therefore WITHDRAWN**, along with the reading of it as a fit failure the chart
+might need changing to fix.  What remains true from that entry: the flow is
+exactly zero above both ceilings by construction, and lensed templates never
+cross them.
+
+### A new inconsistency, flagged not asserted
+
+`selection_terms`' two branches draw from DIFFERENT populations.  `templates`
+lenses the noiseless, UN-marginalised templates; `flow` draws the centroid-
+marginalised population at the real `Sigma_X`.  The targets are centroid-
+affected, so in principle the marginalised one is right and the templates
+branch is missing a step.  The data does not cleanly pick a side -- observed
+kept-fraction minus `P_s`, over three windows:
+
+| window | templates | flow |
+|--------|-----------|------|
+| size (2.2,3.5)  | +0.0005 | -0.0081 |
+| flux > 1345     | -0.0024 | +0.0029 |
+| size (2.6,3.3)  | +0.0065 | -0.0013 |
+
+Both are within ~0.8% and neither is uniformly better.  Worth resolving on its
+own terms, but it is not the size of effect that explains anything measured
+here.
+
+### Where the R sign flip stands
+
+Still unexplained.  Now also NOT the bulk's fit near the ceilings, NOT the
+centroid clip, NOT the centroid transport's magnitude, NOT the selection
+machinery, NOT ESS/MC or the proposal, NOT the second-order shear response, NOT
+training-data volume.  What is established positively: BFD's template-sum prior
+is healthy on the same faint targets where the flow inverts (Fisher ratio +1.26
+against -0.03), and a flux window whose collar clears `Mf ~ 1450` gives a stable
+`m1 ~ -0.02`.
+
+### Artifacts
+
+- No code change.
+- Scratchpad: `gapclose.py`.
