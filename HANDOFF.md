@@ -2871,3 +2871,87 @@ is the open design question, and nothing here settles it.
 - No code change.
 - Scratchpad: `composite.py`.  Note `bias.pqr` returns only (Q, R);
   `bias.pqr_full` is the one that also returns `log P`.
+
+## 2026-08-28 (cont.): where the spikiness comes from -- the JACOBIAN, forced
+by heavy-tailed chart coordinates.  Not band-limiting.
+
+### The base coordinates are textbook -- the flow normalises correctly
+
+Catalog pushed to base space through the BULK checkpoint only (`rest.inverse`
+is the data -> base direction; `rest.transform` is not, checked empirically by
+which gives robust sd ~ 1):
+
+| | bulgedisc_v2 | gauss2 | reference |
+|---|---|---|---|
+| `\|z_base\|` p50 / p99 / p99.9 / max | 2.137 / 3.692 / 4.246 / 7.65 | 2.097 / 3.836 / 4.457 / 6.91 | chi_5 p99.9 = 4.42 |
+| per-slot robust sd | 0.996 0.997 0.992 1.195 1.188 | 1.001 1.001 1.004 1.030 1.021 | 1 |
+| frac any slot > 3.09 | 0.0059 | 0.0091 | 0.002 |
+
+Indistinguishable, and bulgedisc has FEWER extreme points than gauss2.  An
+earlier reading in this file of base-space `p99.9 = 113` was the CENTROID flow
+with a handful of outliers and is withdrawn.
+
+### The score is the log-det term
+
+`log p(z) = log p_base(T(z)) + SUM_i log|det J_i|`, so the score splits into
+`-(dT/dz)^T T(z)` and `grad_z SUM log|det|`:
+
+| | base pullback p50 | log-det p50 | total p50 |
+|---|---|---|---|
+| bulgedisc_v2 | 24.17 | **20.53** | 18.91 |
+| gauss2       |  7.88 | **2.51**  |  6.36 |
+
+The log-det term is **8x** larger; the two partially cancel, which is why the
+total is below the base part.  And by concentration bin the score climbs
+8.91 -> 14.72 -> 35.01 -> 89.72 -> 233.65 while `|z_base|` moves only
+2.249 -> 3.191: **the score grows 26x while the base position grows 1.4x**, so
+all of the growth is in the Jacobian, none in where the point lands.
+`corr(|score|, |z_base|) = 0.370`.
+
+### Why the Jacobian has to be that stiff
+
+The chart coordinates the bulk must Gaussianise:
+
+| slot | bulgedisc skew | bulgedisc exc kurt | gauss2 skew | gauss2 exc kurt |
+|------|----------------|--------------------|-------------|-----------------|
+| 0 log10 Mf | **1.775** | **3.807** | -0.014 | 0.007 |
+| 1 logit u  | 0.184 | 0.110 | 0.275 | -0.468 |
+| 2 logit v  | 0.239 | 0.261 | 0.215 | -0.605 |
+| 3 spin-2   | 0.035 | **3.435** | -0.002 | -0.084 |
+| 4 spin-2   | -0.016 | **3.328** | -0.012 | -0.059 |
+
+gauss2's are already near-Gaussian (|exc kurt| < 0.61); bulgedisc's are heavily
+SKEWED in flux and heavy-TAILED in ellipticity.  The bulk is a stack of AFFINE
+MAF steps (`Spin0AutoregressiveLayer` loc + `_bounded_log_scale`,
+`Spin2CouplingLayer` shared scale -- no splines), and an affine map can only
+Gaussianise a heavy tail by varying its scale rapidly.  `grad log|det| =
+-grad SUM ls` IS that rate.  The stiffness is the price of compressing heavy
+tails with affine maps, and the score inherits it.
+
+Note the two heavy slots are exactly what the real-data retune introduced: the
+flux power law spanning 3.5 decades, and the `|e|` marginal widened to match
+DES/COSMOS (2026-08-27 entries).
+
+Worth noting the near-ceiling coordinates (slots 1 and 2) are NOT the heavy
+ones -- the score's correlation with `v` is real but `v` is a correlate of
+faintness, not the cause.  The earlier reading that the chart's logit stretch
+at the ceiling was to blame is not supported by this.
+
+### What this implies
+
+The defect is a BASE / TRANSFORM-FAMILY mismatch, not a density-fit problem and
+not something to fix by smoothing the density.  Structural options, none tested
+and none carrying a tuned bandwidth:
+
+1. A heavier-tailed base (e.g. Student-t) so the transport does not have to
+   compress a kurtosis-3.8 coordinate into a Gaussian at all.
+2. A chart that pre-Gaussianises slot 0 the way the logit already handles the
+   two size ratios -- the flux power law is the largest single offender
+   (skew 1.775).
+3. A transform family that can absorb tails without a steep scale.
+
+### Artifacts
+
+- No code change.
+- Scratchpad: `spikesrc.py`.  Note `Invert(Chain(bulk)).inverse` is the
+  data -> base direction, not `.transform`.
