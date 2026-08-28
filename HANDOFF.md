@@ -2653,3 +2653,73 @@ population that piles up against the point-source limit is not mapped to
 - Scratchpad: flow-vs-catalog mass ratios near both ceilings, the
   bulk/Sigma_X=0/Sigma_X-real `log_prob` split, the lensed-template ceiling
   check, and the selected-sample composition table.
+
+## 2026-08-28 (cont.): dropping the off-chart rows is a NO-OP -- and the
+previous entry's inference from `log p = -4892` was wrong
+
+Tried the fix the previous entry proposed and `_safe_logit`'s docstring argues
+for: instead of clipping a transport whose base point leaves the chart, give
+that row zero density.  Implemented in `CentroidMarginalize.transform_and_log_
+det` as `jnp.where(on_chart(_transport(...)), log_det, -inf)` -- applied to the
+LOG-DET, not the output, so `y` stays finite and the `-inf` is a g-INDEPENDENT
+additive constant (zero weight in `log_conv_is`'s logsumexp, zero gradient, no
+0 * inf).
+
+Rerun of the identical configuration (2000 g = 0 targets, S = 8192, alpha 0.5,
+seed 12345):
+
+| | clip (before) | -inf drop (after) |
+|--------------------------|---------|---------|
+| bulgedisc_v2 `sum R11`   | +89793  | +88006  |
+| bulgedisc_v2 Fisher ratio| -0.272  | -0.278  |
+| gauss2 `sum R11`         | -73601  | -73578  |
+| gauss2 Fisher ratio      | +0.958  | +0.958  |
+
+**No change.**  The clip fires often -- 7.8% of `bulgedisc_v2` targets' own
+transports leave the chart (3.3% for gauss2), 2.2% of in-domain kernel draws
+do, and 40.7% of targets have at least one such draw (32.8% for gauss2) -- and
+it makes no difference, because `log p ~ -4892` ALREADY underflows to exactly
+zero weight in float32.  Replacing zero with zero.
+
+### Correcting the previous entry
+
+It concluded that the clipped rows "survive `sane_targets` and enter the
+ensemble sums as essentially-zero-density galaxies", implying they poison the
+sums.  **They do not.**  They enter with zero weight and contribute nothing.
+The `-4892` measurement was a POINT-DENSITY evaluation on noiseless training
+galaxies, which is not how `bias.py` uses the flow -- it uses it inside a
+weighted logsumexp over kernel draws, where such a row is simply absent.  The
+centroid clip is NOT the cause of the R sign flip.
+
+What that entry established and which still stands: the bulk flow fits the
+ceiling region well (median `log p` rising monotonically -44.9 -> -22.9 as
+`v -> 1`, and identical at `Sigma_X = 0`), and the centroid layer at the real
+`Sigma_X` collapses the POINT density there.  The collapse is real; its
+consequence for Q and R is nil.
+
+The change was REVERTED: it costs an extra `_transport` per draw in the hot
+path (`transform_and_log_det` runs inside `log_conv_is` for every draw) and
+buys nothing measurable.  `tests/test_centroid.py` 12/12 after the revert.
+
+Also note the user's objection, which is correct and is why the alternative was
+not attempted: `v_out < 1` is NOT guaranteed by anything, so bounding the
+transport to enforce it would be inventing a constraint rather than restoring
+one.
+
+### What is still unexplained
+
+The R sign flip at the faint/unresolved end.  Not the centroid approximation's
+magnitude, not its clip, not the selection machinery, not ESS/MC, not the
+second-order shear response, not training-data volume.  The flow's SAMPLING
+deficit near the ceilings (flow/catalog mass ratio 0.51 at 0.98, 0.20-0.25 at
+0.99) has not been attributed -- it was measured at the real `Sigma_X`, so it
+could be the centroid layer's generative direction rather than the bulk, and
+that split has not been made.  That is the obvious next measurement: repeat the
+flow-vs-catalog mass comparison with `Sigma_X = 0`, where the bulk is known to
+fit.
+
+### Artifacts
+
+- No net code change (the experiment was reverted).
+- Scratchpad: `dropclip.py`, which reports the clip rates and the before/after
+  Fisher ratios.
