@@ -2955,3 +2955,105 @@ and none carrying a tuned bandwidth:
 - No code change.
 - Scratchpad: `spikesrc.py`.  Note `Invert(Chain(bulk)).inverse` is the
   data -> base direction, not `.transform`.
+
+## 2026-08-28 (cont.): capacity is a hard null, and a knob-free route --
+Fisher scoring on a cross-fit OPG metric instead of the broken R
+
+### More layers/width/depth: NULL, as the decomposition predicted
+
+`grad log|det J| = grad log p - J^T grad log p_base` is fixed once the DENSITY
+is fixed, so architecture can only move it by changing the fitted density --
+and the density already matches the template sum to 0.01 nats.  Tested anyway,
+bulk only, 20000 steps, same data and seed:
+
+| | held-out NLL | score p50 at the Mf 900-1100 peak |
+|---|---|---|
+| L8 W64 D2 (current) | 38.9748 | 36.50 |
+| L16 W128 D3 | 38.9709 | 37.13 |
+
+4x the parameters and 3.4x the training time buys **-0.004 nats** and leaves
+the score marginally HIGHER.  Every flux bin agrees within ~3%.  Together with
+the retrain null (`log P` already right) this closes the "train bigger/longer"
+direction on this population.
+
+### Where the stiffness actually sits: slots 1 and 2, at the flux TURNOVER
+
+Per-slot decomposition of the score, `bulgedisc_v2`:
+
+| Mf bin | \|score\| p50 | slot0 | slot1 | slot2 | spin2 | slot0 share of q^2 | dlnN/dlog10Mf |
+|--------|---------------|-------|-------|-------|-------|--------------------|---------------|
+| < 700       | 14.83 | 7.27 |  7.87 |  6.70 | 0.90 | **0.495** | **+22.3** |
+| 700-900     | 30.54 | 3.47 | 19.06 | 17.91 | 2.52 | 0.164 | +22.1 |
+| **900-1100**| **36.56** | 1.65 | **25.92** | **24.61** | 3.36 | **0.001** | **-0.13** |
+| 1100-1300   | 27.14 | 1.22 | 19.54 | 18.48 | 2.69 | 0.000 | -2.34 |
+| 3000-5000   | 14.53 | 1.12 | 10.46 |  9.87 | 1.59 | 0.000 | -1.80 |
+
+This REFUTES "the flow cannot learn the steep faint-end die-off".  At the score
+peak slot 0 carries 0.1% of the squared score; it is slots 1 and 2 (the logit
+size and concentration coordinates) at 25.9 and 24.6.  And the peak sits where
+the flux marginal is FLAT (`dlnN/dlog10Mf = -0.13`, the turnover), not where it
+is steep.  In the genuine die-off (Mf < 900, slope +22) slot 0 DOES carry the
+score (share 0.50 and 0.16) exactly as that hypothesis predicts -- but the total
+score there is LOWER and those bins hold 9.6% of the catalog.  gauss2's slots 1
+and 2 are flat at ~1.9-2.1 everywhere, a 13x gap.
+
+Since slots 1 and 2 have near-Gaussian MARGINALS (excess kurtosis 0.11, 0.26),
+this is CONDITIONAL structure: `p(z1|z0)` and `p(z2|z0,z1)` must swing hard as
+flux crosses the turnover.  By flux, the score is 30.5 at S/N 7.8-10, peaks at
+36.6 at S/N 10-12.3, and falls monotonically to 9.6 above S/N 111; gauss2 is
+FLAT at 5.9-7.2 across its whole range including its faintest bin at S/N 7.4,
+so this is not a depth effect -- at matched S/N ~ 10 it is 36.6 against 6.3.
+
+### A knob-free route: Fisher scoring, not Newton
+
+`bias.ghat` takes a Newton step `ghat = -(SUM r)^-1 SUM q`, i.e. it consumes
+the one quantity verified BROKEN while `SUM q` is verified right (corr 0.896
+against the template sum, 0.983 on gauss2).  Fisher scoring solves the same
+likelihood equation with the outer-product (BHHH/OPG) metric,
+
+    ghat = (SUM q q^T)^-1 SUM q
+
+which has no free parameter and is positive-definite by construction.  On the
+cached 20000-target run:
+
+| | Newton (r) | OPG (q q^T) |
+|---|---|---|
+| bulgedisc unwindowed | **-1.27730** | **-0.15594** |
+| bulgedisc flux > 1600 | -0.03662 | -0.17674 |
+| gauss2 unwindowed | -0.00698 | **-0.03605** |
+| gauss2 flux > 2200 | -0.00739 | -0.03469 |
+
+Unwindowed bulgedisc goes from -128% to -16% with no window and no parameter.
+OPG carries its own **-3.5% bias on gauss2**, stable across windows -- and that
+bias is the standard noise inflation `E[qhat qhat^T] = q q^T + Var[eps]`, which
+overestimates the information and shrinks `ghat`.  Confirmed by its S scaling
+(3000 targets, seed 4242):
+
+| | S = 8192 | S = 32768 |
+|---|---|---|
+| gauss2 Newton | -0.00391 | -0.00907 |
+| gauss2 OPG | -0.01187 | **-0.00979** |
+| bulgedisc Newton | -1.27184 | -1.28456 |
+| bulgedisc OPG | -0.22423 | **-0.19192** |
+
+gauss2's OPG converges onto Newton's answer as S grows, so the excess is
+O(1/S), not a modelling error.
+
+**That makes it exactly removable with no tuned constant**: cross-fit the outer
+product over disjoint draw sets, `E[qhat^(A) qhat^(B)T] = q q^T` when A and B
+are independent, so the `eps eps^T` term vanishes in expectation rather than
+being subtracted by a fitted correction.  `pqr_streamed` already stores
+per-chunk `B/A` values for its delete-one jackknife, so the independent halves
+are in hand.
+
+Caveats, unresolved: OPG equals Newton only for a correctly specified model, so
+this sidesteps the broken `R` rather than fixing the density; bulgedisc's OPG
+is still -0.19 at S = 32768 and falling, and whether cross-fitting takes it to
+zero is untested; and `ghat`'s selection branch assembles `R` from `-SUM r`
+plus the eq. (40) terms, so it would need the OPG form threaded through
+consistently.
+
+### Artifacts
+
+- No code change.  Scratchpad: `byflux.py`, `whichslot.py`, `capacity.py`
+  (which also writes two bulk checkpoints), and the OPG comparisons.
