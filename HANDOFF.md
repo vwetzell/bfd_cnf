@@ -2800,3 +2800,74 @@ against -0.03), and a flux window whose collar clears `Mf ~ 1450` gives a stable
 
 - No code change.
 - Scratchpad: `gapclose.py`.
+
+## 2026-08-28 (cont.): flow vs template sum on the COMPOSITE -- log P is right,
+R is not.  A retrain is ruled out.
+
+Every diagnostic before this checked COMPONENTS (marginals, dm/dg, d2m/dg2,
+transport magnitude, log-det, ESS) and all of them pass in the failing region,
+which is why "train longer" kept looking plausible.  This compares the thing
+`bias.py` actually consumes -- `log P(M|g)`, `Q`, `R` at g = 0 -- target by
+target against BFD's template sum, both as absolute densities in 5-D moment
+space so there is no free constant.
+
+200 targets per flux group, S = 8192, alpha 0.5, 100000 templates:
+
+| population / bin | quantity | flow | templates | median diff | corr |
+|------------------|----------|------|-----------|-------------|------|
+| bulgedisc faintest 20% | log P | -37.2367 | -37.2822 | +0.0099 | **0.995** |
+| bulgedisc faintest 20% | Q1    |   0.0699 |   0.0722 | +0.0378 | 0.896 |
+| bulgedisc faintest 20% | R11   | **+56.54** | **-3.83** | +60.33 | **0.319** |
+| bulgedisc faintest 20% | sum R11 | +3.155e4 | -1024 | | |
+| bulgedisc middle 20%   | log P | -39.5099 | -39.4899 | -0.0370 | 0.989 |
+| bulgedisc middle 20%   | R11   | -11.7675 |  -8.6440 | -0.8544 | 0.085 |
+| bulgedisc middle 20%   | sum R11 | -1887 | -2984 | | |
+| gauss2 faintest 20%    | log P | -42.7795 | -42.7171 | -0.0167 | 0.995 |
+| gauss2 faintest 20%    | Q1    |   0.2273 |   0.0958 | +0.0016 | 0.983 |
+| gauss2 faintest 20%    | R11   |  -9.2728 |  -8.9939 | -0.1617 | 0.516 |
+| gauss2 faintest 20%    | sum R11 | **-1956** | **-1976** | | |
+| gauss2 middle 20%      | R11   | -32.4002 | -32.2882 | +0.1688 | 0.965 |
+| gauss2 middle 20%      | sum R11 | -7320 | -7381 | | |
+
+**The flow's `log P` is right** -- correlation 0.995 and a median offset of 0.01
+nats against an exact template sum.  `Q` is broadly right (0.896).  `R` is
+wrong in sign and magnitude, correlation 0.32.  The gauss2 control reproduces
+the template sum's `R` to **1%** (sum -1956 vs -1976; middle bin -7320 vs
+-7381, corr 0.965), so the comparison itself is sound and the flow CAN get R
+right when the population allows it.
+
+(The bulgedisc BRIGHTEST row is the template sum failing, not the flow:
+`sum R11 = -2.67e8`, the known sparse-coverage breakdown at a flux tail
+reaching 2.7e6.  Disregard it; the flow is the trustworthy side there.)
+
+### Consequence: a retrain is not the answer
+
+Training drives `log P`, and `log P` already matches an exact reference to 0.01
+nats in the bin where the estimator inverts.  More steps or a different
+schedule optimises a quantity that is already correct.  That is consistent with
+the three nulls already on record -- the 23-run capacity sweep, the 10x data
+retrain, and shear steps past the 60k plateau -- none of which moved the bias,
+and it explains WHY they were null rather than leaving it a coincidence.
+
+### What the defect actually is
+
+`R = E_w[d2 log p] + Var_w[d log p]` over the importance-weighted draws.  The
+flow reproduces the integral (`log P`) and the first moment of the score (`Q`)
+but not the second.  The measured bulk score is 18-34 in z units against
+gauss2's 6.4, while the template sum's score is BOUNDED by construction --
+its bandwidth is exactly the noise covariance C, so it cannot carry structure
+finer than the kernel it is convolved with.  The flow can and does, and the
+weighted VARIANCE of that structure is what inflates R positive.
+
+So this is a SMOOTHNESS problem, not a fit problem.  That returns to the
+band-limiting idea, previously set aside because `eps` was a free knob -- but
+now with a knob-free statement of the target: the flow's score across the
+kernel should behave like the template sum's, whose bandwidth is set by C
+rather than chosen.  How to impose that without introducing a tuned parameter
+is the open design question, and nothing here settles it.
+
+### Artifacts
+
+- No code change.
+- Scratchpad: `composite.py`.  Note `bias.pqr` returns only (Q, R);
+  `bias.pqr_full` is the one that also returns `log P`.
