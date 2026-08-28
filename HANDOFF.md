@@ -2110,3 +2110,187 @@ layer and not the shear layer.  Concretely, in rough order:
   comparison, per-target Q/R dumps, the S scan, the `Mr/Mf` grid scans, the
   `R11` decomposition, the flux/`Mr/Mf`-binned `dm/dg` check, the bulk-score
   profile, and the second-order ablation.
+
+## 2026-08-28 (cont.): the flow's density is the defect, not the population --
+BFD's own template-sum prior is healthy on exactly the targets the flow fails,
+and selection cannot be used to escape it
+
+Follow-up to the entry above, on the user's instruction that `bulgedisc_v2` is
+the realistic population and the METHOD must adapt to it.  Also corrects one
+of that entry's own tests.
+
+### Correction: the S scan was not an independent convergence test
+
+The previous entry claimed `sum R11` "flat over a 16x range in S".  That used
+ONE seed, and `pqr_streamed` seeds chunk `c` as `seed + 7919*c`, so S = 2048 /
+8192 / 32768 are NESTED draw sets, not independent ones.  Redone with an
+independent seed per point:
+
+| proposal | S = 8192 | 32768 | 131072 |
+|----------|----------|-------|--------|
+| alpha 0.5 | +59704   | +51771 | +51643 |
+| alpha 1.0 | +2074    | -3366  | +6016  |
+
+So the conclusion SURVIVES, and is now properly grounded: `alpha 0.5` is
+converged by S = 32768, `alpha 1.0` is not converged at any of these (matching
+the `alpha1-ess-does-not-scale` memory).  Four independent seeds at S = 8192,
+alpha 0.5, on 500 faint targets: +49565 / +62799 / +49685 / +54062 --
+reproducible, so this is estimator BIAS-free convergence to a positive R, not
+variance.  gauss2 over the same seeds: -8606 to -8907, ratio 0.945-0.978.
+
+### The sign constraint: what it actually rests on, and it is intact
+
+`sum_i r_i` is the ensemble log-likelihood Hessian.  It is forced negative only
+through `E[q^2] = E[-r]`, which needs (a) `Z(g) = INT P(M|g) dM = 1` for all g
+and (b) the targets to be drawn from the model.  (a) is what a normalising flow
+guarantees -- but only while every layer stays injective, because
+`transform_and_log_det` uses `slogdet(...)[1] = log|det|` and will happily keep
+going through a fold.
+
+Both checked:
+
+- **The shear map DOES fold.**  `det(d unshear/dz) <= 0` for 0.07-0.11% of
+  noisy targets at `g = +/-0.02` (0.00% of noiseless training galaxies, and
+  exactly 1.0 at g = 0 in both populations, as it must be).  The folded rows
+  sit near the ceiling -- median `Mr/Mf` 3.63, `z1` 2.81.  bulgedisc's folds are
+  far more violent than gauss2's (min det -81.6 vs -2.8) but occur at the same
+  RATE, so this is not the discriminator.
+- **Normalisation survives them.**  `Z(g)` estimated with BOUNDED weights
+  (defensive mixture `q = (p_0 + p_g)/2`, so `p_g/q <= 2`; the naive
+  `E_{p0}[p_g/p_0]` has unbounded weights and diverges -- its max log-ratio is
+  +1128 on bulgedisc and +607699 on gauss2, so do not use it):
+
+  | g1 | bulgedisc_v2 Z | gauss2 Z |
+  |------|----------------|----------|
+  | 0.000 | 1.00000 (control) | 1.00000 (control) |
+  | 0.005 | 0.99984 | 1.00000 |
+  | 0.020 | 0.99946 | 1.00011 |
+  | 0.040 | 0.99968 | 1.00009 |
+
+  1 to within 5e-4.  The folds are too rare to move the integral.
+
+So the mechanical half of the identity holds, and the zero crossing IS genuine
+model misspecification.  Worth stating plainly because it is easy to expect a
+hard sign constraint here: there is none per target (P is a Gaussian mixture in
+g, not log-concave), and the ensemble constraint is an expectation that assumes
+the model is right.
+
+### Where the defect lives: the Mc/Mr ceiling, not the flux floor
+
+The bulk score, on each population's own noiseless training galaxies, sorted by
+the slot-2 chart coordinate `v = Mc / (POINT_SOURCE_MC * Mr)`:
+
+| v | bulgedisc_v2 score p50 | gauss2 score p50 |
+|---------------|------|------|
+| < 0.80        |  8.9 |  5.8 |
+| 0.80 - 0.90   | 14.7 |  6.2 |
+| 0.90 - 0.95   | 35.0 |  7.4 |
+| 0.95 - 0.99   | 96.3 | 14.3 |
+| > 0.99        | 355  | none |
+
+Below v = 0.80 bulgedisc_v2 is gauss2-like.  It has **15.5%** of its training
+population (17.3% of its noisy targets) above v = 0.95, against gauss2's 1.0%,
+and reaches v = 0.998 where gauss2 stops at 0.977.  The flux dependence
+reported in the previous entry is a CORRELATE of this: the top 1% by score have
+median Mf 1037, Mr/Mf 3.556, v 0.970.  This supersedes the "flux floor / cliff
+in log10 Mf" reading -- the flux floor was the wrong suspect.
+
+### Selection is not an escape -- eq. (40) re-imports the error
+
+Re-derived the window for this population (the committed `FLUX_WINDOW =
+(2500, 50000)` was calibrated when the median flux was 5090; it is now 1770).
+Fisher ratio on 6000 g=0 targets, scanning the cut:
+
+| S/N cut | Mf cut | kept | sum -R11 | ratio |
+|---------|--------|------|----------|-------|
+| none    | -      | 95%  | -2.38e5  | -0.28 |
+| 10      | 896    | 85%  | -1.19e5  | -0.53 |
+| 12      | 1076   | 73%  | +9533    | +6.15 |
+| 15      | 1345   | 58%  | +4.16e4  | +1.27 |
+| 20      | 1793   | 45%  | +3.84e4  | +1.13 |
+
+`sum -R11` passes through ZERO between S/N 10 and 12, which is why the ratio
+poles there.  gauss2 sits at 0.99-1.01 for EVERY window including no cut.
+Cutting on `v` instead does NOT work (at S/N 0, v < 0.90 keeps 60% and still
+gives ratio +2.55, having crossed zero); at S/N >= 15 the ratio is 1.22-1.26 at
+every v cut.  So flux/S-N is the operating selection and v is the correlate.
+
+Full measurement, 20000 targets, `--window-size 2.2 3.5 --window-flux 1345 1e9`:
+
+```
+  windowed, uncorrected: m1 = -0.01649 +/- 0.00486
+  windowed, corrected:   m1 = +0.87631 +/- 0.03566
+  unwindowed:            m1 = -1.28003 +/- 0.01342
+  quintiles: q1 -1.027, q2 -1.167, q3 +0.100, q4 -0.024, q5 -0.006
+```
+
+The cut alone gives an ordinary-looking 1.6% bias.  **The eq. (40)/(45)-(46)
+correction then takes it to +0.88**, and this is not a bug in the correction:
+`P_s = 0.5486` and `Q_s` consistent with zero are both sane, and the terms came
+from `--window-terms templates`, i.e. the true population, not the flow.  The
+correction's job is to add back what the CUT galaxies would have contributed --
+which is precisely the faint population the flow gets wrong.  So a selection
+cannot be used to dodge a density error; eq. (40) puts it straight back.  The
+windowed-uncorrected number is only the shear of the selected subpopulation.
+
+### The decisive experiment: BFD's own prior on the same targets
+
+The paper's prior (eq. 38) is a template sum, `P(M|g) = (1/N) SUM_G
+N(M - m_G(g); C)` -- a kernel density estimate whose bandwidth IS the noise
+covariance, so its score is bounded by construction and no fitted-density spike
+can exist.  Its Q and R are exact autodiff of that sum: no flow, no importance
+sampling, no proposal, no ESS.  100000 templates, 400 targets per bin:
+
+| targets        | bulgedisc_v2 sum -R11 | ratio | gauss2 sum -R11 | ratio |
+|----------------|-----------------------|-------|-----------------|-------|
+| faintest 20%   | **+1971**             | +1.26 | +4048           | +1.15 |
+| middle 20%     | +4115                 | +0.96 | +14943          | +0.96 |
+| brightest 20%  | +4.26e8               | +2.3e5| +92791          | +1.18 |
+
+**At the faint end the template sum is healthy (+1971, ratio +1.26) exactly
+where the flow gives -9.3e4 and ratio -0.03.**  The population is not
+intrinsically pathological and the noise level is not too deep -- the fitted
+density is the defect.
+
+(bulgedisc's BRIGHTEST bin breaks the template sum instead, ratio 2.3e5: 100000
+templates cannot cover a flux tail that reaches 2.7e6, so the KDE has no
+support out there.  That is the failure mode the flow exists to fix, and it is
+a real argument for the flow -- just not at the faint end.)
+
+### What this means for adapting the method
+
+The flow has to reproduce, at the faint/unresolved end, what the template sum
+does there.  The property the template sum has and the fitted flow lacks is
+that its density is band-limited to the noise scale: BFD's prior is never
+sharper than C, so `grad log P` is bounded, whereas the flow is free to put
+structure at any scale and does (score p99 ~ 1e5 in z units, and identical on
+the 1M retrain, so it is structural rather than overfitting).
+
+Directions, none of them yet built:
+
+1. Make the fitted prior no sharper than the template sum.  Note that "no
+   sharper than C" is not a tuned bandwidth -- it is the bandwidth BFD's own
+   prior already has.  A noise-split (`train on m + N(0, eps C)`, evaluate with
+   kernel `(1-eps)C`) is exact in `P(M|g)` for ANY eps and in a pre-test cut the
+   faint-end score p99 from 282878 to 154 at eps = 0.02 while barely moving
+   gauss2 -- but eps is a free parameter, and the user has ruled that out as
+   tuning.  Any version of this needs eps pinned by an argument, not chosen.
+2. Attack the chart instead.  The score climbs with `v -> 1`, i.e. against
+   `POINT_SOURCE_MC`.  A population that genuinely reaches v = 0.998 sits at
+   `z2 = +6.2` in a logit chart, in a tail with almost no training mass.  A
+   smooth population under a logit link would give a BOUNDED score there
+   (`grad_z log p -> -1`), so the measured 355 says the flow is not
+   representing that tail, not that the chart is wrong in principle.  Worth
+   checking whether the z2 marginal is actually fit out there before
+   redesigning anything.
+3. Use the template sum as the supervision target for the density itself, the
+   way `--deriv-weight` already uses bfd's exact derivatives -- the faint-end
+   `log P` from the template sum is computable and correct.
+
+### Artifacts
+
+- No code changed.  All measurement.
+- Scratchpad (not committed): the window/Fisher scans, the independent-seed and
+  alpha convergence scans, the fold determinant test, the bounded-weight
+  normalisation test, the score-vs-v localisation, and the template-sum Q/R.
+- `.session/next_prompt.md` updated.
