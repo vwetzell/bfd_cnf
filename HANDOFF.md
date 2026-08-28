@@ -2552,3 +2552,104 @@ matters relative to the region being avoided.)
 - No code change in this entry.
 - Scratchpad: the `R_s` boundary decomposition, the flux-collar sweeps for both
   populations, and the collar-vs-spread calculation.
+
+## 2026-08-28 (cont.): how far off at the point-source limit -- the CENTROID
+layer's `_safe_logit` clip, firing on 2.2% of the population
+
+Question: how well does the flow match the data as the point-source limits are
+approached?  (Above them it is exactly zero by construction -- `raw_from_
+standard` applies `POINT_SOURCE * sigmoid(z1) * Mf` -- so only the approach
+from below is at issue.  Confirmed too that `shear.lens`'s Taylor-lensed
+templates never cross either ceiling: 0/100000 at g = 0.04, and `max u`
+actually FALLS with shear, 0.99753 -> 0.99740.  So both `selection_terms`
+branches already satisfy "P = 0 above the limit"; no constraint is owed there.)
+
+### The deficit, measured
+
+Flow samples vs the training catalog, mass per bin, ratio flow/catalog:
+
+| bin | bulgedisc_v2 u | bulgedisc_v2 v | gauss2 v |
+|-----|----------------|----------------|----------|
+| 0.90-0.95 | 1.017 | 1.028 | 0.919 |
+| 0.95-0.98 | 0.898 | 0.890 | 0.735 |
+| 0.98-0.99 | **0.507** | **0.509** | (empty) |
+| 0.99-0.995| **0.203** | **0.254** | (empty) |
+| 0.995-1.0 | 0.207 | 0.184 | (empty) |
+
+Matches to 1-3% up to 0.95, then loses half the mass by 0.98 and ~75% by 0.99.
+`gauss2` shows the same qualitative deficit but holds only ~1% of its catalog
+above 0.95 and never reaches 0.98; `bulgedisc_v2` holds **15.4%** above 0.95
+and 2.2% above 0.98.  Same defect, 15x the exposure.
+
+### It is NOT the bulk fit -- it is the centroid layer's clip
+
+`log_prob` on the flow's OWN training galaxies, split three ways:
+
+| v bin | n | bulk only | centroid, Sigma_X = 0 | centroid, Sigma_X real | frac v_out >= 1 |
+|-------|---|-----------|------------------------|-------------------------|-----------------|
+| < 0.80      | 19461 | -44.87 | -44.87 | -44.86    | 0.0000 |
+| 0.80-0.90   | 37956 | -39.50 | -39.50 | -39.55    | 0.0000 |
+| 0.90-0.95   | 27122 | -34.25 | -34.25 | -35.90    | 0.0000 |
+| 0.95-0.98   | 13248 | -29.72 | -29.72 | -49.61    | 0.0000 |
+| 0.98-0.99   |  1869 | -25.61 | -25.61 | **-653.91**  | 0.0054 |
+| 0.99-1.00   |   344 | -22.87 | -22.87 | **-4891.54** | **0.7209** |
+
+The bulk flow fits the ceiling region PERFECTLY -- `log p` rises monotonically
+-44.9 -> -22.9 as `v -> 1`, exactly as a well-fit density should, and at
+`Sigma_X = 0` the centroid layer is the identity and reproduces it bit for bit.
+Switching on the real `Sigma_X` collapses it by 4800 nats.
+
+Mechanism: `_transport`'s data -> base direction pushes `v = Mc/(rc Mr)` PAST
+1, where `standard_from_raw`'s `_safe_logit` hard-clips.  `frac v_out >= 1` is
+0.54% in the 0.98-0.99 bin and **72.1%** in the 0.99-1.00 bin.  A maximum-
+likelihood fit could not have left 0.34% of its own training data at
+`log p = -4892` (that alone is 16.6 nats of a ~35 nat mean NLL), which is what
+first said the bulk was not the culprit.
+
+`_safe_logit`'s docstring anticipates exactly this and argues the affected rows
+should be DROPPED -- "the right outcome for a target this ansatz genuinely
+cannot represent, not a bug to paper over", on the grounds that the clip zeroes
+the gradient so the `jacfwd` log-det comes back `-inf` and `bias.py` discards
+the row.  In practice they are NOT dropped: the clip yields a FINITE
+`log p ~ -4892`, so the rows survive `sane_targets` and enter the ensemble sums
+as essentially-zero-density galaxies.
+
+### Relation to the earlier "centroid falsified" entry
+
+That entry measured the transport's MAGNITUDE -- `trace(P)` p50/p99
+0.005/0.038, round-trip residual, log-det spread over kernel draws -- and found
+`bulgedisc_v2` milder than `gauss2` in every column.  **That stands.**  What it
+never tested was whether the CLIP guarding the ansatz's failure mode fires.  It
+fires on 2.2% of this population, concentrated exactly where the Fisher ratio
+inverts and where the top-20 R-dominating targets sit (`Mc/Mr` 6.0-7.3, i.e.
+`v` 0.90-1.10).  So the Gaussian-in-k approximation's SIZE is not the problem,
+as the user said; its failure HANDLING is.
+
+### Why this explains the size-window result
+
+`Mr/Mf = 3.5` is `u = 3.5/POINT_SOURCE = 0.948` -- the size window's upper edge
+sits exactly at the knee where the fit starts degrading, so its boundary collar
+is in the damaged region while its SAMPLE is clean (the cut removes 100% of
+`u > 0.95` by construction, yet 8.0% of the kept targets still have
+`v > 0.95`).  The flux window keeps 5-8% of `u > 0.95` and `v > 0.95` targets
+and still works, because its boundary is in a well-modelled place.  That is the
+boundary-flux argument in its sharpest form: what matters is where the BOUNDARY
+sits, not whether the sample contains badly-modelled galaxies.
+
+### Next
+
+The concrete defect is now a handful of rows whose centroid transport leaves
+the chart.  Options, none tested: honour the docstring's own intent and make
+those rows genuinely non-finite so they are dropped (changes which targets are
+measured, and 2.2% is not negligible); bound the transport so `v_out < 1` by
+construction the way `_transport`'s `sign < 0` branch already bounds
+`trace(P)`; or reconsider the chart at the ceiling as the user suggested, so a
+population that piles up against the point-source limit is not mapped to
+`z = +inf`.
+
+### Artifacts
+
+- No code change in this entry.
+- Scratchpad: flow-vs-catalog mass ratios near both ceilings, the
+  bulk/Sigma_X=0/Sigma_X-real `log_prob` split, the lensed-template ceiling
+  check, and the selected-sample composition table.
