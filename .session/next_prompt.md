@@ -1,144 +1,100 @@
-Read HANDOFF.md's last several sections in full before doing anything else
--- everything from "2026-08-27: the centroid layer is now an exact,
-zero-parameter analytic transport" through the final entry, "'still not
-good enough' / 'keep trying the bulge disc' -- a third stale target, then
-a log-normal sigma closes most of the remaining gap". Branch:
+Read HANDOFF.md's last section in full before doing anything else --
+"2026-08-28 (cont.): the centroid approximation is NOT the cause -- the
+ensemble R has flipped sign at the faint end". Branch:
 `feat/centroid-shear-conditioning`.
 
 ## Where things stand
 
-Last session did two things, in order:
+The `m1 ~ -1` catastrophe on `bulgedisc_deep_v2` is diagnosed down to a
+mechanism, but not fixed.
 
-1. Landed the analytic (zero-free-parameter) centroid marginalisation
-   layer in `models/centroid.py` and confirmed it generalises from
-   `gauss2` to `bulgedisc` (see the two 2026-08-27 entries on that).
-2. Spent the rest of the session retuning `../bfd_cnf_imsims/imsims/
-   sim.py`'s `bulgedisc` population against real DES/COSMOS templates
-   (`~/Documents/BFD_cNF/summary_templates_new.fits`), via the corner
-   plot in `dev/check_bulgedisc_vs_real.py`. This was NOT asked to reach
-   a specific number -- the user's calls throughout were "still not good
-   enough" / "keep trying" / "close enough", so read the last several
-   HANDOFF entries to understand what "close enough" actually landed on:
-   `Mr/Mf` median 3.14 (target 3.50), std 0.43 (target 0.47), median
-   `|e|` 0.090 (target 0.089, near-exact). NOT a perfect match, but the
-   user was satisfied enough to move on to this task.
+**The previous session's centroid-approximation hypothesis is FALSIFIED and
+the user's disagreement was correct.** Measured directly: the analytic
+transport's `trace(P)`, its round-trip residual, its pre-cap `|dz|` and its
+log-det spread over kernel draws are all comparable to -- in the tail, milder
+than -- `gauss2_deep`'s. Do not revisit it.
 
-**`../bfd_cnf_imsims` has UNCOMMITTED changes** (`fit_gauss2_p0.py`,
-`imsims/sim.py`, `tests/test_sim.py`) -- `git status`/`git diff` there
-before doing anything else so you know exactly what changed. Consider
-whether to commit them (ask the user if unsure; they were never asked
-for this session, only edited).
+**What is actually wrong:** the ensemble `R` has the wrong SIGN. The Fisher
+identity `sum q^2 / sum(-r)` is `+0.958` for `gauss2_deep` and `-0.272` for
+`bulgedisc_deep_v2`. `ghat = -R^-1 Q` off a wrong-signed R is exactly the
+"tight `m1` pinned near -1" symptom. Use this ratio as the health check from
+now on: it needs one arm rather than three, it is far cheaper than `m1`, and
+it localises the failure.
 
-**Every existing `bulgedisc`-population artifact on disk is now STALE**
-against the retuned population: `../bfd_cnf_imsims/data/moments.fits`
-(if it's the bulgedisc training set), `targets_deep_g0_200k.fits`/
-`targets_deep_g1p02_200k.fits`/`targets_deep_g1m02_200k.fits`,
-`copies_bulgedisc_deep.fits`, and every `flows/*bulgedisc*.eqx`
-checkpoint (`bulk_bulgedisc.eqx`, `shear_bulgedisc_fresh.eqx`,
-`centroid_bulgedisc_deep_analytic.eqx`). They were trained/rendered
-against the population BEFORE this session's flux/size/ellipticity
-retune. Don't reuse them -- render and train fresh, with new filenames
-so the stale ones stay around for comparison rather than being silently
-overwritten (e.g. `_v2` or a date suffix -- your call).
+**Where:** entirely in the two faintest flux quintiles (`Mf < ~1450`, S/N <
+~16). q3/q4/q5 give +1.02/+1.15/+1.19, as healthy as gauss2's.
 
-## Task
+**Why:** `R` contains `Var_w[score_g]` over the importance-weighted draws, and
+`score_g` scales with `|grad_z log p_bulk|`. That score is 6.4 (median, flat in
+flux) for gauss2 and 18.2 for `bulgedisc_v2`, rising to 33.6 in the faintest
+quintile with a p99 of 483. The retune INVERTED the flux dependence: the old
+bulgedisc's score rose with flux (steepest where the kernel is narrowest,
+harmless); the retuned one's falls with flux, so the density is steepest
+exactly where the noise kernel is widest -- and the retune also moved the
+median flux down 3x, putting most of the catalog there.
 
-Pick up training a new flow on the retuned `bulgedisc` image sims, and
-measure the multiplicative bias on deep (noisy) targets from the SAME
-retuned population. Concretely, in `../bfd_cnf_imsims` then back in
-`bfd_cnf`:
+## Ruled out this session, with numbers (do not re-run)
 
-1. Render a noiseless training catalog: `python -u -m imsims.sim --n
-   <N> --pop bulgedisc --out data/<new-name>.fits` (the last session used
-   `--n 40000` for corner-plot checks; the prior full training run used
-   a much larger N -- check `HANDOFF.md`'s "the analytic transport
-   generalises to bulgedisc" entry, which used
-   `bulk.py train --data moments.fits --steps 20000` at whatever N
-   `moments.fits` was rendered at, and pick something comparable or
-   larger for a real training run, not the 40k smoke-test size).
-2. `bulk.py train --data <new-moments>.fits --steps 20000` (or more --
-   `--steps 20000` was "clean, val nll 40.42" last time this population
-   was trained, but that was the PRE-retune population).
-3. `shear.py train --data <new-moments>.fits --deriv-weight 1e4 --steps
-   60000` -- **`--deriv-weight 1e4` is not optional for this
-   population**, confirmed twice now (`shear.py --help` explains why:
-   NLL alone cannot identify the spin-0 response). Do not skip it or
-   treat it as a tuning knob to search over.
-4. Render deep (noisy) targets at the established depth (`noise_sigma`
-   2.73, image-level noise + `recenter()`, matched +g/-g/g0 triplet) --
-   check `imsims/sim.py`'s `CATALOGS`/`--add-noise`/`--noise-sigma`
-   plumbing and the `bulgedisc_deep` comment block in `bias.py`'s
-   `CATALOGS` dict for the exact recipe (200k targets each of
-   `g1p02`/`g1m02`/`g0` last time).
-5. Render `copies_bulgedisc.fits` fresh (`python -u -m imsims.copies
-   --n <N> --pop bulgedisc --out data/<new-copies-name>.fits`) and run
-   `centroid.py train --copies <...> --flow <...> --init <shear
-   checkpoint>` -- this is a warm-start + `check` only, there is nothing
-   left to train in the centroid layer (zero free parameters); don't
-   wait on a training loop.
-6. Back in `bfd_cnf`: `bias.py --flow <new centroid checkpoint> --pop
-   bulgedisc_deep --samples 8192 --alpha 0.5 --chunk 4096
-   --batch-budget 65536 --n-targets 20000`. **Use `--alpha 0.5`, not the
-   default 1.0** -- confirmed this session and the one before that
-   `--alpha 1.0` is ESS-starved at this noise depth and gives an
-   unreliable, differently-signed `m1` (see
-   `[[bulgedisc-deep-centroid-q2q3-blowup]]` memory / the "q2/q3
-   instability" HANDOFF entry).
+- **ESS / Monte-Carlo bias.** `sum R11` flat over S = 2048/8192/32768
+  (+18477/+21901/+19589). Kernel ESS matches gauss2's (median 153 vs 149).
+- **Ceiling-violating targets alone.** Dropping every `Mr/Mf > POINT_SOURCE`
+  or `Mc/Mr > POINT_SOURCE_MC` target plus a 3% margin still leaves
+  `sum R11 = +4795`. (This also CORRECTS the previous entry's item 4: the top
+  20 by |R| carry 8.9% of `sum |R|`, but the top 20 by SIGNED R11 carry 58%.)
+- **The second-order shear response.** Full ablation at 4000 targets x 3 arms:
+  full -1.28915, no-2nd-spin0 -1.34367, no-2nd-spin2 -1.29118, no-2nd-at-all
+  -1.34654. Every one slightly worse. A clean negative. (A single-point grid
+  scan at `M1 = M2 = 0` looks like it confirms this hypothesis -- it does not
+  survive the ensemble. Do not be fooled by it.)
+- **The shear layer's fit.** `dm/dg` / `d2m/dg2` vs bfd truth in the faint
+  quintiles is 0.4%/1.9%/3.3%/3.1%/4.1% -- the response is fit well exactly
+  where R is wrong.
+- **Training-data volume.** `bulgedisc_v2_1M`'s score profile is identical to
+  the 100k flow's (18.9 vs 18.2 median).
+- **Setup/config differences.** Headers, `cov` vs `noise_sigma^2` scaling,
+  chart constants across all three layers of every checkpoint, and the
+  bulk+shear warm-start graft are all clean -- see the HANDOFF entry.
 
-## What to actually check once you have a number
+## Next steps, in rough priority order
 
-- Report `m1` (and the by-quintile breakdown `bias.py` prints)
-  plainly, with whatever precision the run supports.
-- The PRIOR `bulgedisc_deep` run (against the OLD, pre-retune
-  population) found `m1 = +0.1627 +/- 0.0735`, dominated by q2/q3's
-  near-uninformative variance while q1/q4/q5 were all within ~1sigma of
-  zero -- an unresolved, real anomaly (see
-  `[[bulgedisc-deep-centroid-q2q3-blowup]]`), NOT explained by ESS,
-  T-saturation, or any mechanism chased down at the time. Check whether
-  the SAME q2/q3 instability shows up again on the retuned population,
-  or whether the more realistic size/flux/ellipticity distribution
-  changes which quintiles (if any) are unstable. This is a genuinely
-  open question, not a formality -- the retuned population's `Mr/Mf`
-  distribution is meaningfully different in shape (log-normal-ish, less
-  ceiling-crowded) from what produced the original instability, so it
-  could easily behave differently.
-- `centroid.py check`'s own table (layer shift vs. catalog shift, plus
-  the ellipticity-response ratio) is worth reporting too, the same way
-  the prior `bulgedisc` entry did -- it's the cleaner, lower-noise signal
-  and was "as good as or better than gauss2_deep's" match last time,
-  worth seeing whether that held up through the retune.
-- No window (`--window-size`/`--window-flux`) has ever been established
-  for `bulgedisc_deep`. Establishing one is legitimate follow-up work if
-  the unwindowed number turns out too noisy to interpret (mirroring what
-  `gauss2_deep`'s window took several sessions to land on) -- but don't
-  reach for it reflexively; check whether the retuned population's
-  smoother `Mr/Mf` distribution alone stabilises q2/q3 first.
-
-**Gotcha to avoid:** `bias.py`'s `CATALOGS`/train-data lookup hardcodes
-`"bulgedisc_deep": "moments.fits"` as the default `--train-data` (used
-for the flow's standardisation, and for `--window-terms templates`). If
-you render the new training catalog under a different filename, either
-pass `bias.py --train-data <new-name>.fits` explicitly every time, or
-update that dict entry -- otherwise `bias.py` will silently standardise
-against the OLD, stale `moments.fits` while your flow was trained on the
-new one, which would quietly corrupt the bias measurement rather than
-error out.
+1. **Decide whether the density really is that sharp or the flow is
+   manufacturing it.** Sample `flows/bulk_bulgedisc_v2.eqx` at faint flux and
+   compare its marginals against `moments_bulgedisc_v2.fits`. Look at the
+   flux floor specifically: the catalog has 22% of its galaxies between
+   `Mf = 562` and `1103` above a hard cut near 300 -- a near-discontinuity in
+   `log10 Mf` the flow has to represent as a cliff. The pre-retune population
+   had no such pile-up.
+2. **If the density is genuinely that sharp, the convolution is the problem,
+   not the fit.** The noise kernel at `Mf ~ 900` is `sqrt(cov00) = 89.6`,
+   i.e. +/-10% in flux, straddling that cliff. The retune's flux floor is a
+   rendering choice, not real-sky physics -- ask whether it should be softened,
+   or the depth reconsidered so the kernel does not span it.
+3. **`sane_targets`' `factor = 1000` guard is far too loose for this
+   population** (threshold 22197 against a worst target of 22735, which it
+   therefore keeps). Symptom-catcher, not the fix, but worth revisiting.
+4. **`split_centroid` never peels.** It returns `(flow, None)` for every flow
+   `bulk.build_flow(shear=True, centroid=True)` builds, because those give the
+   layer `cond_dim = 5`. So `bias.py` differentiates through the centroid layer
+   on BOTH populations and the `centroid_transform`/log-det-in-the-weight path
+   is dead code. Not a difference between the populations, but re-check
+   anything whose reasoning assumed the peel was live.
 
 ## Working rules (carried over, still true)
 
-- `shear.py train` on `bulgedisc` needs `--deriv-weight 1e4` -- see
-  above, already learned the hard way twice.
-- `centroid.py train` has nothing to train any more (zero free
-  parameters) -- it warm-starts + runs `check`; don't wait on a training
-  loop for it.
-- `bias.py` on a `_deep` population needs `--batch-budget 65536` or it
-  OOMs the 16GB card; don't run two GPU jobs concurrently.
-- Always use `--alpha 0.5` for `bulgedisc_deep` (see above).
-- `python -u <script>` from the relevant repo root.
-- Any real-data numeric target pulled from `summary_templates_new.fits`
-  for a NEW comparison must be re-verified against the exact filtering
-  path of whatever it's being compared to -- this bit the previous
-  session three separate times (flux target twice, `|e|` target once).
-  Don't assume a number from HANDOFF.md's history is still the exact
-  target to hit without re-deriving it the same way the comparison
-  itself computes it.
+- `shear.py train` on `bulgedisc` needs `--deriv-weight 1e4`.
+- `centroid.py train` has nothing to train (zero free parameters) -- warm
+  starts + runs `check` only.
+- Always use `--alpha 0.5` for any `_deep` population at `noise_sigma` in the
+  0.9-2.73 range (`--alpha 1.0` is ESS-starved and unreliable).
+- `bias.py` on a `_deep` population needs `--batch-budget 65536` or it OOMs
+  the 16GB card; don't run two GPU jobs concurrently.
+- `noise_sigma = 0.9` is the correct depth for `bulgedisc_deep_v2`. It matches
+  the two populations almost exactly in `Sigma_X / (Mf Mr)`, the dimensionless
+  combination that drives the centroid layer (1.2e-3 vs 1.15e-3).
+- `python -u <script>` from the relevant repo root; background long jobs with
+  `nohup ... & disown` and poll the PID directly. `pgrep -f <script>` SELF-
+  MATCHES the polling shell's own command line -- wait on the PID or on the
+  output file, never on `pgrep -f`.
+- Any real-data numeric target pulled from `summary_templates_new.fits` for a
+  NEW comparison must be re-verified against the exact filtering path of
+  whatever it's being compared to -- bit this investigation three times.

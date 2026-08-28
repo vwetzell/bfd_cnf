@@ -1731,3 +1731,382 @@ sanity checks.
   for log-normal; 23/23 pass throughout both rounds.
 - `dev/moments_bulgedisc_realmatch.fits`, `plots/bulgedisc_vs_real_corner.png`:
   regenerated after each round.
+
+## 2026-08-28: training a flow on the retuned `bulgedisc` surfaces a
+catastrophic `m1 ~ -1` on `bulgedisc_deep` -- extensively narrowed down,
+NOT resolved, and the leading hypothesis is disputed by the user
+
+Picked up the retuned-population task from `.session/next_prompt.md`:
+render fresh `bulgedisc` training/target catalogs against the real-data
+retune (previous several entries), retrain bulk/shear/centroid, and measure
+`bulgedisc_deep`'s multiplicative bias. Steps 1-5 (render 100k noiseless
+training catalog, `bulk.py train --steps 20000`, `shear.py train
+--deriv-weight 1e4 --steps 60000`, render 200k deep targets, render copies,
+warm-start centroid) all went cleanly and matched or beat the pre-retune
+numbers: `dm/dg` residuals Mf 0.35%/Mr 2.31%/Mc 4.90% (vs. the prior
+population's 2.81%/26.12%/40.73%), `centroid.py check`'s ellipticity-response
+ratio 0.708 (vs. the prior population's 0.635, `gauss2_deep`'s 0.70).
+
+Then `bias.py --pop bulgedisc_deep_v2 --samples 8192 --alpha 0.5 --chunk 4096
+--batch-budget 65536 --n-targets 20000` (added a `"bulgedisc_deep_v2"` entry
+to `CATALOGS`/`TRAIN_DATA` pointing at the new files, since the existing
+`"bulgedisc_deep"` entry's filenames are the STALE pre-retune catalogs --
+those are left alone and still work): `m1 = -1.01112 +/- 0.00023`. Not a
+noisy/inconclusive number like the prior population's `+0.1627 +/- 0.0735` --
+this is TIGHT and pinned near -1 (zero measured shear response) for three of
+five `Mf` quintiles (q1 -1.0011+/-0.0001, q2 -1.0028+/-0.0005, q3
+-1.0201+/-0.0008), q4 sign-flipped (+1.12+/-0.16), only q5 sane
+(-0.016+/-0.006).
+
+### What was ruled out, with evidence
+
+1. **`Mc/Mr` ceiling excess.** The retuned population's noisy deep targets
+   have 14.2% of rows above `POINT_SOURCE_MC` (6.662089) vs. the old
+   population's 3.8% (both 0% in the noiseless training catalog -- it is
+   noise pushing them over). Excluding those targets from the `ghat` sum
+   offline: m1 still -1.02. Not the cause.
+2. **Noise depth mismatch (real, but not sufficient).** The retune dropped
+   the training catalog's median `Mf` 5067 -> 1859 (a deliberate, correct
+   consequence of matching real DES/COSMOS flux). `noise_sigma = 2.73` was
+   calibrated years ago against the OLD population to put flux S/N's 5th
+   percentile at 10, median at 19; at the retuned population it now gives
+   median S/N 6.8 -- below the old population's OWN 5th percentile.
+   Recalibrated to `noise_sigma = 0.9` (median S/N 19.8-20.4, 5th pct ~9.5,
+   matching the old target), re-rendered all three deep-target catalogs and
+   `copies_bulgedisc_v2.fits` at the corrected depth (same filenames,
+   overwriting the wrong-depth versions -- the noise_sigma=2.73 deep
+   catalogs no longer exist on disk), re-warm-started centroid. `bias.py`
+   at the corrected depth: `m1 = -1.26963 +/- 0.01158` -- WORSE, not fixed.
+   Real bug, real fix (this depth is now the correct one to use going
+   forward), but not the cause of the `m1~-1` catastrophe.
+3. **Jackknife/chunk-count MC bias** (`pqr_streamed`'s own documented
+   `O(1/S)` bias mechanism). `--chunk 4096` (2 chunks) vs `--chunk 1024` (8
+   chunks) on the same 4000-target subset: `m1 = -1.27901` both ways, no
+   material change. Not the cause.
+4. **Outlier/spike domination.** The top 20 targets by |R| carry only
+   8.9% of `R`'s ensemble sum; it takes 1206/19998 targets (6%) to reach 90%
+   of the sum. This is a broad effect across a real fraction of the
+   population, not a handful of `sane_targets`-evading spikes.
+5. **Training-data sparsity.** Rendered 1M noiseless galaxies (10x), retrained
+   bulk/shear/centroid from scratch on that at the corrected depth. `dm/dg`
+   residuals barely moved (0.35/2.26/0.60/0.60/4.83 vs. 0.35/2.31/0.60/0.61/
+   4.90). Unwindowed `bias.py`: `m1 = -1.17832 +/- 0.01002` -- still
+   catastrophic. More data did not help.
+6. **Ellipticity extremity.** Targets with pathological `R` (diag > 100) have
+   LOWER measured `|e|` than the rest (0.091 vs 0.127 median) -- rounder, not
+   more elliptical; `corr(rdiag, |e|) = -0.089`. `gauss2_deep`'s own noisy
+   `|e|` reaches as high as 378 (pure noise excursion) and it is still clean
+   unwindowed. Not ellipticity.
+7. **`Mc/Mr`-ceiling PROXIMITY (not excess -- the whole distribution sitting
+   near the boundary).** `gauss2_deep`'s own `Mc/Mr` median is 5.76, all but
+   identical to the retuned `bulgedisc_deep`'s 5.90 at the corrected depth --
+   and `gauss2_deep` is clean. Ruled out as the differentiator.
+8. **`safe_point`/`in_domain` masking leaking a poisoned gradient through
+   `jnp.where`.** Measured directly: a `bulgedisc_deep` target with 24.4% of
+   its 8192 kernel draws out-of-domain has `flow.log_prob` at `safe_point`'s
+   dummy as extreme as -3.4e15. Suspected this leaks into the Hessian via
+   JAX's `where`-gradient semantics. Directly disproved: pulled
+   `gauss2_deep`'s OWN worst-masked target (93% of draws masked, dummy
+   `log_prob` = -2.35e18, even more extreme) and computed its real `R` via
+   `pqr_streamed` -- `rdiag = 13.9`, completely sane. Masking is handled
+   correctly in both populations.
+9. **Low ESS / weight concentration among the surviving in-domain draws.**
+   Measured directly for the same pathological target: ESS = 500.6 (healthy),
+   top-5 weights ~0.004 each (not dominated by 1-2 draws). Not degenerate.
+10. **Centroid transport's log-det swamping the g-dependent signal in float32
+    precision.** Measured `|log-det|` of the centroid layer's Jacobian
+    directly for both "bad" `bulgedisc` targets and `gauss2` targets: all
+    values are small (<0.4) for both populations, nowhere near large enough
+    to swamp anything.
+11. **Streaming/jackknife-merge artifact in `pqr_streamed`.** Computed the
+    FULL, unchunked Hessian of `log_conv_is` directly via `jax.hessian` on all
+    8192 draws at once for the same pathological target, bypassing
+    `pqr_streamed`'s chunking entirely: `rdiag = 823.6`, still huge. The
+    pathological curvature is present in the CORE Hessian-of-logsumexp
+    computation itself, not a streaming/merge artifact.
+
+### Where this was left, and an explicit disagreement to resolve first
+
+The session's own working hypothesis (not the user's) was that `bulgedisc`'s
+non-Gaussian bulge+disc profile makes `models/centroid.py`'s analytic
+Gaussian-in-k transport only APPROXIMATE (exact for `gauss2`, which is
+literally a Gaussian-in-k mixture), and that the retuned population's wider
+`Mr/Mf` spread pushes enough targets into a regime where that approximation
+error, small in the aggregate `check` shift, is large enough per-target to
+land the shear-response network's g-Hessian in a genuinely bad, sparsely-
+resolved pocket -- consistent with `--no-centroid` being sane
+(`m1 = -0.0836 +/- 0.0227`, comparable to the old population's own
+`--no-centroid` baseline of `-0.0361 +/- 0.0132`) while `--with-centroid`
+is catastrophic.
+
+**The user explicitly disagrees with this**: the Gaussian-in-k approximation
+should be good enough not to cause a failure this large, and there is likely
+ANOTHER bug or difference between the `gauss2_deep` setup (known to work) and
+the retuned `bulgedisc_deep_v2` setup (broken) that has not yet been found --
+not a graceful approximation-quality effect. This is a live disagreement, not
+settled, and the next session should treat the approximation-quality
+hypothesis as unproven rather than default to it.
+
+**The eleven-item elimination list above is not gospel either.** It was
+produced under time pressure across many rounds of ad hoc diagnostic
+scripts, at least one of which (the first `safe_point` clip-rate test) was
+initially methodologically wrong -- it bypassed `in_domain` masking and gave
+a misleading result until redone correctly. Re-verify a ruled-out item's own
+measurement before leaning on it if the next session's work starts to
+contradict it, rather than assuming it was airtight. See
+`.session/next_prompt.md` for where to pick this up.
+
+### Artifacts
+
+- `bias.py`: added `"bulgedisc_deep_v2"` to `CATALOGS` (targets:
+  `targets_deep_g1p02_200k_v2`/`g1m02`/`g0`) and `TRAIN_DATA`
+  (`moments_bulgedisc_v2.fits`) -- the ONLY code change this session. NOT
+  YET COMMITTED. `"bulgedisc_deep"`'s own entries are untouched and still
+  point at the pre-retune catalogs.
+- `../bfd_cnf_imsims/data/moments_bulgedisc_v2.fits` (100k, noiseless),
+  `moments_bulgedisc_v2_1M.fits` (1M, noiseless): fresh renders against the
+  committed real-data retune.
+- `../bfd_cnf_imsims/data/targets_deep_g1p02_200k_v2.fits`/`g1m02`/`g0`,
+  `copies_bulgedisc_v2.fits`: rendered TWICE this session, first at
+  `noise_sigma = 2.73` (matching the old population's depth, WRONG for this
+  one), then re-rendered under the SAME filenames at the corrected
+  `noise_sigma = 0.9` -- only the corrected-depth version exists on disk now.
+- `flows/bulk_bulgedisc_v2.eqx`, `shear_bulgedisc_v2.eqx`,
+  `centroid_bulgedisc_v2.eqx`: 100k-galaxy training, `--deriv-weight 1e4`,
+  centroid warm-started twice (stale-depth copies, then corrected-depth
+  copies) -- the checkpoint on disk reflects the corrected depth.
+- `flows/bulk_bulgedisc_v2_1M.eqx`, `shear_bulgedisc_v2_1M.eqx`,
+  `centroid_bulgedisc_v2_1M.eqx`: the 10x-training-data retrain, corrected
+  depth throughout, used to rule out data sparsity (point 4 above).
+- No `models/centroid.py`, `shear.py`, or `bulk.py` changes this session --
+  the investigation was entirely measurement/diagnosis, not a code fix.
+- Numerous `/tmp` scratchpad diagnostic scripts and `.npz`/`.log` dumps
+  (`pqr_v2_corrected.npz`, `pqr_v2_1M.npz`, `pqr_old_centroid.npz`, etc.),
+  not committed, not preserved past the session's scratchpad directory.
+
+## 2026-08-28 (cont.): the centroid approximation is NOT the cause -- the
+ensemble R has flipped sign at the faint end, and the Fisher identity is the
+diagnostic that finds it
+
+Picked up `.session/next_prompt.md`'s five steps against the previous entry's
+open disagreement.  The user's position -- that the Gaussian-in-k centroid
+transport is good enough and something else is different between
+`gauss2_deep` and `bulgedisc_deep_v2` -- is CORRECT, and the previous entry's
+working hypothesis is now directly falsified.
+
+### Step 1: the approximation-quality hypothesis, measured directly -- FALSIFIED
+
+Per-target, on each population's own g=0 deep targets (20k rows, both arms of
+the comparison run through the SAME code):
+
+| quantity (p50 / p99)                    | bulgedisc_deep_v2 | gauss2_deep    |
+|-----------------------------------------|-------------------|----------------|
+| `trace(P)` (the transport's strength)   | 0.0050 / 0.038    | 0.0047 / 0.129 |
+| round-trip \|z_rt - z\| (unmarg->marg)  | 4e-4 / 0.707      | 5e-4 / 0.501   |
+| `\|dz\|` before the `_EXP_MAX` tanh cap | 0.033 / 9.52      | 0.057 / 18.1   |
+| frac of targets with `trace(P) > 0.5`   | 0.0000            | 0.0005         |
+| centroid log-det spread over 512 kernel draws (p50 / p99 nats) | 0.16 / 3.10 | 0.10 / 3.55 |
+
+The transport is not merely comparable, it is MILDER on `bulgedisc_deep_v2`
+than on the population that works -- gauss2 is the one with the heavier tail
+in every column.  `Sigma_X / (Mf Mr)`, the dimensionless combination that sets
+`trace(P)`, is 1.2e-3 for bulgedisc_v2 and 1.15e-3 for gauss2: the corrected
+`noise_sigma = 0.9` depth matched the two populations almost exactly in the
+variable that actually drives this layer.  There is no regime difference for
+an approximation error to be large in.
+
+### Step 2: every constant and config difference -- CLEAN
+
+- Catalog headers are identical except `NOISESIG`/`SIG_XY`: `PIXSCALE 0.2`,
+  `WTSIGMA 0.65`, `PSFSIGMA 0.4`, `SEED 0`, `IMGNOISE T`, same 9 columns, same
+  `G1 = +/-0.02`, in all three populations.
+- `SIG_XY` and `cov_odd` scale EXACTLY with `noise_sigma` (326.02/107.48 =
+  3.0333 = 2.73/0.9), and the even-moment `cov` scales exactly with
+  `noise_sigma^2` (73924.016 * (0.9/2.73)^2 = 8038 vs the 8034.249 on disk).
+  The re-render at the corrected depth is self-consistent.
+- Chart constants inside each checkpoint agree across all three layers:
+  `RawMomentStandardize.mean/std` == `CentroidMarginalize.mean/std` ==
+  `ShearResponse.chart_loc/chart_scale`, byte-identical, in
+  `centroid_bulgedisc_v2.eqx`, `centroid_bulgedisc_v2_1M.eqx` AND
+  `centroid_gauss2_deep_analytic.eqx`.  No repeat of the 2026-08-24 stale-chart
+  bug.
+- The centroid warm-start graft is complete: `centroid_bulgedisc_v2.eqx`'s
+  chart and all 8 bulk layers are BIT-IDENTICAL to `shear_bulgedisc_v2.eqx`'s,
+  and the shear layer differs in exactly 2 of 13 leaves -- `coeffs.u_mean`
+  (max 3.0e-3) and `coeffs.u_white` (max 2.9e-2), the expected consequence of
+  `sync_chart_constants` being handed the copies catalog's GALAXIES table
+  rather than the 90% training slice.  0.3%, not a bug.
+- Note for whoever reads `split_centroid` next: it returns `(flow, None)` for
+  every flow `bulk.build_flow(shear=True, centroid=True)` produces, because
+  those give the layer `cond_dim = 5`.  The peel is DEAD CODE on both
+  populations -- so `bias.py` differentiates through the centroid layer in
+  both, identically.  Not a difference between them, but it means the
+  `centroid_transform`/log-det-in-the-weight path is never exercised.
+
+### Step 3: moment-file structure -- CLEAN
+
+Training and target moment distributions agree within each population
+(v2 train Mf p1/50/99 = 728/1770/186278 vs targets 693/1776/179275;
+Mr/Mf p50 3.149 vs 3.131).  No structural anomaly, no degenerate `cov`.
+
+### What is actually wrong: R's SIGN, via the Fisher identity
+
+The BFD estimator needs `sum_targets R` negative; the check that it is is the
+Fisher identity `sum q^2 / sum (-r)`, which should be ~1 when the flow matches
+the population the targets were drawn from.  Measured on 2000 g=0 deep targets
+at S=8192, alpha=0.5:
+
+| population        | sum q1^2 | sum -R11 | ratio  |
+|-------------------|----------|----------|--------|
+| gauss2_deep       | 70491    | +73601   | +0.958 |
+| bulgedisc_deep_v2 | 24450    | -89793   | -0.272 |
+
+`sum R11` is POSITIVE for bulgedisc_v2.  `ghat = -R^-1 Q` off a
+wrong-signed R is what "`m1` pinned at -1 with a 1e-4 error bar" IS -- and it
+explains why the number was tight rather than noisy.  **This is a far cheaper
+and sharper health check than `m1`: it needs one arm, not three, and it is
+diagnostic rather than a single summary number.  Use it going forward.**
+
+Broken down by flux quintile (same 2000 targets):
+
+| Mf quintile        | bulgedisc_v2 ratio | gauss2 ratio |
+|--------------------|--------------------|--------------|
+| q1 (faintest)      | **-0.031**         | +0.998       |
+| q2                 | **-0.191**         | +0.926       |
+| q3                 | +1.018             | +0.908       |
+| q4                 | +1.150             | +0.939       |
+| q5 (brightest)     | +1.194             | +1.007       |
+
+The failure is ENTIRELY in the two faintest flux quintiles (`Mf < ~1450`,
+flux S/N < ~16).  q3-q5 are as healthy as gauss2's.  gauss2's own q1 reaches
+`Mf = 254` (S/N ~ 0.9) and is clean, so this is not "faint" per se.
+
+### What it is NOT (measured this session, on top of the previous entry's list)
+
+1. **Not ESS or Monte-Carlo bias.**  `sum R11` over the same 500 targets at
+   S = 2048 / 8192 / 32768: +18477 / +21901 / +19589 -- flat over a 16x range.
+   gauss2 over the same scan: -18069 / -18127 / -18269.  Kernel ESS is the
+   same in both (median 153 vs 149 per 2048 draws; 5th pct 17.7 vs 32.3).
+2. **Not the ceiling-violating targets alone.**  Dropping every target with
+   `Mr/Mf > POINT_SOURCE` or `Mc/Mr > POINT_SOURCE_MC`, plus a 3% margin
+   (13.5% of the catalog), still leaves `sum R11 = +4795`; gauss2 at the same
+   target count is -72691.  NOTE this SUPERSEDES the previous entry's item 4:
+   the top 20 targets by |R| carry 8.9% of `sum |R|`, but the top 20 by
+   SIGNED R11 carry **58%** of `sum R11` and the top 100 carry **92%**.  The
+   earlier test measured the wrong quantity.  All 20 of those targets sit at
+   `Mf = 780-1080` with `Mr/Mf = 3.0-4.4` and `Mc/Mr = 6.0-7.3`.  The worst
+   (R11 = 2.26e4) is just BELOW `sane_targets`' own guard (1000 x median |R|
+   norm = 22197) -- the guard is calibrated far too loose for this population.
+3. **Not the second-order shear response.**  A single-point grid scan at
+   `M1 = M2 = 0`, `Mf = 900` looked conclusive -- `R11` runs -28 flat up to
+   `Mr/Mf = 3.2`, crosses zero at ~3.33 and reaches +143 by 3.45, and zeroing
+   the second-order spin-0 coefficients (`s0`'s `p2`/`p3` columns) flattens it
+   to a stable -9.  It does NOT survive the ensemble.  Full ablation at 4000
+   targets x 3 arms:
+
+   | ablation        | m1       | Fisher ratio |
+   |-----------------|----------|--------------|
+   | full            | -1.28915 | -0.354       |
+   | no 2nd spin0    | -1.34367 | -0.419       |
+   | no 2nd spin2    | -1.29118 | -0.356       |
+   | no 2nd at all   | -1.34654 | -0.422       |
+
+   Every ablation is slightly WORSE.  A clean negative -- do not re-run it.
+   (Control through the identical harness: `gauss2_deep` full = **-0.00767**,
+   ratio +0.985.  The measurement path is correct.)
+4. **Not the shear layer's fit.**  `dm/dg` and `d2m/dg2` against bfd's exact
+   per-template truth, on held-out rows, binned by flux AND by `Mr/Mf`: the
+   worst bin for bulgedisc_v2 is 6.4% (Mr) / 14.7% (Mc) at the smallest
+   `Mr/Mf`, and in the faint quintiles where the estimator dies it is
+   0.4%/1.9%/3.3%/3.1%/4.1%.  The response is fit well exactly where R is
+   wrong.
+5. **Not training-data volume.**  See below -- the 1M retrain has an identical
+   density-steepness profile, consistent with the previous entry's item 5.
+
+### The mechanism: the bulk density's SCORE, and where it peaks
+
+`R = E_w[H_g] + Var_w[score_g]` over the importance-weighted draws, and
+`score_g = -grad_z log p_bulk . A` with `A = d(unshear)/dg`.  `||A||` is
+comparable in the two populations (median 6.2 vs 4.3, p99 34 vs 53), so
+`Var_w[score_g]` is set by `|grad_z log p_bulk|`.  Measured on each
+population's OWN noiseless training galaxies (4000 rows):
+
+| flow                       | p50   | p90    | p99   |
+|----------------------------|-------|--------|-------|
+| gauss2                     | 6.4   | 11.6   | 88.6  |
+| bulgedisc OLD (pre-retune) | 32.4  | 86.4   | 351   |
+| bulgedisc_v2               | 18.2  | 103.2  | 483   |
+| bulgedisc_v2_1M            | 18.9  | 97.7   | 476   |
+
+and by flux quintile (p50):
+
+| Mf quintile | gauss2 | bulgedisc OLD | bulgedisc_v2 |
+|-------------|--------|---------------|--------------|
+| q1 faintest | 6.8    | 17.4          | **33.6**     |
+| q2          | 6.1    | 35.1          | 26.9         |
+| q3          | 6.0    | 33.8          | 19.7         |
+| q4          | 6.2    | 36.8          | 15.5         |
+| q5          | 6.9    | 39.7          | 10.4         |
+
+Two things read off this.  First, `bulgedisc_v2` and `bulgedisc_v2_1M` are
+identical, so the steepness is a property of the population as this flow
+parameterises it, not of sample size or overfitting.  Second -- and this is
+the actual difference from the OLD population, which measured a merely-bad
+`m1 = +0.16` rather than -1 -- the retune **inverted the flux dependence**.
+gauss2's score is flat in flux, the old bulgedisc's RISES with flux (steepest
+where the noise kernel is narrowest, i.e. harmless), and the retuned one
+FALLS with flux: its density is steepest exactly at the faint end where the
+noise kernel is widest.  The retune also moved the population's median flux
+down 3x (5090 -> 1770), so that faint end is now where most of the catalog
+lives.
+
+A per-point decomposition of `R11 = A^T H A + grad_z(log p_bulk) . U11 +
+d2/dg1^2 logdet` confirms which term carries it (the three sum to the full
+`R11` to printed precision):
+
+```
+bulgedisc_v2, Mf=900     Mr/Mf   full R11   A^T H A   grad.U11   |grad log p|
+                          2.800     -28.49    -7.335     -20.70          20.8
+                          3.200     -25.18    -7.058     -18.03          47.3
+                          3.400     +60.10    -5.065     +69.89         164.3
+                          3.500     +80.41    -8.744    +100.60         215.3
+gauss2, Mf=1500           2.800    -105.40   -95.750      -4.30           5.3
+                          3.300     -21.65   -25.080      +1.17           4.6
+```
+
+gauss2's `R11` is carried by the healthy `A^T H A` term with a score of ~5;
+bulgedisc_v2's is carried entirely by the score term with a score up to 215.
+
+### Where to pick this up
+
+The lever is the BULK density's steepness at faint flux, not the centroid
+layer and not the shear layer.  Concretely, in rough order:
+
+1. Ask whether the retuned population's density really is that sharp or
+   whether the flow is manufacturing structure: sample the flow at faint flux
+   and compare its marginals against the catalog's, and look at the flux
+   floor specifically -- `moments_bulgedisc_v2.fits` has 22% of its galaxies
+   between `Mf = 562` and `1103` above a hard cut near 300, i.e. a
+   near-discontinuity in `log10 Mf` that the flow must represent as a cliff.
+   The OLD population had no such pile-up at its faint end.
+2. If the density is genuinely that sharp, the convolution is the problem, not
+   the fit: the noise kernel at `Mf ~ 900` is `sqrt(cov00) = 89.6`, i.e. +/-10%
+   in flux, straddling the cliff.  Consider whether the retune's flux floor
+   should be softened (it is a rendering choice, not real-sky physics) or the
+   depth reconsidered so the kernel does not span it.
+3. `sane_targets`' `factor = 1000` guard is far too loose here (threshold
+   22197 against a worst target of 22735, which it therefore keeps).  It was
+   calibrated on a population with `max/median ~70` for |R|.  Worth revisiting
+   on its own terms, though it is a symptom-catcher, not the fix.
+4. Re-check anything that depends on `split_centroid` actually peeling: it
+   never does for a chained flow (see Step 2's last bullet).
+
+### Artifacts
+
+- `bias.py`'s `bulgedisc_deep_v2` `CATALOGS`/`TRAIN_DATA` entries, previously
+  uncommitted, are committed with this entry.  No other code changed --
+  this session was measurement only.
+- Scratchpad diagnostics (not committed): transport round-trip, chart/graft
+  comparison, per-target Q/R dumps, the S scan, the `Mr/Mf` grid scans, the
+  `R11` decomposition, the flux/`Mr/Mf`-binned `dm/dg` check, the bulk-score
+  profile, and the second-order ablation.

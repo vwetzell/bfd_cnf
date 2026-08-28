@@ -154,6 +154,12 @@ CATALOGS = {
     "bulgedisc_deep": {"plus": "targets_deep_g1p02_200k",
                        "minus": "targets_deep_g1m02_200k",
                        "zero": "targets_deep_g0_200k"},
+    # Same recipe as bulgedisc_deep, rendered against the 2026-08-27 real-data
+    # retune (see HANDOFF.md). "_deep"'s targets/flows predate the retune and
+    # are kept as-is for comparison.
+    "bulgedisc_deep_v2": {"plus": "targets_deep_g1p02_200k_v2",
+                          "minus": "targets_deep_g1m02_200k_v2",
+                          "zero": "targets_deep_g0_200k_v2"},
     # The analytic population: two co-elliptical Gaussians whose moments were
     # DRAWN from a chosen density rather than pushed forward from galaxy
     # parameters, so P(m|g), Q and R are known in closed form -- `truth.py`.
@@ -187,6 +193,7 @@ CATALOGS = {
 TRAIN_DATA = {
     "bulgedisc": "moments.fits", "bulgedisc_noisy": "moments.fits",
     "bulgedisc_deep": "moments.fits",
+    "bulgedisc_deep_v2": "moments_bulgedisc_v2.fits",
     "sersic": "moments_sersic.fits",
     "gauss2": "gauss2_g0_1M.fits", "gauss2_2k": "gauss2_g0_2k.fits",
     "gauss2_deep": "gauss2_g0_1M.fits",
