@@ -2294,3 +2294,133 @@ Directions, none of them yet built:
   alpha convergence scans, the fold determinant test, the bounded-weight
   normalisation test, the score-vs-v localisation, and the template-sum Q/R.
 - `.session/next_prompt.md` updated.
+
+## 2026-08-28 (cont.): the selection machinery is VALIDATED and works for
+arbitrary windows -- one real bug fixed in it, and the remaining failure is
+still the density
+
+Against the requirement that the flow must accept an arbitrary window and
+return an unbiased corrected windowed mean shear.  Templates are noiseless and
+the PSF is exact, so there is no excuse for eq. (40)/(45)-(46) not to deliver
+that; this entry establishes that it DOES, and that what blocks it on
+`bulgedisc_v2` is the fitted density, not the correction.
+
+### The correction is correct: three independent checks
+
+**1. The formula.**  `ghat`'s correction is the truncated-data likelihood
+`L = PROD_sel P(M_i|g) * PROD_unsel (1 - P_s(g))`, whose first two g-derivatives
+give exactly `Q = SUM q - N_ns Q_s/(1-P_s)` and
+`R = -SUM r + N_ns (Q_s Q_s^T/(1-P_s)^2 + R_s/(1-P_s))`.  That is what is coded.
+
+**2. `P_s`, `Q_s`, `R_s` against finite differences** of `P_s(g)` computed
+directly on the same templates (common random numbers, so only the g dependence
+is differenced):
+
+| window | P_s autodiff / direct | R_s11 autodiff / finite-diff | ratio |
+|--------|-----------------------|------------------------------|-------|
+| size (2.2,3.5)      | 0.945279 / 0.945279 | +4.235e-2 / +4.053e-2 | 1.045 |
+| flux > 2500         | 0.876065 / 0.876065 | -1.854e-1 / -1.836e-1 | 1.010 |
+| size (2.6,3.3)      | 0.706952 / 0.706952 | +1.645e-1 / +1.627e-1 | 1.011 |
+| boxed (2.4,3.4)x(3000,20000) | 0.706959 / 0.706959 | -7.70e-3 / -8.94e-3 | 0.861 |
+
+`P_s` exact to six digits; `R_s` to 1-4% on the three windows where it is
+resolvable.  The boxed window's ratio is NOT a discrepancy -- its `R_s` is 20x
+smaller and `R_s h^2/2 = 3.8e-7` sits at the float32 noise floor of the
+difference.  `window_prob` handles its own moving boundary correctly (the
+quadrature substitution carries `t0`, `t1` and the `0.5*(t1-t0)` Jacobian, all
+functions of Mf), which was the obvious suspect and is not the problem.
+
+**3. End to end on `gauss2_deep`, seven arbitrary windows** (20000 targets,
+S=8192; Q and R do not depend on the window so one pass serves all of them):
+
+| window                | kept  | P_s   | uncorr m1 | corr m1  |
+|-----------------------|-------|-------|-----------|----------|
+| size (2.2,3.5)        | 0.947 | 0.945 | -0.00524  | -0.00635 |
+| flux > 2500           | 0.880 | 0.876 | -0.00899  | -0.00409 |
+| flux > 4000           | 0.683 | 0.682 | -0.01185  | -0.00242 |
+| size (2.2,3.5) & >2500| 0.852 | 0.847 | -0.00753  | -0.00461 |
+| size (2.6,3.3)        | 0.715 | 0.707 | +0.00633  | +0.00064 |
+| flux < 12000          | 0.872 | 0.873 | -0.00422  | -0.00979 |
+| boxed                 | 0.711 | 0.707 | -0.00222  | -0.00197 |
+
+against unwindowed `m1 = -0.00698 +/- 0.00145`.  The correction cuts the
+window-to-window spread from 0.018 to 0.010 and pulls each window toward the
+unwindowed value -- most visibly the tight size cut, +0.00633 -> +0.00064.
+Residual window-dependence is ~0.005 in m1, which is the accuracy of the
+machinery as it stands and is worth knowing against an LSST budget of ~1e-3.
+
+### Bug found and fixed: `selection_terms` NaNs on one bad draw
+
+`--window-terms flow` returned `P_s = NaN` for EVERY window on
+`bulgedisc_v2`.  Cause: about 1 prior draw in 262144 overflows float32 (the
+flow's `log10 Mf` tail reaches `Mf = 2.1e8`), and one non-finite row NaNs the
+whole `jnp.mean` and with it `P_s`, `Q_s` and `R_s`.  `gauss2` produces none,
+which is why it was never seen.
+
+Fixed in `selection_terms` by dropping non-finite draws from the sample at
+g = 0, OUTSIDE the autodiff, rather than masking in-graph -- measured
+directly, an in-graph `jnp.where` mask fixes the VALUE but leaves the
+g-Hessian NaN.  Finiteness ONLY, not `in_domain`: `window_prob` needs Mf and
+Mr, not chart-domain membership, and `draw` is not required to return
+chart-representable moments (`tests/test_selection.py` hands it an analytic
+Gaussian population, half of which is off-chart -- adding `in_domain` silently
+redefined `P_s` and failed that test).  `gauss2`'s numbers are unchanged to
+every printed digit; the count is reported when it fires; 65/65 tests pass.
+
+### With the flow branch working, it is a density diagnostic
+
+`--window-terms flow` vs `templates` measures the flow's density error near
+the window edge, which is what that option's docstring says it is for:
+
+| window | R_s11 flow | R_s11 templates | ratio |
+|--------|------------|-----------------|-------|
+| bulgedisc_v2 size (2.2,3.5) | +2.83e-1 | -2.59e0  | **-0.11** |
+| bulgedisc_v2 flux > 1345    | -2.38e-1 | -2.61e-1 | +0.91 |
+| bulgedisc_v2 size (2.6,3.3) | -1.52e0  | +2.96e-1 | **-5.14** |
+| gauss2 size (2.2,3.5)       | +1.13e-2 | +4.24e-2 | +0.27 |
+| gauss2 flux > 1345          | -5.49e-2 | -4.84e-2 | +1.13 |
+| gauss2 size (2.6,3.3)       | +1.27e-1 | +1.65e-1 | +0.77 |
+
+On a FLUX window the flow's selection response is right to 9%.  On a SIZE
+window it has the WRONG SIGN on `bulgedisc_v2` -- the `Mr/Mf` boundary runs
+through the region where the density is spiky (`v = Mc/(rc Mr) -> 1`, previous
+entry), and the flow's response to shear across that boundary is not merely
+inaccurate but inverted.
+
+### The acceptance test on bulgedisc_v2: still fails, as expected
+
+Same seven-window sweep, `--window-terms templates` (so the correction terms
+are exact and only `SUM q`, `SUM r` come from the flow):
+
+| window                | kept  | uncorr m1 | corr m1  |
+|-----------------------|-------|-----------|----------|
+| size (2.2,3.5)        | 0.807 | -2.61291  | -2.15448 |
+| flux > 1345           | 0.633 | +0.03590  | +0.07275 |
+| flux > 2000           | 0.446 | -0.05037  | -0.01988 |
+| size (2.2,3.5) & >1345| 0.547 | -0.00907  | +0.89979 |
+| size (2.6,3.3)        | 0.529 | +5.96962  | +4.24066 |
+| flux < 12000          | 0.897 | -1.22832  | -1.22879 |
+| boxed (2.4,3.4)x(1500,20000) | 0.385 | -0.02000 | -0.01377 |
+
+Corrected `m1` ranges over -2.15 to +4.24.  Every window that keeps the faint
+population is catastrophic; the ones with a flux floor and a bounded bright
+end land near zero.  Since the correction terms are exact here, the
+window-dependence is entirely `SUM q`, `SUM r` from the flow over the selected
+targets: different windows admit different amounts of the region the density
+gets wrong, so the answers scatter.  This is the same conclusion as the
+previous entry, now demonstrated across windows rather than at one.
+
+### Where this leaves the requirement
+
+The requirement is achievable and the machinery for it is in place and
+validated.  What it needs is a prior that is accurate over the WHOLE
+population, because `P_s`, `Q_s` and `R_s` are population integrals: the
+correction deliberately reaches outside the window, so the flow cannot be made
+correct only where the targets are kept.  That is the remaining work, and it
+is the density problem of the previous entry, unchanged.
+
+### Artifacts
+
+- `bias.py`: `selection_terms` drops non-finite draws (the only code change).
+- Scratchpad: the seven-window sweeps for both populations, the `R_s`
+  finite-difference validation, and the flow-vs-templates `R_s` comparison.

@@ -1122,12 +1122,37 @@ def selection_terms(draw, z, cov, size, flux, batch=16384):
         return val, dq, jnp.stack([h0, h1], axis=-1)
 
     chunked = eqx.filter_jit(one_chunk)
+    keep_at_zero = eqx.filter_jit(
+        lambda zc: jnp.isfinite(draw(zero, zc)).all(-1))
     n = len(z)
     ps_acc, qs_acc, rs_acc, w_acc = 0.0, np.zeros(2), np.zeros((2, 2)), 0
     qs_chunks = []
+    n_dropped = 0
     for i in range(0, n, batch):
         z_chunk = jnp.asarray(z[i:i + batch])
+        # Drop NON-FINITE prior draws BEFORE differentiating.  A single such
+        # row NaNs the whole `jnp.mean` and with it P_s, Q_s and R_s -- which
+        # is how `--window-terms flow` came back NaN for every window on
+        # bulgedisc_v2: its log10(Mf) tail reaches 2e8 and about 1 draw in
+        # 262144 overflows float32 (gauss2 has none, which is why this went
+        # unseen).  Masking in-graph with `jnp.where` fixes the VALUE but not
+        # the g-Hessian, measured directly; removing the row from the sample
+        # is unconditional.  The test is at g = 0 and outside the autodiff, so
+        # it is a property of the sample, not a g-dependent seam -- the same
+        # reason `pqr_streamed` computes `in_domain` on the raw draw once.
+        #
+        # FINITENESS ONLY, deliberately: `window_prob` needs Mf and Mr, not
+        # chart-domain membership, and `draw` is not required to return
+        # chart-representable moments (`tests/test_selection.py` hands it an
+        # analytic Gaussian population, half of which is off-chart).  Adding
+        # `in_domain` here silently redefined P_s and failed that test.
+        ok = np.asarray(keep_at_zero(z_chunk))
+        if not ok.all():
+            n_dropped += int((~ok).sum())
+            z_chunk = z_chunk[jnp.asarray(ok)]
         nb = z_chunk.shape[0]
+        if nb == 0:
+            continue
         val, dq, d2q = chunked(z_chunk)
         val = float(np.asarray(val, dtype=np.float64))
         dq = np.asarray(dq, dtype=np.float64)
@@ -1138,6 +1163,9 @@ def selection_terms(draw, z, cov, size, flux, batch=16384):
         w_acc += nb
         qs_chunks.append(dq)
 
+    if n_dropped:
+        print(f"  selection_terms: dropped {n_dropped}/{n} non-finite prior "
+              f"draws ({n_dropped / n:.1e})")
     ps, qs, rs = ps_acc / w_acc, qs_acc / w_acc, rs_acc / w_acc
     qs_stack = np.stack(qs_chunks)
     # Standard error of the mean from the chunk-to-chunk scatter -- the same
