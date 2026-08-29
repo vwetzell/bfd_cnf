@@ -96,19 +96,27 @@ from models.bijections import POINT_SOURCE_MC
 
 
 def to_coords(m):
-    """Raw moments -> chart coordinates t = [log10 Mf, logit(Mr/(POINT_SOURCE
-    Mf)), logit(Mc/(POINT_SOURCE_MC Mr)), M1/Mr, M2/Mr].
+    """Raw moments -> SIM's chart t = [log10 Mf, logit(Mr/(POINT_SOURCE Mf)),
+    Mc/Mr, M1/Mr, M2/Mr].
 
-    Duplicates `bulk.to_coords` line for line (ellipsis indexing in place of a
-    fixed leading batch axis, so this same function autodiffs a single (5,)
-    target under `jacfwd` and still runs on a (n, 5) batch) -- the two must
-    NOT drift apart; `tests/test_truth.py::test_to_coords_matches_bulk` is the
-    guard.
+    This must track `imsims.sim`, NOT `bulk.to_coords`, and that is the whole
+    point: `log_p0` evaluates a Gaussian whose mean and covariance are
+    `sim.GAUSS2_MU`/`GAUSS2_COV`, and those are defined in sim's chart (see
+    `sim._gauss2_m_of_t`, whose inverse this is).  `bulk.to_coords` differs in
+    slot 2 -- it uses `logit(Mc/(POINT_SOURCE_MC Mr))` where sim uses the raw
+    ratio `Mc/Mr` -- so matching `bulk` instead, as this did until
+    2026-08-28, evaluated `mu[2] = 5.974` (an Mc/Mr value) against a
+    coordinate worth about 2.16.  That is what made `truth.py` unusable as
+    ground truth: `log_prob` was a Gaussian in the wrong variable, and every
+    `Q`, `R` derived from it was wrong with it.
+
+    The old docstring called `bulk` agreement an invariant and
+    `tests/test_truth.py::test_to_coords_matches_bulk` enforced it.  It was
+    exactly backwards; the test now checks sim's chart instead.
     """
     u = m[..., 1] / (sim.POINT_SOURCE * m[..., 0])
-    v = m[..., 4] / (POINT_SOURCE_MC * m[..., 1])
     return jnp.stack([jnp.log10(m[..., 0]), jnp.log(u) - jnp.log1p(-u),
-                      jnp.log(v) - jnp.log1p(-v), m[..., 2] / m[..., 1],
+                      m[..., 4] / m[..., 1], m[..., 2] / m[..., 1],
                       m[..., 3] / m[..., 1]], axis=-1)
 
 

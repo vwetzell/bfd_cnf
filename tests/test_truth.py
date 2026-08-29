@@ -7,7 +7,7 @@ Builds a small gauss2 population directly from `imsims.sim` /
 
   1. log_prob(m, 0) == log_p0(m) exactly (the two Jacobians in the formula
      coincide at g = 0).
-  2. to_coords matches bulk.to_coords, so the two charts cannot drift apart.
+  2. to_coords inverts sim._gauss2_m_of_t, the chart P0 is defined in.
   3. log_prob is a proper change of variables under a real shear, checked
      against an INDEPENDENT reconstruction (not truth.py's own call chain).
   4. pqr matches central finite differences of log_prob in g.
@@ -56,12 +56,25 @@ def test_log_prob_at_zero_shear_is_log_p0():
         assert np.isclose(a, b, rtol=1e-10), (m_i, a, b)
 
 
-def test_to_coords_matches_bulk():
-    import bulk
+def test_to_coords_matches_sim():
+    """`to_coords` must invert `sim._gauss2_m_of_t`, NOT match
+    `bulk.to_coords`.
 
-    want = bulk.to_coords(M)
-    got = np.asarray(jax.vmap(truth.to_coords)(jnp.asarray(M)))
-    np.testing.assert_allclose(got, want, rtol=1e-12)
+    `log_p0` evaluates a Gaussian at `sim.GAUSS2_MU`/`GAUSS2_COV`, and those
+    live in sim's chart, whose slot 2 is the raw ratio `Mc/Mr`.  This test used
+    to assert agreement with `bulk.to_coords`, which uses
+    `logit(Mc/(POINT_SOURCE_MC Mr))` there -- so it actively enforced the bug
+    that made `truth.py` unusable as ground truth (HANDOFF.md, 2026-08-28).
+    Round-tripping through sim's own inverse is the invariant that matters.
+    """
+    from imsims import sim as _sim
+
+    t = np.asarray(jax.vmap(truth.to_coords)(jnp.asarray(M)))
+    np.testing.assert_allclose(_sim._gauss2_m_of_t(t), M, rtol=1e-10)
+
+    # and it must NOT equal bulk's, which is the chart P0 is not in
+    import bulk
+    assert not np.allclose(t, bulk.to_coords(M), rtol=1e-3)
 
 
 def test_log_prob_is_a_proper_change_of_variables():
@@ -189,7 +202,7 @@ def test_batch_matches_single():
 
 if __name__ == "__main__":
     test_log_prob_at_zero_shear_is_log_p0()
-    test_to_coords_matches_bulk()
+    test_to_coords_matches_sim()
     test_log_prob_is_a_proper_change_of_variables()
     test_pqr_matches_finite_differences()
     test_pqr_recovers_the_input_shear()
