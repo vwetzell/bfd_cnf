@@ -3669,3 +3669,58 @@ g-autodiff and runs once per draw in `log_conv_is`.  Worth costing against the
 ### Artifacts
 
 - Scratchpad: `radial.py`, `angular.py`.
+
+## 2026-08-28 (cont.): prototype -- carrying W(k) explicitly closes 27% of the
+centroid gap, not all of it
+
+Tested before implementing, against the copy-weighted ground truth on 300
+`copies_gauss2_deep` galaxies.
+
+Setup validated first: the weight rebuilt from bfd's own coefficients
+(`[0.349792, 0.487396, 0.150208, 0.012604]`, `kmax = 1.07635 pi / 0.65`) gives
+`<k^2>` under W alone = **3.692575**, matching `POINT_SOURCE` to every digit --
+so the weight, kmax, units and quadrature grid are all right.
+
+| model | ellipticity response | ratio to exact |
+|---|---|---|
+| exact (copies) | +8.730e-3 | -- |
+| current ansatz (Gaussian PRODUCT) | +6.155e-3 | 0.705 |
+| **W explicit, Gaussian GALAXY** | **+6.856e-3** | **0.785** |
+| W explicit + `beta` deformation fixed by Mc | +6.856e-3 | 0.785 (solve failed) |
+
+So the proposed fix is real and in the right direction -- it closes **27% of
+the gap** (0.295 -> 0.215) -- but it is NOT sufficient by itself.
+
+The `beta` extension (galaxy model `(1 + beta q) exp(-q/2)`, `beta` fixed by
+`Mc`, exactly determined by the five measured moments) could not be solved: the
+family cannot match `Mc/Mr` to better than ~3% (residual 0.166 against a target
+of ~5.75), so it is too rigid.  That is consistent rather than surprising --
+the earlier Gamma-family sweep already showed radial deformations move the
+response by at most +/-15% and by ~5% at the measured `nu`.
+
+### What is still missing
+
+The residual 21.5% is not radial (two independent tests now say so) and not
+co-elliptical structure: a mixture of co-elliptical Gaussians shares one shape
+matrix, so all its isophotes are similar ellipses and it falls in the
+"elliptical with arbitrary radial law" class the Gamma sweep already bounded at
++/-15%.  The remaining candidates are things that make the k-space isophote
+SHAPE vary with k, which the prototype's single elliptical Gaussian galaxy
+cannot represent.  A circular PSF times an elliptical galaxy would do exactly
+that, and `PSFSIGMA = 0.4` is circular in these sims -- worth checking whether
+the moments are of the PSF-convolved or PSF-deconvolved profile before assuming
+it, since a circular GAUSSIAN PSF times an elliptical Gaussian is still a single
+elliptical Gaussian and would change nothing.
+
+### Cost, if it is pursued
+
+Even the partial fix replaces closed-form 2x2 algebra with a 3-parameter
+nonlinear solve per galaxy plus a 2-D quadrature, inside the g-autodiff and
+once per draw in `log_conv_is`.  For 27% of a 5e-3 bias -- about 1.4e-3 -- that
+is a poor trade as it stands.  It only becomes worth building if the remaining
+21.5% is also identified and fixed, taking the whole 5e-3.
+
+### Artifacts
+
+- Scratchpad: `wexplicit.py` (self-checking: it prints `<k^2>` under W and
+  should always read 3.692575).
