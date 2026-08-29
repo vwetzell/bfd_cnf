@@ -4192,3 +4192,73 @@ NOT YET IMPLEMENTED.
 ### Artifacts
 
 - Scratchpad: `differential.py`.
+
+## 2026-08-29 -- The four caveats checked: the differential layer cures gauss2, not bulgedisc
+
+`scratchpad/diff_checks.py`, 4000 galaxies of each copy catalog, sigma scan
+[0.6, 1.6].  `ratio` = differential/exact ellipticity response, `abs err` is
+what propagates to m1, `edge wt` is the fraction of copy weight in the outer
+10% of each galaxy's own u grid.
+
+```
+=== gauss2_deep      (nominal edge wt 1.2e-4, ESS median 25)
+  current 0 -> Sigma_X0:  ratio 0.7024,  abs err 2.49e-3
+  scale   ratio   abs err  vs cur   edge wt   ESS  grid
+   0.60  0.9014  5.13e-4   0.206  2.3e-05     9   ok
+   0.70  0.9122  3.56e-4   0.143  4.0e-05    12   ok
+   0.80  0.9236  2.14e-4   0.086  6.2e-05    16   ok
+   0.90  0.9357  9.31e-5   0.037  8.8e-05    20   ok
+   1.10  0.9635  5.56e-5   0.022  1.7e-04    30   ok
+   1.25  0.9878  4.75e-5   0.019  3.4e-04    39   ok
+   1.40  1.0163  1.04e-4   0.042  8.7e-04    49   ok
+   1.60  1.0637  6.15e-4   0.247  2.8e-03    63   marginal
+
+=== bulgedisc_v2     (nominal edge wt 4.2e-6, ESS median 25)
+  current 0 -> Sigma_X0:  ratio 0.7084,  abs err 1.19e-3
+   0.60  0.7526  6.60e-4   0.555  7.0e-08     9   ok
+   0.70  0.7487  5.36e-4   0.451  3.0e-07    12   ok
+   0.80  0.7454  3.84e-4   0.323  8.0e-07    16   ok
+   0.90  0.7432  2.05e-4   0.172  1.7e-06    20   ok
+   1.10  0.7440  2.24e-4   0.188  1.5e-05    30   ok
+   1.25  0.7509  5.75e-4   0.484  1.1e-04    39   ok
+   1.40  0.7644  9.07e-4   0.763  4.9e-04    49   ok
+   1.60  0.7945  1.23e-3   1.032  2.0e-03    64   marginal
+```
+
+**1. bulgedisc: the relative test fails.**  The ratio is pinned at 0.74-0.79 at
+EVERY scale, against gauss2's 0.90-0.99.  Centring does not cure the 30%
+deficit; it shrinks the STEP, so the same fractional error rides a smaller
+response.  This is the split the controlled decomposition already found: the KBH
+weight is worth 2.7%, the galaxy's second component the rest -- and bulgedisc's
+misaligned bulge+disc is still present in the copy-mean moments that the
+differential transport starts from.  What survives is the absolute error, 5.8x
+smaller at +/-10% depth (2.0e-4 vs 1.19e-3), not 50x.
+
+**2. Depth range.**  gauss2 stays within 10% of current over `sigma` in
+[0.7, 1.4] (a factor 4 in Sigma_X), and its error is a U with the minimum at
+x1.25 rather than at x1.0 -- the Gaussian ansatz changes sign near there.
+bulgedisc's useful band is only [0.9, 1.1]; at x1.4 it is 0.76x current and at
+x1.6 it buys nothing.
+
+**3. Copy grid: valid, and slightly wider than the factor-1.4 rule.**  Edge
+weight stays below 1e-3 through x1.4 on both populations and only reaches
+2-3e-3 at x1.6.  The binding constraint at the LOW end is not the grid but the
+ESS: median 25 at nominal, 9 at x0.6, so the copy "truth" is itself noisiest
+exactly where the gauss2 error grows again -- part of the 0.60/0.70 rise is
+that noise, not the scheme.  Usable range `sigma` in [0.7, 1.4].
+
+**4. bulgedisc's -0.02 windowed error is untouched**, now by measurement and not
+only by argument.  That bias sits in the flow's `R` (corr 0.319 vs the template
+sum, wrong sign, in the two faintest flux quintiles) while `log P` correlates at
+0.995.  The differential scheme only moves where the centroid marginalisation
+happens; it leaves the bulk density alone, and it now also fails to remove
+bulgedisc's own centroid deficit.  Both bulgedisc problems survive.
+
+Net: real, but oversold from one population.  gauss2's -5.2e-3 centroid floor
+goes away.  bulgedisc gains ~5x in absolute error over a narrow +/-10% band,
+moving its centroid contribution from ~5e-3 toward ~1e-3, and does not touch the
+larger -0.02.  Getting bulgedisc to 1e-3 still needs the two-component ansatz.
+
+### Artifacts
+
+- Scratchpad: `diff_checks.py` (supersedes `differential.py`).
