@@ -179,6 +179,61 @@ def test_displacement_covariance_matches_the_linearisation():
     assert np.abs(got - want).max() / np.abs(want).max() < 1e-5, (got, want)
 
 
+def test_transport_is_exact_for_a_gaussian_in_k():
+    """The one case the ansatz claims exactness for, checked to machine precision.
+
+    `models/centroid.py` models `W(k) I(k)` as Gaussian in k -- "exact for a
+    single Gaussian profile times a Gaussian-shaped weight".  Then
+    `W(k)I(k) = c exp(-1/2 k^T A k)` and bfd's kernels (1, k^2, kx^2-ky^2,
+    2 kx ky, k^4) give, with `B = A^-1`,
+
+        Mf = 2 pi c / sqrt(det A)
+        Mr = Mf tr B,   M1 = Mf (B00 - B11),   M2 = 2 Mf B01
+        Mc = Mf (3 B00^2 + 3 B11^2 + 2 B00 B11 + 4 B01^2)
+
+    and damping by `exp(-1/2 k^T Sigma_u k)` is EXACTLY `A -> A + Sigma_u`, so
+    the marginalised moments are the same formulas at `A + Sigma_u`.  No
+    quadrature, no approximation -- ground truth in closed form.
+
+    Worth pinning because the layer's measured 25-30% ellipticity-response
+    undershoot on `copies_gauss2_deep` looked like it could be an algebra slip
+    in the spin-2 branch (the `(I+P)^-1 R` vs `R (I+P)^-1` ordering, or a factor
+    in `M1'`/`M2'`).  It is not: this passes at 1e-14, so the closed form is
+    right and the whole undershoot is `W(k) I(k)` not being Gaussian -- which it
+    is not even for a single-Gaussian GALAXY, since the weight is
+    KBlackmanHarris rather than a Gaussian (HANDOFF.md, 2026-08-28).
+    """
+    rng = np.random.default_rng(0)
+
+    def moments_from_A(A):
+        B = np.linalg.inv(A)
+        mf = 2 * np.pi / np.sqrt(np.linalg.det(A))
+        return np.array([mf, mf * np.trace(B), mf * (B[0, 0] - B[1, 1]),
+                         2 * mf * B[0, 1],
+                         mf * (3 * B[0, 0] ** 2 + 3 * B[1, 1] ** 2
+                               + 2 * B[0, 0] * B[1, 1] + 4 * B[0, 1] ** 2)])
+
+    def rand_spd(scale):
+        L = np.tril(rng.normal(size=(2, 2)))
+        L[np.diag_indices(2)] = np.abs(L[np.diag_indices(2)]) + 0.6
+        return scale * (L @ L.T)
+
+    worst = 0.0
+    for _ in range(100):
+        A = rand_spd(rng.uniform(0.5, 3.0))
+        m = moments_from_A(A)
+        # `_transport` forms Sigma_u = J^-1 Sigma_X J^-T itself, so invert that
+        # to hand it the Sigma_X producing the Sigma_u wanted.
+        su = rand_spd(rng.uniform(0.002, 0.05) * np.trace(A) / 2)
+        j = -0.5 * np.array([[m[1] + m[2], m[3]], [m[3], m[1] - m[2]]])
+        sx = j @ su @ j.T
+        want = moments_from_A(A + su)
+        got = np.asarray(_transport(
+            jnp.asarray(m), jnp.asarray([sx[0, 0], sx[0, 1], sx[1, 1]]), 1.0))
+        worst = max(worst, float(np.abs(got / want - 1).max()))
+    assert worst < 1e-10, worst
+
+
 def test_transport_is_first_order_in_sigma_x_for_small_sigma():
     """The shift is linear in Sigma_X in the small-Sigma_X limit.
 

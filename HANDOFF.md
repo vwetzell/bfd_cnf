@@ -3525,3 +3525,70 @@ this against the copy catalog directly, with no `bias.py` run in between.
 ### Artifacts
 
 - Scratchpad: `sigma_u.py`, `ansatz_err.py`.
+
+## 2026-08-28 (cont.): the centroid closed form is EXACT -- no algebra bug.
+The 30% is the weight function.
+
+The previous entry's leading suspect was an algebra slip in the spin-2 branch
+(a flat 30% in one channel with the spin-0 channels right to 2%).  It is not.
+
+### Worked analytically, then verified numerically
+
+For a Gaussian weight times a Gaussian galaxy, `W(k)I(k) = c exp(-1/2 k^T A k)`
+and bfd's kernels (1, k^2, kx^2-ky^2, 2 kx ky, k^4) give, with `B = A^-1`:
+
+    Mf = 2 pi c / sqrt(det A)
+    Mr = Mf tr B,   M1 = Mf (B00 - B11),   M2 = 2 Mf B01
+    Mc = Mf (3 B00^2 + 3 B11^2 + 2 B00 B11 + 4 B01^2)
+
+so the ansatz's `R = (1/(2 Mf)) [[Mr+M1, M2],[M2, Mr-M1]]` is exactly `B =
+A^-1`.  Damping by `exp(-1/2 k^T Sigma_u k)` is exactly `A -> A + Sigma_u`, and
+
+    R~ = (I + R Sigma_u)^-1 R = (I + A^-1 Sigma_u)^-1 A^-1
+       = [A (I + A^-1 Sigma_u)]^-1 = (A + Sigma_u)^-1
+
+which is the correct new width matrix -- **the `(I+P)^-1 R` ordering the
+docstring flags is right**.  `Mf' = Mf / sqrt(det(I+P))` equals
+`sqrt(det A / det(A + Sigma_u))`, and `(2 Mr^2 + M1^2 + M2^2)/Mf` works out to
+`Mc` identically, so the differential Mc correction is exact too.
+
+Numerically:
+
+| check | result |
+|---|---|
+| the moment formulas above vs 2-D quadrature | agree to 3e-15 |
+| `_transport` vs exact, 200 random Gaussians | worst rel. err **1.8e-14** |
+| ellipticity response ratio, same setup | **1.000000** |
+
+against 0.702 on `copies_gauss2_deep`.  So the closed form reproduces the
+marginalisation to machine precision in the spin-2 channel too.
+
+### Consequence
+
+The entire 25-30% undershoot is `W(k) I(k)` not being Gaussian in k.  And note
+this is NOT only about the galaxy: the weight is **KBlackmanHarris**, not a
+Gaussian, so the product is non-Gaussian even for a single-Gaussian galaxy.
+The ansatz is therefore never exact in practice -- the docstring's "exact for a
+single Gaussian profile times a Gaussian-shaped weight" is true but the second
+half of that condition never holds here.
+
+That also explains the otherwise-backwards `nu` trend in the previous entry:
+`nu` measures the GALAXY's radial non-Gaussianity, but the dominant departure
+is the WEIGHT's, which `nu` does not track.
+
+### Where a fix would come from
+
+The ansatz fixes a one-parameter radial k-scale from `Mr/Mf` alone and then
+treats `Mc` differentially.  The moments already in hand give THREE radial
+k-moments of `W(k)I(k)` -- `<1>`, `<k^2>`, `<k^4>` via Mf, Mr, Mc -- so a
+two-parameter radial family fixed by both `Mr/Mf` AND `Mc/Mr` would use
+information that is currently discarded, with no free constant.  Whether that
+captures the KBlackmanHarris window's shape well enough is untested.
+`centroid.py check` is the loop.
+
+### Artifacts
+
+- `tests/test_centroid.py::test_transport_is_exact_for_a_gaussian_in_k` --
+  pins the exactness claim at 1e-10 so a future edit to the closed form cannot
+  quietly break the one case it is supposed to nail.  13/13 pass.
+- Scratchpad: `gauss_exact.py`.
