@@ -4041,3 +4041,83 @@ moments provably do not determine.
 ### Artifacts
 
 - Scratchpad: the per-galaxy kappa scatter test and the rho scan (inline).
+
+## 2026-08-29 (cont.): the template sum does NOT have this problem, and with
+Sigma_X dependence required the route is a copies-trained conditional flow
+
+Asked whether BFD's template sum suffers the same limitation.  It does not, and
+the reason identifies what to do instead.
+
+### Why the template sum is immune
+
+Eq. (36) ENUMERATES the copies: `P(M,s|G,g) = J(M) SUM_u d2u L[X^G(u); 0,
+Sigma_X] L[M - M^G(u)]`.  Its effective prior over latent moments is the copy
+CLOUD -- each galaxy contributes a spread of points, not one -- and it never
+inverts moments -> profile, because it holds the actual galaxy.  Our centroid
+layer is a deterministic MAP on moments: it can shift a density but not broaden
+it, so it structurally cannot reproduce a copy cloud.  That is a consequence of
+having replaced templates with a density over moment space, not a bug.
+
+What the map omits, measured on 3000 `copies_gauss2_deep` galaxies:
+
+| moment | copy-cloud sd | vs C_M width | vs population sd |
+|--------|---------------|--------------|------------------|
+| Mf | 22.1  | 8.1%  | 0.4% |
+| Mr | 119.4 | 11.3% | 0.7% |
+| M1 | 57.6  | 7.7%  | **5.3%** |
+| M2 | 57.6  | 7.7%  | **5.3%** |
+| Mc | 930.6 | 11.2% | 0.9% |
+
+Correcting the previous entry's emphasis: the BROADENING dominates, not the
+uncertainty on the mean shift.  The unpredictable part of the shift is +/-11% of
+~5.7e-4 in `e`, i.e. ~6e-5, while the copy-cloud spread in `e` is ~3.4e-3 --
+fifty times larger.
+
+### Sigma_X dependence is clean; the covariance is not predictable
+
+| sigma scale | Sigma_X rel | mean shift | Var[M1] |
+|---|---|---|---|
+| 0.80 | 0.640 | 1.000 | 1.000 |
+| 1.00 | 1.000 | 1.600 | 2.352 |
+| 1.25 | 1.562 | 2.580 | 5.405 |
+
+`Delta ~ Sigma_X` and `C_cent ~ Sigma_X^2`, exactly as parity predicts: for the
+EVEN moments `dM_a/du = 0` at u = 0 (the integrand is real and even), so the
+shift is second order in u and the variance fourth.  So the Sigma_X dependence
+is a known power law, not something that has to be learned.
+
+**But `C_cent` is not predictable from the moments.**  Fractional scatter of
+`Var[M1]` is 1.964 overall and 1.916 within fine `(Mr/Mf, Mc/Mr, |e|)` bins --
+conditioning removes ~5% of the variance, against 49% for the mean shift.  That
+kills the `C_cent(m, Sigma_X)` model proposed in the previous entry: it cannot
+be tabulated because the moments do not determine it.
+
+### What survives, given Sigma_X dependence is required
+
+Train the flow on COPY moments, conditioned on Sigma_X.  Reweighting is free --
+`w(u)` depends on Sigma_X, so one copy grid yields training data at any Sigma_X
+in its validity range (roughly a factor 1.4 in sigma_XY), which is what
+`centroid.py --sigma-scale` already does.  Sample Sigma_X per batch and the flow
+learns `p(m | g, Sigma_X)` directly from exact eq. (36) weights.
+
+Two properties that matter:
+
+* it is a DENSITY over copy moments, not a bijection applied to a galaxy
+  density, so it CAN represent the broadening no deterministic layer can;
+* the Sigma_X dependence is learned from exact weights rather than derived from
+  an ansatz, and the `Sigma_X` / `Sigma_X^2` scalings above give the right
+  functional form to learn against.
+
+This means dropping `CentroidMarginalize` and making bulk+shear conditional on
+`(g, Sigma_X)`.  A real architecture change, but it removes the transport
+approximation, the 30% spin-2 deficit and the +/-11% floor together, because
+nothing is inferred from moments any more.  The copies catalog already carries
+`moments`, `dm_dg` and `d2m_dg2` PER COPY -- exactly what `bulk.train` and
+`shear.train` consume -- and `CopySampler` already draws copies by weight
+(though it fixes Sigma_X at construction and would need that lifted).
+
+NOT YET ATTEMPTED.
+
+### Artifacts
+
+- Scratchpad: the copy-cloud spread and Sigma_X-scaling measurements (inline).
