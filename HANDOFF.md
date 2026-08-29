@@ -4508,3 +4508,60 @@ decides whether the fix belongs in the chart, the bulk, or the shear layer.
 ### Artifacts
 
 - Scratchpad: `rsplit.py`, `tsplit.py`.
+
+## 2026-08-29 -- B is the BULK's score, not the shear layer's log-det (99.6%)
+
+g enters the chain only through the shear layer, so with `z_c` the
+(g-independent) output of raw2standard + centroid,
+
+    d_g log p =  d_g log|det J_shear|        <- "logdet"
+               + grad log p_rest . d_g S_g   <- "transport"
+
+and `B = Var[logdet] + Var[transport] + 2 Cov`.  `scratchpad/bsplit.py`:
+
+```
+chain reconstruction vs flow.log_prob, on each target's top-weight draw:
+  max RELATIVE diff = 4.39e-06
+
+ Mf quintile  Var[logdet]  Var[transp]        2Cov     B total  logdet %  transp %
+          q1    1.622e-01    2.034e+02   6.040e-01   2.042e+02       0.1      99.6
+          q2    1.531e-01    8.171e+01  -7.354e-02   8.179e+01       0.2      99.9
+          q3    8.592e-02    2.958e+01   8.086e-02   2.975e+01       0.3      99.4
+          q4    5.769e-02    9.252e+00   8.917e-02   9.399e+00       0.6      98.4
+          q5    1.141e-02    1.697e+00   2.361e-02   1.732e+00       0.7      98.0
+         ALL    9.406e-02    6.514e+01   1.448e-01   6.538e+01       0.1      99.6
+```
+
+The cross term is negligible everywhere -- the two channels are effectively
+independent -- and TRANSPORT carries 98-99.6% of B in every quintile.  The B
+totals match `rsplit.py` to four digits.
+
+**CORRECTS the emphasis in the "spikiness is the Jacobian" entry.**  The log-det
+gradient of 20.5 (vs gauss2's 2.5) was a real measurement of the density's
+roughness, but the log-det's own contribution to the SCORE VARIANCE is 0.1%.
+The variance arrives through `grad_z log p_bulk` contracted with the shear
+displacement, and the displacement is a smooth network output -- so the
+roughness is in the BULK density's gradient field.
+
+**Consequence: the repair belongs in the bulk density or its chart, not the
+shear layer.**  That is also why every shear-side lever in this repo's history
+came back null -- more shear steps, the score term, band-weighting, the
+second-order ablation.  They were all acting on 0.1% of the problem.
+
+**Verification note.**  The first run's self-check reported max |diff| = 5.7e7
+and was a BAD CHECK, not a bad split: it compared an arbitrary draw's log p at
+magnitudes ~1e10 (masked / far-tail draws), where float32 has ~1e3 of absolute
+resolution and a jit reordering alone moves it by 1e7.  Checked properly
+standalone, the manual walk matches `flow.log_prob` EXACTLY (diff 0.0, value and
+gradient, over 40 targets); the in-run check now uses the top-weight draw and a
+relative tolerance.
+
+**Next:** separate WHY `grad_z log p_bulk` is bad -- too LARGE in magnitude (the
+chart's heavy tails making the density genuinely steep at faint flux, log10 Mf
+skew 1.78) or too ROUGH at fixed magnitude (affine MAF steps unable to
+represent a smooth steep density).  Compare against the template sum's
+`grad_M log P` at the same points, in magnitude and in local variation.
+
+### Artifacts
+
+- Scratchpad: `bsplit.py`.
