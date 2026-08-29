@@ -3442,3 +3442,86 @@ chain is measured and clean at the 1e-3 level on this population.  Two ways in:
 - Scratchpad: `exact_split.py` (three modes: `flow`, `truth`, `combine` --
   separate processes because importing `truth` enables x64 and the flow
   checkpoints are float32), `split_{flow,truth}_{plus,minus}.npz`.
+
+## 2026-08-28 (cont.): the centroid layer's 30% deficit is SPIN-2 ONLY, and it
+is neither Sigma_u nor the single-Gaussian collapse
+
+With the budget closed onto the centroid layer (previous entry), two candidate
+mechanisms were tested against the exact copy-weighted marginalisation on 4000
+`copies_gauss2_deep` galaxies.  Both are NEGATIVE, and what survives is sharper.
+
+### Sigma_u is not the problem
+
+The layer uses `Sigma_u = J^-1 Sigma_X J^-T`, the LINEARISATION of
+`X^G(u) ~ J u`, and treats `|J(u)|` as constant.  The true density is
+`w(u) = d2u |J(u)| N(X(u); 0, Sigma_X)`, which the copy catalog carries
+exactly (`u`, `xy`, `da` per copy).  Exact weighted second moment vs the
+linearisation:
+
+| trace(Sigma_u) exact / linearised | p10 | p50 | p90 |
+|---|---|---|---|
+| all | 1.0014 | **1.0087** | 1.0557 |
+| faintest 25% | | 1.0471 | |
+| brightest 25% | | 1.0017 | |
+
+1-5%, not 25-30%.  A response linear in `Sigma_u` cannot lose 30% here.
+
+### The deficit is confined to spin-2
+
+Ansatz (`_transport(m, sigma_x, +1)`) against the exact copy-weighted mean:
+
+| channel | ansatz / exact |
+|---|---|
+| Mf fractional shift | 0.976 |
+| Mr fractional shift | 1.004 |
+| Mc fractional shift | 1.089 |
+| **ellipticity response** | **0.702** |
+
+The spin-0 channels are right to ~2% (Mc to 9%).  Only the spin-2 response is
+short, and by 30% -- reproducing the module docstring's own "25-30%
+undershoot" number, now localised to one channel.
+
+### And it is NOT the single-Gaussian collapse
+
+`gauss2` is a two-Gaussian mixture, so `W(k)I(k)` is a SUM of two Gaussians in
+k while the ansatz solves for ONE width matrix `R` from `(Mf, Mr, M1, M2)`.
+That predicts the error should grow with the profile's non-Gaussianity.  Using
+`nu = Mc Mf / (2 Mr^2 + M1^2 + M2^2)`, which is exactly 1 for a single Gaussian
+in k (it is the ansatz's own `mc_ansatz` ratio):
+
+| nu bin | n | exact response | ansatz response | ratio |
+|--------|---|----------------|-----------------|-------|
+| 0.909-0.929 | 800 | 4.945e-3 | 3.851e-3 | 0.779 |
+| 0.929-0.942 | 800 | 5.545e-3 | 4.286e-3 | 0.773 |
+| 0.942-0.958 | 800 | 8.039e-3 | 6.303e-3 | 0.784 |
+| 0.958-0.984 | 800 | 1.036e-2 | 6.667e-3 | 0.644 |
+| 0.984-1.066 | 800 | 1.279e-2 | 8.156e-3 | 0.638 |
+
+The ratio gets WORSE as `nu -> 1`, i.e. as the profile becomes MORE Gaussian --
+backwards from the hypothesis.  (Caveat: `nu` correlates with size and flux, so
+this is suggestive rather than airtight, but it certainly does not support the
+collapse being the mechanism.)
+
+### What that leaves, and the test to run next
+
+`Sigma_u` right, spin-0 algebra right, profile model not the driver, deficit
+flat at ~30% in one channel.  **A flat factor in a single channel looks like an
+algebra error rather than an approximation** -- candidates being the
+`(I+P)^-1 R` versus `R (I+P)^-1` ordering the docstring itself flags as
+non-commuting, or a factor in `M1' = Mf'(R~xx - R~yy)` / `M2' = 2 Mf' R~xy`.
+
+The decisive test: **a single elliptical Gaussian is a case where the ansatz is
+supposed to be EXACT.**  Evaluate the damping integral
+`INT W(k) kernel_a(k) I(k) exp(-1/2 k^T Sigma_u k)` numerically for one and
+compare against `_transport`.  Disagreement is a bug in the closed form;
+agreement means the ansatz is right and the 30% really is the two-component
+profile, which the `nu` trend argues against.  `gauss2` cannot serve as this
+test because it is a TWO-Gaussian mixture -- the unit test needs a
+single-Gaussian galaxy built for the purpose.  NOT YET RUN.
+
+Note `centroid.py check` gives a fast iteration loop for any fix: it measures
+this against the copy catalog directly, with no `bias.py` run in between.
+
+### Artifacts
+
+- Scratchpad: `sigma_u.py`, `ansatz_err.py`.
