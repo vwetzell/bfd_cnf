@@ -4262,3 +4262,49 @@ larger -0.02.  Getting bulgedisc to 1e-3 still needs the two-component ansatz.
 ### Artifacts
 
 - Scratchpad: `diff_checks.py` (supersedes `differential.py`).
+
+## 2026-08-29 -- Two-Gaussian + exact W on bulgedisc: 0.90, not 0.99
+
+`scratchpad/twogauss_bd.py`, 600 galaxies per catalog, ratio to copy truth,
++- is a 400-resample galaxy bootstrap.  Every rung is driven by the five
+measured moments alone.
+
+```
+=== gauss2_deep (control)            exact response +9.06e-03
+     0. current _transport   0.7412 +- 0.0327   abs err 2.35e-3
+     1. 1-Gauss + exact W    0.8286 +- 0.0374   abs err 1.55e-3
+     2. 2-Gauss + exact W    1.0368 +- 0.0400   abs err 3.34e-4
+
+=== bulgedisc_v2                     exact response +4.27e-03
+     0. current _transport   0.7245 +- 0.0164   abs err 1.18e-3
+     1. 1-Gauss + exact W    0.7938 +- 0.0189   abs err 8.80e-4
+     2. 2-Gauss + exact W    0.8976 +- 0.0122   abs err 4.37e-4
+```
+
+Solves: 600/600 on gauss2, 586/600 on bulgedisc (14 galaxies have moments
+outside the co-elliptical two-Gaussian's reachable set); residuals ~3e-16.
+
+The gauss2 control is consistent with 1.0 at 0.9 sigma, retiring the earlier
+0.9905 (same quantity, 300 galaxies).  But that control was never a real test:
+gauss2's galaxy IS two co-elliptical Gaussians at `BULGE_FRAC = 0.5`, so
+`analytic.theta_of_m` inverts the generative parameters and rung 2 is close to a
+self-consistency check.  bulgedisc_v2 is a Sersic bulge + exponential disc,
+MISALIGNED -- wrong profile, not co-elliptical -- and there it stalls at
+0.8976 +- 0.0122, i.e. 8.4 sigma from closing.
+
+Budget of bulgedisc's 27.6% deficit: exact W buys 6.9 points, the second
+Gaussian 10.4, and **10.2 +- 1.2 points survive**.  The survivor is what a
+co-elliptical model structurally cannot hold -- the bulge/disc misalignment,
+the same thing that pins Mr/Mf at 3.0-3.2.  Relaxing co-ellipticity is 7
+parameters against 5 measured moments: underdetermined without new moments,
+which the standing constraint rules out.
+
+**Not yet measured, and the obvious next move:** the two failure modes are
+independent.  The differential scheme shrinks the STEP (bulgedisc abs err
+2.0e-4 at +/-10% depth); this rung improves the fractional accuracy OF a step
+(0.72 -> 0.90).  Composing them -- a 2-Gauss + exact-W transport carrying only
+the `Sigma_X0 -> Sigma_X` differential -- projects to ~8e-5.
+
+### Artifacts
+
+- Scratchpad: `twogauss_bd.py`.
