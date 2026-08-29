@@ -3366,3 +3366,79 @@ turn the -0.0062 gauss2 floor from "consistent with the centroid layer's
 - `truth.py`: `to_coords` slot 2 is now `Mc/Mr`.
 - `tests/test_truth.py`: `test_to_coords_matches_sim` replaces
   `test_to_coords_matches_bulk`.
+
+## 2026-08-28 (cont.): the exact split, and the budget closes -- the estimator
+is unbiased to 1.7e-4 and the whole floor is the centroid layer
+
+With `truth.py` fixed, the model/estimator split is now arithmetic rather than
+inference.  Done on NOISELESS `gauss2` (`CATALOGS["gauss2"]`, the 1M
+catalogs), where `P(M|g)` is a point evaluation: no draws, no importance
+sampling, no convolution, and no acceptance-boundary subtlety, since every
+catalog target is interior to the rejection region.  200000 targets, paired
+(same targets for both models, so the shape noise cancels in the difference).
+
+| | m1 |
+|---|---|
+| **truth, exact Q and R** | **-0.000171 +/- 0.000107** |
+| flow, bulk+shear (`shear_gauss2_60k.eqx`) | -0.000784 +/- 0.000462 |
+| difference, paired bootstrap | **-0.00061 +/- 0.00048** |
+
+per-target agreement `corr(Q1) = 0.9844`, `corr(R11) = 0.8542`.
+
+Three things follow, all at or below the 1e-3 target:
+
+1. **The BFD estimator is intrinsically unbiased to 1.7e-4.**  The single
+   Newton step, the +/- antisymmetrisation, the ensemble sums and the |Q|/|R|
+   guard together carry no 1e-3 bias.  That retires the whole
+   "Newton-truncation / finite-g" class of worry.
+2. **bulk+shear contribute -6.1e-4 +/- 4.8e-4**, consistent with zero at 1.3
+   sigma.  On gauss2 the fitted prior and its shear response are essentially
+   exact at the level that matters.
+3. So the entire -0.0062 noisy floor is introduced by the two things present
+   ONLY in the noisy path: the centroid layer and the IS convolution.
+
+### The budget, closed
+
+| configuration | m1 |
+|---|---|
+| noiseless (no centroid, no convolution) | -0.0008 |
+| noisy, `--no-centroid` (S = 32768) | -0.0132 +/- 0.0053 |
+| noisy, with centroid (S = 32768) | -0.0062 +/- 0.0012 |
+
+Centroid marginalisation costs **-0.0124** if left unmodelled; the layer
+recovers **+0.0070** of it, i.e. 53%; the residual -0.0062 is its 47%
+shortfall.  The "needed +0.0132" is now ANCHORED by the noiseless baseline
+rather than inferred, which is what the earlier `--no-centroid` difference
+alone could not do.
+
+For orientation, `models/centroid.py`'s header quotes a 25-30% undershoot of
+the ELLIPTICITY RESPONSE; that is a different quantity from a 47% shortfall in
+m1, but the same order, and both point at the same place.
+
+### What to do next
+
+The target is now singular and quantitative: **the centroid layer captures 53%
+of the centroid effect and needs to capture ~100%.**  Everything else in the
+chain is measured and clean at the 1e-3 level on this population.  Two ways in:
+
+* The Gaussian-in-k ansatz's spin-2 response is the documented weak point, and
+  `centroid.py check` already measures it against the copy catalog -- that is
+  the loop to close, and it needs no `bias.py` run to iterate.
+* The convolution's own contribution has NOT been separated from the centroid
+  layer's within the noisy path.  The clean way is the same exact split done
+  here, but with `truth.log_prob` inside `log_conv_is` on the noisy targets --
+  affordable (measured ~2600 evals/s, so 2000 targets x 8192 draws is ~1.8 h
+  per arm), with one caveat to handle first: `sample_population_gauss2` uses
+  rejection at ~30% acceptance, so the true density is P0 RESTRICTED, and
+  draws landing outside the accepted region should get zero density where
+  `truth.log_prob` returns a finite one.  The acceptance test is explicit
+  (`resid < GAUSS2_RESID_TOL`, sigma/rho in range, `|e| < GAUSS2_E_MAX`) so it
+  can be masked, but the boundary is g-DEPENDENT (shear moves `|e|`) and a hard
+  `jnp.where` has no gradient there, so the masked convolution would miss a
+  boundary term.  Worth thinking through before spending the hours.
+
+### Artifacts
+
+- Scratchpad: `exact_split.py` (three modes: `flow`, `truth`, `combine` --
+  separate processes because importing `truth` enables x64 and the flow
+  checkpoints are float32), `split_{flow,truth}_{plus,minus}.npz`.
