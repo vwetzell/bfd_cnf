@@ -4565,3 +4565,59 @@ represent a smooth steep density).  Compare against the template sum's
 ### Artifacts
 
 - Scratchpad: `bsplit.py`.
+
+## 2026-08-29 -- The bulk's score OSCILLATES in the weight-carrying bulk; the ceiling tail is a red herring
+
+`scorefield.py` (flow score vs a template KDE) and `tail.py`/`tail2.py` (where
+the blow-ups are, unweighted vs pi-weighted).
+
+```
+=== flow score vs template KDE, 22174 in-domain points, 200 faint targets
+  flow |score| per noise sigma: median 16.9, p90 3.28e+08
+  KDE h   |score| med   flow/KDE med   cos angle   corr per-dim
+   0.25          11.9           1.42       0.440          0.000
+   0.50          3.09           5.47       0.436          0.000
+   1.00          1.21          13.96       0.328          0.000
+
+=== |score| per noise sigma, 409600 draws over 400 faint targets
+  UNWEIGHTED   q50/q90/q99/q99.9:  34.1  3.6e6  6.5e13  1.7e15
+  pi-WEIGHTED  q50/q90/q99/q99.9:  20.3  323.5  1953    10011
+  unweighted fraction |score| > 1e4:  25.6%
+  pi-weighted  fraction |score| > 1e4:   0.105%
+  top 50% of weight (7213 of 409600 draws):  40.9% of B
+  top 90% of weight (27597 draws):           91.5% of B
+  pi-weighted median 1-u = 1.049e-01, 1-v = 8.682e-02
+```
+
+**RED HERRING, recorded so it is not chased again.**  Unweighted, 25.6% of
+in-domain draws carry |score| > 1e4, the p99.9 reaches 1e15, and it correlates
+with the chart's point-source ceiling (corr(log|score|, log(1-u)) = -0.513).
+Those draws have log p ~ -1e14, so pi = 0 EXACTLY and they cannot enter
+B = Var_pi[score]: under the weights they hold 0.105% of the mass, and the
+weight-carrying draws sit at 1-u = 0.105, nowhere near the ceiling.  The chart's
+logit divergence is real and IRRELEVANT to the bias.
+
+**B is carried by the mainstream of the cloud** -- the draws holding the top 50%
+of the weight carry 41% of B, the top 90% carry 91.5%.  Not an outlier artifact.
+
+**What is actually wrong.**  In the weight-carrying region the flow's
+g-direction score has sd sqrt(204) = 14.3 against the template sum's
+sqrt(6.93) = 2.63 -- **5.4x too much variation**.  |grad log p| runs median 20.3
+with p90 324, a 16x spread inside a single noise kernel.  Against a fine
+template KDE (h = 0.25) the median MAGNITUDE is only 1.42x high, but the
+DIRECTION agrees at cos = 0.44.
+
+So: not too steep, and not a singularity -- the fitted density's GRADIENT FIELD
+OSCILLATES through the ordinary bulk of the population, ~5x more than the true
+density's, with the direction half wrong.  Magnitude approximately right is
+exactly why log P matches templates to 0.01 nats while its derivative does not.
+
+**Points at the bulk's REPRESENTATION, not the chart's tails.**  Affine MAF
+couplings fitting a heavy-tailed coordinate reproduce a density accurately in
+value while its gradient rings.  Two candidate repairs, both architecture and
+neither tuning: a smoother flux coordinate (log10 Mf skew 1.78), or monotonic
+rational-quadratic splines in place of the affine steps.
+
+### Artifacts
+
+- Scratchpad: `scorefield.py`, `tail.py`, `tail2.py`.
