@@ -4676,3 +4676,70 @@ coordinate straining the fit.
 ### Artifacts
 
 - Scratchpad: `ring.py`.
+
+## 2026-08-29 -- Gaussianising the flux axis: a C2 cubic quantile spline, 32 knots
+
+`scratchpad/gaussianise.py`, `fluxshape.py`, `c2spline.py`.
+
+**Flux is the worst axis, but NOT the only one.**  `bulk.to_coords` per slot,
+bulgedisc_v2 vs gauss2 (which the same stack fits at Fisher 0.96):
+
+```
+              slot   bd skew   bd kurt   g2 skew   g2 kurt
+          log10 Mf     1.775     3.807    -0.012     0.013
+    logit Mr/PS.Mf     0.184     0.110     0.276    -0.467
+   logit Mc/PSc.Mr     0.239     0.261     0.215    -0.605
+             M1/Mr     0.035     3.435     0.007    -0.068
+             M2/Mr    -0.016     3.328    -0.008    -0.066
+```
+
+The two logit slots are FINE.  The spin-2 pair carries excess kurtosis ~3.4,
+comparable to flux's 3.8 -- so it wants the same treatment, but RADIAL (a
+monotone map of |e| with the direction untouched) or the equivariance breaks.
+
+**Why two parameters cannot do the flux axis.**  A fitted sinh-arcsinh zeroes
+skew AND kurtosis exactly and still leaves Anderson-Darling at 144 (current
+log10 Mf: 919; rank-transform ceiling: 0.15).  Box-Cox is worse: lambda = -0.79
+zeroes skew but drives kurtosis to -1.  The shape is not skewness -- it is a
+sharp lower edge plus a long upper tail:
+
+```
+  percentile      0.1      1      5     50     95     99   99.9
+  log10 Mf      2.750  2.862  2.930  3.248  4.460  5.270  5.983
+  matched Gauss 1.832  2.222  2.570  3.409  4.249  4.597  4.987
+```
+
+i.e. a detection/flux cut piled against a floor, with a power-law tail above.
+No two-moment family reaches a truncation.
+
+**The transform must be C2, not merely monotone.**  `log p(x) = log p_z(T(x)) +
+log|T'(x)|`, so the SCORE carries `T''/T'`.  A PCHIP is only C1 and would inject
+a T'' jump of ~560 at every knot -- discontinuities in exactly the quantity
+`ring.py` showed is currently smooth.  A natural cubic spline is C2 and, though
+monotonicity is not guaranteed by construction, it holds here:
+
+```
+  knots    kind     skew     kurt      AD    min T'    max T'  max |T''| jump
+     16   pchip   0.0624  -0.0252    1.24    0.8577    13.548        428.862
+     16   cubic   0.0394  -0.0210    0.59    0.9274    13.012          0.003
+     32   cubic   0.0157  -0.0154    0.33    0.9093    14.847          0.010
+     64   cubic   0.0076  -0.0471    0.17    0.7926    15.074          0.033
+    128   cubic   0.0054  -0.0592    0.15    0.7937    15.653          0.166
+```
+
+**Recommendation: 32-knot natural cubic spline on the flux quantiles.**  AD
+919 -> 0.33, min T' = 0.909, T'' jump 0.010.
+
+Implementation notes: knots span [2.750, 5.983] while the data reach
+[2.477, 6.438] and draws go further, so the extrapolation must continue C2
+(match value, slope AND curvature at the ends -- NOT linearly).  The constants
+are fitted to the template flux marginal, the same status as
+`RawMomentStandardize`'s mean/std (which are TRAINABLE) -- a population
+statistic, not a knob tuned against m1, but that is the user's call.
+
+**Still a hypothesis.**  That Gaussianising the marginals reduces the score's
+ringing needs a bulk retrain and a re-run of `rsplit.py` to confirm B falls.
+
+### Artifacts
+
+- Scratchpad: `gaussianise.py`, `fluxshape.py`, `c2spline.py`.
