@@ -4370,3 +4370,73 @@ the whole of the bulgedisc problem.
 ### Artifacts
 
 - Scratchpad: `learned_ceiling.py`.
+
+## 2026-08-29 -- Centroid gain implemented and calibrated; NULL on bulgedisc's bias
+
+Implemented the population-calibrated spin-2 gain from the previous entry.
+
+- `models/centroid.py`: `_transport(m, sigma_x, sign, gain=1.0)` scales the
+  ELLIPTICITY displacement `e = (M1 + i M2)/Mr` only.  Mf and Mr come out
+  exactly as the ansatz computes them -- the spin-0 channels were already right
+  to 2-9%, and rescaling `Sigma_u` instead would have moved them by the full
+  gain.  `CentroidMarginalize.gain` is a STATIC field, so it stays off the leaf
+  list and every checkpoint written before today still deserialises.
+- `bulk.build_flow(..., centroid_gain=1.0)`; `--centroid-gain` on both
+  `centroid.py` and `bias.py`.
+- `centroid.py calibrate`: fits the gain on half the galaxies, reports the other
+  half.  Held out because the binned kappa table overfitted this once and the
+  in-sample ratio is 1 by construction.
+
+Calibration on `copies_bulgedisc_v2.fits` (100k galaxies):
+
+```
+  fitted on 10000 galaxies, tested on 10000
+  uncorrected ratio  train 0.7121   HELD OUT 0.7109
+  corrected ratio    train 1.0000   HELD OUT 0.9984
+  centroid gain = 1.4043
+```
+
+`centroid.py check` at that gain, end to end through the real layer:
+ellipticity response ratio **0.708 -> 0.9929**, spin-0 shifts undisturbed
+(Mf -3.755e-3 vs catalog -3.886e-3, Mr -7.340e-3 vs -7.213e-3).
+
+Tests: 69/69 pass.  Three new ones pin that gain 1.0 is bit-identical to the old
+path, that the gain scales the ellipticity shift while leaving Mf/Mr untouched,
+that the round trip survives a gain at anisotropic Sigma_X (residual < 1e-3
+against the bare layer's 1e-5), and that rotation equivariance holds.
+
+### The bias: a matched pair, and a NULL
+
+`--pop bulgedisc_deep_v2 --samples 8192 --alpha 0.5 --chunk 4096
+--batch-budget 65536 --n-targets 20000 --flow flows/centroid_bulgedisc_v2.eqx`,
+run sequentially so they did not contend for the card.
+
+```
+                     gain 1.0                gain 1.4043
+  m1            -1.26963 +/- 0.01158    -1.27050 +/- 0.01163
+  c1            -1.21e-03               -1.22e-03
+  q1 (faintest)  -1.0250                 -1.0254
+  q2             -1.1512                 -1.1514
+  q3             +0.1352                 +0.1315
+  q4             +0.0028                 +0.0024
+  q5             -0.0010                 -0.0011
+```
+
+The shift is -0.0009 against a +/-0.0116 error bar: a null.
+
+**This is the expected outcome, not a failed fix.**  The exact-split budget put
+the whole centroid contribution at ~5e-3, three orders below the 1.27 here.
+What dominates is the documented R sign inversion at the faint end -- q1 and q2
+pinned at -1.03 and -1.15 (zero measured shear response) while q4/q5 are clean
+at ~0.001-0.003.  Correcting the centroid's ellipticity response cannot touch a
+quintile whose response has collapsed for a different reason.
+
+The centroid layer is now correct on bulgedisc and is OFF the critical path.  It
+was worth fixing -- a real 30% error that would surface at the 1e-3 level -- but
+the binding constraint is the flow's density: R correlates 0.319 with the
+template sum and flips sign in the two faintest flux quintiles, where log P
+still correlates at 0.995.
+
+### Artifacts
+
+- Scratchpad: `bias_gain1.log`, `bias_gain140.log`, `run_bias.sh`.

@@ -1470,6 +1470,11 @@ def main():
                         "standardisation; defaults to the matching moments file)")
     p.add_argument("--g", type=float, default=0.02)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--centroid-gain", type=float, default=1.0,
+                   help="scalar amplification of the centroid layer's SPIN-2 "
+                        "shift; 1.0 is the bare ansatz. Measure it with "
+                        "`centroid.py calibrate` on this population's own "
+                        "copies -- it does not transfer between populations.")
     p.add_argument("--boot", type=int, default=200)
     p.add_argument("--samples", type=int, default=0,
                    help="Monte Carlo draws per target from its noise kernel. "
@@ -1583,7 +1588,8 @@ def main():
     slice90 = lambda arr: arr[:int(0.9 * len(arr))]
     m_train = m_train_full if use_centroid else slice90(m_train_full)
     flow = bulk.build_flow(jr.key(a.seed), m_train, shear=True,
-                           centroid=use_centroid)
+                           centroid=use_centroid,
+                           centroid_gain=a.centroid_gain)
     flow = eqx.tree_deserialise_leaves(a.flow, flow)
     print(f"{a.flow} on the {a.pop} targets"
           + (" (image noise, recentred; centroid layer on)" if use_centroid

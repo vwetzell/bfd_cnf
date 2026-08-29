@@ -408,3 +408,54 @@ if __name__ == "__main__":
             fn()
             print(f"  {name} ok")
     print("ok")
+
+
+def test_gain_is_a_no_op_at_one_and_scales_the_spin2_shift():
+    """`gain` amplifies the ellipticity shift and leaves Mf, Mr untouched.
+
+    The layer's ansatz undershoots the ellipticity response ~30% on realistic
+    populations (see `_transport`'s docstring); the gain is the population
+    calibration that closes it.  Default 1.0 must reproduce the old numbers
+    exactly, so every checkpoint written before it existed still means what it
+    used to.
+    """
+    base = _transport(M, SIGMA_X, 1.0)
+    assert float(jnp.abs(_transport(M, SIGMA_X, 1.0, 1.0) - base).max()) == 0.0
+
+    e = lambda m: jnp.stack([m[2] / m[1], m[3] / m[1]])
+    e0, e1 = e(M), e(base)
+    for gain in (0.5, 1.38, 2.0):
+        got = _transport(M, SIGMA_X, 1.0, gain)
+        # spin-0 channels are deliberately untouched by the gain
+        assert float(jnp.abs(got[0] - base[0]) / base[0]) < 1e-7, gain
+        assert float(jnp.abs(got[1] - base[1]) / base[1]) < 1e-7, gain
+        # and the ellipticity SHIFT is scaled by exactly the gain
+        want = e0 + gain * (e1 - e0)
+        assert float(jnp.abs(e(got) - want).max()) < 1e-6, gain
+
+
+def test_round_trip_survives_a_gain():
+    """A gain leaves the layer invertible to well under the tanh cap.
+
+    The two directions are exact inverses only for the bare ansatz; scaling
+    the displacement breaks that at second order in a shift that is itself
+    ~1e-2, so the residual must stay far below the 1e-5 the bare layer holds
+    to be harmless.  Checked at an anisotropic Sigma_X, where R and Sigma_u do
+    not commute.
+    """
+    for gain in (0.7, 1.38):
+        layer = CentroidMarginalize(mean=MEAN, std=STD, gain=gain)
+        for sx in (SIGMA_X, SIGMA_X_ANISO):
+            y, ld = layer.inverse_and_log_det(Z, sx)
+            x, ld2 = layer.transform_and_log_det(y, sx)
+            assert float(jnp.abs(x - Z).max()) < 1e-3, (gain, sx)
+            assert abs(float(ld + ld2)) < 1e-3, (gain, sx)
+
+
+def test_gain_keeps_the_rotation_equivariance():
+    """The gain scales a spin-2 vector, so it cannot introduce a direction."""
+    layer = CentroidMarginalize(mean=MEAN, std=STD, gain=1.38)
+    for phi in (0.3, 1.1, 2.7):
+        a = _rotate(layer.unmarginalize(Z, SIGMA_X_ANISO), phi)
+        b = layer.unmarginalize(_rotate(Z, phi), _rotate_sigma(SIGMA_X_ANISO, phi))
+        assert float(jnp.abs(a - b).max()) < 1e-8, phi

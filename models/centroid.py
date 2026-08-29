@@ -305,7 +305,7 @@ def standard_from_raw(m, mean, std):
     return (z - mean) / std
 
 
-def _transport(m, sigma_x, sign):
+def _transport(m, sigma_x, sign, gain=1.0):
     """The centroid-marginalisation map on raw moments, both directions.
 
     `sign = +1.0`: base -> data (forward marginalisation, physically what
@@ -315,8 +315,17 @@ def _transport(m, sigma_x, sign):
     measured moments regardless of which direction is being evaluated; only
     the sign of the k-space damping `P` differs.
 
-    No free parameters: everything here is either a fixed bfd moment-kernel
-    identity or a deterministic function of `m` and `sigma_x`.
+    `gain` scales the SPIN-2 displacement only, leaving Mf and Mr exactly as
+    the ansatz computes them.  At `gain = 1.0` (the default) nothing changes.
+    It exists because the Gaussian-in-k ansatz undershoots the ellipticity
+    response by ~30% on realistic galaxies -- a two-Gaussian galaxy with W(k)
+    carried exactly recovers only a third of that, the rest being bulge/disc
+    misalignment no co-elliptical model can represent, while a single scalar
+    calibrated against the population's own copy catalog closes it to ~0.4% on
+    held-out galaxies.  The spin-0 channels are left alone because they are
+    already right to 2-9%; rescaling Sigma_u instead would have moved them by
+    the full gain.  `centroid.py calibrate` measures it; it does NOT transfer
+    between populations, so it must be recalibrated for each.
     """
     Mf, Mr, M1, M2, Mc = m[0], m[1], m[2], m[3], m[4]
     R = (0.5 / Mf) * jnp.array([[Mr + M1, M2], [M2, Mr - M1]])
@@ -340,6 +349,11 @@ def _transport(m, sigma_x, sign):
     Mr_out = Mf_out * (r_tilde[0, 0] + r_tilde[1, 1])
     M1_out = Mf_out * (r_tilde[0, 0] - r_tilde[1, 1])
     M2_out = Mf_out * 2.0 * r_tilde[0, 1]
+    # Amplify the ELLIPTICITY shift, not the moments: e = (M1 + i M2) / Mr is
+    # what the response is measured in, and scaling M1/M2 directly would drag
+    # the gain through Mr's own (already accurate) change.
+    M1_out = Mr_out * (M1 / Mr + gain * (M1_out / Mr_out - M1 / Mr))
+    M2_out = Mr_out * (M2 / Mr + gain * (M2_out / Mr_out - M2 / Mr))
     mc_ansatz_in = (2.0 * Mr ** 2 + M1 ** 2 + M2 ** 2) / Mf
     mc_ansatz_out = (2.0 * Mr_out ** 2 + M1_out ** 2 + M2_out ** 2) / Mf_out
     Mc_out = Mc + (mc_ansatz_out - mc_ansatz_in)
@@ -365,10 +379,15 @@ class CentroidMarginalize(AbstractBijection):
     # Static, for the reason given in models/shear.py: a plain field assigned in
     # __init__ turns its contents into pytree leaves and breaks checkpoints.
     cond_shape: tuple = eqx.field(static=True, default=(3,))
+    # Static for a second reason too: a calibration constant, like the chart's
+    # POINT_SOURCE, and keeping it off the leaf list means every checkpoint
+    # written before it existed still deserialises.
+    gain: float = eqx.field(static=True, default=1.0)
     mean: jax.Array = eqx.field(default=None)
     std: jax.Array = eqx.field(default=None)
 
-    def __init__(self, mean=None, std=None, cond_dim=3):
+    def __init__(self, mean=None, std=None, cond_dim=3, gain=1.0):
+        self.gain = float(gain)
         self.mean = non_trainable(jnp.zeros(5) if mean is None
                                   else jnp.asarray(mean))
         self.std = non_trainable(jnp.ones(5) if std is None
@@ -381,7 +400,7 @@ class CentroidMarginalize(AbstractBijection):
         mean, std = unwrap(self.mean), unwrap(self.std)
         _, sigma_x = split_condition(condition)
         m = raw_from_standard(x, mean, std)
-        y = standard_from_raw(_transport(m, sigma_x, -1.0), mean, std)
+        y = standard_from_raw(_transport(m, sigma_x, -1.0, self.gain), mean, std)
         return x + _EXP_MAX * jnp.tanh((y - x) / _EXP_MAX)
 
     def marginalize(self, y, condition):
@@ -389,7 +408,7 @@ class CentroidMarginalize(AbstractBijection):
         mean, std = unwrap(self.mean), unwrap(self.std)
         _, sigma_x = split_condition(condition)
         m = raw_from_standard(y, mean, std)
-        x = standard_from_raw(_transport(m, sigma_x, 1.0), mean, std)
+        x = standard_from_raw(_transport(m, sigma_x, 1.0, self.gain), mean, std)
         return y + _EXP_MAX * jnp.tanh((x - y) / _EXP_MAX)
 
     def transform_and_log_det(self, x, condition=None):

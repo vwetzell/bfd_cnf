@@ -171,7 +171,7 @@ def coeff_stats(t, mean=None, std=None):
 
 
 def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH,
-               shear=False, centroid=False):
+               shear=False, centroid=False, centroid_gain=1.0):
     """Bulk flow standardised against `m_train`; conditioned on g and/or Sigma_X.
 
     The generative stack is ``base -> bulk -> shear(g) -> centroid(Sigma_X) ->
@@ -253,7 +253,8 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
         chart_loc=t.mean(0)[:3], chart_scale=t.std(0)[:3])
         if shear else None)
     head = ([CentroidMarginalize(cond_dim=cond or 3,
-                                 mean=t.mean(0), std=t.std(0))]
+                                 mean=t.mean(0), std=t.std(0),
+                                 gain=centroid_gain)]
             if centroid else []) + \
            ([shear_layer] if shear else [])
     bijection = Invert(Chain([raw2standard, *head, *bulk]).merge_chains())

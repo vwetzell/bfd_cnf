@@ -399,13 +399,54 @@ def check(flow, copies, galaxies, sigma_x, n=4000):
     e0 = e(m0)
     resp = lambda mm: ((e(mm) * np.conj(e0)).real.sum()
                        / (e0 * np.conj(e0)).real.sum() - 1.0)
-    print(f"  ellipticity response  catalog {resp(target):+.4e}   "
-          f"layer {resp(m0 + pred):+.4e}")
+    rc, rl = resp(target), resp(m0 + pred)
+    print(f"  ellipticity response  catalog {rc:+.4e}   layer {rl:+.4e}"
+          f"   ratio {rl / rc:.4f}")
+
+
+def _responses(flow, copies, galaxies, sigma_x, n):
+    """Per-galaxy spin-2 response, catalog truth and layer prediction."""
+    target, keep = weighted_copy_mean(copies, galaxies, sigma_x)
+    m0 = galaxies["moments"][keep][:n]
+    target = target[:n]
+    layer, chart = _centroid_layer(flow), _chart(flow)
+    pred = m0 + np.asarray(jax.vmap(dm_dsigma, in_axes=(None, 0, None, None))(
+        layer, jnp.asarray(m0, dtype=jnp.float32),
+        jnp.asarray(sigma_x, dtype=jnp.float32), chart))
+    e = lambda mm: (mm[:, 2] + 1j * mm[:, 3]) / mm[:, 1]
+    e0 = e(m0)
+    proj = lambda mm: ((e(mm) - e0) * np.conj(e0)).real
+    return proj(target), proj(pred)
+
+
+def calibrate(flow, copies, galaxies, sigma_x, n=20000, seed=0):
+    """The scalar spin-2 gain, fitted on half the galaxies and reported on the
+    other half.
+
+    Held out because a binned kappa table already overfitted this once, and
+    because the in-sample ratio is guaranteed to be 1 by construction.  The
+    gain does NOT transfer between populations -- fitting on gauss2 and
+    applying to bulgedisc lands at 1.03, worse than the population's own -- so
+    run this against the copy catalog of the population being measured.
+    """
+    rx, rp = _responses(flow, copies, galaxies, sigma_x, n)
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(rx))
+    tr, te = idx[: len(idx) // 2], idx[len(idx) // 2:]
+    gain = rx[tr].sum() / rp[tr].sum()
+    print(f"  fitted on {len(tr)} galaxies, tested on {len(te)}")
+    print(f"  uncorrected ratio  train {rp[tr].sum() / rx[tr].sum():.4f}"
+          f"   HELD OUT {rp[te].sum() / rx[te].sum():.4f}")
+    print(f"  corrected ratio    train {1.0:.4f}"
+          f"   HELD OUT {gain * rp[te].sum() / rx[te].sum():.4f}")
+    print(f"\n  centroid gain = {gain:.4f}   "
+          f"(pass as --centroid-gain to centroid.py / bias.py)")
+    return gain
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("mode", choices=["train", "check"])
+    p.add_argument("mode", choices=["train", "check", "calibrate"])
     p.add_argument("--copies", default="../bfd_cnf_imsims/data/copies_bulgedisc.fits")
     p.add_argument("--flow", default="flows/centroid.eqx")
     p.add_argument("--init", default="flows/shear.eqx",
@@ -423,6 +464,12 @@ def main():
                         "the old g = 0 behaviour, or for a catalog with no\n"
                         "per-copy derivatives.")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--centroid-gain", type=float, default=1.0,
+                   help="scalar amplification of the layer's SPIN-2 shift. 1.0 "
+                        "is the bare Gaussian-in-k ansatz, which undershoots "
+                        "the ellipticity response ~30%% on realistic "
+                        "populations. Measure it with `calibrate` against this "
+                        "population's own copies; it does not transfer.")
     a = p.parse_args()
 
     copies, galaxies = load_copies(a.copies)
@@ -437,7 +484,8 @@ def main():
     # Standardise the bulk against the unmarginalised galaxy moments, which is
     # the population the frozen bulk was trained on.
     m_train = np.asarray(galaxies["moments"], dtype=np.float64)
-    flow = bulk.build_flow(jr.key(a.seed), m_train, shear=True, centroid=True)
+    flow = bulk.build_flow(jr.key(a.seed), m_train, shear=True, centroid=True,
+                           centroid_gain=a.centroid_gain)
 
     if a.mode == "train":
         if a.init:
@@ -477,7 +525,10 @@ def main():
         print(f"wrote {a.flow}")
     else:
         flow = eqx.tree_deserialise_leaves(a.flow, flow)
-    check(flow, copies, galaxies, sigma_x)
+    if a.mode == "calibrate":
+        calibrate(flow, copies, galaxies, sigma_x, seed=a.seed)
+    else:
+        check(flow, copies, galaxies, sigma_x)
 
 
 if __name__ == "__main__":
