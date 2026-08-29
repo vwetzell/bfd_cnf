@@ -4121,3 +4121,74 @@ NOT YET ATTEMPTED.
 ### Artifacts
 
 - Scratchpad: the copy-cloud spread and Sigma_X-scaling measurements (inline).
+
+## 2026-08-29 (cont.): centring the layer at a nominal Sigma_X cuts its error
+10-50x -- this is the route to 1e-3
+
+Proposal tested: bulk+shear learn the COPY-moment density at a nominal
+`Sigma_X0` (so the full marginalisation at the operating point, broadening
+included, is learned exactly from the copies), and the centroid layer carries
+only the DIFFERENTIAL Sigma_X dependence around it.
+
+The k-space damping composes -- damping by `Sigma_u` then `Sigma_u'` equals
+damping by `Sigma_u + Sigma_u'` -- so stepping `Sigma_X0 -> Sigma_X` is the same
+`_transport` applied to the already-marginalised moments with the difference.
+Measured against the copy grid, which gives truth at any Sigma_X by reweighting
+(4000 `copies_gauss2_deep` galaxies):
+
+| sigma scale | Sigma_X rel | exact resp | differential | ratio | abs err | vs current |
+|---|---|---|---|---|---|---|
+| *(current, 0 -> Sigma_X)* | 1.000 | 8.365e-3 | 5.875e-3 | 0.7024 | 2.49e-3 | 1.00 |
+| 1.10 | 1.210 | 1.522e-3 | 1.466e-3 | **0.9635** | 5.6e-5 | **0.02** |
+| 1.25 | 1.562 | 3.909e-3 | 3.862e-3 | **0.9878** | 4.8e-5 | **0.02** |
+| 0.90 | 0.810 | -1.447e-3 | -1.354e-3 | 0.9357 | 9.3e-5 | 0.04 |
+| 0.80 | 0.640 | -2.805e-3 | -2.591e-3 | 0.9236 | 2.1e-4 | 0.09 |
+
+Two gains, both real:
+
+* **relative accuracy 92-99% against 70%** -- starting from the
+  already-marginalised moments puts the transport at a better effective
+  profile, and by the composition property the residual is second order in the
+  STEP rather than in the full depth;
+* **the ABSOLUTE error, which is what reaches m1, falls to 2-9%** of the current
+  scheme's.  The 2.49e-3 response error is what produces the -5.2e-3 m1 floor,
+  so scaling by 0.02-0.09 puts the residual at roughly **1e-4 to 5e-4** -- at or
+  below the 1e-3 target.
+
+### Why this also dissolves the Var[.|m] floor
+
+The +/-11% floor and the missing copy-cloud broadening are both about a
+deterministic map having to MANUFACTURE the marginalisation from moments.  Here
+the marginalisation at `Sigma_X0` is in the learned density, so nothing has to
+manufacture it; the layer only perturbs an already-correct distribution.
+
+Also correcting an over-statement two entries above: "a deterministic map cannot
+broaden a density" is too strong.  Any two smooth densities on the same support
+are diffeomorphic, so a LEARNED Sigma_X-conditioned bijection has no structural
+barrier.  What `_transport` specifically cannot do is produce the right marginal,
+because it is derived as a per-galaxy mean shift and applied pointwise.
+
+### Caveats
+
+* Tested on `copies_gauss2_deep` only; `copies_bulgedisc_v2` not checked.
+* The error grows with depth range -- already 9% at `sigma x 0.8` -- so a survey
+  spanning much more than +/-25% needs re-checking.
+* The copy grid is valid over roughly a factor 1.4 in `sigma_XY`, which bounds
+  both the training data and the span the layer can be asked to cover.
+* This addresses the gauss2 floor.  `bulgedisc_v2`'s separate -0.02 windowed
+  density error is untouched by it.
+
+### What it would take
+
+`bulk.train`/`shear.train` consume `moments`, `dm_dg`, `d2m_dg2`, which the
+copies catalog carries PER COPY, and `CopySampler` already draws copies by their
+eq. (36) weight -- so training on copies at a fixed `Sigma_X0` needs no new
+machinery.  The layer's contract changes from `0 -> Sigma_X` to
+`Sigma_X0 -> Sigma_X`, i.e. `_transport` receives the differential and is the
+identity at `Sigma_X = Sigma_X0`.
+
+NOT YET IMPLEMENTED.
+
+### Artifacts
+
+- Scratchpad: `differential.py`.
