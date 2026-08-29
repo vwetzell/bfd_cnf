@@ -3214,3 +3214,77 @@ else), then the realistic-population model error, and only then statistics.
 
 - No code change.  Scratchpad: `floor.py`, `floor_S*.npz` (per-target Q, R and
   observed moments at each S, for offline reuse).
+
+## 2026-08-28 (cont.): the gauss2 floor IS the centroid layer's known
+undershoot; and the analytic route is blocked by the stale truth.py chart
+
+### Can the remaining bias be determined analytically?
+
+For `gauss2` in principle YES -- `truth.py` gives exact `P(m|g)`, `Q`, `R` in
+closed form, so the decomposition is available:
+
+    m1(exact Q, R)  = the estimator's INTRINSIC bias with a perfect model
+    m1(flow  Q, R)  = the total
+    difference      = model error, isolated
+
+(For the noisy `_deep` targets it needs `INT P(m|g) k(M-m) dm` with
+`truth.log_prob` in place of the flow -- the same `log_conv_is` structure, so
+the machinery exists.)
+
+**It is blocked.**  The 2026-08-20 stale-chart bug is unfixed, and re-measured:
+
+| `bulk.to_coords` slot | `sim.GAUSS2_MU` (what P0 assumes) | catalog mean (what was generated) | offset |
+|---|---|---|---|
+| 0 log10 Mf | 3.7874 | 3.7407 | 0.16 sd |
+| 1 | 2.0477 | 1.5074 | 0.75 sd |
+| **2** | **5.9740** | **1.8615** | **8.3 sd** |
+
+`truth.py` evaluates P0 in a chart where slot 2 sits 8.3 sigma from where the
+catalog actually lives.  Fixing it is NOT a mean/cov swap: the catalog's
+coordinates are mildly non-Gaussian in the CURRENT chart (slot 2 skew 0.215,
+excess kurtosis -0.605), which is what a population drawn Gaussian in the OLD
+chart looks like after the slot-2 logit was redefined.  It needs the actual
+chart composition.  Worth doing -- it is the most powerful diagnostic available
+for this whole problem and would settle the model/estimator split exactly.
+
+### Meanwhile, the floor is attributed empirically
+
+`gauss2_deep`, S = 32768, 19976 targets:
+
+| | m1 |
+|---|---|
+| with the centroid layer | **-0.00619 +/- 0.00121** |
+| `--no-centroid` (`flows/shear_gauss2_60k.eqx`) | **-0.01316 +/- 0.00533** |
+| the layer's contribution | +0.0070 +/- ~0.0055 |
+
+The layer supplies about 53% of the +0.0132 needed to reach zero.
+`models/centroid.py`'s own header records "a roughly flat 25-30% UNDERSHOOT"
+of the ellipticity response measured on `copies_gauss2_deep` -- which predicts
+it should supply 70-75%.  Those agree within the large error on the
+no-centroid arm, and the residual has the right sign and order either way.
+
+So the ~5e-3 gauss2 floor is consistent with the centroid transport's KNOWN
+spin-2 response shortfall -- a modelling deficiency its own docstring already
+flags, not an estimator or training artifact.  Note this is the Gaussian-in-k
+ansatz being incomplete, NOT the earlier (falsified) claim about its magnitude
+or its clip: on gauss2 the transport is supposed to be exact, and the
+undershoot is measured there anyway.
+
+### Where that leaves the 1e-3 target
+
+| gap | size | status |
+|-----|------|--------|
+| centroid spin-2 undershoot (gauss2 floor) | ~5e-3 | ATTRIBUTED, unfixed -- the gate |
+| model error on `bulgedisc_v2` | -0.02 windowed | diagnosed, unfixed |
+| estimator O(1/S) after jackknife | ~1.1e-3 at S = 8192 | halved by S = 32768 |
+| statistics at 20000 targets | +/-0.0012 | 200k on disk; a 200k 2-arm run projects to ~30 h |
+
+The order stands: close the centroid undershoot first (it gates validation of
+everything else and it is the largest term on the clean population), then the
+realistic-population density error, then statistics.  Unblocking `truth.py`
+would make the first step exactly measurable rather than inferred from a
+`--no-centroid` difference with a +/-0.0055 error bar.
+
+### Artifacts
+
+- No code change.  Scratchpad: `g2_nocent.log`, and the truth.py chart check.
