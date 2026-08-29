@@ -4621,3 +4621,58 @@ rational-quadratic splines in place of the affine steps.
 ### Artifacts
 
 - Scratchpad: `scorefield.py`, `tail.py`, `tail2.py`.
+
+## 2026-08-29 -- Correction: the score is SMOOTH and ringing, not kinked. NLL is the reason
+
+The user pushed back on the previous entry's spline rationale: silu should make
+the affine transforms smooth.  CORRECT, and the previous entry's mechanism
+("affine coupling's log-density is piecewise-linear, so its score is a step
+function") was WRONG.  `bulk.build_flow` passes `jax.nn.silu` to every
+`EquivariantAutoregressiveLayer`, so `mu_i(x_<i)` and `s_i(x_<i)` are
+C-infinity; an affine coupling's log-density is QUADRATIC in its own coordinate;
+and the only clip in the path (`_safe_logit`, bijections.py:147) bites
+out-of-range draws, which carry zero weight.  There is no kink to find.
+
+Measured directly (`scratchpad/ring.py`) -- walk +/-3 noise sigma through each
+target's highest-weight draw and count oscillations of the g1-score, against a
+template KDE at h = 0.25 (the same object: a PRIOR's g-score, using each
+template's own dm/dg):
+
+```
+24 lines, +/-3.0 noise sigma, 401 points each
+            local extrema  totalvar/range  sd of score  wavelength/sigma
+      flow           16.8            1.83    1.214e+13             0.649
+KDE h=0.25            5.5            1.90        4.352             2.400
+```
+
+`totalvar/range` is essentially IDENTICAL (1.83 vs 1.90) -- same shape
+character, not a jagged field.  What differs is FREQUENCY: the flow's score
+turns over every 0.649 noise sigma against the true 2.400, ~3.7x faster, i.e.
+structure finer than the kernel it is integrated against.  (Non-finite points,
+where a line leaves the chart, are dropped; including them the raw extrema count
+is 64.4, which is why the first pass reported NaN magnitudes.)
+
+**The real mechanism is the OBJECTIVE, not the architecture.**  NLL constrains
+`log p` pointwise and says nothing about `grad log p`.  Many densities fit the
+templates equally well in value while differing in gradient, and maximum
+likelihood has no preference among them.  That is exactly the measured
+signature: log P matches templates to 0.01 nats at corr 0.995, while the score's
+direction agrees at cos 0.44 and its variance is 29x too large.  Value pinned,
+derivative free.
+
+**Consequence for the two candidate repairs.**  The spline case now rests on a
+compositional argument, not a smoothness one: an affine coupling needs many
+stacked layers to build a non-Gaussian conditional, the composed Jacobian is a
+product across all of them, and high-frequency content compounds; a spline
+builds the same conditional in one layer.  UNMEASURED.  The COORDINATE route has
+the stronger evidence, and it is the same evidence that argues against blaming
+the layer type: the identical stack with the same silu gives gauss2 a log-det
+gradient of 2.5 and Fisher 0.96 against bulgedisc's 20.5.  Same network, same
+activations -- what changed is the chart's coordinate distributions (flux skew
+1.78, spin-2 kurtosis 3.4 vs gauss2's textbook ones).  With the null capacity
+sweep and the 1M retrain that ruled out data sparsity, that points at the
+coordinate straining the fit.
+
+### Artifacts
+
+- Scratchpad: `ring.py`.
