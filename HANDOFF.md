@@ -3724,3 +3724,66 @@ is a poor trade as it stands.  It only becomes worth building if the remaining
 
 - Scratchpad: `wexplicit.py` (self-checking: it prints `<k^2>` under W and
   should always read 3.692575).
+
+## 2026-08-28 (cont.): SOLVED in principle -- two-Gaussian galaxy + exact W
+reproduces the centroid response to 99.05%
+
+Question raised: the weight is a simple known function, so why can we not get
+this right with it?  Answer: we can.  The weight was never the obstacle.
+
+| model | ellipticity response | ratio to exact |
+|---|---|---|
+| exact (copy-weighted truth) | +8.730e-3 | -- |
+| current ansatz: single Gaussian PRODUCT | +6.155e-3 | 0.705 |
+| single Gaussian GALAXY + exact W | +6.856e-3 | 0.785 |
+| **two-Gaussian GALAXY + exact W** | **+8.647e-3** | **0.9905** |
+
+300 `copies_gauss2_deep` galaxies.  The last row closes **96.8%** of the gap;
+the residual ~1% is consistent with the `Sigma_u` linearisation measured at
+1-5% earlier.
+
+The two-Gaussian row uses `analytic.theta_of_m` to recover the galaxy's own
+(flux, sigma, rho, e1, e2) from its moments, then damps BOTH components --
+exact, since `exp(-1/2 k^T Sigma_u k)` times a Gaussian is `C_i -> C_i +
+Sigma_u` for each -- and contracts with bfd's own weighted kernels.  No new
+quadrature beyond what `analytic.moments` already does.
+
+### Correcting the previous entry
+
+It concluded "the residual 21.5% is not radial", citing the Gamma sweep's
++/-15% bound.  **That bound does not apply and the conclusion was wrong.**  The
+sweep deformed the radial law of the PRODUCT `W I` with W absorbed; here the
+GALAXY's radial law is deformed with W carried separately, and
+`W(|k|) f(k^T S k)` is not of the form `g(k^T S k)`, so it is a strictly larger
+model class.  The residual WAS radial -- in the galaxy, not in the product.
+
+### Why the current ansatz cannot get there
+
+Collapsing `W I` into ONE Gaussian forces a single k-scale AND a single
+k-independent isophote shape.  The real product has neither: W is circular
+while the galaxy is elliptical, so the shape varies with k, and a bulge+disc
+galaxy has two scales.  Separating W from I fixes the first (0.705 -> 0.785)
+and giving the galaxy two scales fixes the second (0.785 -> 0.9905).
+
+### The recipe, and what it costs
+
+Exactly determined and knob-free: a co-elliptical two-Gaussian galaxy has five
+parameters (F, sigma, rho, e1, e2) against five measured moments -- which is
+precisely the solve `analytic.theta_of_m` already performs.  `BULGE_FRAC = 0.5`
+is a basis convention that makes the count work, not a tuned constant.
+
+Cost is the open question, and it is steeper than the earlier estimate: a 5-D
+Newton solve PLUS a k-grid contraction per evaluation, and since
+`split_centroid` never peels (see the 2026-08-28 config entry) that runs once
+per DRAW inside `log_conv_is`.  One mitigation: the centroid layer is
+g-independent, so JAX propagates symbolic zeros and the Newton solve is never
+differentiated with respect to g.
+
+For the value: closing this buys the ~5e-3 gauss2 floor, i.e. it is the
+difference between a method that stops at 6e-3 and one that can reach the 1e-3
+target -- the noiseless split already showed the estimator and bulk+shear are
+clean at 1.7e-4 and 6e-4.
+
+### Artifacts
+
+- Scratchpad: `ceiling2g.py`.
