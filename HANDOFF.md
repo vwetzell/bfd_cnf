@@ -3787,3 +3787,73 @@ clean at 1.7e-4 and 6e-4.
 ### Artifacts
 
 - Scratchpad: `ceiling2g.py`.
+
+## 2026-08-28 (cont.): can the centroid fix be analytic, with no Newton solve?
+
+Not with the moments as they stand, for TWO independent reasons -- but there is
+a clean route that trades run-time compute for a few more measured moments.
+
+### Obstacle 1: four of the five fourth moments are not measured
+
+To first order in `Sigma_u`, `dM_a = -1/2 Sigma_u,ij <W kernel_a k_i k_j I>`, so
+the response is a contraction of `M4_ijkl = <W k_i k_j k_k k_l I>`.  In 2D that
+tensor has five independent components, decomposing by spin as
+
+| part | components | measured? |
+|------|------------|-----------|
+| spin-0 | `<k^4>` | **yes -- Mc** |
+| spin-2 | `<(kx^2-ky^2) k^2>`, `<2 kx ky k^2>` | no |
+| spin-4 | `<kx^4 - 6 kx^2 ky^2 + ky^4>`, `<4 kx ky (kx^2-ky^2)>` | no |
+
+Everything else the first-order response needs is already in hand -- for kernel
+1, `<W k_i k_j I>` IS `(Mr, M1, M2)`.  So the ONLY missing input is the spin-2
+and spin-4 parts of `M4`.  The Gaussian ansatz supplies them by Wick from the
+second moments, which is exactly where its 30% goes.
+
+### Obstacle 2: first order is not accurate enough anyway
+
+On 300 `copies_gauss2_deep` galaxies, ellipticity-response ratio to the exact
+copy-weighted truth:
+
+| method | ratio |
+|--------|-------|
+| current ansatz | 0.705 |
+| 1st order, `M4` all Gaussian | 0.777 |
+| 1st order, `M4` spin-0+2 exact | 1.145 |
+| 1st order, `M4` FULLY exact | **1.092** |
+| non-perturbative, two-Gaussian galaxy + exact W | 0.9905 |
+
+Even given the exact `M4`, first order overshoots by 9%.  Against the 0.9905
+row -- same galaxy information, evaluated non-perturbatively -- that 9% is
+purely the truncation.  The series converges slowly because the damping
+`exp(-1/2 k^T Sigma_u k)` bites hardest on the high-k tail, where the exponent
+is not small even though the galaxy-averaged `trace(P)` is 0.005.
+
+### The analytic, solve-free route: change the basis
+
+Expand `W(k) I(k)` in a Gauss-Hermite (shapelet) basis of fixed scale.  Two
+properties line up:
+
+* the coefficients are LINEAR functionals of the image, so bfd can measure them
+  exactly like any other moment -- the same k-sum with more kernels;
+* Gaussian damping maps that basis onto itself ANALYTICALLY and
+  non-perturbatively -- a scale change plus a known finite mixing of
+  coefficients.
+
+That yields exact damped moments with no Newton solve, no run-time quadrature
+and no model assumption; the cost moves out of the estimator and into the
+catalog.  UNTESTED -- the mixing coefficients and how many orders are needed for
+1% have not been worked out, and it would need `imsims.copies`/bfd to record the
+extra moments.
+
+### The cheaper middle ground
+
+By equivariance the response coefficients depend only on `(Mr/Mf, Mc/Mr, |e|)`,
+so they can be precomputed once on a 3-D grid and interpolated: no solve at run
+time, fully differentiable, cheap.  It keeps a model assumption (whatever
+generated the table) but removes the cost objection to the two-Gaussian fix.
+
+### Artifacts
+
+- Scratchpad: `fourth.py`, which also contains a spin decomposition of `M4` and
+  a first-order response builder, both reusable.
