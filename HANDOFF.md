@@ -3857,3 +3857,62 @@ generated the table) but removes the cost objection to the two-Gaussian fix.
 
 - Scratchpad: `fourth.py`, which also contains a spin decomposition of `M4` and
   a first-order response builder, both reusable.
+
+## 2026-08-28 (cont.): the pragmatic centroid fix -- a binned table OVERFITS;
+only a single constant transfers
+
+Tested the "precompute a correction table in `(Mr/Mf, Mc/Mr, |e|)`" idea, whose
+whole appeal was avoiding the per-draw Newton solve.  Correction defined as
+`kappa = (exact response) / (ansatz response)`, with the copy-weighted
+marginalisation as ground truth on both populations, 9000 galaxies each.
+
+The test that matters is TRANSFER -- build `kappa` on `gauss2`, apply to
+`bulgedisc_v2`:
+
+| | uncorrected | 3-D table (48 bins) | single constant |
+|---|---|---|---|
+| gauss2 (self) | 0.7142 | 1.0000 | 1.0000 |
+| **bulgedisc_v2 (transfer)** | 0.7021 | **0.9595** | **0.9830** |
+
+**The binned table transfers WORSE than a single number** -- 4.1% residual
+against 1.7%.  It is overfitting `gauss2`.  The per-quartile structure shows
+why: the two populations do not share the dependence.
+
+| kappa by Mr/Mf quartile | q1 | q2 | q3 | q4 |
+|---|---|---|---|---|
+| gauss2 | 1.445 | 1.312 | 1.497 | 1.329 |
+| bulgedisc_v2 | 1.514 | 1.330 | 1.254 | 1.217 |
+
+gauss2's is non-monotonic (sampling noise); bulgedisc's is cleanly monotonic.
+So `(Mr/Mf, Mc/Mr, |e|)` does NOT capture the physics across populations and
+the table learned gauss2's noise.  **The tabulated version as proposed is
+dead.**
+
+### What survives, and its caveats
+
+A single constant `kappa = 1.4001`, COMPUTED from the copy catalogs rather than
+tuned against `m1`, corrects the ensemble ellipticity response to 1.7% across a
+population change.  Two things to hold against it:
+
+* bulgedisc's genuine 1.514 -> 1.217 trend across `Mr/Mf` means a constant is
+  right on the ENSEMBLE average and wrong per galaxy by 10-20%.  A selection
+  that cuts on size would expose exactly that structure -- and the whole reason
+  windows matter here is the boundary-flux result, so this is not hypothetical.
+* the `m1` gain cannot be read off `kappa`: the layer captures 53% of the m1
+  effect while its ellipticity response sits at 70%, so the two measures do not
+  map onto one another.  It needs a `bias.py` run to settle.
+
+### Standing recommendation
+
+The only option measured to reach ~1% per galaxy is still the two-Gaussian
+galaxy with `W(k)` carried exactly (0.9905), and its cost is a 5-D Newton solve
+plus a k-grid contraction per draw.  Everything cheaper that has been tried --
+matching `Mc/Mr`, a first-order expansion even with the exact `M4`, and now a
+binned correction table -- either fails or transfers badly.  The one untried
+route that is both cheap at run time and model-free is the shapelet basis
+(previous entry), which moves the cost into the catalog by measuring a few more
+linear moments.
+
+### Artifacts
+
+- Scratchpad: `kappa.py`.
