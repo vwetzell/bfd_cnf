@@ -4440,3 +4440,71 @@ still correlates at 0.995.
 ### Artifacts
 
 - Scratchpad: `bias_gain1.log`, `bias_gain140.log`, `run_bias.sh`.
+
+## 2026-08-29 -- The R collapse is Var[score], and the template sum sizes it
+
+`R` for a convolved target splits exactly, with `pi_s = softmax(log w_s + log p_s)`:
+
+    Q = E_pi[d_g log p]    R = E_pi[d2_g log p] + Var_pi[d_g log p]
+                               \_____ A ______/   \______ B _______/
+
+A is the curvature (negative for a sane model), B the score variance (positive
+definite).  R flipping sign means B beat A.  `scratchpad/rsplit.py` (flow) and
+`scratchpad/tsplit.py` (template sum, the reference).
+
+```
+=== FLOW, bulgedisc_deep_v2 (n=2000, median draw ESS 267)
+ Mf quintile  E[d2logp] A  Var[score] B      R=A+B  Fisher R  Fisher A only
+          q1   -5.789e+01     2.042e+02  1.463e+02    -0.051          0.130
+          q2   -4.558e+01     8.179e+01  3.620e+01    -0.219          0.174
+          q3   -4.075e+01     2.975e+01 -1.100e+01     1.177          0.318
+          q4   -2.366e+01     9.399e+00 -1.426e+01     1.195          0.720
+          q5   -1.702e+01     1.732e+00 -1.529e+01     1.345          1.208
+         ALL   -3.698e+01     6.538e+01  2.839e+01    -0.465          0.357
+  top 1% of targets carry 27.7% of sum(B)
+
+=== TEMPLATE SUM, bulgedisc_v2 (exact, 100k templates, no IS)
+      flux group            A            B        R=A+B    B/|A|  Fisher R    ESS
+    faintest 20%   -1.186e+01   6.930e+00   -4.928e+00    0.584     1.258   7402
+      middle 20%   -7.144e+01   6.115e+01   -1.029e+01    0.856     0.955    565
+   brightest 20%   -1.069e+06   4.002e+03   -1.065e+06    0.004      93.07      1
+
+=== TEMPLATE SUM, gauss2_deep
+    faintest 20%   -1.259e+01   2.468e+00   -1.012e+01    0.196     1.154   5015
+      middle 20%   -6.841e+01   3.105e+01   -3.736e+01    0.454     0.961   1629
+   brightest 20%   -5.239e+02   2.920e+02   -2.320e+02    0.557     1.178     28
+```
+
+**B is the disease, and it is now sized against truth.**  At the faint end the
+flow gives `B/|A| = 3.53` and R goes positive; the template sum on the SAME
+population gives 0.584 and stays negative at Fisher 1.258.  So the flow's score
+variance is **29x too large** (204 vs 6.93) and its curvature **4.9x too large**
+(57.9 vs 11.9).  `B/|A|` runs 3.53, 1.79, 0.73, 0.40, 0.10 across flux
+quintiles -- monotone, and tracking exactly where m1 collapses.
+
+**Q is roughly right.**  Backing mean q^2 out of the Fisher columns: flow 7.53
+(= 0.130 x 57.89) against the template sum's 6.20 (= 1.258 x 4.928), i.e. 21%
+high in q^2, ~10% in Q.  First derivative fine, BOTH second-order quantities
+badly inflated -- consistent with log P matching templates to 0.01 nats, since
+getting the density right constrains neither the roughness of its g-response
+nor its curvature.
+
+**Mechanism this points at:** `d_g log p = grad_z log p_bulk . d_g z +
+d_g log|det|`.  At faint flux the bulk density is steep, so `grad_z log p_bulk`
+is large and any error in the shear displacement is multiplied by it -- the
+VARIANCE over the importance cloud more than the mean, which is why B is
+inflated 29x while Q is inflated 1.1x.  The template sum cannot do this: its
+bandwidth IS C, so its score is bounded by construction.
+
+**Caveats.**  The brightest template row is meaningless (ESS 1 -- 100k templates
+give the brightest targets no near neighbours).  The flow's quintiles are of its
+own 2000-target sample, the template groups of 40000, so the selections are
+close but not identical; immaterial at 29x.
+
+**Not yet done:** split B by where the score comes from -- `grad_z log p_bulk`
+(bulk steepness) versus the shear layer's own `d_g log|det|` -- which is what
+decides whether the fix belongs in the chart, the bulk, or the shear layer.
+
+### Artifacts
+
+- Scratchpad: `rsplit.py`, `tsplit.py`.
