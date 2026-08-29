@@ -3288,3 +3288,81 @@ would make the first step exactly measurable rather than inferred from a
 ### Artifacts
 
 - No code change.  Scratchpad: `g2_nocent.log`, and the truth.py chart check.
+
+## 2026-08-28 (cont.): truth.py FIXED -- the analytic ground truth is usable
+again, and it supersedes the Fisher-identity conclusion
+
+### The bug
+
+`truth.to_coords` used slot 2 = `logit(Mc/(POINT_SOURCE_MC Mr))`, deliberately
+duplicating `bulk.to_coords` -- its docstring called that an invariant and
+`tests/test_truth.py::test_to_coords_matches_bulk` enforced it.  But `log_p0`
+evaluates a Gaussian at `sim.GAUSS2_MU`/`GAUSS2_COV`, and those are defined in
+SIM's chart (`sim.py` line 377, and `sim._gauss2_m_of_t` whose inverse this
+is):
+
+    sim:  t = [log10 Mf, logit(Mr/(POINT_SOURCE Mf)), **Mc/Mr**, M1/Mr, M2/Mr]
+    bulk: t = [log10 Mf, logit(Mr/(POINT_SOURCE Mf)), **logit(Mc/(rc Mr))**, ...]
+
+So it compared `mu[2] = 5.974`, an `Mc/Mr` value, against a coordinate worth
+about 2.16.  `log_prob` was a Gaussian in the wrong variable and every `Q`,
+`R` derived from it was wrong with it.  That is the 2026-08-20 "truth chart is
+stale" entry, now located exactly.
+
+**Correcting this session's own earlier diagnosis**: the "8.3 sigma" table a
+few entries above compared `sim.GAUSS2_MU` against `bulk.to_coords` means --
+two different charts -- so it was not itself evidence of anything.  In sim's
+own chart the catalog sits at [3.7413, 1.5089, 5.7046] against
+`GAUSS2_MU` [3.7874, 2.0477, 5.9740], i.e. -0.15/-0.75/-0.54 sd, with a
+NARROWER spread (0.296/0.499/0.371 against 0.301/0.719/0.497) -- exactly the
+documented ~30% rejection truncating and shifting P0.  The catalog and
+`GAUSS2_MU` were always consistent; only `to_coords` was wrong.
+
+### Validated externally
+
+| | before | after |
+|---|---|---|
+| `truth.log_prob(m, 0)` median on its own catalog | -311.97 | **-43.26** |
+| Fisher identity `SUM q^2 / SUM(-r)` from exact Q, R | 1.94 (recorded) | **1.0038** |
+
+The density is now in line with the flow's -41.6 on the same population
+instead of 270 nats low, and the analytic Fisher identity closes to 0.4% on
+4000 noiseless targets.
+
+**That supersedes the standing conclusion that gauss2 fails the Fisher identity
+at 1.94 "because the catalog is P0 restricted".**  The restriction is real and
+correctly handled -- `log_prob` evaluates P0 at the LATENT moments, so its
+normalising constant is g-independent and cancels out of Q and R -- but it was
+never the cause.  The chart was.
+
+### Why it survived so long
+
+Every other test in `tests/test_truth.py` is self-consistent within whichever
+chart `to_coords` happens to use: the change-of-variables check, the
+finite-difference check on `pqr`, even the end-to-end "recovers an injected
+shear from exact Q, R".  The only test that reached outside `truth.py` was
+`test_to_coords_matches_bulk`, and it was pointing at the wrong reference.  It
+is replaced by `test_to_coords_matches_sim`, which round-trips through
+`sim._gauss2_m_of_t` and asserts the chart does NOT equal `bulk`'s.  65/65
+pass.
+
+### What this unlocks
+
+The exact decomposition is now available on `gauss2_deep`:
+
+    m1 from exact (Q, R)   = the estimator's INTRINSIC bias with a perfect model
+    m1 from flow  (Q, R)   = the total
+    difference             = model error, isolated
+
+For the noisy targets it needs `INT P(m|g) k(M-m) dm` with `truth.log_prob` in
+place of the flow -- the same `log_conv_is` structure, so the machinery exists;
+cost is `truth.log_prob`'s 30-step Newton solve per draw, which argues for a
+few thousand targets rather than 20000.  That is the measurement that would
+turn the -0.0062 gauss2 floor from "consistent with the centroid layer's
+25-30% undershoot" into an exact attribution.  NOT YET RUN.
+
+### Artifacts
+
+- `truth.py`: `to_coords` slot 2 is now `Mc/Mr`.
+- `tests/test_truth.py`: `test_to_coords_matches_sim` replaces
+  `test_to_coords_matches_bulk`.
