@@ -3592,3 +3592,80 @@ captures the KBlackmanHarris window's shape well enough is untested.
   pins the exactness claim at 1e-10 so a future edit to the closed form cannot
   quietly break the one case it is supposed to nail.  13/13 pass.
 - Scratchpad: `gauss_exact.py`.
+
+## 2026-08-28 (cont.): the 30% is the CIRCULAR WEIGHT times an ELLIPTICAL
+galaxy.  Matching Mc will not fix it; carrying W(k) explicitly would.
+
+Two candidate fixes tested by quadrature against `_transport`.  In every test a
+circular GAUSSIAN window is the control, since it keeps the product Gaussian and
+the ansatz must stay exact there -- it does, to 1.0000, which validates each
+setup.
+
+### Matching Mc/Mr (a two-parameter radial law): DEAD, and backwards
+
+Model `W(k)I(k) = f(q)`, `q = k^T A k`, with `f` a Gamma family
+`q^(a-1) exp(-q/theta)` -- `a = 1` IS the Gaussian, so the family contains the
+current ansatz.  Sweeping `a` and reading off `nu = Mc Mf/(2Mr^2+M1^2+M2^2)`:
+
+| a | nu | I2 I0 / I1^2 | ansatz/exact |
+|---|-----|--------------|--------------|
+| 1.00 | 1.0000 | 2.000 | **1.0000** |
+| 1.05 | 0.9762 | 1.952 | 1.0242 |
+| 1.10 | 0.9545 | 1.909 | **1.0472** |
+| 1.35 | 0.8704 | 1.741 | 1.1475 |
+| 0.80 | 1.1249 | 2.250 | 0.8901 |
+
+The real data has `nu` p10/p50/p90 = 0.923/0.949/1.005, i.e. `a ~ 1.1`, where
+the radial correction is **+4.7%** -- it would make the ansatz OVER-predict,
+while the data shows it UNDER-predicting by 30%.  Over the whole plausible `nu`
+range the effect is at most +/-15%.  **Matching `Mc/Mr` cannot close the gap and
+pushes the wrong way.**  Do not build it.
+
+### The circular weight times an elliptical galaxy: CONFIRMED
+
+The ansatz assumes the k-space isophotes are concentric SIMILAR ellipses -- one
+ellipticity for all k.  `W(k)` is circular and `I(k)` elliptical, so the
+product's ellipticity VARIES with k.  Elliptical Gaussian galaxy times a
+circular window, isotropic `Sigma_X` as the sims have (so
+`Sigma_u = J^-1 Sigma_X J^-T` is anisotropic and aligned with the galaxy):
+
+| circular window | ansatz/exact | product ellipticity by \|k\| shell |
+|---|---|---|
+| **Gaussian (control)** | **1.0000** | +0.011 -> +0.238 |
+| `exp(-(k/k0)^4)` | **0.877** | +0.011 -> +0.196 |
+| `(1-(k/kmax)^2)^3` | **0.862** | +0.011 -> +0.179 |
+| top hat | **0.802** | +0.011 -> +0.201 |
+| *real data* | *0.702* | |
+
+Right sign, right order.  The shells show the mechanism: the product's
+ellipticity rises steeply with `|k|`, and a circular non-Gaussian window
+compresses that rise; a single k-independent ellipticity cannot represent the
+gradient.
+
+**A caution recorded because it bit here**: an earlier version of this test
+imposed isotropic `Sigma_u` and got ratios 1.55-2.79, i.e. the WRONG direction.
+The sims have isotropic `Sigma_X`, not `Sigma_u`, and the resulting alignment of
+`Sigma_u` with the galaxy dominates the spin-2 response.  Any future test of
+this layer must impose `Sigma_X`.
+
+### The fix this points to, and its cost
+
+Stop absorbing `W(k)` into the Gaussian: model only the GALAXY `I(k)` as an
+elliptical Gaussian and keep the known `W(k)` explicit in
+
+    M_a(Sigma_u) = INT W(k) kernel_a(k) I_gal(k) exp(-1/2 k^T Sigma_u k) d2k
+
+`W` is KBlackmanHarris and known exactly, so this adds no free constant and is
+exact for a Gaussian GALAXY -- a strictly weaker assumption than the present
+one, which needs a Gaussian PRODUCT.
+
+Cost, which is the reason not to start it casually: recovering `I_gal`'s
+parameters from the measured moments becomes a small per-galaxy nonlinear solve
+(3 unknowns from `Mr/Mf`, `M1/Mr`, `M2/Mr`), and the damping integral needs
+quadrature -- replacing closed-form 2x2 algebra that currently sits INSIDE the
+g-autodiff and runs once per draw in `log_conv_is`.  Worth costing against the
+~5e-3 m1 it would buy before committing.
+
+### Artifacts
+
+- Scratchpad: `radial.py`, `angular.py`.
