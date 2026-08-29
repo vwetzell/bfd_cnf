@@ -3916,3 +3916,53 @@ linear moments.
 ### Artifacts
 
 - Scratchpad: `kappa.py`.
+
+## 2026-08-29: it is NOT the weight -- KBH costs 2.7%, the galaxy's second
+component costs the rest.  Corrects the 2026-08-28 attribution.
+
+Asked whether `kappa` is just the Gaussian-vs-KBlackmanHarris width difference.
+It cannot be a WIDTH mismatch in the second-moment sense -- the ansatz solves
+`R` from `(Mf, Mr, M1, M2)`, so its fitted Gaussian matches `<k_i k_j>` of the
+true `W I` exactly.  And it turns out not to be the weight's SHAPE either.
+
+Controlled decomposition, single elliptical Gaussian galaxy throughout so the
+galaxy is not a confound, Sigma_X isotropic:
+
+| case | ansatz/exact |
+|------|--------------|
+| 1. Gaussian weight matched to KBH's `<k^2>` (control) | **1.0000** |
+| 2. KBH weight -- the WEIGHT's share | **0.9734** |
+| 3. KBH weight + TWO-Gaussian galaxy (rho = 0.4) | **0.8344** |
+
+`<k^4>/<k^2>^2` is 1.8042 for KBH against 1.9884 for the matched Gaussian -- a
+9% kurtosis difference that costs only **2.7%** of response error.  Adding a
+second galaxy component costs another **14%** at rho = 0.4, and more at
+realistic rho.
+
+### This corrects the 2026-08-28 attribution
+
+That entry concluded "the 30% is the circular weight times an elliptical
+galaxy", on the strength of circular windows giving 0.877 / 0.862 / 0.802.  But
+those test windows (`exp(-(k/k0)^4)`, `(1-(k/kmax)^2)^3`, a top hat) are far
+more aggressive than KBH actually is.  **The real weight is gentle -- 2.7% --
+and the deficit is dominated by the galaxy's multi-scale structure.**  That is
+also the consistent reading of the two-Gaussian result (0.9905): it was the
+GALAXY component doing the work, not carrying W explicitly.
+
+Practical consequence: a fix that only carries `W` exactly buys ~3%, not 30%.
+The 0.785 measured for "single Gaussian galaxy + exact W" on real galaxies is
+mostly still galaxy error, not weight error.
+
+### Is it "a width" operationally?
+
+A `Sigma_u` rescale can mimic it -- the response is essentially linear in the
+rescale (ansatz/exact = 0.9734, 1.1679, 1.3623, 1.5566 at x1.0, 1.2, 1.4, 1.6),
+so x1.03 fixes case 2 and x1.20 fixes case 3.  But the required factor tracks
+the GALAXY's internal structure (rho), not the weight.  That is exactly why the
+single `kappa` carries a real `Mr/Mf` trend (1.51 -> 1.22) and a depth
+dependence rather than being universal, and why it is a per-population
+calibration rather than a constant of the method.
+
+### Artifacts
+
+- Scratchpad: `isitwidth.py`.
