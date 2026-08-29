@@ -3966,3 +3966,78 @@ calibration rather than a constant of the method.
 ### Artifacts
 
 - Scratchpad: `isitwidth.py`.
+
+## 2026-08-29 (cont.): there is NO better approximation from these five moments
+-- the response is only half-determined by them, and the rest is Var[.|m]
+
+Asked whether there is a better way to approximate the centroid marginalisation.
+Measured answer: not from `(Mf, Mr, M1, M2, Mc)`.
+
+### The five moments determine only about half the response
+
+Per-galaxy `kappa = (exact response)/(ansatz response)` on 4243 well-determined
+`copies_gauss2_deep` galaxies (cut to the upper 60% in `|e|` and in the ansatz's
+own projection, so the ratio is not dominated by division noise):
+
+| | robust sd |
+|---|---|
+| overall | **0.227** |
+| within fine bins of `(Mr/Mf, Mc/Mr, |e|)` -- 216 bins | **0.162** |
+
+Conditioning on all the moment information removes 0.227 -> 0.162, i.e. explains
+**~49% of the variance**.  About **+/-11% per galaxy survives** and cannot be
+predicted by ANY function of the five moments.  (Part of the 0.162 is
+estimation noise in the per-galaxy ratio, so it is an upper bound -- but the
+conclusion does not turn on the exact value.)
+
+### Why -- and why `Mc` in particular cannot rescue it
+
+A controlled two-component scan (single elliptical shape, varying bulge/disc
+size ratio `rho`, real KBH weight):
+
+| rho | `nu = Mc Mf/(2Mr^2+M1^2+M2^2)` | ansatz/exact |
+|-----|--------------------------------|--------------|
+| 1.00 | 0.9759 | 0.9537 |
+| 0.70 | 1.0185 | 0.8658 |
+| 0.55 | 1.0680 | 0.7949 |
+| 0.40 | 1.0939 | 0.7931 |
+| 0.30 | 1.0746 | 0.8363 |
+
+Within the scan `nu` does track the error.  But the REAL catalog has
+`nu` p10/p50/p90 = 0.923/0.949/1.005 -- BELOW the single-Gaussian value of
+0.976 -- which the scan maps to `rho ~ 1` and an error of ~0.95, while the real
+error is 0.70.  So the mapping is broken by other degrees of freedom (size
+relative to `kmax`, the PSF, the flux ratio).  That is also why the earlier
+Gamma-family correction pointed the wrong way.
+
+### This is the layer's own documented floor, now quantified
+
+`models/centroid.py`'s "What it cannot carry" already names it: "the same
+`Var[.|m]` floor as the shear layer -- two galaxies with identical moments
+marginalise differently, and a deterministic transport can only carry the
+conditional mean of that."  The +/-11% IS that floor.  It is missing
+information, not a modelling failure to be out-argued.
+
+### The structural route that follows
+
+The layer applies a deterministic TRANSPORT -- it moves the mean.  But the
+marginalisation is genuinely stochastic at fixed `m`: a spread, not a shift.
+The structurally honest treatment carries it as extra CONVOLUTION COVARIANCE
+beside `C_M`:
+
+    P(M|g) = INT p(m|g) N(M - m - Delta(m); C_M + C_cent(m)) dm
+
+with `Delta` the mean shift the current layer already computes and `C_cent` the
+induced moment covariance.  Three properties the transport lacks: it represents
+the physics correctly; the +/-11% becomes a MODELLED variance instead of an
+unmodelled error; and it needs only the SECOND moment of the scatter, a far
+weaker requirement than predicting each galaxy's own shift.
+
+UNTESTED, and the honest catch is that `C_cent` plausibly needs the same high-k
+information the mean shift does, so it may inherit the same problem.  But it is
+the only route left that does not require predicting per-galaxy behaviour the
+moments provably do not determine.
+
+### Artifacts
+
+- Scratchpad: the per-galaxy kappa scatter test and the rho scan (inline).
