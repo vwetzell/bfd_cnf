@@ -4308,3 +4308,65 @@ the `Sigma_X0 -> Sigma_X` differential -- projects to ~8e-5.
 ### Artifacts
 
 - Scratchpad: `twogauss_bd.py`.
+
+## 2026-08-29 -- The 0.898 stall is the analytic class, not the five moments
+
+Scope: fixed isotropic Sigma_X (both catalogs carry exactly one isotropic
+`cov_odd` row).  `scratchpad/learned_ceiling.py`, 6000 galaxies/catalog.
+
+Construction is layer-shaped and equivariant: keep the ansatz's spin-2
+DIRECTION, learn only a scalar gain `kappa` on the four rotation invariants
+(log10 Mf, Mr/Mf, Mc/Mr, |e|).  Rotating the galaxy leaves the invariants fixed
+and rotates the direction with it -- the `Spin2CouplingLayer` trick.
+
+```
+                                    ens ratio     |err|  per-gal scatter
+--- bulgedisc_v2: fit on own train half, tested on held-out half (n=2906)
+  0. current _transport                0.7266    0.2734            0.274
+     + constant kappa                  1.0000    0.0000            0.377
+     + learned kappa(4 invariants)     0.9960    0.0040            0.368
+  2. 2-Gauss + exact W                 0.9076    0.0924            0.358
+     + constant kappa                  1.0149    0.0149            0.401
+     + learned kappa(4 invariants)     1.0049    0.0049            0.381
+
+--- TRANSFER: fit on gauss2, applied to bulgedisc (n=5812)
+  0. current _transport                0.7266    0.2734            0.332
+     + gauss2 constant kappa           1.0274    0.0274            0.469
+     + gauss2 learned kappa            0.9590    0.0410            0.482
+  2. 2-Gauss + exact W                 0.9006    0.0994            0.401
+     + gauss2 constant kappa           0.8936    0.1064            0.398
+     + gauss2 learned kappa            0.8211    0.1789            0.417
+```
+
+**The information IS in the five moments.**  Held out, bulgedisc goes 0.7266 ->
+0.9960.  The 10-point misalignment residual that no co-elliptical two-Gaussian
+could reach is recoverable; the analytic model could not REPRESENT it, not
+could not see it.
+
+**One number does it.**  A single constant beats the 4-invariant model
+within-population, so nothing elaborate is warranted -- the layer stays
+closed-form with one calibrated gain.
+
+**It does not transfer.**  gauss2's constant gives 1.0274 on bulgedisc and
+gauss2's learned kappa 0.9590 (worse than the constant); on top of 2-Gauss + W
+the transfer actively degrades it to 0.8211.  Same overfitting that killed the
+binned table.  The within-population 1.0000 is a random split of ONE population,
+so it tests sampling stability, not generalisation.  Consequence: the gain must
+be calibrated per population, against that population's own copy catalog.
+That trades "zero-parameter analytic" for a fit against ground truth -- same
+status as bulk/shear, and copies are constructible for real data since they are
+shifts of the noiseless deep templates.  USER'S CALL under the no-tuning rule.
+
+**Unresolved.**  Per-galaxy scatter RISES under correction (0.274 -> 0.368);
+unbiased scatter largely cancels in the ensemble but its effect on the density
+is untested, and part of it is copy MC noise at median ESS 25.  The ensemble
+spin-2 response is a scalar proxy: necessary for m1, not proof that the full
+density and its g-derivatives come right.
+
+If it holds, bulgedisc's centroid response error drops 1.18e-3 -> ~2e-5, taking
+the centroid layer off the table and leaving the -0.02 windowed density error as
+the whole of the bulgedisc problem.
+
+### Artifacts
+
+- Scratchpad: `learned_ceiling.py`.
