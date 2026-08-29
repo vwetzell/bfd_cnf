@@ -3145,3 +3145,72 @@ stable to 3000 (2026-08-28 collar entry).
 - `bias.py`: `_merge_opg`, `pqr_streamed(opg=True)`, `ghat(..., opg=)`,
   `bias(..., opg=)`.  All opt-in; no default behaviour changes.
 - Scratchpad: `opgtest.py`.
+
+## 2026-08-28 (cont.): the road to 1e-3 -- the gate is a ~5e-3 floor on
+gauss2, and it is NOT draws, targets, or the estimator
+
+Asked how to reach `|m1| ~ 1e-3`.  The honest starting point is that NOTHING
+measured in this session reaches it, including on the population where the
+method works: `gauss2_deep` sits at `-0.0070 +/- 0.0015` at S = 8192, ~5 sigma
+from zero and 7x the target.  So `bulgedisc_v2` is not the only obstacle, and
+until the gauss2 floor is understood no fix to it can be validated -- a 1e-3
+improvement is invisible under a 7e-3 floor.
+
+### S-convergence: settled, and it closes the "more draws" route
+
+Same 19976 targets, same seed, so the draw sets are NESTED across S and the
+shape noise is common:
+
+| S | chunks k | jackknife | m1 | delta |
+|---|----------|-----------|----|-------|
+| 2048  | 1  | **off** | -0.015682 +/- 0.003100 | -- |
+| 8192  | 4  | on | -0.006978 +/- 0.001509 | +0.00870 |
+| 32768 | 16 | on | **-0.006190 +/- 0.001205** | **+0.00079** |
+
+Two readings, and the first is a confound worth recording:
+
+* **`chunk = 2048` makes S = 2048 a SINGLE chunk, and `_merge_finish` falls
+  back to the un-jackknifed plain estimator (`if not jackknife or k < 2`).**
+  So that row is not "fewer draws", it is "no bias correction", and the +0.0087
+  step to S = 8192 measures what the jackknife is WORTH, not an S trend.  Any
+  run with `--samples <= --chunk` is silently uncorrected.
+* Between the two JACKKNIFED points, 4x the draws bought **+7.9e-4**.  If that
+  residual is O(1/S) the asymptote is about **-0.0052**, so only ~1.1e-3 of the
+  S = 8192 number is estimator residual.
+
+So: more draws will not reach 1e-3 (the S residual is ~1e-3 and nearly
+exhausted by S = 32768), and more targets will not either -- they shrink the
++/-0.0012, not the -0.0062 central value, which is 5.1 sigma from zero.  The
+Fisher ratio is 1.002-1.008 at every S, so the model is not the issue here
+either.
+
+### What the ~5e-3 floor probably is
+
+`models/centroid.py`'s own header records that on `copies_gauss2_deep` -- where
+the Gaussian-in-k transport is claimed EXACT, gauss2 being literally a Gaussian
+mixture -- the ellipticity response still shows "a roughly flat 25-30%
+UNDERSHOOT across the whole population".  The centroid layer is worth +0.0138
+in m1 (`centroid-layer-status` memory).  A 30% shortfall on +0.0138 is ~4e-3,
+which is the measured floor to within its error.
+
+That is a specific, cheap test rather than a hypothesis: `--no-centroid` on
+`gauss2_deep` at S = 32768.  If the layer supplies ~+0.014 of a needed ~+0.020,
+the arithmetic closes and the 1e-3 target becomes a question about the
+transport's spin-2 response, not about `bulgedisc_v2` at all.  NOT YET RUN.
+
+### The three gaps to 1e-3, with sizes
+
+| gap | size | status |
+|-----|------|--------|
+| model error on the realistic population | -0.02 (windowed, flux >= 1600) | diagnosed, not fixed |
+| method floor on a GOOD model (gauss2) | **-0.0052 asymptotic** | suspect identified, untested |
+| estimator O(1/S) residual after jackknife | ~1.1e-3 at S = 8192 | measured; halve it with S = 32768 |
+| statistical, 20000 targets | +/-0.0012 at S = 32768 | 200k targets are on disk; ~10x more is affordable but SLOW (a 200k x 2-arm run at S = 8192 projects to ~30 h) |
+
+Order of attack: the gauss2 floor first (it gates validation of everything
+else), then the realistic-population model error, and only then statistics.
+
+### Artifacts
+
+- No code change.  Scratchpad: `floor.py`, `floor_S*.npz` (per-target Q, R and
+  observed moments at each S, for offline reuse).
