@@ -4743,3 +4743,66 @@ ringing needs a bulk retrain and a re-run of `rsplit.py` to confirm B falls.
 ### Artifacts
 
 - Scratchpad: `gaussianise.py`, `fluxshape.py`, `c2spline.py`.
+
+## 2026-08-31 -- NEGATIVE: Gaussianising the flux axis makes B 25x WORSE
+
+Implemented the sinh-arcsinh warp of the chart's flux axis (commit 5639186,
+identity by default), retrained the whole chain on bulgedisc_v2 at
+`--flux-sas 3.409382,0.510387,0.708531,0.487389`, and measured B.
+
+The warp does what it says on the marginal: slot 0's skew 1.775 -> -3e-13 and
+excess kurtosis 3.807 -> +5.5e-13, exactly.  It does NOT help the bias.
+
+```
+=== bulgedisc OLD chart (log10 Mf)          n=2000, median draw ESS 267
+ Mf quintile  E[d2logp] A  Var[score] B      R=A+B  Fisher R  Fisher A only
+          q1   -5.789e+01     2.042e+02  1.463e+02    -0.051          0.130
+          q2   -4.558e+01     8.179e+01  3.620e+01    -0.219          0.174
+          q5   -1.702e+01     1.732e+00 -1.529e+01     1.345          1.208
+         ALL   -3.698e+01     6.538e+01  2.839e+01    -0.465          0.357
+
+=== bulgedisc NEW chart (sinh-arcsinh)
+          q1   -3.513e+03     5.133e+03  1.621e+03    -0.050          0.023
+          q2   -3.572e+03     3.672e+03  9.982e+01    -0.528          0.015
+          q5   -2.098e+01     3.038e+00 -1.794e+01     1.256          1.074
+         ALL   -2.145e+03     2.475e+03  3.301e+02    -0.153          0.024
+```
+
+B goes 204 -> 5133 in the faintest quintile (25x worse), A blows up 61x with
+it, and the Fisher ratio is unchanged where it matters (q1 -0.051 -> -0.050)
+and worse in q2 (-0.219 -> -0.528).
+
+**Mechanism, and the flaw in the reasoning that motivated this.**  Shear's
+`dm/dg` residual on Mf went **0.35% -> 51.58%** in the retrain.  `d_g log p` on
+RAW moments is chart-INDEPENDENT for a perfectly fitted density -- the chart is
+internal and its log-det is g-independent, so it cancels out of Q and R
+entirely.  The only way a chart change can move B is by changing how well the
+flow FITS.  So the warp did not add roughness; it made the SHEAR RESPONSE far
+harder to represent, because `models/shear.py` expresses the response in chart
+coordinates and a chart whose Jacobian varies 22x across the population turns a
+smooth response function into a violently varying one.  Better bulk marginal,
+much worse response, ~25:1 against.
+
+**This also kills the 32-knot spline**, not just this instance: its T' varies
+0.79 -> 15.1, the same order, so it would strain the response the same way.  The
+whole "Gaussianise the flux axis" line is CLOSED.
+
+**And it retires the inference that motivated it.**  The gauss2-vs-bulgedisc
+contrast (flux skew 1.78 vs 0.01, log-det gradient 20.5 vs 2.5) was CORRELATION,
+not causation.  Removing the flux axis's non-Gaussianity entirely does not
+reduce the score's ringing.
+
+`bias.py` was not run: the Fisher ratio is the runbook's cheap proxy for exactly
+this, and at q1 = -0.050 it is still sign-flipped, so m1 would still be near -1.
+
+**Code status.**  The warp stays in (identity by default, 71/71 tests pass,
+byte-identical to the old chart when `flux_sas=None`) so the negative is
+reproducible, but it should NOT be enabled.  `flows/bulk_sas.eqx`,
+`shear_sas.eqx`, `centroid_sas.eqx` are the warped-chart checkpoints; the
+centroid gain recalibrates to 1.4042, i.e. unchanged, as expected since the
+centroid layer's deficit is chart-independent.
+
+### Artifacts
+
+- Scratchpad: `train_sas.sh`, `t_bulk.log`, `t_shear.log`, `t_cent.log`,
+  `t_calib.log`, `rsplit.py` (now runs both charts).
