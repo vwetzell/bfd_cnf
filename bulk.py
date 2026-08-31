@@ -130,7 +130,7 @@ def load_moments(path):
     return np.asarray(fitsio.read(path)["moments"], dtype=np.float64)
 
 
-def to_coords(m):
+def to_coords(m, flux_sas=None):
     """Raw moments -> the flow's transformed coordinates t (for plotting).
 
     Mirrors `RawMomentStandardize._forward_transform`, including slots 1 and
@@ -139,7 +139,11 @@ def to_coords(m):
     """
     u = m[:, 1] / (POINT_SOURCE * m[:, 0])
     v = m[:, 4] / (POINT_SOURCE_MC * m[:, 1])
-    return np.stack([np.log10(m[:, 0]), np.log(u) - np.log1p(-u),
+    f = np.log10(m[:, 0])
+    if flux_sas is not None:
+        mu, sig, a, b = flux_sas
+        f = np.sinh((np.arcsinh((f - mu) / sig) - a) / b)
+    return np.stack([f, np.log(u) - np.log1p(-u),
                      np.log(v) - np.log1p(-v), m[:, 2] / m[:, 1], m[:, 3] / m[:, 1]],
                     axis=-1)
 
@@ -171,7 +175,8 @@ def coeff_stats(t, mean=None, std=None):
 
 
 def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH,
-               shear=False, centroid=False, centroid_gain=1.0):
+               shear=False, centroid=False, centroid_gain=1.0,
+               flux_sas=None):
     """Bulk flow standardised against `m_train`; conditioned on g and/or Sigma_X.
 
     The generative stack is ``base -> bulk -> shear(g) -> centroid(Sigma_X) ->
@@ -197,8 +202,9 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
             f"Mr/Mf = {POINT_SOURCE}, where the flow's chart is undefined. "
             "The bound is on the LATENT moment; if these are noisy "
             "measurements they need a deconvolving objective, not this one.")
-    t = to_coords(m_train)
-    raw2standard = RawMomentStandardize(mean=t.mean(0), std=t.std(0))
+    t = to_coords(m_train, flux_sas)
+    raw2standard = RawMomentStandardize(mean=t.mean(0), std=t.std(0),
+                                        flux_sas=flux_sas)
     _u_stats = coeff_stats(t)
 
     key, k_shear = jr.split(key, 2)
@@ -254,7 +260,7 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
         if shear else None)
     head = ([CentroidMarginalize(cond_dim=cond or 3,
                                  mean=t.mean(0), std=t.std(0),
-                                 gain=centroid_gain)]
+                                 gain=centroid_gain, flux_sas=flux_sas)]
             if centroid else []) + \
            ([shear_layer] if shear else [])
     bijection = Invert(Chain([raw2standard, *head, *bulk]).merge_chains())
@@ -361,6 +367,14 @@ def _split(m, frac=0.9):
     return m[:n], m[n:]
 
 
+def _flux_sas(s):
+    """Parse "mu,sig,a,b" for `--flux-sas`; see `models.bijections.sas`."""
+    v = tuple(float(x) for x in s.split(","))
+    if len(v) != 4:
+        raise argparse.ArgumentTypeError("--flux-sas needs mu,sig,a,b")
+    return v
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("mode", choices=["train", "corner"])
@@ -368,6 +382,8 @@ def main():
     p.add_argument("--flow", default="flows/bulk.eqx")
     p.add_argument("--steps", type=int, default=4000)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--flux-sas", type=_flux_sas, default=None,
+                   help="fitted sinh-arcsinh warp of the flux axis as \"mu,sig,a,b\"; omit for the plain log10 this chart has always used. Gaussianises log10 Mf (skew 1.78 -> 0 on bulgedisc_v2). MUST match across bulk/shear/centroid/bias or the charts disagree.")
     p.add_argument("--out", default="plots/bulk_corner.png")
     a = p.parse_args()
 
@@ -375,7 +391,7 @@ def main():
     m_train, m_val = _split(m)
     key = jr.key(a.seed)
     k_build, k_train, k_sample = jr.split(key, 3)
-    flow = build_flow(k_build, m_train)
+    flow = build_flow(k_build, m_train, flux_sas=a.flux_sas)
 
     if a.mode == "train":
         flow = train(flow, m_train, k_train, steps=a.steps)

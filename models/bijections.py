@@ -349,6 +349,46 @@ def propagate_cov_to_std_jax(
 # ---------------------------------------------------------------------------
 
 
+def sas(x, p):
+    """sinh-arcsinh warp of the flux coordinate.  `p = (mu, sig, a, b)`.
+
+    `log10 Mf` is the one badly non-Gaussian chart axis on a realistic
+    population -- skew 1.775 and excess kurtosis 3.807 on bulgedisc_v2, against
+    0.01 and 0.01 for gauss2, which the same stack fits cleanly.  The cause is a
+    hard detection cut (Mf >= 300 exactly) with a power-law tail above, and the
+    strain shows up as a bulk score that rings at 0.65 noise sigma where the
+    true prior's turns over every 2.4 (HANDOFF.md, 2026-08-29).
+
+    This is the two-parameter Jones-Pewsey family on the centred coordinate
+    `w = (x - mu)/sig`.  It zeroes skew AND kurtosis exactly, is C-infinity,
+    monotone for `b > 0`, inverts in closed form, and -- unlike a Box-Cox power
+    with lambda < 0 -- stays UNBOUNDED, so it invents no support edge at the
+    bright end where there is no physics.  It does not reach a quantile
+    transform (Anderson-Darling 144 against 919 now and 0.15 for the rank map):
+    no smooth two-parameter family Gaussianises a truncation.  It is the cheap
+    test of whether the chart is what makes the score ring.
+
+    `p = None` is the identity, which is the default everywhere, so every
+    checkpoint written before this existed still means what it used to.
+    """
+    mu, sig, a, b = p
+    return jnp.sinh((jnp.arcsinh((x - mu) / sig) - a) / b)
+
+
+def sas_inv(y, p):
+    """Inverse of `sas`, in closed form."""
+    mu, sig, a, b = p
+    return mu + sig * jnp.sinh(b * jnp.arcsinh(y) + a)
+
+
+def sas_log_deriv(x, p):
+    """log dS/dx, for the chart's log-det."""
+    mu, sig, a, b = p
+    w = (x - mu) / sig
+    return (jnp.log(jnp.cosh((jnp.arcsinh(w) - a) / b))
+            - jnp.log(b) - 0.5 * jnp.log1p(w ** 2) - jnp.log(sig))
+
+
 class RawMomentStandardize(AbstractBijection):
     """
     Raw x = [Mf, Mr, M1, M2, Mc]   (bfd's even-moment order)
@@ -399,8 +439,13 @@ class RawMomentStandardize(AbstractBijection):
 
     mean: jax.Array
     std: jax.Array
+    # Static: a fixed reparameterisation of the flux axis, not a fitted leaf.
+    # `None` (the default) is the plain log10 this chart has always used.
+    flux_sas: tuple | None = eqx.field(static=True, default=None)
 
-    def __init__(self, mean=None, std=None):
+    def __init__(self, mean=None, std=None, flux_sas=None):
+        self.flux_sas = None if flux_sas is None else tuple(
+            float(v) for v in flux_sas)
         """Initialise with optional mean and std for the standardisation step.
 
         Parameters
@@ -461,6 +506,8 @@ class RawMomentStandardize(AbstractBijection):
                               x[..., 3], x[..., 4])
 
         z0_0 = jnp.log10(Mf)
+        if self.flux_sas is not None:
+            z0_0 = sas(z0_0, self.flux_sas)
         u = Mr / (POINT_SOURCE * Mf)
         z0_1 = jnp.log(u) - jnp.log1p(-u)
         v = Mc / (POINT_SOURCE_MC * Mr)
@@ -491,7 +538,9 @@ class RawMomentStandardize(AbstractBijection):
         mean, std = self._effective()
         z0 = z * std + mean
         log10_const = jnp.log(jnp.array(10.0, dtype=z0.dtype))
-        Mf = jnp.exp(z0[..., 0] * log10_const)
+        l10 = (z0[..., 0] if self.flux_sas is None
+               else sas_inv(z0[..., 0], self.flux_sas))
+        Mf = jnp.exp(l10 * log10_const)
         Mr = POINT_SOURCE * jnn.sigmoid(z0[..., 1]) * Mf
         Mc = POINT_SOURCE_MC * jnn.sigmoid(z0[..., 2]) * Mr
         M1 = z0[..., 3] * Mr
@@ -533,6 +582,10 @@ class RawMomentStandardize(AbstractBijection):
         v = Mc / (POINT_SOURCE_MC * Mr)
         lad_geom = lad_geom - (jnp.log(v) + jnp.log1p(-v)
                                 + jnp.log(jnp.array(POINT_SOURCE_MC, dtype=Mf.dtype)))
+        if self.flux_sas is not None:
+            # Slot 0's own factor is now d sas(log10 Mf)/dMf, i.e. the plain
+            # 1/(Mf ln10) already counted above TIMES dS/d(log10 Mf).
+            lad_geom = lad_geom + sas_log_deriv(jnp.log10(Mf), self.flux_sas)
         lad_std = -jnp.sum(jnp.log(self._effective()[1]))
         return z, lad_geom + lad_std
 

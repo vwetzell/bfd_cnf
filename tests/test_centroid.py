@@ -459,3 +459,52 @@ def test_gain_keeps_the_rotation_equivariance():
         a = _rotate(layer.unmarginalize(Z, SIGMA_X_ANISO), phi)
         b = layer.unmarginalize(_rotate(Z, phi), _rotate_sigma(SIGMA_X_ANISO, phi))
         assert float(jnp.abs(a - b).max()) < 1e-8, phi
+
+
+def test_flux_sas_is_the_identity_by_default_and_inverts_when_set():
+    """The flux warp is off unless asked for, and is a bijection when on.
+
+    `flux_sas=None` must reproduce the plain log10 chart EXACTLY, so every
+    checkpoint written before the warp existed still means what it used to.
+    With it on, the layer's frozen chart copy has to invert to float precision
+    -- `raw_from_standard` and `standard_from_raw` are hand-mirrored from
+    `RawMomentStandardize`, so a warp added to one and not the other is a
+    silent, population-wide chart mismatch.
+    """
+    from models.centroid import raw_from_standard, standard_from_raw
+    P = (3.4094, 0.5104, 0.708531, 0.487389)
+
+    # off by default: byte-identical round trip through the mirrored chart
+    z_plain = standard_from_raw(M, MEAN, STD)
+    assert float(jnp.abs(standard_from_raw(M, MEAN, STD, None) - z_plain).max()) == 0.0
+
+    # on: still an exact bijection, and actually different from the plain chart
+    z = standard_from_raw(M, MEAN, STD, P)
+    assert float(jnp.abs(z - z_plain).max()) > 1e-3
+    back = raw_from_standard(z, MEAN, STD, P)
+    assert float(jnp.abs(back / M - 1.0).max()) < 1e-5
+
+    # and the layer carrying it round-trips like the bare one does
+    layer = CentroidMarginalize(mean=MEAN, std=STD, flux_sas=P)
+    for sx in (SIGMA_X, SIGMA_X_ANISO):
+        y, ld = layer.inverse_and_log_det(z, sx)
+        x, ld2 = layer.transform_and_log_det(y, sx)
+        assert float(jnp.abs(x - z).max()) < 1e-4, sx
+        assert abs(float(ld + ld2)) < 1e-3, sx
+
+
+def test_flux_sas_log_det_matches_autodiff():
+    """The chart's hand-written log-det must equal the Jacobian's, warp on.
+
+    The warp adds one analytic term to `lad_geom`; getting it wrong would not
+    break any round trip, it would just quietly bias every density the flow
+    reports.  Autodiff is the only honest check.
+    """
+    from models.bijections import RawMomentStandardize
+    P = (3.4094, 0.5104, 0.708531, 0.487389)
+    ch = RawMomentStandardize(mean=MEAN, std=STD, flux_sas=P)
+    for scale in (0.5, 1.0, 2.0):
+        m = M * jnp.array([scale, scale, scale, scale, scale])
+        _, ld = ch.transform_and_log_det(m)
+        j = jax.jacfwd(lambda v: ch.transform_and_log_det(v)[0])(m)
+        assert abs(float(jnp.linalg.slogdet(j)[1] - ld)) < 1e-6, scale

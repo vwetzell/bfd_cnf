@@ -461,6 +461,14 @@ def derivs_plot(flow, log10mf, mrmf, mcmr, m_range, n, out):
     print(f"wrote {out}")
 
 
+def _flux_sas(s):
+    """Parse "mu,sig,a,b" for `--flux-sas`; see `models.bijections.sas`."""
+    v = tuple(float(x) for x in s.split(","))
+    if len(v) != 4:
+        raise argparse.ArgumentTypeError("--flux-sas needs mu,sig,a,b")
+    return v
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("mode", choices=["train", "check", "derivs", "scatter"])
@@ -500,6 +508,8 @@ def main():
                         "comparable to the ~35 nat NLL and recovers alpha = "
                         "1.00 in that self-consistency control.")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--flux-sas", type=_flux_sas, default=None,
+                   help="fitted sinh-arcsinh warp of the flux axis as \"mu,sig,a,b\"; omit for the plain log10 this chart has always used. Gaussianises log10 Mf (skew 1.78 -> 0 on bulgedisc_v2). MUST match across bulk/shear/centroid/bias or the charts disagree.")
     p.add_argument("--log10mf", type=float, default=3.6)
     p.add_argument("--mrmf", type=float, default=3.3)
     p.add_argument("--mcmr", type=float, default=None,
@@ -524,14 +534,16 @@ def main():
     labels = load_labels(a.data)
     val_labels = None if labels is None else labels[n_train:]
 
-    flow = bulk.build_flow(jr.key(a.seed), train_set[0], shear=True)
+    flow = bulk.build_flow(jr.key(a.seed), train_set[0], shear=True,
+                           flux_sas=a.flux_sas)
 
     if a.mode == "train":
         # Warm start the bulk from phase 1: it already knows p(m) at g=0, so the
         # optimiser only has to find the g dependence.
         if a.init:
             bulk_only = eqx.tree_deserialise_leaves(
-                a.init, bulk.build_flow(jr.key(a.seed), train_set[0]))
+                a.init, bulk.build_flow(jr.key(a.seed), train_set[0],
+                                        flux_sas=a.flux_sas))
             # `flow` is [raw2standard, shear, *bulk]; `bulk_only` is
             # [raw2standard, *bulk].  Graft every non-shear slot, in order.
             keep = [i for i, b in enumerate(flow.bijection.bijection.bijections)

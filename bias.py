@@ -1454,6 +1454,14 @@ def bootstrap(qp, rp, qm, rm, g=0.02, n=200, seed=0, sel=None, ns=None):
     return np.std(np.array(out), axis=0)
 
 
+def _flux_sas(s):
+    """Parse "mu,sig,a,b" for `--flux-sas`; see `models.bijections.sas`."""
+    v = tuple(float(x) for x in s.split(","))
+    if len(v) != 4:
+        raise argparse.ArgumentTypeError("--flux-sas needs mu,sig,a,b")
+    return v
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--flow", default="flows/shear.eqx")
@@ -1470,6 +1478,8 @@ def main():
                         "standardisation; defaults to the matching moments file)")
     p.add_argument("--g", type=float, default=0.02)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--flux-sas", type=_flux_sas, default=None,
+                   help="fitted sinh-arcsinh warp of the flux axis as \"mu,sig,a,b\"; omit for the plain log10 this chart has always used. Gaussianises log10 Mf (skew 1.78 -> 0 on bulgedisc_v2). MUST match across bulk/shear/centroid/bias or the charts disagree.")
     p.add_argument("--centroid-gain", type=float, default=1.0,
                    help="scalar amplification of the centroid layer's SPIN-2 "
                         "shift; 1.0 is the bare ansatz. Measure it with "
@@ -1589,7 +1599,8 @@ def main():
     m_train = m_train_full if use_centroid else slice90(m_train_full)
     flow = bulk.build_flow(jr.key(a.seed), m_train, shear=True,
                            centroid=use_centroid,
-                           centroid_gain=a.centroid_gain)
+                           centroid_gain=a.centroid_gain,
+                           flux_sas=a.flux_sas)
     flow = eqx.tree_deserialise_leaves(a.flow, flow)
     print(f"{a.flow} on the {a.pop} targets"
           + (" (image noise, recentred; centroid layer on)" if use_centroid
@@ -1605,7 +1616,8 @@ def main():
         # proposal's RawMomentStandardize is silently off.
         m_train_prop = m_train_full if img_noise else slice90(m_train_full)
         proposal = bulk.build_flow(jr.key(a.seed), m_train_prop, shear=True,
-                                   centroid=img_noise)
+                                   centroid=img_noise,
+                                   flux_sas=a.flux_sas)
         proposal = eqx.tree_deserialise_leaves(a.proposal_flow, proposal)
         print(f"  proposal flow: {a.proposal_flow} "
               f"(draws shared across eval flows)")

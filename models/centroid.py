@@ -160,7 +160,8 @@ import jax.numpy as jnp
 from flowjax.bijections import AbstractBijection
 from paramax import non_trainable, unwrap
 
-from .bijections import POINT_SOURCE, POINT_SOURCE_MC
+from .bijections import (POINT_SOURCE, POINT_SOURCE_MC, sas,
+                         sas_inv, sas_log_deriv)
 
 # The tail's OUTPUT magnitude, in standardised-z units -- not a physics bound,
 # a numerical/estimator-stability one.  `_transport` is exact within the
@@ -237,7 +238,7 @@ def split_condition(condition):
     return g, c[..., -3:]
 
 
-def raw_from_standard(z, mean, std):
+def raw_from_standard(z, mean, std, flux_sas=None):
     """Undo `RawMomentStandardize`: the inverse chart, [Mf, Mr, M1, M2, Mc].
 
     Exactly `RawMomentStandardize._inverse_transform` (`models/bijections.py`)
@@ -248,7 +249,7 @@ def raw_from_standard(z, mean, std):
     z0 = std[0] * z[0] + mean[0]
     z1 = std[1] * z[1] + mean[1]
     z2 = std[2] * z[2] + mean[2]
-    Mf = jnp.power(10.0, z0)
+    Mf = jnp.power(10.0, z0 if flux_sas is None else sas_inv(z0, flux_sas))
     Mr = POINT_SOURCE * jnn.sigmoid(z1) * Mf
     Mc = POINT_SOURCE_MC * jnn.sigmoid(z2) * Mr
     M1 = (std[3] * z[3] + mean[3]) * Mr
@@ -286,7 +287,7 @@ def _safe_logit(v):
     return jnp.log(v) - jnp.log1p(-v)
 
 
-def standard_from_raw(m, mean, std):
+def standard_from_raw(m, mean, std, flux_sas=None):
     """The chart, forward: [Mf, Mr, M1, M2, Mc] -> standardised z.
 
     Matches `RawMomentStandardize._forward_transform`, exactly inverting
@@ -297,6 +298,8 @@ def standard_from_raw(m, mean, std):
     u = Mr / (POINT_SOURCE * Mf)
     v = Mc / (POINT_SOURCE_MC * Mr)
     z0 = jnp.log10(Mf)
+    if flux_sas is not None:
+        z0 = sas(z0, flux_sas)
     z1 = _safe_logit(u)
     z2 = _safe_logit(v)
     z3 = M1 / Mr
@@ -383,11 +386,16 @@ class CentroidMarginalize(AbstractBijection):
     # POINT_SOURCE, and keeping it off the leaf list means every checkpoint
     # written before it existed still deserialises.
     gain: float = eqx.field(static=True, default=1.0)
+    # Must match the chart this layer sits behind -- see `mean`/`std`.
+    flux_sas: tuple | None = eqx.field(static=True, default=None)
     mean: jax.Array = eqx.field(default=None)
     std: jax.Array = eqx.field(default=None)
 
-    def __init__(self, mean=None, std=None, cond_dim=3, gain=1.0):
+    def __init__(self, mean=None, std=None, cond_dim=3, gain=1.0,
+                 flux_sas=None):
         self.gain = float(gain)
+        self.flux_sas = None if flux_sas is None else tuple(
+            float(v) for v in flux_sas)
         self.mean = non_trainable(jnp.zeros(5) if mean is None
                                   else jnp.asarray(mean))
         self.std = non_trainable(jnp.ones(5) if std is None
@@ -399,16 +407,18 @@ class CentroidMarginalize(AbstractBijection):
         """Closed form; `transform`'s map, from observed moments back to base."""
         mean, std = unwrap(self.mean), unwrap(self.std)
         _, sigma_x = split_condition(condition)
-        m = raw_from_standard(x, mean, std)
-        y = standard_from_raw(_transport(m, sigma_x, -1.0, self.gain), mean, std)
+        m = raw_from_standard(x, mean, std, self.flux_sas)
+        y = standard_from_raw(_transport(m, sigma_x, -1.0, self.gain), mean,
+                          std, self.flux_sas)
         return x + _EXP_MAX * jnp.tanh((y - x) / _EXP_MAX)
 
     def marginalize(self, y, condition):
         """Closed form; the forward physical map, base -> data."""
         mean, std = unwrap(self.mean), unwrap(self.std)
         _, sigma_x = split_condition(condition)
-        m = raw_from_standard(y, mean, std)
-        x = standard_from_raw(_transport(m, sigma_x, 1.0, self.gain), mean, std)
+        m = raw_from_standard(y, mean, std, self.flux_sas)
+        x = standard_from_raw(_transport(m, sigma_x, 1.0, self.gain), mean,
+                          std, self.flux_sas)
         return y + _EXP_MAX * jnp.tanh((x - y) / _EXP_MAX)
 
     def transform_and_log_det(self, x, condition=None):

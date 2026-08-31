@@ -444,6 +444,14 @@ def calibrate(flow, copies, galaxies, sigma_x, n=20000, seed=0):
     return gain
 
 
+def _flux_sas(s):
+    """Parse "mu,sig,a,b" for `--flux-sas`; see `models.bijections.sas`."""
+    v = tuple(float(x) for x in s.split(","))
+    if len(v) != 4:
+        raise argparse.ArgumentTypeError("--flux-sas needs mu,sig,a,b")
+    return v
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("mode", choices=["train", "check", "calibrate"])
@@ -464,6 +472,8 @@ def main():
                         "the old g = 0 behaviour, or for a catalog with no\n"
                         "per-copy derivatives.")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--flux-sas", type=_flux_sas, default=None,
+                   help="fitted sinh-arcsinh warp of the flux axis as \"mu,sig,a,b\"; omit for the plain log10 this chart has always used. Gaussianises log10 Mf (skew 1.78 -> 0 on bulgedisc_v2). MUST match across bulk/shear/centroid/bias or the charts disagree.")
     p.add_argument("--centroid-gain", type=float, default=1.0,
                    help="scalar amplification of the layer's SPIN-2 shift. 1.0 "
                         "is the bare Gaussian-in-k ansatz, which undershoots "
@@ -485,12 +495,14 @@ def main():
     # the population the frozen bulk was trained on.
     m_train = np.asarray(galaxies["moments"], dtype=np.float64)
     flow = bulk.build_flow(jr.key(a.seed), m_train, shear=True, centroid=True,
-                           centroid_gain=a.centroid_gain)
+                           centroid_gain=a.centroid_gain,
+                           flux_sas=a.flux_sas)
 
     if a.mode == "train":
         if a.init:
             prior = eqx.tree_deserialise_leaves(
-                a.init, bulk.build_flow(jr.key(a.seed), m_train, shear=True))
+                a.init, bulk.build_flow(jr.key(a.seed), m_train, shear=True,
+                                        flux_sas=a.flux_sas))
             pb = prior.bijection.bijection.bijections
             # prior is [raw2standard, shear, *bulk]; this chain inserts the
             # centroid layer after the chart, so it is
