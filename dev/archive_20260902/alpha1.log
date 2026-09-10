@@ -1,0 +1,26 @@
+##### ALPHA=1.0 (pure kernel draws)
+pushforward residual at g=(0.02,-0.01): median |d log p| = 1.17e-03, max 1.23e+03 nats over 29 targets
+
+gauge-K weight dropped for a non-finite dPsi/dg: median 0.00e+00, max 1.60e-03 of 1.0
+
+=== bulgedisc_deep_v2  flows/centroid_bulgedisc_v2.eqx   n=600, 4096 draws, alpha=1.0
+
+--- gauge P (current: g moves the prior)   median ESS 159
+ Mf quintile            A            B        R=A+B  Fisher R
+          q1   -1.635e+02    8.415e+01   -7.935e+01     6.588
+          q2   -4.355e+01    4.297e+01   -5.774e-01    19.555
+          q3   -2.030e+02    3.152e+01   -1.715e+02     3.150
+          q4   -2.148e+01    7.467e+00   -1.401e+01     1.215
+          q5   -1.815e+01    3.050e+00   -1.510e+01     1.325
+         ALL   -8.994e+01    3.383e+01   -5.611e+01     3.961
+
+--- gauge K (g moves the kernel, as BFD)   median ESS 159
+ Mf quintile            A            B        R=A+B  Fisher R
+          q1   -1.707e+01    1.299e+01   -4.086e+00     2.532
+          q2   -2.719e+01    1.793e+01   -9.253e+00     0.888
+          q3   -8.005e+01    6.785e+01   -1.220e+01     1.181
+          q4   -1.136e+03    1.976e+05    1.965e+05    -0.001
+          q5   -4.412e+05    4.369e+05   -4.288e+03     0.005
+         ALL   -8.849e+04    1.269e+05    3.844e+04    -0.001
+
+Q agreement between gauges (should be exact-ish): median |dQ1/Q1| = 2.142e-01

@@ -122,6 +122,31 @@ def test_selection_terms_self_consistent():
     assert np.all(qs_err > 0), "multiple chunks must give a nonzero SEM"
 
 
+def test_selection_terms_fd_matches_autodiff():
+    """`fd=h` must reproduce the autodiff terms on a model where BOTH are
+    well behaved -- the linear-Gaussian population of the test above, whose
+    P_s is smooth in g, so the only difference is the O(h^2) truncation.
+
+    This does NOT test the case `fd` exists for (an Mr/Mf window, where the
+    exact d2F/dg2 has no usable mean and only the difference converges); it
+    pins that the stencil itself is right, so a disagreement there is the
+    physics and not the arithmetic.
+    """
+    rng = np.random.default_rng(3)
+    n = 80_000
+    L = np.linalg.cholesky(COV)
+    z_mean = np.array([950.0, 2280.0, 0.0, 0.0, 0.0])
+    z = jnp.asarray(z_mean + rng.standard_normal((n, 5)) @ L.T)
+    draw = lambda g, zz: zz + g[0] * jnp.asarray(V1) + g[1] * jnp.asarray(V2)
+
+    ps, qs, rs, _ = selection_terms(draw, z, COV, SIZE, FLUX, batch=16_000)
+    psf, qsf, rsf, _ = selection_terms(draw, z, COV, SIZE, FLUX, batch=16_000,
+                                       fd=2e-3)
+    assert abs(psf - ps) < 1e-12, (psf, ps)          # same draws, same P_s
+    assert np.max(np.abs(qsf - qs) / np.abs(qs)) < 1e-3, (qsf, qs)
+    assert np.max(np.abs(rsf - rs) / np.abs(rs)) < 1e-3, (rsf, rs)
+
+
 def test_selection_correction_removes_the_bias():
     """The identity that is the whole point: a fully analytic 5-D linear-
     Gaussian model, where q_i, r_i are known exactly, shows that eq. (45)-(46)

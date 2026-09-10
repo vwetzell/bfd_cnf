@@ -1,0 +1,18 @@
+200 faintest of 2000: Mf 360-899
+reusing chains from dev/hmc_ref.npz
+NUTS: 8000 draws x 200 targets; min n_eff 3678 (median 5657), max r_hat 1.001
+gauge-K pi draws dropped for a non-finite dPsi/dg: median 0.00e+00, max 3.75e-04
+
+                                    mean A      mean B      mean R       med R  Fisher R      med Q1
+        HMC reference, gauge P  -1.453e+04   1.310e+07   1.308e+07   2.458e+06    -0.000  -9.553e-01
+        HMC reference, gauge K  -7.038e+02   5.542e+00  -6.982e+02  -3.679e+00     0.013  -5.720e-02
+
+gauge agreement under pi (the convergence certificate):  median |dR/R| = 1.000e+00,  median |dQ/Q| = 9.567e-01
+Hill tail index of gauge-P score under pi: median 1.20, min 0.25  (< 2 => Var_pi[d_g log p] does not exist)
+  0/200
+         IS gauge P, alpha=0.5  -5.267e+01   2.026e+02   1.499e+02   3.695e+01    -0.062  -1.080e-01
+                              vs reference: median |dR/R| = 1.082e+01, sign disagrees on 68.0% of targets, median |dQ/Q| = 2.269e-01
+  0/200
+         IS gauge P, alpha=1.0  -1.771e+02   6.378e+01  -1.133e+02  -5.229e+00     2.826   2.730e-01
+                              vs reference: median |dR/R| = 1.672e+00, sign disagrees on 34.0% of targets, median |dQ/Q| = 5.489e-01
+wrote dev/hmc_ref.npz

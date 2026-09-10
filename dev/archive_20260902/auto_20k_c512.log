@@ -1,0 +1,72 @@
+flows/centroid_bulgedisc_v2.eqx on the bulgedisc_deep_v2 targets (image noise, recentred; centroid layer on)
+  dropping 2 targets (1.0e-04) whose recentring did not converge
+  streaming 8192 draws/target in chunks of 512 (64 targets at a time)
+integrating under C_M with 8192 draws/target (alpha = 0.5): ESS = 561 (median), 116 (5th pct), frac<10 = 0.000
+    quintile  median ESS   5th pct   frac<10
+          q1         431       153     0.000
+          q2         417       136     0.000
+          q3         387        65     0.000
+          q4         898       101     0.000
+          q5        3701       630     0.000
+  plus:
+    64/19998 targets
+    2048/19998 targets
+    4032/19998 targets
+    6016/19998 targets
+    8000/19998 targets
+    9984/19998 targets
+    11968/19998 targets
+    13952/19998 targets
+    15936/19998 targets
+    17920/19998 targets
+    19904/19998 targets
+    39 targets had no draw with any weight; they contribute nothing
+    24 targets kept the plain Q, R (one chunk carries the weight)
+  minus:
+    64/19998 targets
+    2048/19998 targets
+    4032/19998 targets
+    6016/19998 targets
+    8000/19998 targets
+    9984/19998 targets
+    11968/19998 targets
+    13952/19998 targets
+    15936/19998 targets
+    17920/19998 targets
+    19904/19998 targets
+    37 targets had no draw with any weight; they contribute nothing
+    24 targets kept the plain Q, R (one chunk carries the weight)
+  zero:
+    64/19998 targets
+    2048/19998 targets
+    4032/19998 targets
+    6016/19998 targets
+    8000/19998 targets
+    9984/19998 targets
+    11968/19998 targets
+    13952/19998 targets
+    15936/19998 targets
+    17920/19998 targets
+    19904/19998 targets
+    41 targets had no draw with any weight; they contribute nothing
+    16 targets kept the plain Q, R (one chunk carries the weight)
+  dropping 3 targets with |Q| or |R| > 1000x the population median (1.5e-04); a flow density-curvature spike, not a domain effect
+    quintile   dropped   outlier     total
+          q1         0         3      4000
+          q2         0         0      3999
+          q3         0         0      4000
+          q4         0         0      3999
+          q5         0         0      4000
+wrote dev/pqr_auto_20k_c512.npz
+
+19995 targets, g1 = +/-0.02
+  m1 = +0.06540 +/- 0.02362
+  c1 = +4.81e-03 +/- 2.8e-03   c2 = -1.10e-03 +/- 2.7e-03
+  unsheared catalog: ghat = (+6.15e-03, -1.99e-03)
+
+   Mf quintile          m1          c1          c2
+            q1     +1.2742   +2.14e-02   +2.03e-02   (+/- 1.2401)
+            q2     +0.0770   +2.85e-03   +1.04e-02   (+/- 0.1287)
+            q3     -0.0056   -3.80e-04   -2.23e-03   (+/- 0.0125)
+            q4     +0.0108   +5.41e-03   -5.90e-03   (+/- 0.0399)
+            q5     -0.0036   +6.21e-03   -3.78e-03   (+/- 0.0030)

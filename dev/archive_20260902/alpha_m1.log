@@ -1,0 +1,65 @@
+##### ALPHA=0.5
+flows/centroid_bulgedisc_v2.eqx on the bulgedisc_deep_v2 targets (image noise, recentred; centroid layer on)
+  dropping 2 targets (1.0e-04) whose recentring did not converge
+  streaming 8192 draws/target in chunks of 4096 (16 targets at a time)
+integrating under C_M with 8192 draws/target (alpha = 0.5): ESS = 529 (median), 106 (5th pct), frac<10 = 0.002
+    quintile  median ESS   5th pct   frac<10
+          q1         412       146     0.000
+          q2         386       133     0.000
+          q3         341        49     0.000
+          q4         936        82     0.005
+          q5        3731       676     0.003
+  plus:
+    11 targets kept the plain Q, R (one chunk carries the weight)
+  minus:
+    12 targets kept the plain Q, R (one chunk carries the weight)
+  zero:
+    11 targets kept the plain Q, R (one chunk carries the weight)
+
+19998 targets, g1 = +/-0.02
+  m1 = -1.27050 +/- 0.01163
+  c1 = -1.22e-03 +/- 6.5e-04   c2 = +4.49e-04 +/- 6.5e-04
+  unsheared catalog: ghat = (-1.18e-03, +4.10e-04)
+
+   Mf quintile          m1          c1          c2
+            q1     -1.0254   -3.40e-04   -2.35e-05   (+/- 0.0016)
+            q2     -1.1514   -3.23e-04   -1.08e-03   (+/- 0.0096)
+            q3     +0.1315   -1.17e-03   -1.60e-03   (+/- 0.0777)
+            q4     +0.0024   +3.92e-03   -5.40e-03   (+/- 0.0175)
+            q5     -0.0011   +6.32e-03   -3.79e-03   (+/- 0.0049)
+##### ALPHA=1.0
+flows/centroid_bulgedisc_v2.eqx on the bulgedisc_deep_v2 targets (image noise, recentred; centroid layer on)
+  dropping 2 targets (1.0e-04) whose recentring did not converge
+  streaming 8192 draws/target in chunks of 4096 (16 targets at a time)
+integrating under C_M with 8192 draws/target (alpha = 1.0): ESS = 317 (median), 5 (5th pct), frac<10 = 0.099
+    quintile  median ESS   5th pct   frac<10
+          q1          23         3     0.290
+          q2          49         4     0.142
+          q3         323        10     0.050
+          q4        1831       113     0.007
+          q5        7459      1408     0.003
+  plus:
+    281 targets kept the plain Q, R (one chunk carries the weight)
+  minus:
+    269 targets kept the plain Q, R (one chunk carries the weight)
+  zero:
+    278 targets kept the plain Q, R (one chunk carries the weight)
+  dropping 23 targets with |Q| or |R| > 1000x the population median (1.2e-03); a flow density-curvature spike, not a domain effect
+    quintile   dropped   outlier     total
+          q1         0        16      4000
+          q2         0         6      3999
+          q3         0         0      4000
+          q4         0         1      3999
+          q5         0         0      4000
+
+19975 targets, g1 = +/-0.02
+  m1 = +0.00711 +/- 0.16723
+  c1 = +7.07e-03 +/- 6.3e-03   c2 = +2.23e-03 +/- 4.1e-03
+  unsheared catalog: ghat = (+4.10e-03, +1.28e-03)
+
+   Mf quintile          m1          c1          c2
+            q1     -0.7703   +1.84e-02   +1.00e-02   (+/- 45.2719)
+            q2     +2.0183   -2.54e-02   +3.71e-02   (+/- 29.5035)
+            q3     +0.1908   +7.22e-03   +1.37e-03   (+/- 0.1216)
+            q4     -0.0836   +5.30e-03   -5.68e-05   (+/- 0.0418)
+            q5     -0.0028   +6.36e-03   -3.93e-03   (+/- 0.0031)

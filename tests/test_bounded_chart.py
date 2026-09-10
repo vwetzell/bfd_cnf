@@ -46,69 +46,57 @@ def test_round_trip_and_log_det():
     assert np.allclose(np.asarray(lad), np.asarray(auto), atol=1e-3)
 
 
-def test_support_closes_at_the_ceiling():
-    """No latent coordinate, however large, maps to Mr/Mf >= POINT_SOURCE."""
-    b = RawMomentStandardize(mean=jnp.zeros(5), std=jnp.ones(5))
-    z = jnp.zeros((5, 5)).at[:, 1].set(jnp.array([0.0, 5.0, 10.0, 50.0, 1e4]))
-    x, _ = jax.vmap(b.inverse_and_log_det)(z)
-    r = np.asarray(x[:, 1] / x[:, 0])
-    # Containment is unconditional: never ABOVE the ceiling, at worst exactly on
-    # it once float32's sigmoid saturates (|z| ~ 17; float64 would be ~37).  The
-    # population's largest galaxy sits at z ~ 2.4, so saturation is ~7 sigma out.
-    assert (r <= POINT_SOURCE).all(), r
-    assert in_domain(x[:3]).all()
+def test_chart_admits_moments_past_the_point_source_limits():
+    """The chart must represent Mr/Mf and Mc/Mr ABOVE the point-source values.
+
+    The bound is a property of the LATENT moment, and every measurement of it
+    is noisy: target moments already exceed it (4.65% of the v3 g=0 arm in
+    Mr/Mf, 4.33% in Mc/Mr), and templates will too once they carry image
+    noise.  A chart that sends those to +/-inf cannot be trained or evaluated
+    on them, so slots 1 and 2 are now the bare ratios.
+    """
+    rng = np.random.default_rng(1)
+    n = 200
+    Mf = 10 ** rng.uniform(3.0, 4.6, n)
+    Mr = Mf * rng.uniform(1.5, 2.0 * POINT_SOURCE, n)        # spans past it
+    Mc = Mr * rng.uniform(0.1, 2.0 * POINT_SOURCE_MC, n)     # and past this
+    e = rng.normal(0, 0.15, (n, 2))
+    m = jnp.asarray(np.stack([Mf, Mr, e[:, 0] * Mr, e[:, 1] * Mr, Mc], -1))
+    assert (np.asarray(Mr / Mf) > POINT_SOURCE).mean() > 0.3
+    assert (np.asarray(Mc / Mr) > POINT_SOURCE_MC).mean() > 0.3
+
+    b = RawMomentStandardize(mean=jnp.zeros(5), std=jnp.ones(5) * 0.7)
+    z, lad = jax.vmap(b.transform_and_log_det)(m)
+    assert bool(jnp.isfinite(z).all()), "chart is finite past the old ceilings"
+    assert bool(jnp.isfinite(lad).all())
+    back = jax.vmap(b.inverse)(z)
+    assert np.allclose(np.asarray(back), np.asarray(m), rtol=1e-5)
+    assert bool(in_domain(m).all()), "in_domain must not reimpose the ceiling"
 
 
-def test_support_closes_at_the_mc_ceiling():
-    """No latent coordinate, however large, maps to Mc/Mr >= POINT_SOURCE_MC."""
-    b = RawMomentStandardize(mean=jnp.zeros(5), std=jnp.ones(5))
-    z = jnp.zeros((5, 5)).at[:, 2].set(jnp.array([0.0, 5.0, 10.0, 50.0, 1e4]))
-    x, _ = jax.vmap(b.inverse_and_log_det)(z)
-    c = np.asarray(x[:, 4] / x[:, 1])
-    # Same saturation argument as slot 1's version above, plus one float32
-    # rounding ulp: once the sigmoid saturates the product is POINT_SOURCE_MC
-    # exactly in real arithmetic, and float32 rounds 6.662089 to 6.6620893.
-    # Without the tolerance this test passes ONLY when another test file has
-    # already switched jax to x64 -- it was doing exactly that, via
-    # tests/test_centroid.py, and failed when run on its own.
-    assert (c <= POINT_SOURCE_MC * (1 + 1e-6)).all(), c
-    assert in_domain(x[:3]).all()
+def test_in_domain_is_only_positivity():
+    """Mf > 0 and Mr > 0 are all the chart needs: Mr/Mf and Mc/Mr are plain
+    ratios, and Mr is the only denominator. Mc may be any sign."""
+    m = sample_moments(16)
+    assert bool(in_domain(m).all())
+    assert not bool(in_domain(m.at[3, 0].set(-1.0))[3])
+    assert not bool(in_domain(m.at[4, 1].set(0.0))[4])
+    # a NEGATIVE Mc is representable -- noise can produce one
+    neg = m.at[5, 4].set(-abs(float(m[5, 4])))
+    assert bool(in_domain(neg)[5])
+    assert bool(jnp.isfinite(
+        RawMomentStandardize(mean=jnp.zeros(5),
+                             std=jnp.ones(5)).transform(neg[5])).all())
 
 
-def test_in_domain_rejects_the_ceiling():
-    m = sample_moments(8)
-    over = m.at[0, 1].set(POINT_SOURCE * m[0, 0] * 1.001)
-    at = m.at[1, 1].set(POINT_SOURCE * m[1, 0])
-    ok = np.asarray(in_domain(over.at[1].set(at[1])))
-    assert not ok[0] and not ok[1] and ok[2:].all()
-
-
-def test_in_domain_rejects_the_mc_ceiling():
-    m = sample_moments(8)
-    over = m.at[0, 4].set(POINT_SOURCE_MC * m[0, 1] * 1.001)
-    at = m.at[1, 4].set(POINT_SOURCE_MC * m[1, 1])
-    ok = np.asarray(in_domain(over.at[1].set(at[1])))
-    assert not ok[0] and not ok[1] and ok[2:].all()
-
-
-def test_in_domain_rejects_non_positive_mc():
-    """Slot 2 is logit(Mc / (rc* Mr)), so Mc <= 0 is a log of a negative -- NaN,
-    which no downstream mask survives.  Reachable: 1.5e-4 of the copy catalog
-    and a comparable share of the noisy path's kernel draws land there."""
-    m = sample_moments(8)
-    m = m.at[0, 4].set(0.0).at[1, 4].set(-abs(m[1, 4]))
-    ok = np.asarray(in_domain(m))
-    assert not ok[0] and not ok[1] and ok[2:].all()
-    z, _ = RawMomentStandardize(mean=jnp.zeros(5), std=jnp.ones(5)) \
-        .transform_and_log_det(m[1])
-    assert not np.isfinite(np.asarray(z)).all(), "the chart survived Mc < 0"
-
-
-def test_build_flow_rejects_out_of_domain_training_data():
+def test_build_flow_accepts_training_data_past_the_ceiling():
+    """Training data above the point-source value must be trainable, because
+    noisy templates will land there."""
     m = np.array(sample_moments(32), dtype=np.float64)
-    m[3, 1] = POINT_SOURCE * m[3, 0] * 1.01
-    with pytest.raises(ValueError, match="point-source ceiling"):
-        bulk.build_flow(jr.key(0), m)
+    m[3, 1] = POINT_SOURCE * m[3, 0] * 1.05
+    flow = bulk.build_flow(jr.key(0), m)
+    lp = flow.log_prob(jnp.asarray(m[3], jnp.float32))
+    assert bool(jnp.isfinite(lp)), lp
 
 
 def test_point_source_constants_match_the_weight_function():

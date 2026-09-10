@@ -1,0 +1,80 @@
+flows/centroid_bulgedisc_v2.eqx on the bulgedisc_deep_v2 targets (image noise, recentred; centroid layer on)
+  dropping 29 targets (1.5e-04) whose recentring did not converge
+  streaming 8192 draws/target in chunks of 4096 (16 targets at a time)
+integrating under C_M with 8192 draws/target (alpha = 0.5): ESS = 527 (median), 106 (5th pct), frac<10 = 0.001
+    quintile  median ESS   5th pct   frac<10
+          q1         411       138     0.000
+          q2         390       135     0.000
+          q3         361        51     0.000
+          q4         947        85     0.003
+          q5        3731       676     0.003
+  plus:
+    16/199971 targets
+    20000/199971 targets
+    39984/199971 targets
+    59968/199971 targets
+    79952/199971 targets
+    99936/199971 targets
+    119920/199971 targets
+    139904/199971 targets
+    159888/199971 targets
+    179872/199971 targets
+    199856/199971 targets
+    2231 targets had no draw with any weight; they contribute nothing
+    1614 targets kept the plain Q, R (one chunk carries the weight)
+  minus:
+    16/199971 targets
+    20000/199971 targets
+    39984/199971 targets
+    59968/199971 targets
+    79952/199971 targets
+    99936/199971 targets
+    119920/199971 targets
+    139904/199971 targets
+    159888/199971 targets
+    179872/199971 targets
+    199856/199971 targets
+    2263 targets had no draw with any weight; they contribute nothing
+    1557 targets kept the plain Q, R (one chunk carries the weight)
+  zero:
+    16/199971 targets
+    20000/199971 targets
+    39984/199971 targets
+    59968/199971 targets
+    79952/199971 targets
+    99936/199971 targets
+    119920/199971 targets
+    139904/199971 targets
+    159888/199971 targets
+    179872/199971 targets
+    199856/199971 targets
+    2245 targets had no draw with any weight; they contribute nothing
+    1604 targets kept the plain Q, R (one chunk carries the weight)
+  dropping 11 targets with |Q| or |R| > 1000x the population median (5.5e-05); a flow density-curvature spike, not a domain effect
+    quintile   dropped   outlier     total
+          q1         0         3     39995
+          q2         0         0     39996
+          q3         0         3     39995
+          q4         0         3     39995
+          q5         0         2     39995
+wrote dev/pqr_200k.npz
+
+window: size (-inf, inf) (Mr/Mf), flux (1600.0, 1000000000.0) (Mf)
+  plus:  109593/199960 targets kept
+  minus: 109595/199960 targets kept
+  selection terms from the templates
+  P_s = 0.5476   Q_s = (-1.922e-04, +1.062e-03)   Q_s_err = (3.3e-04, 9.6e-04)
+  windowed, uncorrected: m1 = -0.04644 +/- 0.00240   c1 = +5.77e-04 +/- 8.3e-04   c2 = +7.93e-04 +/- 9.1e-04
+  windowed, corrected:   m1 = -0.01378 +/- 0.00306   c1 = +6.23e-04 +/- 9.2e-04   c2 = +6.73e-04 +/- 9.3e-04
+
+199960 targets, g1 = +/-0.02
+  m1 = +0.02206 +/- 0.00796
+  c1 = -1.35e-04 +/- 8.3e-04   c2 = +4.11e-04 +/- 8.4e-04
+  unsheared catalog: ghat = (-2.41e-04, +4.78e-04)
+
+   Mf quintile          m1          c1          c2
+            q1     +0.5199   +4.64e-03   +2.93e-03   (+/- 0.1595)
+            q2     +0.0890   -4.40e-03   -2.70e-03   (+/- 0.0260)
+            q3     -0.0297   +2.41e-04   +3.32e-04   (+/- 0.0033)
+            q4     -0.0242   -5.01e-04   +2.15e-03   (+/- 0.0033)
+            q5     -0.0087   +1.06e-03   -1.27e-04   (+/- 0.0055)

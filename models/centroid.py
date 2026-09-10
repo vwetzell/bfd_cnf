@@ -157,11 +157,11 @@ import equinox as eqx
 import jax
 import jax.nn as jnn
 import jax.numpy as jnp
+import jax.random as jr
 from flowjax.bijections import AbstractBijection
 from paramax import non_trainable, unwrap
 
-from .bijections import (POINT_SOURCE, POINT_SOURCE_MC, sas,
-                         sas_inv, sas_log_deriv)
+from .bijections import sas, sas_inv, sas_log_deriv
 
 # The tail's OUTPUT magnitude, in standardised-z units -- not a physics bound,
 # a numerical/estimator-stability one.  `_transport` is exact within the
@@ -177,6 +177,21 @@ from .bijections import (POINT_SOURCE, POINT_SOURCE_MC, sas,
 # the same "must stay a diffeomorphism / bounded per-galaxy contribution"
 # argument that constant was already established under.
 _EXP_MAX = 0.5
+
+# How far the k^4 spin-2 coefficient may depart from its Gaussian value of 1.
+# Generous on purpose: a bound that bites is the `_COEFF_MAX` trap -- it
+# underfits AND severs the gradient at saturation.  The population-average
+# value the two response channels ask for is ~0.87 (ellipticity) to ~-0.3
+# (size), so the useful range straddles zero and 3.0 covers both with room.
+_C_MAX = 3.0
+
+
+def _zero_head(mlp):
+    """`mlp` with its output layer zeroed, so it returns exactly 0 at init."""
+    mlp = eqx.tree_at(lambda m: m.layers[-1].weight, mlp,
+                      jnp.zeros_like(mlp.layers[-1].weight))
+    return eqx.tree_at(lambda m: m.layers[-1].bias, mlp,
+                       jnp.zeros_like(mlp.layers[-1].bias))
 
 
 def _rational_bound(x, c):
@@ -250,41 +265,11 @@ def raw_from_standard(z, mean, std, flux_sas=None):
     z1 = std[1] * z[1] + mean[1]
     z2 = std[2] * z[2] + mean[2]
     Mf = jnp.power(10.0, z0 if flux_sas is None else sas_inv(z0, flux_sas))
-    Mr = POINT_SOURCE * jnn.sigmoid(z1) * Mf
-    Mc = POINT_SOURCE_MC * jnn.sigmoid(z2) * Mr
+    Mr = z1 * Mf
+    Mc = z2 * Mr
     M1 = (std[3] * z[3] + mean[3]) * Mr
     M2 = (std[4] * z[4] + mean[4]) * Mr
     return jnp.stack([Mf, Mr, M1, M2, Mc])
-
-
-def _safe_logit(v):
-    """`logit(v)`, with `v` clipped to `(eps, 1-eps)` first.
-
-    `_transport`'s data <-> base direction is only exact WITHIN the Gaussian-
-    in-k ansatz (module docstring); on a real (not exactly Gaussian) galaxy,
-    its output ratio can land at or past the chart's own point-source
-    ceiling -- `v >= 1` -- where the true `log(v) - log1p(-v)` is a log of a
-    non-positive number, i.e. NaN, not -inf, and nothing downstream survives
-    that (same failure mode `models/bijections.py`'s `safe_point` exists
-    for).
-
-    A smooth rational-bound rescale of `v` itself (an earlier version of
-    this function) is the WRONG tool: real galaxies span most of `(0, 1)`,
-    not just a neighbourhood of 0.5, so any smooth global rescale with a
-    bound near 1 measurably distorts ordinary, safely-in-range targets, not
-    just the rare boundary case -- caught as a median z-space shift of
-    ~0.5-1.2 (should be ~1e-3, matching T's own scale) on
-    `targets_gauss2_deep_g0_200k.fits` (HANDOFF.md, 2026-08-27).  A hard
-    `jnp.clip` is exact (a true no-op) for any `v` not already at the
-    boundary, unlike a smooth rescale over the whole domain; it does zero
-    the gradient exactly at the clip, so this layer's `jacfwd` log-det comes
-    back `-inf` for a row that hits it, same as `-inf`/NaN Q or R elsewhere
-    in this codebase -- `bias.py` already drops those (`dropping N targets
-    with a non-finite Q or R`), which is the right outcome for a target
-    this ansatz genuinely cannot represent, not a bug to paper over.
-    """
-    v = jnp.clip(v, 1e-6, 1.0 - 1e-6)
-    return jnp.log(v) - jnp.log1p(-v)
 
 
 def standard_from_raw(m, mean, std, flux_sas=None):
@@ -295,20 +280,18 @@ def standard_from_raw(m, mean, std, flux_sas=None):
     docstring.
     """
     Mf, Mr, M1, M2, Mc = m[0], m[1], m[2], m[3], m[4]
-    u = Mr / (POINT_SOURCE * Mf)
-    v = Mc / (POINT_SOURCE_MC * Mr)
     z0 = jnp.log10(Mf)
     if flux_sas is not None:
         z0 = sas(z0, flux_sas)
-    z1 = _safe_logit(u)
-    z2 = _safe_logit(v)
+    z1 = Mr / Mf
+    z2 = Mc / Mr
     z3 = M1 / Mr
     z4 = M2 / Mr
     z = jnp.stack([z0, z1, z2, z3, z4])
     return (z - mean) / std
 
 
-def _transport(m, sigma_x, sign, gain=1.0):
+def _transport(m, sigma_x, sign, c_spin2=1.0, c_spin4=1.0):
     """The centroid-marginalisation map on raw moments, both directions.
 
     `sign = +1.0`: base -> data (forward marginalisation, physically what
@@ -318,17 +301,45 @@ def _transport(m, sigma_x, sign, gain=1.0):
     measured moments regardless of which direction is being evaluated; only
     the sign of the k-space damping `P` differs.
 
-    `gain` scales the SPIN-2 displacement only, leaving Mf and Mr exactly as
-    the ansatz computes them.  At `gain = 1.0` (the default) nothing changes.
-    It exists because the Gaussian-in-k ansatz undershoots the ellipticity
-    response by ~30% on realistic galaxies -- a two-Gaussian galaxy with W(k)
-    carried exactly recovers only a third of that, the rest being bulge/disc
-    misalignment no co-elliptical model can represent, while a single scalar
-    calibrated against the population's own copy catalog closes it to ~0.4% on
-    held-out galaxies.  The spin-0 channels are left alone because they are
-    already right to 2-9%; rescaling Sigma_u instead would have moved them by
-    the full gain.  `centroid.py calibrate` measures it; it does NOT transfer
-    between populations, so it must be recalibrated for each.
+    The two corrections after the backbone are the measured k^4 brackets.
+    Every first-order response is the contraction
+    `dM_a = -1/2 Sigma_u^{ij} <k_i k_j kernel_a>`, and writing each symmetric
+    bracket as trace + traceless gives, with `s0 = tr(Sigma_u)`,
+    `s1 = Su_xx - Su_yy`, `s2 = 2 Su_xy`:
+
+        dMf = -1/4 (s0 Mr + s1 M1 + s2 M2)
+        dMr = -1/4 (s0 Mc + s1 N1 + s2 N2)
+        dM1 = -1/4 (s0 N1 + s1 (Mc + K1)/2 + s2 K2/2)
+        dM2 = -1/4 (s0 N2 + s1 K2/2   + s2 (Mc - K1)/2)
+
+    `Mf, Mr, M1, M2, Mc` are all measured; `N = N1 + i N2` (the k^4 SPIN-2
+    moment `int k^2 (kx^2-ky^2) G + i int k^2 2 kx ky G`) and `K = K1 + i K2`
+    (k^4 spin-4) are not.  Wick on the Gaussian ansatz gives
+    `N = 3 Mr (M1 + i M2) / Mf` and `K = 3 (M1 + i M2)^2 / Mf`, and those are
+    what the closed-form backbone above implicitly uses -- verified against
+    its own expansion to 8 digits on the v3 prior.
+
+    `c_spin2` and `c_spin4` are the trained coefficients:
+    `N = c_spin2 * 3 Mr (M1+iM2)/Mf` and `K = c_spin4 * 3 (M1+iM2)^2/Mf`.
+    Both are REAL, not complex.  An imaginary part would rotate each k^4 moment
+    away from the direction the measured spin-2 moment sets -- real per galaxy
+    (isophote twist, bulge/disc misalignment) but zero in conditional mean given
+    parity-even conditioning.  Every invariant these coefficients can see
+    (Mr/Mf, Mc/Mr, |e|) is parity even, so a free imaginary part could only
+    learn a parity-odd artifact of the training sample.  Same failure class as
+    the spin-2 standardisation anisotropy.
+
+    That is also the precise sense in which `K` is "zero for a co-elliptical
+    galaxy": not that the spin-4 MOMENT vanishes (it does not -- an ellipse has
+    one), but that its phase is locked to twice the spin-2 moment's, leaving
+    only a real magnitude for `c_spin4` to carry.  Breaking the lock needs a
+    second spin-2 direction, which on this population does not exist and which
+    an elliptical PSF would supply.
+
+    All three corrections are added at first order rather than resummed: once
+    the ansatz's own `Mc`, `N` and `K` are overridden there is no closed form
+    left to resum, and each stays a few percent of its channel even in the
+    barely-resolved tail.
     """
     Mf, Mr, M1, M2, Mc = m[0], m[1], m[2], m[3], m[4]
     R = (0.5 / Mf) * jnp.array([[Mr + M1, M2], [M2, Mr - M1]])
@@ -352,12 +363,33 @@ def _transport(m, sigma_x, sign, gain=1.0):
     Mr_out = Mf_out * (r_tilde[0, 0] + r_tilde[1, 1])
     M1_out = Mf_out * (r_tilde[0, 0] - r_tilde[1, 1])
     M2_out = Mf_out * 2.0 * r_tilde[0, 1]
-    # Amplify the ELLIPTICITY shift, not the moments: e = (M1 + i M2) / Mr is
-    # what the response is measured in, and scaling M1/M2 directly would drag
-    # the gain through Mr's own (already accurate) change.
-    M1_out = Mr_out * (M1 / Mr + gain * (M1_out / Mr_out - M1 / Mr))
-    M2_out = Mr_out * (M2 / Mr + gain * (M2_out / Mr_out - M2 / Mr))
     mc_ansatz_in = (2.0 * Mr ** 2 + M1 ** 2 + M2 ** 2) / Mf
+    s0 = jnp.trace(sigma_u)
+    s1 = sigma_u[0, 0] - sigma_u[1, 1]
+    s2 = 2.0 * sigma_u[0, 1]
+    # The k^4 TRACE bracket, measured instead of assumed: the Wick trace is
+    # `mc_ansatz_in`, and Mc/Mc_ansatz has p50 0.928 on the v3 prior (sd
+    # 0.003-0.006 within an Mr/Mf bin, so it is nearly a function of size).
+    Mr_out = Mr_out - sign * 0.25 * s0 * (Mc - mc_ansatz_in)
+    # The k^4 SPIN-2 bracket.  It enters dMr contracted with Sigma_u's own
+    # traceless part (|s|/s0 = 0.178 on this population, ~2|e|, and ANTI-
+    # aligned with the galaxy) and dM1/dM2 contracted with its trace -- so one
+    # coefficient moves the size response and the ellipticity response
+    # together, with ~35x more leverage on the latter.
+    dN1 = (c_spin2 - 1.0) * 3.0 * Mr * M1 / Mf
+    dN2 = (c_spin2 - 1.0) * 3.0 * Mr * M2 / Mf
+    Mr_out = Mr_out - sign * 0.25 * (s1 * dN1 + s2 * dN2)
+    M1_out = M1_out - sign * 0.25 * s0 * dN1
+    M2_out = M2_out - sign * 0.25 * s0 * dN2
+    # The k^4 SPIN-4 bracket.  It appears ONLY in dM1/dM2, and only against
+    # Sigma_u's traceless part -- there is no spin-4 piece of dMf or dMr,
+    # because a trace cannot see one.  This is the slot an elliptical PSF
+    # needs: it is the only bracket that can carry a spin-2 direction the
+    # galaxy's own ellipticity does not set.
+    dK1 = (c_spin4 - 1.0) * 3.0 * (M1 ** 2 - M2 ** 2) / Mf
+    dK2 = (c_spin4 - 1.0) * 6.0 * M1 * M2 / Mf
+    M1_out = M1_out - sign * 0.125 * (s1 * dK1 + s2 * dK2)
+    M2_out = M2_out - sign * 0.125 * (s1 * dK2 - s2 * dK1)
     mc_ansatz_out = (2.0 * Mr_out ** 2 + M1_out ** 2 + M2_out ** 2) / Mf_out
     Mc_out = Mc + (mc_ansatz_out - mc_ansatz_in)
     return jnp.stack([Mf_out, Mr_out, M1_out, M2_out, Mc_out])
@@ -372,8 +404,9 @@ class CentroidMarginalize(AbstractBijection):
     (or the chained ``(5,)`` ``[g1, g2, C00, C01, C11]`` -- see
     `split_condition`).
 
-    No trainable parameters: see the module docstring.  `mean`/`std` are a
-    frozen copy of the chart's constants, needed only to convert between the
+    One trainable object: `coeff`, the net behind `_transport`'s `c_spin2`
+    (the k^4 spin-2 bracket -- see `_transport`).  `mean`/`std` are a frozen
+    copy of the chart's constants, needed only to convert between the
     standardised z this bijection operates on and the raw moments `_transport`
     needs a physical scale for -- see `raw_from_standard`.
     """
@@ -382,43 +415,106 @@ class CentroidMarginalize(AbstractBijection):
     # Static, for the reason given in models/shear.py: a plain field assigned in
     # __init__ turns its contents into pytree leaves and breaks checkpoints.
     cond_shape: tuple = eqx.field(static=True, default=(3,))
-    # Static for a second reason too: a calibration constant, like the chart's
-    # POINT_SOURCE, and keeping it off the leaf list means every checkpoint
-    # written before it existed still deserialises.
-    gain: float = eqx.field(static=True, default=1.0)
     # Must match the chart this layer sits behind -- see `mean`/`std`.
     flux_sas: tuple | None = eqx.field(static=True, default=None)
     mean: jax.Array = eqx.field(default=None)
     std: jax.Array = eqx.field(default=None)
+    coeff: eqx.nn.MLP = eqx.field(default=None)
 
-    def __init__(self, mean=None, std=None, cond_dim=3, gain=1.0,
-                 flux_sas=None):
-        self.gain = float(gain)
+    def __init__(self, mean=None, std=None, cond_dim=3, flux_sas=None,
+                 key=None):
         self.flux_sas = None if flux_sas is None else tuple(
             float(v) for v in flux_sas)
         self.mean = non_trainable(jnp.zeros(5) if mean is None
                                   else jnp.asarray(mean))
         self.std = non_trainable(jnp.ones(5) if std is None
                                  else jnp.asarray(std))
+        # Zero final layer => both coefficients == 1 EXACTLY at init, i.e. the untrained
+        # layer is the bare Gaussian-in-k ansatz (plus the measured k^4 trace),
+        # so a --steps 0 run reproduces the zero-parameter transport bit for
+        # bit and the hidden layer's own init never shows up in a baseline.
+        self.coeff = _zero_head(eqx.nn.MLP(
+            3, 2, 32, 1, activation=jnn.tanh,
+            key=jr.key(0) if key is None else key))
         # (3,) alone, or (5,) = [g1, g2, C00, C01, C11] when chained after shear.
         self.cond_shape = (cond_dim,)
 
+    def chart(self):
+        """The frozen chart's constants, spin-2 pair forced isotropic.
+
+        EXACTLY `RawMomentStandardize._effective`, and for the same reason --
+        this layer must read the chart the chart actually applies.  It was
+        reading `self.mean`/`self.std` RAW, which `bulk.build_flow` and
+        `bulk.sync_chart_constants` both copy straight off `chart.mean`/
+        `chart.std` while the chart itself only ever uses `_effective()`.  So
+        the layer decoded M1 and M2 with two DIFFERENT scales and a nonzero
+        mean, and its map was not rotation-equivariant: on `centroid_v10.eqx`
+        `std[3]/std[4] = 1.0146` and `mean[3:] = (1.1e-4, -5.1e-4)`, worth a
+        45-deg equivariance residual of 4.3e-5 (p50) against the 8.6e-7 float32
+        floor -- 50x, and 850x at p99.9 (`dev/centroid_equivariance.py`).  The
+        `_EXP_MAX` clamp, the other suspect, is measurably inert: removing it
+        changes the residual by nothing (`dev/clamp_census.py` says why -- the
+        spin-2 |dz| p99 is 0.098 against `_EXP_MAX = 0.5`).
+        Same failure `e_scale` had in the shear layer
+        ([[e-scale-was-unsymmetrised]]); this layer never got the fix.
+
+        Applied HERE rather than at construction for the reason `_effective`
+        gives, plus one this layer has of its own: the raw values are baked
+        into every existing checkpoint, and `eqx.tree_deserialise_leaves`
+        overwrites whatever `build_flow` put there.  A construction-site fix
+        would be inert for exactly the flows that need it.
+        """
+        mean, std = unwrap(self.mean), unwrap(self.std)
+        spin2_scale = jnp.sqrt(0.5 * (std[3] ** 2 + std[4] ** 2))
+        return mean.at[3:].set(0.0), std.at[3:].set(spin2_scale)
+
+    def bracket_coeffs(self, m, mean, std):
+        """`(c_spin2, c_spin4)` for one galaxy, from parity-even invariants.
+
+        The chart's own standardised size and concentration logits (`z[1]`,
+        `z[2]`) plus `|e|^2` in units of the chart's symmetrised spin-2 std.
+        Nothing here is a new population constant -- all three come from the
+        frozen chart copy this layer already carries, which is what keeps this
+        net out of the stale-constants failure mode the shear layer's
+        coefficient whitening fell into.  Flux is deliberately NOT an input:
+        it is dimensionful, and the ansatz's error is a property of the
+        galaxy's shape, not of how bright it is.
+
+        `|e|^2`, not `|e|`: the two carry the same information (the net can
+        compose any monotone function of one from the other) but `|e|` is
+        `sqrt(M1^2 + M2^2)`, whose gradient is infinite at a perfectly round
+        galaxy -- and a round galaxy is exactly the case
+        `test_gradients_are_finite_for_a_round_galaxy` exists to catch.
+
+        One trunk, two heads -- both coefficients are functions of the same
+        three invariants, and a shared trunk is the arrangement the shear
+        layer's five coefficients already use.
+        """
+        z = standard_from_raw(m, mean, std, self.flux_sas)
+        u = jnp.stack([z[1], z[2],
+                       (m[2] ** 2 + m[3] ** 2) / (m[1] * std[3]) ** 2])
+        return 1.0 + _rational_bound(self.coeff(u), _C_MAX)
+
     def unmarginalize(self, x, condition):
         """Closed form; `transform`'s map, from observed moments back to base."""
-        mean, std = unwrap(self.mean), unwrap(self.std)
+        mean, std = self.chart()
         _, sigma_x = split_condition(condition)
         m = raw_from_standard(x, mean, std, self.flux_sas)
-        y = standard_from_raw(_transport(m, sigma_x, -1.0, self.gain), mean,
-                          std, self.flux_sas)
+        y = standard_from_raw(
+            _transport(m, sigma_x, -1.0,
+                       *self.bracket_coeffs(m, mean, std)),
+            mean, std, self.flux_sas)
         return x + _EXP_MAX * jnp.tanh((y - x) / _EXP_MAX)
 
     def marginalize(self, y, condition):
         """Closed form; the forward physical map, base -> data."""
-        mean, std = unwrap(self.mean), unwrap(self.std)
+        mean, std = self.chart()
         _, sigma_x = split_condition(condition)
         m = raw_from_standard(y, mean, std, self.flux_sas)
-        x = standard_from_raw(_transport(m, sigma_x, 1.0, self.gain), mean,
-                          std, self.flux_sas)
+        x = standard_from_raw(
+            _transport(m, sigma_x, 1.0,
+                       *self.bracket_coeffs(m, mean, std)),
+            mean, std, self.flux_sas)
         return y + _EXP_MAX * jnp.tanh((x - y) / _EXP_MAX)
 
     def transform_and_log_det(self, x, condition=None):

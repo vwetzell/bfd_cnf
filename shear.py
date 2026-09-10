@@ -48,6 +48,9 @@ import bulk
 # paired experiment on 2026-08-20.  Costs ~7%.
 jax.config.update("jax_default_matmul_precision", "highest")
 
+from flowjax.bijections import Chain, Invert
+from flowjax.distributions import Transformed
+
 from models.shear import G_MAX, ShearResponse, dm_dg
 
 # Second-order in g is the model (paper sec. 5.5), so training over a range wider
@@ -154,8 +157,24 @@ def partial_norms(m, q_true, r_true):
             jnp.sqrt(jnp.mean((r_true / s) ** 2, axis=0)))
 
 
+def bulk_score(flow, m, batch=2000):
+    """grad_m log p_bulk at each training moment, with the shear layer peeled off.
+
+    Q = score . u + div u, so this is the weight the ESTIMATOR puts on a response
+    error -- and the reason a response fit that is uniformly excellent in the
+    unweighted metric (slope 1.000, corr 0.999 on all ten partials) can still sit
+    16x above its Var[Q|m] floor once contracted with the score.  Constant during
+    shear training, because the bulk is frozen.
+    """
+    bij = [b for b in flow.bijection.bijection.bijections
+           if not isinstance(b, ShearResponse)]
+    bulk_flow = Transformed(flow.base_dist, Invert(Chain(bij).merge_chains()))
+    g = eqx.filter_jit(jax.vmap(jax.grad(bulk_flow.log_prob)))
+    return jnp.concatenate([g(m[i:i + batch]) for i in range(0, len(m), batch)])
+
+
 def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
-          g_max=G_MAX, deriv_weight=0.0):
+          g_max=G_MAX, deriv_weight=0.0, score=None, score_weight=0.0):
     """Likelihood only by default: the g dependence is learned from P(m|g) alone.
 
     The cost is convergence.  The g dependence is worth ~0.3 nats/galaxy against
@@ -189,6 +208,12 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
     """
     m, q, r = (jnp.asarray(a) for a in data)
     nq, nr = partial_norms(m, q, r) if deriv_weight else (None, None)
+    # Per-moment normalisation of the score-weighted term, <(score_i Q_i)^2>,
+    # shape (5,).  Fractional like the `mse` above, so the two weights are on
+    # the same scale -- and per moment, so Mr and Mc cannot trade against each
+    # other on magnitude.
+    ns = jnp.mean((score[:, None, :] * q) ** 2, axis=(0, 1)) if score_weight \
+        else None
     opt = optax.chain(optax.clip_by_global_norm(1.0),
                       optax.adam(optax.cosine_decay_schedule(lr, steps)))
     params, static = eqx.partition(flow, _trainable(flow, bulk_frozen))
@@ -211,7 +236,23 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
             s = _scale(m[idx])[:, None, :]
             mse = (jnp.mean(((qq - q[idx]) / s / nq) ** 2)
                    + jnp.mean(((rr - r[idx]) / s / nr) ** 2))
-            return nll + deriv_weight * mse, nll
+            loss = nll + deriv_weight * mse
+            if score_weight:
+                # Score-weighted, but NOT contracted.  Contracting first --
+                # mean((score . dq)^2) -- is the metric the estimator is actually
+                # sensitive to, and supervising it directly does cut that metric
+                # 28x for free.  It also leaves a four-dimensional null space per
+                # template, and the optimiser walks straight into it: Mr and Mc
+                # each grew ~10x on the extreme-score tail while anti-aligning,
+                # so the contraction cancelled to 0.04 out of a ~90 sum and m1
+                # merely changed sign (see `flows/shear_v3_sw.eqx`).  Weighting
+                # each moment by the score SEPARATELY keeps the part that
+                # matters -- that the tail is where the estimator looks -- and
+                # removes the direction the exploit lived in.
+                d = score[idx][:, None, :] * (qq - q[idx])
+                loss = loss + score_weight * jnp.mean(
+                    jnp.mean(d ** 2, axis=(0, 1)) / ns)
+            return loss, nll
 
         (loss, nll), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, state = opt.update(grads, state, params)
@@ -507,6 +548,16 @@ def main():
                         "isotropic population; 1e4 is what makes the term "
                         "comparable to the ~35 nat NLL and recovers alpha = "
                         "1.00 in that self-consistency control.")
+    p.add_argument("--score-weight", type=float, default=0.0,
+                   help="weight on a SCORE-WEIGHTED first-order response term, "
+                        "mean((grad log p_bulk)_i (dm/dg - truth)_i)^2 per "
+                        "moment i, each normalised by <(score_i Q_i)^2>. The "
+                        "per-moment deriv loss is unweighted and fractional, so "
+                        "it charges nothing for the ~1%% of templates -- low "
+                        "flux, high Mr/Mf -- where the bulk score is large; "
+                        "those templates carry 65-84%% of the squared response "
+                        "error and the whole flux gradient in m1. Added to "
+                        "`--deriv-weight`'s term, not a replacement.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--flux-sas", type=_flux_sas, default=None,
                    help="fitted sinh-arcsinh warp of the flux axis as \"mu,sig,a,b\"; omit for the plain log10 this chart has always used. Gaussianises log10 Mf (skew 1.78 -> 0 on bulgedisc_v2). MUST match across bulk/shear/centroid/bias or the charts disagree.")
@@ -559,9 +610,14 @@ def main():
             # now (see the docstring).
             flow = bulk.sync_chart_constants(flow, m_train=train_set[0])
             print(f"warm started bulk from {a.init}")
+        # After the graft, so it is THIS chain's bulk.  Frozen during training,
+        # so once is enough.
+        score = bulk_score(flow, jnp.asarray(train_set[0])) if a.score_weight \
+            else None
         flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps,
                      batch=a.batch, lr=a.lr, g_max=a.g_max,
-                     deriv_weight=a.deriv_weight)
+                     deriv_weight=a.deriv_weight, score=score,
+                     score_weight=a.score_weight)
         print(f"val nll {val_nll(flow, val_set, jr.key(99)):.4f}")
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")

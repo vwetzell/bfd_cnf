@@ -1,0 +1,34 @@
+Read NEXT_SESSION_guard.md first — it supersedes NEXT_SESSION_1e3.md.
+
+The guard scan (dev/rs_guard_scan.sh) should have finished. Read it:
+
+    grep -E "===|nominal" logs/rs_guard_scan.outer.log
+
+Column order is: nominal n_in P_s R_s11 R_s12 tracels m1_unc m1_corr ±gal.
+Index 3 is R_s11, index 7 is m1_corr. Parsing this wrong produces plausible
+nonsense — it already happened once.
+
+Combine those rungs with the ones already on disk (guard 100 and unguarded,
+in logs/rs_g100_*.log and logs/rs_ladder_26_s*.log) into one m1-vs-guard
+table with per-guard standard errors, and decide:
+
+  * PLATEAU over a decade of guard -> quote m1 = plateau ± 0.0022 (galaxy)
+    ± (spread across the plateau), then judge whether slices 1-4 are worth
+    26 GPU-h. They only are if the truncation systematic came in under ~1e-3.
+
+  * NO PLATEAU -> the guard is choosing the answer. Stop measuring m1 and go
+    upstream: census the dropped draws (sign and magnitude of R + QQ^T, and
+    where they sit relative to the window) and fix in_support, which is a BOX
+    against a curved manifold. dev/rs_census.py and dev/clamp_census.py exist.
+
+Also still unexplained and worth a look either way: the guard RAISES R_s11
+(0.0619 -> 0.0727) and P_s (0.2326 -> 0.2416), where truncating a
+heavy-tailed mean should lower it. It is cutting large NEGATIVE R + QQ^T, so
+"drop the biggest |Q|, |R|" may be the wrong cut.
+
+Constraints: ONE JAX job at a time (GPU and CPU). Do NOT set JAX_PLATFORMS=cpu
+on window_scan. Do not edit a running bash script. Slices 1-4 are NOT started
+and slice 0's PQR is at pqr/g2v3e_s0.npz.
+
+Write the outcome into [[road-to-1e-3]] and correct [[rs-tail-is-unphysical-draws]]
+with the 2^28 evidence.

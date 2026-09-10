@@ -4806,3 +4806,2163 @@ centroid layer's deficit is chart-independent.
 
 - Scratchpad: `train_sas.sh`, `t_bulk.log`, `t_shear.log`, `t_cent.log`,
   `t_calib.log`, `rsplit.py` (now runs both charts).
+
+## 2026-09-01 -- The residual ~1% is the Mr/Mf support edge; the selection
+correction is sound but its error bar is missing; three hypotheses died
+
+Branch `feat/centroid-shear-conditioning`. All work offline on the saved
+200k run (`dev/pqr_200k.npz`, gauge auto, S=8192, alpha 0.5,
+`flows/centroid_bulgedisc_v2.eqx`) plus one controlled training triple.
+
+### 1. The residual is ONE sub-population, and it is flux-independent
+
+`dev/split_residual.py`, slicing the flux-windowed (`Mf >= 1600`) residual on
+the clean truth moments:
+
+| Mr/Mf | share | m1 |
+|---|---|---|
+| < 3.26 | 75% | within +/-0.012 |
+| 3.26-3.43 | 15% | -0.050 to -0.067 |
+| 3.43-4.12 | 10% | **-0.16 to -0.24** |
+
+The 4x5 flux x size table spans Mf 1600 to 3.1e6 and every flux row repeats the
+same profile (-0.24/-0.23/-0.16/-0.16 in the top size bin).  Arithmetic closes:
+8.6% of the window x -0.13 = the -0.012 seen.  Ellipticity and
+`v = Mc/(POINT_SOURCE_MC Mr)` splits are the same effect through correlated
+coordinates.  **This CORRECTS the earlier "residual bias is flux-dependent"
+reading: inside the flux window there is no flux dependence, the apparent trend
+was the size mix.**
+
+Cutting the edge works.  `dev/size_offline.py` (offline size sweep, one
+`selection_terms` call per point; `TERMS=flow|templates`, `FD`, `FLUX_LO` envs):
+
+| Mr/Mf hi | kept | corrected m1, flow route | templates route |
+|---|---|---|---|
+| none | 54.8% | -0.01723 | -0.01378 |
+| 3.60 | 53.8% | -0.01717 | -0.01405 |
+| 3.45 | 50.1% | -0.00986 | -0.00196 |
+| 3.30 | 43.0% | -0.00098 | -0.00368 |
+| 3.20 | 37.5% | -0.00327 | -0.00302 |
+| 3.00 | 26.8% | +0.01667 | +0.02557 |
+
+(262144 draws, `fd=0.02`.)  Paired drift vs no size cut, flow route:
++0.0074 +/- 0.0014 at 3.45, +0.0162 +/- 0.0021 at 3.30.
+
+### 2. Why the corrected m1 climbs at a tight ceiling -- and why it is NOT
+truncation
+
+`dev/window_leverage.py`.  `D_sel/D` = -3.1/-1.0/+2.0/+5.0/+6.4% at ceilings
+none/3.45/3.30/3.20/3.00, and `dm1` per 1% of `R_s11` =
++0.0003/+0.0001/-0.0002/-0.0005/-0.00065 (~-0.13 to -0.21 per UNIT `R_s11`).
+Uncorrected m1 at 3.00 is +0.086 and the correction cancels 0.070 of it.
+
+**`R_s`'s h -> 0 limit is DIVERGENT for a size window**, as
+`selection_terms`'s own docstring warned (per-draw `d2F/dg2 ~ Mf^2` against
+occupancy falling as 1/Mf).  With `fd=None` at 3.00 one template carries
+**656%** of `R_s11` and the half-split spread is **354%**.  The jvp value is
+not ground truth.
+
+`P_s(g)` IS genuinely non-quadratic at a tight ceiling -- `dev/ps_ladder.py`
+(fixed draw set, even/odd split) gives `R_eff = 2 even(g)/g^2` flat to 0.2%
+over 16x in g at the flux-only window and moving 15-18% between g=0.02 and
+0.04 at 3.2/3.0.  **But that does not explain the climb.**  `dev/profile_ps.py`
+solves the estimating equation with the selection term evaluated AT the
+operating shear -- `(c(u) I - R) g = Q - N_ns Q_s/(1-P_s)`,
+`c = 2 N_ns P_even'(u)/(1-P_s)`, `P_even'` a LOCAL central difference in
+`u = |g|^2`, no per-draw `dF` and no Taylor from zero.  `c(0) = N_ns
+R_s/(1-P_s)` exactly, so eq. (45)-(46) is its `u -> 0` case.  Over 3 draw seeds
+at 2^20 draws:
+
+| ceiling | profile | eq. (45)-(46) | seed sd profile / eq |
+|---|---|---|---|
+| none | -0.0171 | -0.0170 | 0.0005 / 0.0003 |
+| 3.30 | +0.0012 | +0.0014 | 0.0011 / 0.0011 |
+| 3.20 | +0.0074 | +0.0080 | 0.0018 / 0.0009 |
+| 3.00 | +0.0101 | +0.0099 | 0.0014 / **0.0045** |
+
+**Same mean everywhere; the profile buys VARIANCE (3x at 3.00), not bias.**  A
+0.0064 shift seen on one seed was a fluctuation.  The h-scan's monotone ramp
+overstates the systematic because its small-h end is noise amplified by 1/h^2.
+
+**The real gap in every number quoted in this repo: `P_s`/`Q_s`/`R_s` are held
+FIXED across bootstrap draws, so the correction's own MC error is in nobody's
+error bar** -- 0.0005 to 0.0018 (profile), up to 0.0045 (eq. 45-46) at 3.00.
+
+Two implementation traps, both of which produced plausible-looking wrong tables
+before a control caught them: (a) `np.polyfit` on `u` spanning [0, 2.5e-3]
+against `P_s ~ 0.5` is conditioned ~1e10 and returns a junk slope; (b)
+evaluating `P_s` along `+g1` only folds the anisotropy into the "even" curve
+and corrupts the derivative by `Q_s/g` ~ 12% of `R_s`.  `dev/profile_ps.py` now
+runs the flux-only window FIRST and exits unless `2 P_even'` reproduces the
+ladder's -0.2306.
+
+### 3. The flow's selection response is ~12% weak, and it is sharpest at the
+flux-only window
+
+`dev/rs_compare.py`, 1M flow, 3 seeds x 2^20 draws, templates' own half-split
+as their error:
+
+| ceiling | flow R_s11 | tmpl R_s11 | flow-tmpl | sigma |
+|---|---|---|---|---|
+| none | -0.2199 +/- 0.0008 | -0.2492 +/- 0.0004 | -0.0293 | **~30** |
+| 3.45 | -0.0677 +/- 0.0107 | -0.1312 +/- 0.0028 | +0.0635 | 5.8 |
+| 3.20 | +0.2323 +/- 0.0279 | +0.3084 +/- 0.0070 | -0.0761 | 2.6 |
+| 3.00 | +0.3459 +/- 0.0071 | +0.2671 +/- 0.0696 | +0.0788 | 1.1 |
+
+**The 3.00 ceiling settles nothing** -- its template reference has a 52%
+half-split.  An earlier claim in-session of a "3 sigma gap at 3.00" was an
+error (the FLOW's 15% half-split was used as the TEMPLATES'); it is 1.1 sigma.
+The flux-only window is where the discrepancy is real and precise: the flow's
+selection response is 11.8% weak at ~30 sigma, worth ~+0.0035 in m1 there.
+
+### 4. Density is right; the g-evolution is not; steps and data do not fix it
+
+`dev/shell_compare.py` separates `R_s`'s two ingredients against the templates
+(bfd's exact `dm/dg`, the true population).
+
+**Density: flow/template mass ratio 0.98-1.01 in EVERY `Mr/Mf` bin from 2.4 to
+3.6, on both the 100k and 1M flows.**  Coverage, tilted training and stratified
+rendering are all aimed at the wrong thing.  Sole exception: `[3.60, 3.80)` at
+0.841 in BOTH flows, unmoved by 10x data -- structural, and 0.4% of the mass.
+
+Response spread (means are ~0 for both by isotropy; only the spread is
+meaningful):
+
+| shell (+/-0.1) | 100k flow / tmpl | 1M flow / tmpl |
+|---|---|---|
+| 3.00 | 1.158 | 1.080 |
+| 3.20 | 1.072 | 1.056 |
+| 3.45 | 1.006 | 0.991 |
+
+10x training data halves the excess at 3.00 -- so it is not a coefficient
+bound.  **But `R_s` does not follow it:** the 1M flow's `R_s11` at the 3.00
+ceiling is 0.3459 +/- 0.0071, unchanged from the 100k flow's ~0.34.  The
+`R_s ~ E[(dv/dg)^2]` link predicted ~+16% and delivered 0%.  **Falsified; do
+not reuse.**
+
+**Shear steps are exhausted.**  Controlled triple from
+`flows/bulk_bulgedisc_v2.eqx`, same seed, `--deriv-weight 1e4`, only `--steps`
+varying (`flows/shear_v2_s{20000,60000,150000}.eqx`):
+
+| steps | dm/dg Mf | Mr | M1 | M2 | Mc |
+|---|---|---|---|---|---|
+| 20k | 0.42% | 2.39% | 0.67% | 0.67% | 4.91% |
+| 60k | 0.34% | 2.31% | 0.60% | 0.61% | 4.89% |
+| 150k | 0.35% | 2.31% | 0.60% | 0.60% | 4.90% |
+
+3.00-shell spread ratio 1.134 / 1.160 / 1.160 -- flat, marginally WORSE with
+more steps.  This qualifies the older "response fit keeps improving past 60k":
+that was with `--deriv-weight 0`, where NLL alone fights an O(g^2) spin-0
+signal.  With 1e4 it is converged at 20k.
+
+### 5. Free cross-fit Fisher check, and why OPG plateaus
+
+Two saved runs over the SAME galaxies and noise with different `--draw-seed`
+give independent `qhat`, so `SUM qhat_a qhat_b` is a cross-fit `SUM q^2` at no
+cost (`dev/fisher_cross.py`).  At bright flux `SUM q^2 / SUM -r` =
+1.081/1.125/1.233 (q3/q4/q5) with plain/cross 1.003/1.005/1.001 -- the
+Fisher-identity violation is real, not MC noise.  Writing
+`m1_N = E[QS]/E[-R] - 1` and `m1_F = E[QS]/E[Q^2] - 1`, the numbers say
+`E[-R] ~ E[QS] ~ 0.85 E[Q^2]`: the model's score carries ~15-25% of variance
+orthogonal to the true score.  **That explains OPG's -0.19 plateau** -- it is
+dividing by a contaminated metric, not converging to a residual bias.  Do not
+adopt OPG to chase this.
+
+### What to quote
+
+Cut at **Mr/Mf <= 3.30** (flux `Mf >= 1600`): corrected m1 = **+0.0012 +/-
+0.0011 (selection MC) +/- 0.0036 (galaxy bootstrap)**, consistent with zero.
+Do NOT quote 3.20 or 3.00 without the selection MC error, and do not use the
+3.00 ceiling to compare the flow against the templates.
+
+### Hypotheses that died today
+
+- Truncation of eq. (45)-(46) in `g` explains the climb at 3.00 -- WITHDRAWN,
+  same mean across seeds.
+- A 3 sigma flow-vs-template `R_s` gap at 3.00 -- ERROR, 1.1 sigma once the
+  templates' own half-split is used.
+- Response spread drives `R_s` -- FALSIFIED by the 1M flow.
+- Training the shear layer longer -- NULL, converged at 20k.
+
+### Artifacts
+
+All offline on saved runs unless noted.  `dev/split_residual.py` (residual by
+moment coordinate), `dev/size_offline.py` (offline size sweep, both routes),
+`dev/window_leverage.py` (leverage + fd/jvp convergence), `dev/ps_ladder.py`
+(`P_s(+/-g)` even/odd ladder), `dev/profile_ps.py` (profile-`P_s` estimator,
+control-gated), `dev/rs_compare.py` (`R_s` vs templates), `dev/shell_compare.py`
+(density vs response split; `CENTROID=0` for shear-stage flows),
+`dev/fisher_cross.py` and `dev/fisher_split.py` (cross-fit Fisher).
+`dev/rs_converge.py` was written but superseded by `rs_compare.py` and not run.
+New checkpoints: `flows/shear_v2_s{20000,60000,150000}.eqx` (shear stage only,
+no centroid stage run on them).
+
+Note: launching two JAX GPU jobs concurrently kills them both
+(`cuSolver ... gpusolverDnCreate failed`, autotuner "No configs could be
+compiled").  Sequence them, and wait on a PID rather than `pgrep -f`.
+
+## 2026-09-02 -- The spin-0 response lead is DEAD, and the `R_s` gap it was
+chasing was overstated ~4x by a broken error bar
+
+Branch `feat/centroid-shear-conditioning`.  All offline, minutes per run.
+
+### 1. The response is not what makes `R_s` weak (`dev/rs_swap.py`)
+
+The templates are the true population and carry bfd's exact derivatives, so
+replacing ONE column of their `dm_dg` with the flow's own response at the same
+moments isolates that coordinate's contribution to `R_s`.  At the flux-only
+window (`Mf >= 1600`), `R_s11`:
+
+| swapped | dm/dg only | + d2m/dg2 |
+|---|---|---|
+| exact | -0.2492 | -0.2492 |
+| Mf | -0.2492 | -0.2495 |
+| Mr | -0.2492 | -0.2492 |
+| Mc | -0.2492 | -0.2492 |
+| all five | -0.2492 | **-0.2495** |
+
+**The flow's ENTIRE response error, first and second order, on every
+coordinate, is worth 0.1% of `R_s11`.**  In hindsight it could not have been
+otherwise: a flux-only window's `F` depends on `Mf` alone, so only the flux
+response enters -- the flow's *best* coordinate (0.35%) -- and it enters as
+`F'' (dMf/dg)^2 + F' d2Mf/dg2`, i.e. squared.  `Mr`'s 2.3% and `Mc`'s 4.9% do
+not touch it at all.  The link the last session proposed is broken; do not
+re-run it, and do not reopen `models/shear.py`'s spin-0 parameterisation on
+these grounds.
+
+### 2. The templates' half-split error bar is 10x too small
+
+`dev/rs_blocks.py`.  Per-template `d2F/dg1^2` is heavy-tailed, so a half-split
+is a terrible variance estimate for it.  On `moments_bulgedisc_v2.fits`
+(100k templates), flux-only window:
+
+- half-split (what `rs_compare.py` printed): **0.0004**
+- 10 blocks of 10k -> sem of the catalog mean: **0.0039**
+- plain sem: 0.0039
+
+Fixed in `dev/rs_compare.py`: the template error is now a 10-block sem.  The
+flow's 3-seed sd is just as unreliable an estimate (3 seeds of the 100k flow
+give 0.0028 where the old table quoted 0.0008) -- treat any `R_s` sd from <10
+samples as a lower bound.
+
+### 3. What the gap actually is
+
+Against the 1M template catalog (the reference with a usable error bar), flux
+-only window, 1M draws per seed:
+
+| | `R_s11` | error |
+|---|---|---|
+| templates, 1M catalog | -0.2348 | 0.0012 (10 blocks) |
+| templates, 100k catalog | -0.2492 | 0.0039 |
+| flow `centroid_bulgedisc_v2` | -0.2273 | 0.0028 (3 seeds: -0.2277/-0.2243/-0.2298) |
+| flow `centroid_bulgedisc_v2_1M` | -0.2203 | (2 seeds: -0.2188/-0.2217) |
+
+**So the flow is 3.2% weak at ~2.4 sigma, not 11.8% at 30 sigma**, worth
+~0.0016 in m1 rather than ~0.0035.  The 100k catalog's -0.2492 is itself a
+high fluctuation (3-4 sigma against the 1M catalog).  Note the 1M-trained flow
+is if anything slightly WORSE than the 100k one, consistent with the last
+session's finding that 10x data does not move `R_s`.
+
+### 4. Where the residual 3% lives: the flux threshold, in the density
+
+`dev/rs_bins.py` splits `R_s11 = sum_b w_b f_b` over bins of the draw's own
+unsheared `Mf`, with `w_b` the population share and `f_b` the mean per-draw
+`(F(+h) + F(-h) - 2F(0))/h^2`.  All of `R_s` comes from `Mf` in [1500, 1900]
+-- it is a boundary flux, ~4% of the population.  In 100-wide bins there, flow
+/ template:
+
+| Mf bin | w ratio | f ratio |
+|---|---|---|
+| 1500-1600 | 0.987 | 0.927 |
+| 1600-1700 | 0.992 | 1.002 |
+| 1700-1800 | 0.984 | 1.066 |
+| 1800-1900 | 0.981 | 0.976 |
+
+The per-bin curvature matches (that is item 1 again, seen locally); the flow
+carries ~2% too little mass in the band.  **Coarse bins lie here** -- with
+400-wide bins the "response ratio" reads 0.98/0.82, which is pure within-bin
+density structure, since `f` swings from -0.03 to -4.3 across a single coarse
+bin.  Any future flow-vs-template comparison at a window edge must bin finer
+than the scale on which `f` varies.
+
+### What this means for the residual m1
+
+The `R_s` route is now worth ~0.0016, inside the errors already quoted on the
+recommended `Mr/Mf <= 3.30` number (+0.0012 +/- 0.0011 +/- 0.0036).  It is no
+longer a candidate for the ~-0.015 unwindowed residual.  The size-edge
+population (top 10% in `Mr/Mf`, m1 -0.16 to -0.24) is still unexplained and is
+where the next session should go -- and note that whatever is wrong there is
+NOT the shear layer's response fit either.  Run at size ceilings, where the
+`Mr` response DOES enter `F`, `dev/rs_swap.py` gives:
+
+| ceiling | exact | swap Mr | swap all |
+|---|---|---|---|
+| 3.45 | -0.1312 | -0.1246 | -0.1233 |
+| 3.30 | +0.1507 | +0.1524 | +0.1508 |
+
+At 3.45 `Mr` does carry the whole swap effect, but the whole effect is 0.0079
+against an observed flow-vs-template gap of 0.0635 -- **12%**.  At 3.30 it is
+under 1%.  The spin-0 response lead is dead at every window.
+
+### Artifacts
+
+`dev/rs_swap.py` (column-swap of the templates' response), `dev/rs_bins.py`
+(density/response split in `Mf` bins; `EDGES`, `TREF` envs), `dev/rs_blocks.py`
+(block error bars for `R_s`, templates or a flow).  `dev/rs_compare.py`'s
+template error bar fixed.
+
+## 2026-09-02 (evening) -- The size edge splits in two: a real bias at
+`Mr/Mf` 3.26-3.59 and a pure noise bin above it
+
+Branch `feat/centroid-shear-conditioning`.  Three 20k-target runs, one flow
+(`flows/centroid_bulgedisc_v2.eqx`), gauge auto, alpha 0.5, draw-seed 1001.
+
+### 1. The MC error explodes exactly where m1 does -- but that is a coincidence
+for the bins that matter
+
+Two runs over the SAME galaxies and noise with different `--draw-seed` give the
+per-target MC error for free (`dev/edge_noise.py`), binned by `Mr/Mf`
+percentile at `Mf >= 1600`, `sane_targets` guard on:
+
+| size pct | Mr/Mf | sd(R)/\|R\| | sd(Q)/\|Q\| | m1 |
+|---|---|---|---|---|
+| 0-25 | 2.40 | 0.01 | 0.01 | -0.003 |
+| 25-50 | 2.86 | 0.02 | 0.01 | +0.000 |
+| 50-75 | 3.13 | 0.05 | 0.02 | -0.007 |
+| 75-90 | 3.34 | 0.15 | 0.05 | -0.064 |
+| 90-98 | 3.49 | **0.48** | 0.24 | -0.153 |
+| 98-100 | 3.64 | **0.97** | 0.83 | -0.261 |
+
+`R = C/A - (B/A)(B/A)^T`, so `-R` is inflated by `Var_MC(Qhat)`, which the seed
+pair measures directly -- a parameter-free prediction (`dev/edge_budget.py`):
+`dm1 = -SUM Var_MC(Qhat) / SUM(-R)` = -0.0026 / -0.0334 / -0.2690 in the last
+three bins, against -0.064 / -0.153 / -0.261 seen.  It lands on the top bin and
+is 4-25x short elsewhere.  **That looked like the answer and it is not.**
+
+### 2. Two controlled runs kill it
+
+`--chunk 512` at fixed `--samples 8192` (16 jackknife chunks instead of 2;
+`--chunk 4096` was what every earlier run used, so `_merge_finish`'s delete-one
+jackknife had only TWO chunks and 198 targets fell back to the plain
+estimator).  And `--samples 32768 --chunk 4096`, same draw-seed so the 8192
+draws nest inside -- a paired 4x-draws comparison.
+
+| size pct | Mr/Mf | S=8192 | S=32768 | chunk 512 | S32k - S8192 |
+|---|---|---|---|---|---|
+| 0-25 | 2.40 | -0.0029 | -0.0022 | -0.0049 | +0.0007 +/- 0.0036 |
+| 25-50 | 2.86 | +0.0002 | +0.0009 | +0.0016 | +0.0007 +/- 0.0005 |
+| 50-75 | 3.13 | -0.0072 | -0.0046 | -0.0036 | +0.0026 +/- 0.0028 |
+| 75-90 | 3.34 | -0.0648 | -0.0646 | -0.0744 | **+0.0002 +/- 0.0101** |
+| 90-98 | 3.49 | -0.1520 | -0.1722 | -0.1278 | -0.0202 +/- 0.0378 |
+| 98-100 | 3.64 | -0.2633 | -0.0830 | -1.6603 | +0.18 +/- 5.44 |
+
+**75-90 and 90-98 do not move with 4x the draws.**  That band -- `Mr/Mf` 3.26
+to 3.59, 23% of the flux-windowed catalog -- is a REAL bias, not finite-S.
+
+**98-100 is a noise bin and nothing else.**  It reads -0.26 / -0.08 / -1.66
+across three configurations, its paired error bar is +/- 5.4, its top five
+targets carry 19-49% of both sums, and `mean -R` flips sign under two of the
+three.  Do not interpret it, do not quote it, and do not let it into a fit.
+
+More chunks is NOT the lever: the fallback count drops 198 -> 16-24 (the
+jackknife does engage), but at the edge the delete-one sums are unstable and
+the top bin blows up to -1.66.  The jackknife hypothesis is closed.
+
+### 3. What this leaves
+
+The residual at `Mf >= 1600` is a genuine bias concentrated in `Mr/Mf`
+3.26-3.59, insensitive to draws, and -- by this morning's `dev/rs_swap.py`
+result -- not the shear layer's response fit either (`Mr` response error is
+worth 12% of the `R_s` gap at a 3.45 ceiling, under 1% at 3.30).  Density mass
+matches the templates to 2% out to 3.6 (2026-09-01 `dev/shell_compare.py`).  So
+the three obvious explanations are all separately excluded, and the next test
+has to compare the flow's per-target `Q`, `R` against BFD's own template sum
+IN THAT BAND -- the one comparison never done at the edge.
+
+### Artifacts
+
+`dev/edge_noise.py` (per-target MC error from a draw-seed pair, by size),
+`dev/edge_budget.py` (the `Var_MC(Qhat)` prediction vs the m1 seen, plus how
+concentrated each bin's sums are), `dev/fisher_cross.py` extended with `BINBY`,
+`FLUX_LO`, `GUARD`, `PCT` envs.  New runs: `dev/pqr_auto_20k_c512.npz`,
+`dev/pqr_auto_20k_S32k.npz` and their logs.
+
+Note: `--batch-budget 65536` now OOMs on this GPU (the Hessian wants 11.7 GiB
+of 16); use 32768.  It costs throughput -- the S=32768 run took ~100 min.
+
+## 2026-09-02 (late) -- The size-edge bias is NOT the flow: BFD's own template
+sum reproduces it, and most of it is the binning's own uncorrected selection
+
+Branch `feat/centroid-shear-conditioning`.  All offline, minutes per run.
+
+### 1. The comparison the last session asked for (`dev/band_tmpl.py`)
+
+BFD's own estimator, on the same targets, with no flow anywhere in it: the
+paper's eq. (35)-(36) sum over the 22.7M shifted template COPIES of
+`copies_bulgedisc_v2.fits`,
+
+    P(M|g) ~ SUM_c w_c N(M - m_c(g); C_M),   w_c = d2u |J| N(X_c; 0, Sigma_X)
+
+so the centroid marginalisation is carried by ENUMERATION -- exactly where the
+flow carries it with a deterministic `CentroidMarginalize` transport.  `Q` and
+`R` are the first two `g`-derivatives of `log P` in closed form (whitened
+residual `u = A(M - m_c)`, `A = chol(C_M)^-1`):
+
+    d_i s_c = u . Aq_i        d_ij s_c = -Aq_i . Aq_j + u . Ar_ij
+
+then the softmax-weighted first and second cumulants.  Validated against
+autodiff through the same sum to 3e-6 relative (`SELFCHECK=1`).  Targets and
+bins are `dev/pqr_auto_20k_S32k.npz`'s, `Mf >= 1600`, binned by the zero arm's
+`Mr/Mf` percentile -- identical to `dev/edge_noise.py`'s bins.
+
+| size pct | Mr/Mf | kept | ESS | slope Q | slope R | **m1 flow** | **m1 templates** |
+|---|---|---|---|---|---|---|---|
+| 0-50 | 2.66 | 172 | 3519 | 1.19 | 0.61 | +0.0044 | +0.0021 |
+| 50-75 | 3.13 | 448 | 7209 | 1.14 | 0.67 | +0.0000 | +0.0117 |
+| 75-90 | 3.34 | 605 | 10680 | 1.18 | 0.79 | **-0.0383** | **-0.0425** |
+| 90-98 | 3.49 | 643 | 12598 | 1.10 | 0.92 | **-0.1958** | **-0.2053** |
+| 98-100 | 3.64 | 184 | 13101 | 1.08 | 0.97 | -0.4948 | -0.4385 |
+
+**BFD's exact template sum has the same bias, bin for bin.**  Reproduced on a
+second 1000-target subsample (75-90: -0.0356 vs -0.0412; 90-98: -0.1958 vs
+-0.2053).  Per-target `Q` correlates at 0.88-0.96 with a slope of 1.08-1.19
+that is FLAT across bins -- the flow's `Q` runs ~15% high everywhere, not in
+the band -- and the `R` slope IMPROVES with size (0.61 -> 0.97), i.e. the flow
+and BFD agree BEST exactly where the "bias" is worst.
+
+So the band is not a flow density error, not a flow response error, and not the
+`--gauge auto` blend.  Together with 2026-09-02's items 1-3, every flow-side
+explanation is now excluded by measurement.
+
+**`kept` is an ESS cut** (`ESSMIN`, default 1000).  100k galaxies do not cover
+the bright/compact corner: a target 60 whitened sigma from its nearest copy
+gets ESS ~25 out of 12M and `|Q| = 120`, which is the same bright-end failure
+[[flow-density-vs-template-sum]] recorded.  Coverage is WORST in the 0-50 bin
+(17% kept) and best in the band (60-65%), so the cut does not favour the
+conclusion.  Without it the outliers put the template sum's Fisher ratio at
+1e2-1e5 and every correlation at zero -- do not read an unguarded template sum.
+
+### 2. Why both are biased: binning by size IS a selection on M
+
+Sorting flux-windowed targets into `Mr/Mf` bins is a cut on the observed
+moments, so eq. (40) applies to it: `E[SUM_{i in S} Q_i] = d_g P(s|g) != 0`.
+Every per-size-bin `m1` in this repo was computed WITHOUT that correction.
+`dev/size_bands.py` applies it band by band on `dev/pqr_200k.npz` (each arm
+masked on its OWN observed moments, which is what eq. (40) corrects,
+`--window-fd 0.02`, selection terms from the 1M template catalog):
+
+| Mr/Mf band | kept | P_s | R_s11 | uncorrected | corrected |
+|---|---|---|---|---|---|
+| < 3.005 | 27.1% | 0.2699 | +0.336 | +0.08225 +/- 0.00357 | **+0.0078 +/- 0.0053** |
+| 3.005-3.252 | 13.4% | 0.1351 | -0.131 | -0.10522 +/- 0.00183 | **-0.0298 +/- 0.0156** |
+| 3.252-3.407 | 7.9% | 0.0786 | -0.235 | -0.29289 +/- 0.00678 | **-0.0081 +/- 0.0311** |
+| 3.407-3.530 | 4.2% | 0.0414 | -0.131 | -0.64857 +/- 0.01266 | -0.4338 +/- 0.0483 |
+| > 3.530 | 2.3% | 0.0222 | -0.075 | -0.62778 +/- 0.03720 | -0.1525 +/- 0.1339 |
+| no size cut | 54.8% | 0.5476 | -0.249 | -0.04644 +/- 0.00240 | -0.01378 +/- 0.00306 |
+
+The last row reproduces the known `Mf >= 1600` number to five digits, so the
+machinery is the same one.  **`Mr/Mf` 3.252-3.407 -- the lower half of the
+"real bias" band -- is consistent with zero once corrected**, and the
+uncorrected number it replaces was -0.293.
+
+The two bands above 3.407 do not clear, but their corrected values are NOT
+measured: swapping the 100k template catalog for the 1M one moved them by
+-0.067 and +0.086, several times the quoted bootstrap bar, and on the 100k
+catalog `selection_terms` fires its boundary-dominated warning in three of the
+five bands.  The correction's own MC error is still missing from these bars
+(see [[selection-correction-g-truncation]]).  Treat everything above
+`Mr/Mf = 3.407` as unmeasured, not as a residual.
+
+### 3. What this costs the previous session's conclusion
+
+"`Mr/Mf` 3.26-3.59 is a REAL bias, unmoved by draws" is now: unmoved by draws,
+yes; but reproduced by BFD's exact estimator, and mostly an artifact of binning
+without eq. (40).  **A per-bin `m1` is not an estimate of a bias.**  It has no
+meaning until the bin's own selection is corrected, and it does not decompose
+the total: the total `-0.01378 +/- 0.00306` at `Mf >= 1600` already carries the
+flux window's correction.
+
+### 4. Two negatives worth not repeating
+
+* **Restricting the template prior sharply to the band is wrong** (`RESTRICT`
+  with a hard cut, first version): it made the healthy bins worse
+  (0-50: +0.0021 -> -0.0669) because the targets' bin is a SOFT, noise-smeared
+  selection.
+* **The soft version (`RESTRICT=1`, reweighting each copy by
+  `bias.window_prob(m)`) only half-works**: 90-98 goes -0.2053 -> -0.0961 and
+  98-100 -0.4385 -> -0.2709, but 0-50 goes +0.0021 -> -0.0555.  That is the
+  right object for a ZERO-arm-binned selection but the wrong one for what
+  eq. (40) corrects, and it is not a route to a number -- use
+  `dev/size_bands.py` instead.
+
+### Artifacts
+
+`dev/band_tmpl.py` (copy-sum `Q`/`R` per target vs the flow's, by size bin;
+envs `PQR`, `PCT`, `NPB`, `ESSMIN`, `SEED`, `RESTRICT`, `SELFCHECK`, `VERBOSE`;
+caches the whitened 12M-copy array to the scratchpad, ~2 min to build, then
+seconds per bin).  `dev/size_bands.py` (per-BAND m1 with the eq. (40)
+correction; `TMPL` selects the template catalog).
+
+## 2026-09-02 (night) -- The selection correction's own MC error, propagated:
+negligible for the flux window, and it DOUBLES every size band's bar
+
+Branch `feat/centroid-shear-conditioning`.  `dev/size_bands.py`, offline,
+~2 min per table.  75/75 tests pass.
+
+### 1. Method
+
+`P_s`, `Q_s`, `R_s` are sample MEANS over the template catalog.  `ghat`'s
+docstring called them "exact analytic derivatives ... not Monte-Carlo
+estimates" -- true of each template's own `dF/dg`, `d2F/dg2`, false of their
+mean, and no quoted bar has ever carried the difference.  Now it does:
+
+* `dev/size_bands.py:per_template` runs `selection_terms`' own fd stencil
+  WITHOUT taking the chunk mean, so any subset's `(P_s, Q_s, R_s)` is one
+  `np.mean` away.  One jitted stencil per band, reused.
+* 20 equal blocks of the 1M catalog, bootstrapped with replacement (keeping
+  the three terms' correlations), re-solving `bias.bias` at each draw with the
+  GALAXY sample held fixed.  Different catalogs, so the two errors add in
+  quadrature.
+* Checked: the block means average back to `selection_terms`' own `R_s11`
+  (assert in the loop).
+* Do NOT call `selection_terms` once per block -- it builds a fresh
+  `eqx.filter_jit` closure per call and the accumulated CUBINs OOM the GPU at
+  about the 20th.  That is why `per_template` exists.
+
+### 2. Result -- the headline number is untouched
+
+`dev/pqr_200k.npz`, `Mf >= 1600`, no size cut, 1M template catalog, fd = 0.02:
+
+| | m1 | galaxy bootstrap | selection MC |
+|---|---|---|---|
+| uncorrected | -0.04644 | 0.00240 | -- |
+| **corrected** | **-0.01577** | **0.00305** | **0.00016** |
+
+**The selection MC error contributes 0.05% of the variance** -- `R_s11` is
+-0.235 +/- 0.0012 there, 0.5%, because a flux-only window averages the whole
+catalog.  So the ~5 sigma residual is real and is NOT the correction's noise.
+Task 1 of the last handoff is answered in the negative: the residual survives.
+
+Note the point estimate moved -0.01378 -> -0.01577 purely by swapping the 100k
+template catalog for the 1M one.  The 100k catalog's own block error on a size
+band is ~0.026, so that is a 100k fluctuation, not a change of method.  **Use
+`moments_bulgedisc_v2_1M.fits` for every selection term from now on.**
+
+### 3. Result -- per band, it is the DOMINANT error
+
+Same run, corrected, `+/- galaxy +/- selection`:
+
+| Mr/Mf band | kept | R_s11 | sd(R_s11) | corrected m1 | total |
+|---|---|---|---|---|---|
+| < 3.005 | 27.1% | +0.336 | 0.026 | +0.00784 +/- 0.00527 +/- 0.00537 | 0.0075 |
+| 3.005-3.252 | 13.4% | -0.128 | 0.033 | -0.03114 +/- 0.01559 +/- 0.02129 | 0.0264 |
+| 3.252-3.407 | 7.9% | -0.237 | 0.018 | -0.00453 +/- 0.03125 +/- 0.03098 | 0.0440 |
+| 3.407-3.530 | 4.2% | -0.129 | 0.008 | **-0.43906** +/- 0.04788 +/- 0.02001 | 0.0519 |
+| > 3.530 | 2.3% | -0.076 | 0.002 | -0.12802 +/- 0.13939 +/- 0.02293 | 0.1413 |
+
+A narrow band averages `R_s` over few templates, so its relative error is
+15-26% instead of 0.5%, and the selection term is as large as the galaxy
+bootstrap or larger.  **Three of the five bands are consistent with zero once
+both errors are carried** -- including 3.252-3.407, whose uncorrected -0.293
+started this whole line of work.
+
+### 4. The one band that survives: 3.407-3.530
+
+-0.439 +/- 0.052, 8 sigma, on 4.2% of the flux-windowed targets.  Checked
+against the finite-difference step, since `one_chunk_fd` carries an O(fd^2)
+bias:
+
+| fd | < 3.005 | 3.005-3.252 | 3.252-3.407 | **3.407-3.530** | > 3.530 |
+|---|---|---|---|---|---|
+| 0.01 | +0.0123 | -0.0612 | +0.0416 | **-0.4344** | -0.1279 |
+| 0.02 | +0.0078 | -0.0311 | -0.0045 | **-0.4391** | -0.1280 |
+| 0.04 | +0.0031 | -0.0102 | -0.0284 | **-0.4256** | -0.1280 |
+
+The middle bands drift by up to 0.07 across the step -- but every drift is
+inside the fd = 0.01 selection bar (0.044, 0.054), so it is that estimate's
+noise, not an `fd^2` systematic.  **3.407-3.530 is stable to 0.013 across a
+4x change in the step**, so its -0.44 is not a finite-difference artifact
+either.  It is the only per-band bias left standing, and by the afternoon's
+`dev/band_tmpl.py` result BFD's own template sum reproduces the flow there
+(90-98 size percentile, median `Mr/Mf` 3.49: -0.2053 vs -0.1958).
+
+### Artifacts
+
+`dev/size_bands.py` gains `per_template`, `selection_error`, `NBLOCK`,
+`TBOOT`; the corrected column now prints both errors and their quadrature sum.
+`bias.ghat`'s docstring corrected on the "not Monte-Carlo estimates" claim.
+
+### 5. The nominal window
+
+**TEMPLATE-ROUTE NUMBERS -- superseded by section 7.**  Kept as the
+flow-vs-templates comparison it turned out to be.
+
+`2500 < Mf < 50000`, `2.2 < Mr/Mf < 3.2`, on `dev/pqr_200k.npz` with the 1M
+template catalog.  45014/44950 targets kept (22.5%), `P_s = 0.2258`,
+`R_s11 = +0.152 +/- 0.021`, `Q_s = (-3.7e-4, -8.4e-4)` -- consistent with the
+zero isotropy demands, which is why the correction moves `c1`/`c2` by < 1e-4.
+
+| | uncorrected | corrected | +/- galaxy | +/- selection | total |
+|---|---|---|---|---|---|
+| **m1** | +0.04664 +/- 0.00059 | **+0.00260** | 0.00458 | 0.00602 | **0.00757** |
+| c1 | +0.00020 +/- 0.00134 | +0.00029 | 0.00125 | 0.00016 | 0.00126 |
+| c2 | +0.00185 +/- 0.00139 | +0.00200 | 0.00129 | 0.00017 | 0.00130 |
+
+**m1 is 0.34 sigma from zero**, and the selection MC error is again the larger
+of the two components.  The correction does all the work (+0.047 -> +0.003), so
+the finite-difference step was checked:
+
+| fd | R_s11 | corrected m1 |
+|---|---|---|
+| 0.01 | +0.170 | -0.00234 +/- 0.00455 +/- 0.01030 |
+| 0.02 | +0.152 | +0.00260 +/- 0.00458 +/- 0.00602 |
+| 0.04 | +0.137 | +0.00666 +/- 0.00459 +/- 0.00322 |
+
+The 0.009 spread is monotone in `fd` and every point is inside the others'
+selection bars, so it is noise-consistent but may carry an O(fd^2) component.
+Quoted as a systematic: **m1 = +0.003 +/- 0.008 (stat) +/- 0.005 (fd step)**.
+One mild concentration warning at `fd = 0.01` (one template at 5% of `R_s11`,
+`Mf = 4.98e4`, on the flux ceiling) -- not the 20-100% pathology the size bands
+show, and the block bootstrap already prices it in.
+
+The flux-only window's -0.0158 +/- 0.0031 and this +0.0026 +/- 0.0076 are not
+in tension: `Mr/Mf < 3.2` excludes the 3.407-3.530 band that carries -0.44.
+
+`dev/size_bands.py` gained `FLUX_HI` for this.
+
+### 6. Is the nominal window's answer sensitive to where its boundaries sit?
+
+**TEMPLATE-ROUTE NUMBERS -- superseded by section 7**, which redoes the whole
+scan on the flow.  The method description below is unchanged and correct.
+
+`dev/window_shift.py`: each of the four boundaries scanned over `+/-2%`,
+`+/-4%` with the other three held nominal.  Two errors, answering different
+questions -- the ABSOLUTE bar (galaxy + selection block bootstrap, in
+quadrature) is "what is m1 in this window", the PAIRED bar is the error on the
+SHIFT against nominal, from one galaxy resample and one template-block
+resample evaluated at all five windows of a panel.  The windows are overlapping
+subsets of one catalog and one template catalog, so the absolute bars are
+heavily correlated and their quadrature difference is the wrong yardstick for a
+drift -- the same distinction `dev/size_offline.py` draws for nested ceilings.
+
+| boundary | value | kept | m1 | +/- abs | drift | +/- paired |
+|---|---|---|---|---|---|---|
+| Mf floor | 2400 | 23.22% | +0.00409 | 0.00742 | +0.00149 | 0.00379 |
+| | 2450 | 22.86% | +0.00609 | 0.00766 | +0.00349 | 0.00383 |
+| | **2500** | 22.51% | **+0.00260** | 0.00763 | -- | -- |
+| | 2550 | 22.17% | +0.00859 | 0.00775 | +0.00599 | 0.00388 |
+| | 2600 | 21.83% | +0.00171 | 0.00785 | -0.00089 | 0.00400 |
+| Mf ceiling | 48000 | 22.44% | -0.00108 | 0.00713 | -0.00368 | 0.00669 |
+| | 49000 | 22.47% | +0.00599 | 0.00699 | +0.00338 | 0.00750 |
+| | 51000 | 22.55% | +0.01541 | 0.00698 | +0.01281 | 0.00654 |
+| | 52000 | 22.58% | +0.00197 | 0.00782 | -0.00063 | 0.00797 |
+| Mr/Mf floor | 2.112 | 23.12% | +0.00560 | 0.00707 | +0.00300 | 0.00225 |
+| | 2.156 | 22.84% | +0.00733 | 0.00748 | +0.00473 | 0.00217 |
+| | 2.244 | 22.15% | +0.00241 | 0.00746 | -0.00020 | 0.00243 |
+| | 2.288 | 21.76% | +0.00319 | 0.00764 | +0.00059 | 0.00301 |
+| Mr/Mf ceiling | 3.072 | 18.09% | +0.00037 | 0.01049 | -0.00223 | 0.00762 |
+| | 3.136 | 20.28% | +0.00060 | 0.00773 | -0.00200 | 0.00735 |
+| | 3.264 | 24.70% | -0.00355 | 0.00657 | -0.00615 | 0.00582 |
+| | 3.328 | 26.73% | -0.00515 | 0.00639 | -0.00775 | 0.00614 |
+
+**Every one of the 20 windows is consistent with m1 = 0**, the whole scan spans
+-0.005 to +0.015, and no drift exceeds 2 sigma of its paired error.  The
+conclusion does not depend on where these boundaries are placed to the percent.
+
+Two things worth knowing anyway:
+
+* **The `Mr/Mf` CEILING is the only boundary with a monotone trend**: m1 falls
+  from +0.0004 at 3.072 to -0.0052 at 3.328, drift -0.0078 +/- 0.0061 at +4%.
+  That is the large-size population being let in, and it is the same direction
+  as the 3.407-3.530 band's -0.44.  `R_s11` falls 0.222 -> 0.036 across the
+  scan and the top template's share of it climbs to 6.9% at 3.328, so pushing
+  the ceiling further runs into the boundary-dominated regime.
+* **The `Mf` CEILING is the least stable boundary.**  Its `R_s11` wobbles
+  0.161/0.141/0.152/0.103/0.151 over `+/-4%` -- a flux ceiling sits on the
+  bright template tail -- which is why its paired bars (0.0065-0.0080) are
+  twice the flux floor's and the +0.0128 excursion at 51000 (2.0 sigma)
+  appears.  Non-monotone, so noise, but it is the boundary to re-measure with
+  more templates if a number at the 0.005 level is ever needed.
+
+`plots/window_shift.png` has the four panels.
+
+## 2026-09-02 (night, cont.) -- CORRECTION: sections 1-6 used the TEMPLATE
+selection terms.  The flow's are the right ones, and they move the answer
+
+Eq. (40)'s `P(s|g)` is an expectation under the SAME prior the targets' `Q`,
+`R` came from.  Taking it from the template catalog instead mixes two priors --
+and `bias.py`'s own `--window-terms` help already recorded that the two
+disagree (the flow runs `P_s` ~4% high).  `bias.py` still defaults to
+`templates`; **`dev/size_bands.py` now defaults to `flow`** (`TERMS=templates`
+gets the old route back, and it remains useful as a density diagnostic).
+
+Everything below is `flows/centroid_bulgedisc_v2.eqx`, 2^20 prior draws in
+float64, seed 31, `dev/pqr_200k.npz`.
+
+### 7a. The three headline numbers, both routes
+
+| window | | templates | **flow** |
+|---|---|---|---|
+| `Mf >= 1600`, no size cut | `R_s11` | -0.235 +/- 0.0012 | -0.228 +/- 0.0050 |
+| | corrected m1 | -0.01577 +/- 0.00305 +/- 0.00016 | **-0.01688 +/- 0.00305 +/- 0.00063** |
+| nominal window | `R_s11` | +0.152 +/- 0.021 | +0.1225 +/- 0.021 |
+| | corrected m1 | +0.00260 +/- 0.00458 +/- 0.00602 | **+0.01088 +/- 0.00461 +/- 0.00573** |
+| | c1 | +0.00029 +/- 0.00126 | -0.00000 +/- 0.00127 |
+| | c2 | +0.00200 +/- 0.00130 | +0.00200 +/- 0.00133 |
+
+The flux-only number barely moves (its `R_s` averages the whole prior, and the
+two priors agree there to 3%).  **The nominal window moves by +0.008, about one
+sigma**, because the flow's `R_s11` is 19% weaker than the templates' on that
+window.  `c1`/`c2` are untouched: `Q_s` is ~7e-4, consistent with the zero
+isotropy demands, so the correction is carried entirely by `R_s`.
+
+`fd` scan on the nominal window, flow route:
+
+| fd | R_s11 | corrected m1 | top draw's share of R_s11 |
+|---|---|---|---|
+| 0.01 | +0.1250 | +0.01017 +/- 0.00461 +/- 0.00979 | 7.7% |
+| 0.02 | +0.1225 | +0.01088 +/- 0.00461 +/- 0.00573 | 3.4% |
+| 0.04 | +0.1025 | +0.01654 +/- 0.00464 +/- 0.00351 | 1.2% |
+
+Same shape as the template route: a 0.006 spread, monotone, every point inside
+the others' selection bars, and the concentration climbing as `fd` shrinks
+exactly as `one_chunk_fd`'s docstring says it will.  **Quote the nominal window
+as m1 = +0.011 +/- 0.007 (stat) +/- 0.005 (fd step)** -- 1.5 sigma, still
+consistent with zero, but no longer the 0.3 sigma the template route gave.
+
+### 7b. The bands, flow route
+
+| Mr/Mf band | kept | R_s11 | corrected m1 (+/- galaxy +/- selection) | templates |
+|---|---|---|---|---|
+| < 3.005 | 27.1% | +0.316 | +0.0119 +/- 0.0053 +/- 0.0056 | +0.0078 |
+| 3.005-3.252 | 13.4% | -0.154 | -0.0148 +/- 0.0159 +/- 0.0215 | -0.0311 |
+| 3.252-3.407 | 7.9% | -0.177 | **-0.0981 +/- 0.0282 +/- 0.0250** | -0.0045 |
+| 3.407-3.530 | 4.2% | -0.141 | -0.4030 +/- 0.0505 +/- 0.0313 | -0.4391 |
+| > 3.530 | 2.3% | -0.072 | -0.1782 +/- 0.1317 +/- 0.0224 | -0.1280 |
+
+**One conclusion from section 3 has to be withdrawn.**  On the template route
+`Mr/Mf` 3.252-3.407 sat at -0.005 +/- 0.044 and was called consistent with
+zero; on the flow route it is -0.098 +/- 0.038, **2.6 sigma**.  The band's
+`R_s11` is -0.177 (flow) against -0.237 (templates), a 25% disagreement, and
+that is the whole difference.  Two bands still sit at zero (`< 3.005`,
+3.005-3.252); the size edge is now 3.25-3.53 rather than 3.41-3.53.
+
+### 7c. The boundary scan, flow route (`plots/window_shift.png` regenerated)
+
+| boundary | value | kept | m1 | +/- abs | drift | +/- paired |
+|---|---|---|---|---|---|---|
+| Mf floor | 2400 | 23.22% | +0.01260 | 0.00737 | +0.00172 | 0.00391 |
+| | 2450 | 22.86% | +0.01455 | 0.00789 | +0.00367 | 0.00387 |
+| | **2500** | 22.51% | **+0.01088** | 0.00781 | -- | -- |
+| | 2550 | 22.17% | +0.01631 | 0.00782 | +0.00543 | 0.00389 |
+| | 2600 | 21.83% | +0.00844 | 0.00796 | -0.00245 | 0.00404 |
+| Mf ceiling | 48000 | 22.44% | +0.01280 | 0.00817 | +0.00192 | 0.00442 |
+| | 49000 | 22.47% | +0.00846 | 0.00897 | -0.00242 | 0.00614 |
+| | 51000 | 22.55% | +0.01242 | 0.00908 | +0.00154 | 0.00558 |
+| | 52000 | 22.58% | +0.01115 | 0.00858 | +0.00026 | 0.00780 |
+| Mr/Mf floor | 2.112 | 23.12% | +0.01214 | 0.00753 | +0.00126 | 0.00345 |
+| | 2.156 | 22.84% | +0.01260 | 0.00761 | +0.00172 | 0.00363 |
+| | 2.244 | 22.15% | +0.01692 | 0.00781 | +0.00603 | 0.00351 |
+| | 2.288 | 21.76% | +0.01455 | 0.00774 | +0.00367 | 0.00454 |
+| Mr/Mf ceiling | 3.072 | 18.09% | +0.00694 | 0.00920 | -0.00394 | 0.00783 |
+| | 3.136 | 20.28% | +0.01986 | 0.01049 | +0.00897 | 0.01025 |
+| | 3.264 | 24.70% | +0.01365 | 0.00592 | +0.00276 | 0.00643 |
+| | 3.328 | 26.73% | -0.00313 | 0.00657 | **-0.01401** | 0.00592 |
+
+**The stability conclusion survives**: every point sits in +0.007 to +0.020
+except the `Mr/Mf` ceiling at +4%, and the whole scan is inside +/-0.02.  Two
+changes from the template route:
+
+* **The `Mf` ceiling is now the STEADIEST boundary**, drifts <= 0.0024 against
+  the template route's +0.0128 excursion.  The flow's prior sample has no
+  bright-tail sparsity to fluctuate on, which is exactly what made the template
+  route wobble there.  The earlier "least stable boundary" reading was a
+  property of the 1M catalog, not of the window.
+* **The `Mr/Mf` ceiling is the one boundary that matters**: -0.0140 +/- 0.0059
+  at +4% (2.4 sigma), and the top draw's share of `R_s11` climbs 1.4% -> 16.1%
+  across the scan as the ceiling walks into the boundary-dominated regime.
+  Consistent with 7b -- pushing the ceiling up admits the 3.25-3.53 band.
+
+### Implementation
+
+`dev/size_bands.py` split into `stencil_moments` (the nine lensed moment sets,
+window-INDEPENDENT, computed once) and `per_template` (`window_prob` over them,
+per window).  That is what makes a 17-window scan affordable on the flow route:
+otherwise every window recompiles the whole bijection stack.  Two traps met on
+the way, both now fixed in place:
+
+* `per_template` with a 131072-row batch costs a **6-minute** XLA compile of
+  one reduce fusion (9 `window_prob`s x 64 Gauss-Legendre nodes).  16384 is
+  seconds.  Do not raise it.
+* boolean-indexing the `(9, 1e6, 5)` stencil on the DEVICE costs another
+  5-minute compile of a gather fusion.  The stencil is kept on the host; 380 MB
+  moves back per window in ~0.04 s.
+
+`selection_terms` is no longer called by `size_bands.py` -- `per_template`'s
+means ARE it, checked equal while both were running, and on the flow route
+calling it too would double the cost.
+
+## 2026-09-02 (night, cont. 2) -- "The flow's R_s disagrees with the templates'"
+was mostly the flow's own draw count.  Raise it, and only ONE window still
+disagrees
+
+`dev/rs_agree.py`.  `R_s` is a boundary flux -- only draws within a noise width
+of the window edge contribute -- so a narrow window uses a few percent of the
+sample and its `R_s` carries a correspondingly large error.  At the flow's old
+2^20 draws that error was 17% on the nominal window, the same size as the
+apparent gap.  **The asymmetry that matters: the templates' error is set by the
+CATALOG (1M galaxies, and there is no more), the flow's by the number of
+DRAWS, which is free.**
+
+At 2^23 flow draws against the 1M template catalog, `fd = 0.02`:
+
+| window | kept | `R_s11` flow | `R_s11` templates | diff | sigma | top draw f/t |
+|---|---|---|---|---|---|---|
+| flux only `Mf>=1600` | 54.8% | -0.2243 +/- 0.0013 | -0.2348 +/- 0.0010 | **+0.0105** | **6.5** | 0.3% / 0.0% |
+| nominal | 22.5% | +0.0935 +/- 0.0083 | +0.1531 +/- 0.0194 | -0.0596 | 2.8 | 0.6% / 1.6% |
+| band < 3.005 | 27.1% | +0.3673 +/- 0.0101 | +0.3364 +/- 0.0262 | +0.0309 | 1.1 | 0.2% / 0.7% |
+| band 3.005-3.252 | 13.4% | -0.1859 +/- 0.0076 | -0.1305 +/- 0.0370 | -0.0554 | 1.5 | 0.2% / 1.9% |
+| band 3.252-3.407 | 7.9% | -0.1942 +/- 0.0061 | -0.2350 +/- 0.0236 | +0.0409 | 1.7 | 0.2% / 1.1% |
+| band 3.407-3.530 | 4.2% | -0.1382 +/- 0.0031 | -0.1308 +/- 0.0094 | -0.0074 | 0.7 | 0.2% / 1.9% |
+
+**Which side is noisy has flipped.**  On every windowed case the templates' block
+sem is now 2 to 6 times the flow's, and the template estimate is far more
+concentrated (top draw 1-2% of `R_s11` against the flow's 0.2%).  With enough
+draws the FLOW is the better-determined estimator of `R_s`; more flow draws can
+no longer improve the comparison.
+
+**Only the flux-only window is a resolved disagreement**: the flow is 4.5% low
+at nominal 6.5 sigma.  Discount that: the 100k catalog gives -0.2492 against
+the 1M's -0.2348, which is 4.5 sigma of the 100k's implied sem, so the template
+block sem looks optimistic by ~1.5-2x.  Call it **4.5% low at >= 3 sigma** --
+real, and the only one.  Every windowed case is 0.7-2.8 sigma, i.e. NOT
+resolved, and cannot be resolved from this side.
+
+### What this changes
+
+`NDRAW` now defaults to 2^23 in `dev/size_bands.py` (~15 min for the stencil).
+On the nominal window that takes the selection MC term on m1 from 0.0057 to
+**0.0024**, below the galaxy bootstrap -- and moves the answer:
+
+| nominal window, flow terms | m1 | +/- galaxy | +/- selection |
+|---|---|---|---|
+| 2^20 draws | +0.01088 | 0.00461 | 0.00573 |
+| **2^23 draws** | **+0.01906** | **0.00471** | **0.00240** |
+
++0.0191 +/- 0.0053 is **3.6 sigma from zero** on the statistical errors alone.
+Do NOT read the 2^20 -> 2^23 move as a convergence test: threefry is
+counter-based, so the 2^20 sample NESTS inside the 2^23 one and the two
+estimates are correlated ([[pqr-streamed-seed-nests]] again).  The block sem at
+2^23 is a valid error on its own -- the blocks are disjoint -- so the number
+stands; it is the *comparison* between draw counts that is not a test.
+
+The band numbers move the same way (2^23, flow): `< 3.005` +0.0014 +/- 0.0052
++/- 0.0019, 3.005-3.252 +0.0063 +/- 0.0162 +/- 0.0047, 3.252-3.407 -0.0731 +/-
+0.0290 +/- 0.0088, 3.407-3.530 -0.4129 +/- 0.0500 +/- 0.0089.
+
+### How to close the remaining 4.5%, and what NOT to do
+
+* **It is a density error on a thin shell, not a response error.**
+  `dev/rs_swap.py` (2026-09-02 morning) put the flow's entire response, both
+  orders, into the templates and moved flux-window `R_s11` by 0.1%.
+  `dev/rs_bins.py` localised it: all of `R_s` comes from `Mf` in [1500, 1900],
+  ~4% of the population, where the per-bin curvature MATCHES and the flow
+  carries ~2% too little MASS.  So the target is the flow's marginal mass on a
+  400-wide flux shell, not the shear layer, not capacity, not more training
+  data -- all three are already null.
+* **Do NOT Richardson-extrapolate the `fd` dependence to zero.**  It is
+  tempting (the nominal window's fd spread, +/-0.005, is now the largest error
+  in the budget) and it is wrong: for a size window the exact `d2F/dg2` has no
+  usable mean at all (Hill index 0.74, `one_chunk_fd`'s docstring), so `fd -> 0`
+  extrapolates toward a quantity that does not exist.  `fd = 0.02` is the
+  OPERATING POINT -- `ghat` solves at `|g| ~ 0.02` and eq. (45)-(46)'s quadratic
+  stands in for `P_s` across that range, not at an infinitesimal.
+* **The principled way to remove that last +/-0.005** is therefore not a better
+  derivative but dropping the quadratic: evaluate `P_s` at each arm's actual
+  `+/-g` instead of reconstructing it from `Q_s`, `R_s`.  That is an algebra
+  change in `ghat`, untried.
+
+### Artifacts
+
+`dev/rs_agree.py` (both stencils, one build each, every window; `NDRAW`,
+`TMPL`, `BOOT`).  `dev/size_bands.py`'s `NDRAW` default raised to 2^23.
+
+## 2026-09-02 (night, cont. 3) -- CORRECTION: the nominal window's "+2%" is a
+SIZE-CEILING correction failing window-independence, not a bias
+
+The user's reaction to `+0.019` was right and the check is one line: the
+unwindowed m1, which needs no selection machinery at all.
+
+    NO WINDOW, no correction:  m1 = +0.02206 +/- 0.00819
+
+That looked like it VALIDATED the nominal window's +0.0191.  It does not --
+it is the faint end, and the agreement is a coincidence.  Per `Mf` quintile,
+unwindowed and uncorrected:
+
+| Mf quintile | median Mf | m1 | share of `SUM q1` | share of `SUM -R11` |
+|---|---|---|---|---|
+| q1 | 907 | **+0.5199 +/- 0.2032** | 16.4% | 5.4% |
+| q2 | 1207 | +0.0890 +/- 0.0281 | 15.0% | 13.1% |
+| q3 | 1776 | -0.0297 +/- 0.0031 | 18.6% | 22.2% |
+| q4 | 3281 | -0.0242 +/- 0.0029 | 23.9% | 28.5% |
+| q5 | 12309 | -0.0087 +/- 0.0053 | 26.0% | 30.8% |
+
+q1 carries 16% of the numerator against 5% of the denominator, so its +0.52
+alone puts +0.028 into the total -- the whole unwindowed number.  That is
+[[r-is-an-is-artifact]]'s unconstrained faint end again: **the windowed number
+is the measurement and the unwindowed one is not a baseline.**  The nominal
+window starts at `Mf > 2500` and never sees q1.
+
+### The ladder (`dev/rs_agree.py`, flow terms, 2^23 draws)
+
+Each row adds ONE boundary to the row above.  Eq. (45)-(46)'s entire content is
+that the corrected m1 should not move.
+
+| window | kept | corrected m1 | +/- galaxy | +/- selection |
+|---|---|---|---|---|
+| `Mf >= 1600` | 54.8% | -0.0174 | 0.0030 | 0.0002 |
+| `Mf >= 2500` | 37.6% | -0.0191 | 0.0037 | 0.0003 |
+| `Mf` 2500-50000 | 34.5% | -0.0202 | 0.0041 | 0.0014 |
+| + size > 2.2 | 31.9% | -0.0159 | 0.0033 | 0.0017 |
+| **nominal (+ size < 3.2)** | 22.5% | **+0.0191** | 0.0047 | 0.0024 |
+| size 2.2-3.2 only, `Mf >= 1600` | 33.6% | +0.0187 | 0.0040 | 0.0024 |
+
+**The flux floor, the flux ceiling and the size FLOOR all correct correctly** --
+four nested windows agreeing to 0.004 over a 23-point spread in kept fraction.
+**Adding the size CEILING jumps it by +0.035**, and the last row proves it is
+the ceiling alone: a different flux window, the same jump.  The template route
+does the same thing (+0.026, same sign, same boundary), so it is not a flow-vs-
+templates issue.
+
+`dev/window_shift.py`'s `Mr/Mf`-ceiling panel and the nominal window's `fd`
+sensitivity were both symptoms of this, read at the time as noise.
+
+### So what is the number
+
+**Quote the flux-selected value: m1 ~ -0.018 +/- 0.004**, stable across four
+nested windows.  Every "nominal window" m1 in sections 5-7 above -- +0.0026
+(templates), +0.0109 (flow, 2^20), +0.0191 (flow, 2^23) -- is that number plus
+a broken size-ceiling correction, and none of them is a bias measurement.
+
+### Why the ceiling specifically
+
+Both reasons were already on record and neither was connected to this:
+
+* **`R_s` for a size ceiling has no `h -> 0` limit** (Hill index 0.74,
+  [[selection-correction-g-truncation]]).  So `fd = 0.02` is not approximating a
+  derivative -- eq. (45)-(46)'s QUADRATIC is standing in for `P_s(g)` across the
+  whole `|g| = 0.02` the estimator solves at, and for this boundary that
+  stand-in is wrong by 0.035 in m1.  `ghat` is one Newton step, i.e. a
+  second-order Taylor expansion of `N_ns log(1 - P_s(g))`; nothing checks that
+  the expansion holds out to the solution.
+* **The targets the ceiling removes are the `Mr/Mf` 3.25-3.53 population**
+  carrying m1 = -0.1 to -0.4 (section 7b).  The correction has to reinstate
+  their contribution FROM THE PRIOR, at the support edge where the density is
+  least trustworthy.
+
+[[selection-terms-are-boundary-flux]]'s "size cuts WORK via `--window-fd 0.02`"
+needs qualifying: they run without NaN, but they do not preserve
+window-independence.
+
+## 2026-09-02 (night, cont. 4) -- NEGATIVE: dropping the quadratic does NOT fix
+the size ceiling.  The exact solve reproduces the estimator, jump and all
+
+`dev/exact_ps.py`.  `ghat` takes one Newton step, i.e. expands
+`N_ns log(1 - P_s(g))` to second order about `g = 0`.  `P_s(g)` is cheap to
+evaluate exactly at any `g`, so keep the targets' quadratic (all `--save-pqr`
+stores) and solve the untruncated scalar equation per arm:
+
+    SUM_i q_i1 + g1 SUM_i r_i11 - N_ns P_s'(g1) / (1 - P_s(g1)) = 0
+
+`P_s` on a 13-point grid over `g1` in [-0.03, 0.03] (`g2 = 0`; the window is
+spin-0), cubic-splined, root-found with `brentq`.  The prior push-forward at
+each grid `g1` is window-independent, so one grid serves every window.  4.2M
+flow draws.  Built-in check: linearising the same solve about zero reproduces
+`bias.ghat`'s 2x2 answer to 1e-4 in every row.
+
+| window | production (fd 0.02 Newton) | **EXACT solve** |
+|---|---|---|
+| `Mf >= 1600` | -0.0174 | -0.0175 +/- 0.0030 |
+| `Mf >= 2500` | -0.0191 | -0.0195 +/- 0.0038 |
+| `Mf` 2500-50000 | -0.0202 | -0.0193 +/- 0.0042 |
+| + size > 2.2 | -0.0159 | -0.0140 +/- 0.0033 |
+| **nominal (+ size < 3.2)** | +0.0191 | **+0.0228 +/- 0.0047** |
+| size 2.2-3.2 only | +0.0187 | +0.0141 +/- 0.0040 |
+
+**The exact solve agrees with the production estimator to <= 0.005 in every
+window and the ceiling jump survives at +0.037.**  Two things follow:
+
+* **The quadratic is not the problem, and `fd = 0.02` is vindicated.**  The
+  operating-point argument in `one_chunk_fd`'s docstring was made on principle;
+  this measures it.  Note the local curvature is NOT the right input: the
+  spline's `R_s(0)` differs from the `fd = 0.02` secant by 10% (flux floor) to
+  a factor 2 (`Mf` 2500-50000), and feeding the spline's `R_s(0)` to `ghat`
+  gives -0.0203/-0.0290/-0.0336/-0.0281/+0.0025/+0.0106 -- wrong by up to 0.017
+  against the exact solve.  `P_s` is genuinely non-quadratic near zero; the
+  0.02 secant is what the estimator needs and the exact solve confirms it.
+* **So the ceiling failure is not an estimator truncation.**
+
+### What it is instead
+
+The template route jumps too (+0.026, section cont. 3), and the templates ARE
+the true population -- so it is not the flow's prior either.  What is left is
+the assumption eq. (45)-(46) makes about the objects it reinstates: that their
+contribution is described by the same likelihood as the ones that were kept.
+**The population a `Mr/Mf < 3.2` ceiling removes is exactly the 3.25-3.53 band
+carrying m1 = -0.1 to -0.4** (section 7b), where the per-target `Q`, `R` are
+demonstrably not right -- and where BFD's own template sum reproduces the flow
+target for target (`dev/band_tmpl.py`).
+
+**A size ceiling cannot be used to cut the biased population away: the
+correction puts it back.**  That is a property of the estimator + the
+population, not of any implementation here, and it is why the flux ladder is
+flat and the size ceiling is not.
+
+### Consequence for the quoted number
+
+Unchanged: **m1 ~ -0.018 +/- 0.004** on the flux-selected windows, which are
+window-independent across four nested cuts and now also reproduced by an
+untruncated solve.  No number from a window with an `Mr/Mf` ceiling should be
+quoted until the size-edge population's own bias is understood.
+
+### Artifacts
+
+`dev/exact_ps.py` (grid `P_s`, spline, untruncated per-arm solve; `GRID`,
+`NDRAW`, `BOOT`).
+
+## 2026-09-02 (night, cont. 5) -- The residual is NOT the flow.  BFD's own
+template sum reproduces it, paired, to +0.0040 +/- 0.0041
+
+Two new offline tools, `dev/edge_share.py` and `dev/prior_n.py`, both on
+`dev/pqr_200k.npz` and the existing 22.7M-copy catalog.  69/69 tests in
+`tests/` pass (`tests/test_truth.py` has a pre-existing collection error,
+`module 'bfd' has no attribute 'KB...'`, untouched here).
+
+### 1. A per-band m1 is not a bias, and this time there is a proof
+
+Three sessions have chased the `Mr/Mf` 3.25-3.53 band's -0.1 to -0.4.  The
+estimating equation is `SUM_i q_i + g SUM_i R_i = 0`, and `E[q] = 0` holds only
+when the average runs over the WHOLE population -- `P(M|g)` is the marginal
+over the prior, so no individual target's `q` has zero mean and no
+subpopulation's does either.  A band's m1 is therefore nonzero for a perfectly
+correct estimator.  Measured, at `Mf` in [1600, 2941) where the copy sum is
+well covered (median ESS 16327), 400 targets per cell:
+
+| cell (`Mr/Mf`) | flow m1 | TEMPLATE SUM m1 | flow `SUM q^2/SUM -r` | templates |
+|---|---|---|---|---|
+| 3.407-3.530 | -0.1767 +/- 0.0337 | **-0.1782 +/- 0.0138** | 0.537 | 0.431 |
+| 3.252-3.407 | -0.0429 +/- 0.0220 | -0.0394 +/- 0.0137 | 0.865 | 0.691 |
+
+BFD's eq. (35)-(36) sum -- no flow, no importance sampling, no gauge -- gives
+the band the same -0.18, and violates the Fisher identity there HARDER than the
+flow does.  Both statistics are properties of conditioning, not of a defect.
+**Do not open the size edge again on the strength of a per-band number.**
+
+### 2. What replaces it: contributions, not per-band m1 (`dev/edge_share.py`)
+
+`ghat = R^-1 SUM q_i` is linear in the targets at fixed `R`, so with the window
+held FIXED each target has an exact additive share `b_i` of the one estimate,
+`SUM_i b_i = m1`, no selection term anywhere.  Binned on the `g = 0` arm's
+moments (independent of both arms' noise and of `g`, so the binning induces no
+correlation), `Mf >= 1600`, m1 = -0.02137:
+
+| `Mr/Mf` band | share of D | contribution | +/- |
+|---|---|---|---|
+| < 3.005 | 60.4% | -0.00305 | 0.00218 |
+| 3.005-3.252 | 22.3% | -0.00058 | 0.00076 |
+| 3.252-3.407 | 10.9% | -0.00554 | 0.00040 |
+| 3.407-3.530 | 4.6% | -0.00718 | 0.00052 |
+| > 3.530 | 1.8% | -0.00502 | 0.00085 |
+
+83% of the total sits above 3.25 on 17% of the weight -- but by section 1 that
+is where the contributions ARE, not where an error is.
+
+**Binning on the arm's OWN moments is what produced the old picture**: the same
+table on the selected arm gives the `< 3.005` band +0.0659 (implied m1 +0.109)
+against -0.0031 (-0.005).  That flip is the whole of the "size edge" as it was
+originally seen.
+
+### 3. `truth` in a saved run is NOT the truth
+
+`bias.py` sets `truth = m["zero"]`, correctly commented "for binning only".  On
+an image-noise catalog that is a THIRD noisy realization -- `targets_deep_g0`'s
+`Mr/Mf` reaches 4.845 against the population's true ceiling 3.683, and `|e|`
+reaches 6.17.  `save_pqr`'s docstring calls it "the clean unsheared moments";
+that is wrong for every image-noise run and it cost an hour here (a census of
+training coverage per (flux, size) cell, comparing NOISELESS training moments
+against NOISY target ones, is meaningless).  Its value is that it is
+independent of both arms, which is what section 2 needs.
+
+### 4. The headline: the flow is exonerated to +/-0.004
+
+`dev/prior_n.py`, `CELL=all`, 40000 random targets of the `Mf >= 1600` window,
+flow and template sum on IDENTICAL targets so the paired difference beats
+either error:
+
+    14764 targets with ESS > 1000
+    flow                 m1 = -0.03212
+    templates - flow          +0.00400 +/- 0.00406
+
+**BFD's own estimator, given the same prior population and the catalogs' own
+exact `dm_dg`/`d2m_dg2`, reproduces the flow's bias.**  Every remedy aimed at
+the flow -- retraining, capacity, the chart, the gauge, the centroid layer --
+is competing for at most 0.004 of a 0.032.
+
+`ESSMIN` is not optional and it is not an edge effect: `C_M` is IDENTICAL for
+every target in these sims (checked: relative spread 0.0), so a BRIGHT target's
+noise ball is tiny against the template spacing and the copy sum starves
+everywhere -- median ESS 26 at `Mf >= 4778` in the BULK as much as at the edge,
+and one bulk cell returned m1 = -7.9 +/- 5.4.  The cut keeps the faint 37% of
+the window; the paired result is a statement about those targets.
+
+Two subsidiary nulls from the same tool:
+
+* **Finite prior is not it.**  Thinning the copy catalog by GALAXY 100k ->
+  6250 does not produce a trend (the numbers are ESS-starved noise), and the
+  Fisher ratio is flat along the flux axis at fixed size -- 0.59/0.70/0.80/
+  0.78/0.79 across a 40x change in galaxies per cell.  It tracks SIZE only.
+* **Not Monte-Carlo either.**  `SUM q^2 / SUM -r` by size band is unmoved by
+  4x the draws (S = 8192 -> 32768: 0.710 -> 0.698, 0.514 -> 0.459), and the
+  cross-fit inflation is < 0.3% outside the top 2%.
+
+### 5. The one shared assumption that IS measurably wrong
+
+Flow and templates share the prior's g-dependence: both lens a template by
+`m + g.dm_dg + g.d2m_dg2.g/2`.  The rendered catalogs test that directly --
+`(m_+ - m_-)/2g - dm_dg` is the third-order term, and noise averages out over
+200k galaxies.  As a fraction of `<|dm_dg|>`, by the `g = 0` arm's `Mr/Mf`:
+
+| band | Mf | Mr | **M1** | M2 | Mc |
+|---|---|---|---|---|---|
+| < 3.005 | +0.0001 | +0.0001 | +0.0027 | +0.0009 | +0.0003 |
+| 3.005-3.252 | +0.0001 | +0.0003 | **+0.0109** | -0.0008 | +0.0004 |
+| 3.252-3.407 | +0.0018 | -0.0005 | **+0.0107** | +0.0060 | -0.0019 |
+| 3.407-3.530 | +0.0056 | +0.0061 | **-0.0179** | +0.0018 | +0.0045 |
+| > 3.530 | -0.0056 | -0.0096 | **-0.2703 (40 sigma)** | -0.0079 | -0.0113 |
+
+Only `M1` -- the component that carries `g1` -- is affected, and it is clean in
+neither the bulk (+0.3%) nor the edge (-27%).  Weighted by each band's share of
+`D` this is worth roughly 0.0005 in m1, so it is NOT the -0.018 on its own, but
+it is a real, shared, 40-sigma defect in the prior's response model and it is
+the third derivative bug in this repo's history ([[bfd-second-derivs-are-float32]],
+[[stale-chart-constants-were-the-peak]]).
+
+**The test that separates a genuine third-order term from a wrong `dm_dg`**:
+render a small catalog at `g = 0.005` and repeat the table.  A true `g^2 d3m/dg3`
+shrinks 16x; a wrong stored derivative does not move.
+
+### Where this leaves the number and the next move
+
+`m1 ~ -0.018 +/- 0.004` on the flux-selected windows is unchanged.  What
+changed is where to look for it: **not in the flow, and not in a size band.**
+The candidates that survive are the ones flow and templates SHARE -- the
+prior's quadratic-in-g response (section 5, sized at ~0.0005 so far), the
+recentring/`badcenter` selection, and the target-vs-prior population itself.
+
+### Artifacts
+
+`dev/edge_share.py` (contribution decomposition, `CUT`, `FLUX_LO`, `SIZE`,
+`CORR`), `dev/prior_n.py` (flow vs copy sum, paired, `CELL`, `NGAL`, `ESSMIN`,
+`FLUX_LO/HI`), one line in `dev/band_tmpl.py`'s cache to keep the `gal` column.
+
+## 2026-09-02 (night, cont. 6) -- The M1 "-27% response error" was the
+DIAGNOSTIC, not the pipeline.  With a clean reference it is +0.8%
+
+`dev/response_g3.py`, plus seven fresh renders (200000 galaxies, `--seed 0
+--pop bulgedisc`, the arguments recovered from `targets_deep_*_200k_v2`'s FITS
+header): noisy `--g1 +/-0.005`, and a NOISELESS set at `g1 = 0, +/-0.005,
++/-0.02`.
+
+### The retraction
+
+Section cont. 5 reported `D(g) = (m_+ - m_-)/2g - dm_dg` reaching -27% in `M1`
+at `Mr/Mf > 3.53`, and the `g = 0.005` render confirmed it does not shrink 16x,
+so it is not the second-order truncation.  Both statements are true and both
+are about a broken reference.  Two mistakes, both in the diagnostic:
+
+* **The `dm_dg` column of a NOISY target catalog is contaminated.**  Same
+  galaxies, rendered with and without `--add-noise`, the column differs -- in
+  `M1`, by -0.25% / -0.55% / -2.1% / **-10.5%** over the bands from 3.005 up.
+  It is evidently taken off the noisy recentred stamp.
+* **Binning on the same arm's noisy `Mr/Mf` correlates the bin with the
+  residual.**  Every arm uses `--seed 0`, so they share the noise FIELD;
+  recentring leaves a little of it in `m_+ - m_-`, and the g = 0 arm's size
+  carries the same field.
+
+Production uses neither: `dev/band_tmpl.py` reads the COPIES (built from the
+noiseless `moments_bulgedisc_v2`) and `shear.py` trains on the same noiseless
+catalog.  The error was confined to cont. 5's table.
+
+### The three measurements, `M1`, as a fraction of `<|dm_dg|>`
+
+| `Mr/Mf` band | noisy arms, NOISY `dm_dg`, noisy bins | noiseless arms, clean ref | **noisy arms, CLEAN ref** |
+|---|---|---|---|
+| < 3.005 | +0.0027 | +0.0001 | **+0.0007** |
+| 3.005-3.252 | +0.0109 | +0.0000 | **+0.0017** |
+| 3.252-3.407 | +0.0107 | -0.0001 | **+0.0030** |
+| 3.407-3.530 | -0.0179 | -0.0002 | **+0.0045** |
+| > 3.530 | -0.2703 | -0.0003 | **+0.0077** |
+
+Mf, Mr, M2, Mc are at 1e-4 in every column.
+
+* **The stored derivative table is RIGHT.**  Noiseless, `dm_dg` reproduces the
+  finite difference to ~1e-4 in every band and component, and the tiny `M1`
+  residual that is left DOES scale as `g^2` (-0.0003 at g = 0.02 -> -0.0000 at
+  g = 0.005), which is the truncation behaving exactly as advertised.
+  `imsims/sim.py`'s "the first derivatives are fine at 0.009%" stands.
+* **What is real is a RECENTRING effect**: with a clean reference the noisy,
+  recentred measurement's `M1` response exceeds the noiseless template response
+  by +0.07% in the bulk rising monotonically to +0.80% at the compact end, and
+  it is IDENTICAL at g = 0.02 and g = 0.005, so it is not a shear-expansion
+  term at all.  Weighted by band population it is ~+0.24%, i.e. worth roughly
+  0.002 in m1 -- 5x cont. 5's estimate, still not the -0.018.
+
+That effect is not unmodelled: the copy sum carries recentring by enumerating
+shifts and the flow carries it in the centroid layer.  So it belongs to the
+open centroid-residual topic ([[centroid-var-floor-quantified]],
+[[centroid-gain-is-population-calibrated]]), not to a new bug -- and the
+question it poses is whether either estimator gets this +0.8% right, which
+`dev/prior_n.py`'s paired agreement suggests they get equally wrong or equally
+right.
+
+### Two things worth keeping
+
+* **Same-seed arms make the pixel noise CANCEL** in `m_+ - m_-` (moments are
+  linear in the image at fixed weight and centroid), which is why 200k galaxies
+  resolve a 0.0001 effect at g = 0.005 where a naive noise budget says they
+  cannot.  It is also why a contaminated reference reproduced to four decimals
+  across a 4x change in `g` and looked so convincing.
+* **Analytic ground truth is NOT available for bulgedisc.**
+  `imsims/analytic.py` is the exact k-space closed form for a two-Gaussian
+  bulge+disc but hard-codes `BULGE_FRAC = 0.5`, while `sim.py:319` draws
+  `bulge_frac ~ U(0, 0.4)` per galaxy; only gauss2 sets
+  `pop["bulge_frac"] = analytic.BULGE_FRAC` (`sim.py:510`).  Generalising
+  `analytic.moments` to a per-galaxy bulge fraction is a one-parameter change
+  and would give bulgedisc an exact `dm_dg`, `moments(theta, g)` and `cov_M` --
+  the cheapest way to make any of this exact rather than rendered.
+
+### Artifacts
+
+`dev/response_g3.py` (`G`, `ZERO`, `PLUS`, `MINUS`, `BIN`, `SIZE`); `ZERO`
+supplies both `dm_dg` and the binning, so point it at a NOISELESS render of the
+same galaxies whenever the arms are noisy.  The seven renders live in the
+session scratchpad -- they are diagnostics, not data.
+
+## 2026-09-02 (night, cont. 7) -- The flow route's selection terms ARE recentred
+and the template route's are not.  Measured, it is worth ~1% of `R_s`
+
+`dev/rs_copies.py`.  The asymmetry is structural and `selection_terms`' own
+docstring names it -- "`L(X^G)`, the detection factor, and its `Delta^2 u` sum
+are what the centroid layer already carries (eq. 36)":
+
+* FLOW route (`dev/size_offline.py:prior_draw`) builds with `centroid=True` and
+  draws through the whole bijection stack, so its prior sample is the
+  RECENTRED population.
+* TEMPLATE route is `shear.lens(tm, tdm, td2m, g)` on
+  `moments_bulgedisc_v2.fits` -- the noiseless, PERFECTLY CENTRED catalog
+  moments lensed by the derivative table.  No shift enumeration at all.
+
+`window_prob` convolves with `C_M` in both, so the noise is common; only the
+recentring is not.  (Note `dev/band_tmpl.py` does not have this problem on the
+TARGET side -- it sums the 22.7M copies, which carry recentring by
+enumeration.  It is the selection-term template route that uses the plain
+moments file.)
+
+Test, without touching a checkpoint: run the template route on the COPIES,
+importance-resampled by their eq. (36) weights to an equally-weighted set
+(`selection_terms` takes a plain mean).  `copies` vs `moments_100k` is then the
+same 100000 galaxies differing ONLY in whether the shifts are enumerated.
+
+### `R_s11`, fd = 0.02
+
+| window | `moments_100k` | **copies (recentred)** | delta | `moments_1M` | flow 2^23 |
+|---|---|---|---|---|---|
+| flux only `Mf>=1600` | -0.2492 | -0.2499 +/- 0.0021 | **-0.0007 (0.3%)** | -0.2348 | -0.2243 |
+| nominal | +0.2633 | +0.2680 +/- 0.0032 | **+0.0047 (1.8%)** | +0.1531 | +0.0935 |
+| band 3.005-3.252 | -0.1112 | -0.0919 | +0.0193 | -0.1305 | -0.1859 |
+| band 3.252-3.407 | -0.2319 | -0.2426 | -0.0107 | -0.2350 | -0.1942 |
+| band 3.407-3.530 | -0.1527 | -0.1522 | +0.0005 | -0.1308 | -0.1382 |
+
+The `+/-` is the spread of two independent resample seeds (2^21 draws each,
+1.46M distinct copies, all 100000 galaxies represented).
+
+**Recentring is not the gap.**  It moves `R_s11` by 0.3% on the flux window --
+not even sign-resolved against the resampling spread -- and 1.8% on the
+nominal one, against a flow-vs-template gap of 4.5% and 39%.
+
+**What dominates is the template route's own galaxy sampling.**  100k -> 1M,
+both CENTRED, moves `R_s11` by 6% on the flux window and 72% on the nominal
+one.  The 100k route also fires `selection_terms`' concentration warning on
+three of five windows (one template carrying 9%, 11%, 22% of `R_s11`), so its
+band numbers are not trustworthy and the two middle bands' larger deltas above
+should not be read as recentring either.  Same conclusion as cont. 2 reached
+from the other side: at 2^23 flow draws the TEMPLATES are the noisy estimator.
+
+### Artifacts
+
+`dev/rs_copies.py` (`ROUTE` in `copies|moments_100k|moments_1M`, `WINDOW`,
+`NDRAW`, `WMIN`, `SEED`, `CACHE`).  ONE route and ONE window per process: the
+`eqx.filter_jit` CUBIN accumulation OOMs the GPU at about the fifth call at 1M
+rows.  The resample is cached so per-window reruns skip the 3 GB copies read.
+
+## 2026-09-02 (cont. 8) -- Provenance audit: the `_v2` chain is CLEAN.  Then a
+clean-slate rebuild to `_v3` at a derived depth, with the provenance made
+mechanical
+
+Two halves.  The audit was the task; the rebuild is what the user asked for on
+the strength of it ("start from scratch just to be safe").
+
+### Part 1 -- the audit.  Nothing stale was in use
+
+`NEXT_SESSION.md`'s Lead 1 -- that `centroid.py:486` trains the centroid layer
+at the TRAINING catalog's `Sigma_X` (119.4) while `bias.py:2096` evaluates at
+the TARGET catalog's (107.5) -- **is wrong, and the mismatch does not exist.**
+`galaxies` on that line comes from `load_copies(a.copies)` (`centroid.py:87`),
+i.e. the COPIES file's `GALAXIES` extension, which was rendered at
+`--noise-sigma 0.9`:
+
+| | `cov_odd[0,0]` | sqrt |
+|---|---|---|
+| `copies_bulgedisc_v2` GALAXIES (centroid TRAINING) | 11551.9639 | 107.480 |
+| `targets_deep_g0_200k_v2` (bias.py EVAL, `bias.py:2096`) | 11551.9639 | 107.480 |
+
+Byte-identical.  `--sigma-scale` never left 1.0.  Nothing to measure.
+
+The 1.0-vs-0.9 render difference is real but INERT.  `sim.NOISE_SIGMA`
+defaulted to 1.0 and the two `moments_*` renders took the default while
+targets/copies passed 0.9 explicitly, so those two files' `cov`/`cov_odd` are
+23% wrong -- and **nothing reads them**: `bias.load_cov` is called on
+`path(cat["zero"])` (`bias.py:2117`) and all ~20 `dev/*.py` `cov_odd` reads go
+through `bias.CATALOGS[POP]['zero']`.  Direct proof `noise_sigma` cannot touch
+the moments: `copies_bulgedisc_v2`'s `GALAXIES` (0.9) is BIT-IDENTICAL to
+`moments_bulgedisc_v2` (1.0) in `moments`, `dm_dg`, `d2m_dg2`, `centroid`,
+`xyshift`, `nda` and `badcenter`; only `cov` differs, by exactly
+0.81 = (0.9/1.0)^2.
+
+Lead 2, all confirmed on `POPULATION` (the noiseless drawn parameters, so no
+noise confound):
+
+* the three target arms are the same 200000 galaxies, exactly, in all 8
+  columns -- the antithetic pairing is intact;
+* `copies_bulgedisc_v2`'s `POPULATION` **and** its `GALAXIES["moments"]` equal
+  `moments_bulgedisc_v2`'s exactly, so the copy sum and the flow share one
+  prior galaxy for galaxy;
+* `moments_bulgedisc_v2_1M`'s first 100000 rows are NOT the 100k catalog -- an
+  independent draw, since `--n` changes the RNG stream.  Same population
+  though: KS on all 8 parameters gives p = 0.31-0.85 against the 100k catalog
+  and p = 0.43-0.94 against the targets.
+
+Lead 3, the checkpoints.  Six distinct files (md5).  In every one the
+`RawMomentStandardize.mean/std` matches its own `ShearResponse.chart_loc/
+chart_scale` and `CentroidMarginalize.mean/std`, and `e_scale` matches the
+symmetrised spin-2 std (0.11200 against slots 0.11208/0.11193; `_1M` 0.110495
+against 0.11051/0.11048).  No repeat of [[stale-chart-constants-were-the-peak]]
+or [[e-scale-was-unsymmetrised]].  Each centroid flow is grafted from its OWN
+shear flow: `centroid_bulgedisc_v2`'s chart is 3.33482 = `shear_bulgedisc_v2`'s,
+and the `_1M` pair's is 3.34471.
+
+**Method note for the next person doing this.**
+`RawMomentStandardize.mean/std` are Adam PARAMETERS (`bulk.train` hands both
+spin-2 slots to the optimiser -- see the class docstring), so a checkpoint's
+chart NEVER reproduces its catalog's raw `to_coords` statistics.  The `_v2`
+drift is 0.075 in mean and 1.21x in slot-0 std.  Do not read that as staleness.
+The discriminating comparison is against the WRONG catalog: old `moments.fits`
+gives 3.783/0.304 where v2 gives 3.409/0.510, and the checkpoints are
+unambiguously on v2.
+
+Two provenance HOLES that the audit could not close, and that motivated part 2:
+
+1. **No training log exists for any `_v2` flow.**  `logs/` has none, the fish
+   history has none (they were run through a tool, not the user's shell), and
+   `retrain*.sh` does not build them.  Their arguments survive only as prose in
+   this file's 2026-08-27 entry.
+2. **`CentroidMarginalize.gain` is `eqx.field(static=True)`** -- not
+   serialised.  No checkpoint records the gain it was trained at.  It predates
+   ed58d41 so it is 1.0, and `bias.py --centroid-gain` defaults to 1.0, so
+   production matched; but passing 1.4043
+   ([[centroid-gain-is-population-calibrated]]) evaluates the weights off their
+   training point with nothing on disk to catch it.
+
+### Part 2 -- the `_v3` rebuild
+
+Everything previously generated was moved to `archive_20260902/` under
+`../bfd_cnf_imsims/data` (130 entries, 93 GB), `flows/` (3143), `logs/` (47),
+`plots/` (6) and `dev/` (66 `.npz`/`.fits`/`.log`).  All are gitignored, so git
+is untouched; tracked `dev/*.py` stayed.  gauss2 and sersic went too.
+
+**`rebuild_v3.sh {render|copies|check|train}` is the only place the `_v3`
+artifacts are produced and the only record of how** -- that is the fix for hole
+1 above.  Three changes against `_v2`:
+
+* `--noise-sigma 0.93` on EVERY render including the noiseless prior, and
+  `sim.NOISE_SIGMA`'s default moved 1.0 -> 0.93 so the slip cannot recur.
+* prior and copies on `--seed 0`, all three target arms on `--seed 1`, so
+  prior and targets are independent BY CONSTRUCTION rather than by the accident
+  of differing `--n`.  The arms share a seed with each other, which is what
+  makes +g and -g the same galaxies under the same noise field.
+* bulk trains to 150000 steps, the converged value ([[bulk-was-undertrained]]);
+  `_v2`'s bulk ran 20000, where the measured m1 is still a function of the
+  schedule.
+
+**The depth, derived rather than inherited.**  Reference is
+`~/Documents/BFD_cNF/summary_templates_new.fits`, 1.37M rows, UNCUT: `Mf` p50
+1199, `sqrt(Var Mf)` p50 60.9, flux S/N p[5,50,95] = 6.8 / **19.2** / 194.
+Two defensible criteria disagree by a factor 1.5 --
+
+| criterion | noise_sigma |
+|---|---|
+| match median flux S/N | **0.927** (used) |
+| match absolute noise, `sqrt(Var Mf)` | 0.612 |
+
+-- because the sim's `Mf` median sits 48% above the real UNCUT median: the flux
+marginal was tuned against the S/N > 10 CUT sample, so it does not reproduce
+the real catalog's undetected faint end.  S/N is the ratio the estimator
+responds to and absolute moment units are arbitrary, so the S/N match wins.
+**At NO depth does the S/N SHAPE match**: sim p5/p50 = 0.48 vs real 0.354,
+p95/p50 = 16.3 vs 10.1.  That is the flux marginal, not the depth, and it is
+the same unfinished business as
+[[bulgedisc-real-match-ellipticity-limit]].  Verified at render: every `_v3`
+catalog comes out at median flux S/N 19.1-19.2.
+
+**`dev/check_provenance.py` turns each of the audit's five bug shapes into an
+assertion** and gates `rebuild_v3.sh train`.  All 14 pass on `_v3`: one
+`noise_sigma` everywhere; arms carry g1 = 0/+0.02/-0.02 and share a population
+row for row; copies' `Sigma_X` == targets' (12334.9307); `C_M` constant;
+copies' `GALAXIES` moments/`dm_dg`/`d2m_dg2` == the prior's; prior and targets
+are different draws; prior inside both chart ceilings (max Mr/Mf 3.6835 vs
+3.6926, max Mc/Mr 6.6488 vs 6.6621 -- tight, and a different draw could cross).
+Copies: 23020358 from 100000 galaxies, detection integral 1.0000.
+
+### The corner plot -- `dev/check_bulgedisc_vs_real.py`, now three-way
+
+Real (measured) / `_v3` prior templates (NOISELESS) / `_v3` g=0 targets (image
+noise + recentred), common S/N > 10 cut, `plots/bulgedisc_vs_real_corner.png`.
+
+| | Mf p50 | Mr/Mf p50 | Mr/Mf sd | Mc/Mr p50 | Mc/Mr sd | \|e\| p50 |
+|---|---|---|---|---|---|---|
+| real | 1540 | 3.495 | 0.475 | 6.673 | 0.700 | 0.090 |
+| v3 templates | 2072 | 3.132 | 0.433 | 5.875 | 0.614 | 0.094 |
+| v3 targets | 2051 | 3.119 | 0.449 | 5.847 | 0.651 | 0.115 |
+
+* The sim is **35% too bright and 10% too small**, and too narrow in both size
+  coordinates.  Known, unfixed, out of scope here.
+* **The real population's MEDIAN `Mc/Mr` is 6.673, ABOVE the chart's ceiling
+  `POINT_SOURCE_MC` = 6.662089** -- which is why 53% of real rows are
+  off-chart.  This has been noted before as "real galaxies routinely exceed
+  this ceiling"; "routinely" undersells it.  More than HALF the real catalog
+  lies outside the chart the flow is built on, and that ceiling is a hard
+  boundary by construction.  The sim never approaches it (0% of templates, 5%
+  of noisy targets).  For a method that is meant to run on the real catalog
+  this is structural, not a tail effect.  NOT chased here.
+* Templates vs targets separate only in `|e|` (0.094 -> 0.115), which is
+  exactly what image noise plus recentring should do -- the check that the
+  target render is the same population MEASURED, not a different population.
+
+Also fixed: `bulk.COORD_LABELS` said `M_r/M_f` and `M_c/M_r` for slots that are
+LOGITS against the point-source ceilings, so a plotted 2.1 looked comparable to
+a catalog `Mr/Mf` of 3.15.  This affected `bulk.py corner` too.
+
+## 2026-09-02 (cont. 9): the centroid layer's k^4 brackets -- steps 1 and 2 of
+the NEXT_SESSION plan.  `gain` is gone, the coefficient is physical, and the
+copy NLL turned out to be blind to it
+
+Steps 1 and 2 of `NEXT_SESSION.md`'s plan, measured separately.  Baselines were
+re-run first, not taken from the file, and reproduce it exactly.
+
+### The decomposition that closes the system
+
+Every first-order centroid response is one contraction,
+`dM_a = -1/2 Sigma_u^{ij} <k_i k_j kernel_a>`.  Writing each symmetric 2x2
+bracket as trace + traceless -- `s0 = tr Su`, `s1 = Su_xx - Su_yy`,
+`s2 = 2 Su_xy` -- closes all four:
+
+    dMf = -1/4 (s0 Mr + s1 M1 + s2 M2)
+    dMr = -1/4 (s0 Mc + s1 N1 + s2 N2)
+    dM1 = -1/4 (s0 N1 + s1 (Mc + K1)/2 + s2 K2/2)
+    dM2 = -1/4 (s0 N2 + s1 K2/2       + s2 (Mc - K1)/2)
+
+`Mf, Mr, M1, M2, Mc` are measured.  `N = N1 + i N2` is the k^4 SPIN-2 moment
+(`int k^2 (kx^2-ky^2) G + i int k^2 2 kx ky G`) and `K = K1 + i K2` the k^4
+spin-4; neither is.  Wick on the Gaussian-in-k ansatz gives
+`N = 3 Mr (M1 + i M2)/Mf` and `K = 3 (M1 + i M2)^2 / Mf`, and those are exactly
+what the closed-form backbone already used -- checked against its OWN
+first-order expansion at Sigma_X * 1e-4, p50 agreement to 8 digits on all four
+channels (the one large max-ratio outlier is a galaxy with M1 ~ 0).
+
+`N` appears TWICE: as dMr's traceless half and as dM1/dM2's trace.  That is why
+one coefficient moves the size and ellipticity responses together -- and why
+step 1's two regressions turned out to be one object.
+
+### Step 1 -- measured `Mc` in dMr's trace part.  Zero parameters
+
+One line in `_transport`: `Mr_out -= sign * 0.25 * s0 * (Mc - Mc_ansatz)`.
+`Mc/Mc_ansatz` has p50 0.928 on the v3 prior.
+
+Ratios (layer/catalog) on the two NATIVE-depth grids:
+
+| | Mf | Mr | Mc | spin-2 |
+|---|---|---|---|---|
+| sigma 0.67 before | 0.981 | 1.039 | 1.179 | 0.7144 |
+| sigma 0.67 after | 0.981 | 0.968 | 1.072 | 0.6194 |
+| sigma 1.30 before | 0.940 | 0.971 | 1.067 | 0.7125 |
+| sigma 1.30 after | 0.940 | 0.912 | 0.984 | 0.6125 |
+
+Mc improved on every axis and its per-galaxy `resid` nearly HALVED (1.89e-3 ->
+1.04e-3 at sigma-scale 0.72; 3.07e-3 -> 1.70e-3 at nominal).  Spin-2 got worse
+by a uniform ~0.095, as predicted, entirely through `e = M1/Mr`'s denominator
+-- raw `M1_out` is untouched.
+
+**The prediction that FAILED, and what it told us.**  `NEXT_SESSION` expected
+Mr to move toward 1.0 on the strength of "dMr too big by 1.10".  It did not:
+Mr was already right (1.039/0.971) and went uniformly 5-9% LOW.  So the
+ansatz's dMr was right BY CANCELLATION -- the trace 7.2% low against a
+traceless half ~7% high.  That traceless half is `N`, which step 2 then fitted.
+
+**Invertibility, settled empirically.**  The backbone was never exactly
+self-inverse: `Sigma_u = R^-1 Sigma_X R^-1 / Mf^2` is re-solved from whichever
+point is handed in, so the round trip always carried an O(Su^2) error.
+Measured on 5000 v3 galaxies at nominal depth, `Mr` round-trip |d|/m p50
+5.52e-5 BEFORE -> 5.16e-5 AFTER (p99 3.09e-3 -> 3.05e-3) against a shift of
+4.8e-3.  No Newton step needed; a first-order correction adds nothing to what
+was already there.
+
+### Step 2 -- one trained coefficient on `N`.  `gain` deleted
+
+`c_spin2` multiplies the Gaussian `N`.  It is REAL, not complex: an imaginary
+part rotates the k^4 spin-2 away from the k^2 one (isophote twist), which is
+real per galaxy but averages to zero given parity-even conditioning, and every
+invariant the coefficient can see (`Mr/Mf`, `Mc/Mr`, `|e|`) is parity even.  A
+free imaginary part could only learn a parity-odd artifact of the training
+sample -- the [[spin2-standardize-anisotropy]] failure class.  Test pins it.
+
+`CentroidMarginalize.coeff` is a 3->32->1 tanh MLP with a ZEROED output layer,
+so `c_spin2 == 1` exactly at init and an untrained layer reproduces the bare
+ansatz bit for bit.  Inputs are the chart's own standardised `z[1]`, `z[2]` and
+`|e|^2` in units of the chart's symmetrised spin-2 std -- no new population
+constants, so no repeat of [[coeff-whitening-was-stale-too]].  `|e|^2` and not
+`|e|`: `sqrt(M1^2+M2^2)` has an infinite gradient at a round galaxy, which
+`test_gradients_are_finite_for_a_round_galaxy` caught immediately.
+
+`gain` is deleted from `models/centroid.py`, `bulk.build_flow`, `--centroid-gain`
+on `bias.py`/`centroid.py`, `dev/gauge.py`, and `centroid.py calibrate` (mode
+removed).  **Old centroid checkpoints no longer deserialise** -- the layer has
+leaves now.
+
+**The copy NLL is blind to this coefficient.**  `NEXT_SESSION` expected the
+existing NLL loop to just work.  It does not: 16000 steps wandered (nll 77-133,
+no trend) and left the layer at a spin-2 response ratio of **-4.4**.
+`dev/c_scan.py` settles why -- a CONSTANT `c` on 65536 copies:
+
+| c | NLL | resp ratio |
+|---|---|---|
+| -1.0 | 113.74 | +6.60 |
+| 0.90 | 113.51 | +1.03 |
+| 1.0 | 113.38 | +0.65 |
+| 3.0 | 113.22 | -5.47 |
+
+0.7 nats of structureless noise while the response sweeps 12-fold.  Not a
+tuning failure: the whole marginalisation changes `|e|` by ~0.5%, a negligible
+perturbation of a density and an enormous one of a shear response.  Only an
+estimator aimed at the response resolves it.
+
+So `centroid.py train` now fits the catalog's own weighted copy shifts by least
+squares (which estimates the CONDITIONAL MEAN -- exactly what a deterministic
+transport can carry, with the `Var[.|m]` floor as residual, not bias).  Both
+channels `N` touches, each normalised by its own catalog spread.  Cheaper than
+NLL too: no log-det.  `--holdout` gives the within-population split.
+
+**Results.**  Fitted `c_spin2` p5/p50/p95 = 0.785/0.843/0.890 -- essentially a
+constant, and a closed-form estimate made BEFORE fitting said 0.87.
+
+| | Mf | Mr | Mc | spin-2 |
+|---|---|---|---|---|
+| sigma 0.67 step 2 | 0.981 | 0.977 | 1.081 | 1.0046 |
+| sigma 1.30 step 2 | 0.940 | 0.920 | 0.992 | 1.0142 |
+
+Held-out half (fit on galaxies [0,50k), reported on [50k,100k)): spin-2 ratio
+**1.0329**.  `dev/sigma_scan.sh`: 1.0233 -> 1.0045 -> 1.0164 across 2x in
+sigma, against 0.724 -> 0.707 before.  The two native grids are DIFFERENT
+galaxies at depths never trained on (Sigma_X 6394 and 24177 vs 12335), so one
+coefficient fitted at one depth holds to 2% over 3.8x in Sigma_X -- because the
+depth dependence is derived, not fitted.  That is what `gain = 1.4043`, a patch
+on the net response, could never do.  M1/M2 per-galaxy `resid` also halved
+(1.32e-4 -> 5.94e-5 at sigma 0.67).
+
+Log-det consistency `|fwd + inv|` p50 **6.96e-4 with the trained c vs 6.70e-4
+at c = 1** -- the coefficient adds nothing.  Full suite 58 passed, 1 skipped.
+
+### What step 2 did NOT close, and what it hands to step 3
+
+`Mr` is still 2-8% low (0.977 / 0.920).  Expected and quantified: the size
+channel sees `N` only through `Sigma_u`'s traceless part, and `|s|/s0 = 0.178`
+on this population -- which is `2|e|` to O(e^2), derived and confirmed
+numerically.  ~35x less leverage than the spin-2 channels.  The scan makes the
+tension explicit: the ellipticity channel wants `c ~ 0.905`, the size channel
+wants `c ~ 0.36`, and the fitted net went to the ellipticity optimum because
+that is where the leverage is.  One `N` cannot satisfy both, so the size
+deficit lives in a bracket `N` cannot reach -- `K` (spin-4, step 3) or second
+order (step 4).
+
+Artifacts: `flows/centroid_v3.eqx` (all 100k, production),
+`flows/centroid_v3_s2.eqx` (holdout 0.5, the validation run),
+`logs/centroid_v3{,_s2}.log`.  `rebuild_v3.sh` updated.  Reproducing the step
+0/1 numbers needs a `git stash` -- the old checkpoint will not load.
+
+## 2026-09-02 (cont. 10): step 3, the k^4 spin-4 bracket.  Implemented and
+correct; a NULL on this population, and provably so -- it is degenerate with
+the spin-2 coefficient until the PSF becomes elliptical
+
+### What was added
+
+`K = c_spin4 * 3 (M1 + i M2)^2 / Mf`, the k^4 SPIN-4 moment, as the third and
+last first-order bracket.  From the decomposition in cont. 9 it enters only
+dM1 and dM2, and only against Sigma_u's TRACELESS part:
+
+    dM1 += -1/8 (s1 dK1 + s2 dK2)      dM2 += -1/8 (s1 dK2 - s2 dK1)
+
+`c_spin4` is a second head on the same trunk as `c_spin2` (3 invariants ->
+32 -> 2, output layer zeroed so BOTH coefficients are exactly 1 at init).
+Real, not complex, for the same parity argument as `c_spin2`.
+
+**A correction to the plan's wording.**  `NEXT_SESSION` says the spin-4
+coefficient is "zero for any co-elliptical G".  It is not: an ellipse HAS a
+spin-4 moment, and the Gaussian/Wick value `3 (M1+iM2)^2 / Mf` is nonzero
+whenever M1 or M2 is.  What is true is that for a co-elliptical G the spin-4
+moment's PHASE is locked to twice the spin-2 moment's, so only a real magnitude
+is left for `c_spin4` to carry.  Breaking the lock needs a SECOND spin-2
+direction -- which is exactly what an elliptical PSF supplies and what this
+population does not have.
+
+### Wiring verified
+
+`dev/c_scan.py` now scans both.  Across `c_spin4` from -1.9 to 3.0 the layer's
+`dMr/Mr` is **-7.2865e-03 at every value, bit-identical** -- a trace cannot see
+a spin-4 moment, and if a refactor ever gave `K` the trace contraction this is
+what would catch it.  `dMf` likewise exactly 0.  `Mc` moves at most 5e-2
+relative, entirely through `mc_ansatz_out`'s dependence on M1_out/M2_out, i.e.
+the differential-Mc correction staying self-consistent.
+`test_spin4_moves_only_the_spin2_channels` pins all of it, plus the requirement
+that `c_spin4` be a no-op on a perfectly round galaxy.
+
+### Why it is a null here: an |e|^2 degeneracy
+
+Per galaxy, on 20000 v3 templates:
+
+    d(response)/dc_spin4  /  d(response)/dc_spin2  =  k |e|^2,
+    k = -0.976 (p50), 8.7% spread
+
+which is what the algebra says: with Sigma_X isotropic, `s = -2 s0 e` and the
+two brackets enter the ellipticity shift only as
+
+    de  ~  (3/4) s0 (Mr/Mf) e  (-c_spin2 + c_spin4 |e|^2)
+
+`|e|^2` is ALREADY one of the net's three inputs, so `c_spin2(|e|^2)` can
+represent anything `c_spin4` adds.  Ensemble leverage ratio 12.1x
+(-3.93 vs +0.32 per unit coefficient, OPPOSITE signs).
+
+The one thing that is NOT degenerate is precisely what cont. 9 left open:
+`c_spin4` moves the ellipticity response WITHOUT touching dMr.  But it cannot
+reach far enough.  dMr wants `c_spin2 ~ 0.37`, which leaves the response ratio
+at ~2.8; pulling that back to 1.0 needs `c_spin4 ~ -4.6` -- a spin-4 moment of
+OPPOSITE SIGN and 4.6x the co-elliptical magnitude, and outside `_C_MAX`.  So
+`K` does not close the Mr deficit either.  That deficit is second order or
+`Var[.|m]`, not a first-order bracket.
+
+### Measured, 3 seeds of the joint fit (holdout 0.5)
+
+| seed | c_spin2 p50 | c_spin4 p50 | held-out spin-2 | native 0.67 spin-2 |
+|---|---|---|---|---|
+| 0 | 0.8444 | 0.618 | 1.0396 | 1.0095 |
+| 1 | 0.8413 | 0.645 | 1.0364 | 1.0034 |
+| 2 | 0.8434 | 0.660 | 1.0317 | 1.0039 |
+
+Step 2, for comparison: c_spin2 0.843-0.859, held-out 1.0329, native 0.67
+0.9993-1.0046.  **The ensemble response is unchanged.**  So is Mr (0.962 vs
+0.960 held out; 0.979 vs 0.977 at native 0.67) and so is `sigma_scan`
+(1.031 -> 1.012 -> 1.024, against step 2's 1.023 -> 1.005 -> 1.016; the ~0.008
+offset is inside the c_spin2 scatter between two step-2 runs).
+
+`c_spin4` is nonetheless well DETERMINED -- 0.641 +/- 0.021 over three seeds,
+nowhere near a bound and not wandering -- because the degeneracy is only 91%
+exact (the 8.7% spread in k above).  What is determined is the combination:
+`c_eff = c_spin2 - c_spin4 |e|^2` comes out 0.831 / 0.824 / 0.827, sd 0.004,
+against step 2's 0.835-0.851.  `corr(c_spin2, c_spin4) = +0.866` across
+galaxies, which is the degeneracy showing up directly in the fit.
+
+**The one thing that did move**: per-galaxy `resid`, reproducibly, at every
+depth -- native 0.67 M1 5.94e-5 -> 5.32e-5 +/- 0.26e-5, M2 5.86-6.04e-5 ->
+5.22e-5, Mr 2.82-2.89e-4 -> 2.52e-4 +/- 0.03e-4.  ~11%, outside both runs'
+scatter.  Note `c_spin4` provably cannot touch Mr at all, so that part is
+`c_spin2`'s refitted SHAPE, not new physics: with `c_spin4` free to carry the
+|e|^2 dependence, `c_spin2` is fitted flatter in |e| (0.821 low-|e| vs 0.852
+high-|e|) and the pair is better conditioned than one coefficient alone.
+
+### Verdict
+
+Keep it, on two grounds that are NOT "it improved the bias": it is the slot an
+elliptical PSF needs (step 3's whole stated purpose), and the per-galaxy
+conditional-mean residual is ~11% better across three seeds.  It is honestly a
+NULL on every ensemble number, and if the extra weakly-identified parameter is
+unwanted, deleting the second head is a one-line revert.  Do not expect it to
+pay until Sigma_X and the PSF stop being circular and constant.
+
+Artifacts: `flows/centroid_v3.eqx` (production, all 100k),
+`flows/centroid_v3_s3{,_seed1,_seed2}.eqx` and their logs.
+
+## 2026-09-03/04 -- The bulk flow could only make p(e | spin-0) an isotropic
+Gaussian.  Fixing that removed the m1 flux gradient; then three separate
+defects in the selection terms turned up behind it
+
+### The audit finding, and it is architectural not a fit quality issue
+
+`Spin2CouplingLayer` applied ONE shared scalar to slots 3, 4, and
+`Spin0AutoregressiveLayer` never read them.  So the whole 8-layer stack
+collapsed to
+
+    b[0:3] = F(z[0:3])          b[3:] = z[3:] * S(z[0:3])
+
+which, against an N(0, I) base, makes the modelled conditional shape density
+EXACTLY an isotropic Gaussian and the spin-2 score EXACTLY linear in e.  Not a
+tuning problem -- nothing in the parameter space could do otherwise.
+
+Diagnostic (new, and the one to keep using): k-NN windows in spin-0,
+`var(|e|^2)/mean(|e|^2)^2`.  The templates want **0.565** at K = 200; the old
+flow gave **1.316** against an architecture FLOOR of 1.000.  Real |e| is a
+narrow shell and the old stack could only err on the over-dispersed side.
+
+### What shipped
+
+A pure stretch whose profile in |e| the net learns:
+
+    y[3:] = x[3:] * exp(h(z0, z1, z2, log1p(|e|^2)))
+
+i.e. the conditioner MLP with |e|^2 as a fourth input.  No analytic family, no
+basis, no spline.  Log-det `2h + log1p(2 q dh/dq)`.  Only the FIRST layer bends
+(the bend composes multiplicatively; the interval-free form still wants the
+data-adjacent coordinate).  Monotonicity is WATCHED, not enforced --
+`check_monotone` measures 0.0000% on training data and on 200k flow samples.
+
+| chain | bulk val nll | disp K=200 | unwindowed m1 |
+|---|---|---|---|
+| old arch | 38.9721 | 1.316 | -0.0391 +/- 0.0066 |
+| power `a` (v6) | 38.7514 | 0.524 | -0.0191 +/- 0.0111 |
+| **free net (v10)** | **38.6776** | **0.526** | **-0.0140 +/- 0.0073** |
+
+Flux quintiles, the diagnostic that had survived every prior change:
+old `-0.095, -0.127, -0.042, -0.023, +0.005` -> v10 `-0.048, -0.034, -0.015,
++0.002, -0.007` (bars 0.056, 0.017, 0.008, 0.016, 0.004).  No monotone trend
+survives.
+
+### Parameterisations that failed -- do not re-derive
+
+* **Power tail** `T = (gamma beta/a) expm1(a log1p(q/beta))`.  Fit well but
+  pinned `a` at a STABILITY ceiling (86.8% of templates at 150k steps).
+  Raising the bound 4 -> 16 gives `val nll inf`: a pure power makes the density
+  unevaluable off the data envelope, which is exactly where the next stage's
+  draws land.
+* **Asymptotically linear rational** `gamma q (beta + c q)/(beta + q)`.
+  Un-pinned everything but fit worst (38.819, disp 0.650) -- a linear tail caps
+  the total compression available.
+* **Rational-quadratic spline.**  Rejected as over-parameterised (28 net-driven
+  knots per galaxy); "fits better on this catalog" is the claim that would not
+  transfer.
+
+The free net beat all three.  It also removed a bug the analytic families
+carried: forming `T(q)/q` as `expm1(z)/z * log1p(u)/u` overflows the first
+factor at z ~ 88 while the product is ~1e31 and representable.
+
+### Then the selection terms, which had THREE independent defects
+
+1. **The `R_s` concentration warning said "template" for `--window-terms flow`
+   runs, where the object is a flow DRAW.**  Cosmetic, but it made the warning
+   un-diagnosable for three chains; `selection_terms` now takes `kind`.
+2. **`--window-fd` is documented as REQUIRED for any `--window-size` cut and
+   was not being passed.**  The reference invocation in the old NEXT_SESSION
+   omitted it, so EVERY windowed number in the v3/v6/v10 comparison used the
+   divergent pathwise estimator.  Symptom in hindsight: the windowed column
+   bounced +0.013 / +0.050 / -0.005 while unwindowed moved smoothly.
+3. **262144 draws is not converged**, and is the noisiest point of the scan.
+   `--window-draws` now defaults to 2^20.
+
+### The fix: a score-function estimator (`--window-terms score`)
+
+`F` cuts on the MEASURED moment and shear acts on the prior, so `F` carries no
+`g` at all.  Differentiating the DENSITY instead of the SAMPLE gives
+
+    Q_s = E[F Q],   R_s = E[F (R + Q Q^T)],    m ~ P(.|0)
+
+No `sigma` in the integrand, so the pathwise `Mf^2/sigma^2` divergence is
+removed by construction rather than truncated.  Three-way comparison at 262144
+draws (`dev/window_terms_compare.py`, minutes rather than a 40-min `bias.py`):
+
+| estimator | R_s11 | R_s22 | Q_s1/err | top share | **Hill** |
+|---|---|---|---|---|---|
+| pathwise | -0.1624 | -0.2882 | 1.05 | 44.6% | 1.42 |
+| fd = 0.02 | -0.1512 | -0.1668 | 1.19 | 6.1% | 1.20 |
+| **score** | -0.1815 | -0.2159 | **0.28** | **4.4%** | **2.92** |
+
+Only the score estimator has finite variance (Hill > 2).  `fd` is NOT the clean
+fix its docstring implies for THIS window: that measurement was on a size
+window with a ceiling, ours is size-floor-only plus a FLUX ceiling, and
+differencing does not cure that (Hill 1.20).
+
+**A free exactness check that was sitting unused: `R_s11 = R_s22` EXACTLY.**
+The window cuts only on spin-0 quantities, so `P_s` can depend on `|g|^2`
+alone.  Violation: pathwise 77%, fd 10%, score 17% at 262144 -- and for the
+score estimator it converges away with draws, which is the proof that it
+converges at all:
+
+| draws | R_s11 | R_s22 | asymmetry |
+|---|---|---|---|
+| 2^16 | -0.2129 | -0.2359 | 10.2% |
+| 2^18 | -0.1815 | -0.2159 | 17.3% |
+| 2^20 | -0.1679 | -0.1651 | **1.7%** |
+| 2^21 | -0.1622 | -0.1694 | **4.3%** |
+
+Converged `R_s11 ~ -0.165`.  `fd = 0.02` gives -0.1512, a gap of 0.014 --
+essentially exactly its independently-estimated O(h^2) bias.  Two estimators
+with unrelated failure modes agreeing to a known systematic.
+
+### Final numbers, `flows/centroid_v10.eqx`
+
+* unwindowed `m1 = -0.01397 +/- 0.00731`
+* windowed, corrected (score, 2^20 draws) `m1 = -0.00368 +/- 0.00964`
+* `R_s11 = -0.165`, top draw 3.8%, no warning
+* per-target PQRs saved to `pqr/v10_score.npz` -- `ghat` is affine in `R_s`, so
+  any further selection variant is now a two-line evaluation with no GPU time.
+  Predicted -0.0038 by extrapolation before the run, measured -0.00368.
+
+The v3/v6 WINDOWED numbers are void (defect 2) and their checkpoints are gone
+and incompatible, so there is no cross-architecture windowed comparison.  The
+unwindowed series is unaffected.
+
+### Open
+
+* **`Q_s2 = -4.4e-03 +/- 2.0e-03`, i.e. 2.2 sigma from a value isotropy forces
+  to be exactly zero.**  Largest seen; the standalone scan gave `Q_s1`/err of
+  0.19, 0.28, -0.50, -1.03.  See the next-session prompt.
+* Centroid ellipticity response ratio **1.0424** against 1.0054 (v6) and
+  1.0078 (v3), with `c_spin4` scattered p5 0.577 to p95 1.209.
+* The response fit is NOT the lever and did not move across any of these
+  chains (dm/dg 0.29/2.29/0.56/0.57/4.91%).  `Var[Q|m]` is ~0.3% of the
+  `E[QQ|m]` term in d2P/dg2, so the "59% irreducible" framing does not survive.
+* The flux input to `_Coeffs` buys ~1% on this population (2.67 -> 2.63%).
+
+---
+
+## 2026-09-05: Phase A and B of the `GUIDING_PRINCIPLES` plan -- the C01
+hypothesis is dead, two quoted numbers were wrong, and the window scan is
+limited by galaxies not by draws
+
+Branch `feat/centroid-shear-conditioning`.  Everything below is offline
+re-solve or a dev script; no new target integration was run.  Test suite 116
+passed / 1 skipped.
+
+### B1: the `C01` hypothesis is FALSIFIED (and it was the whole story)
+
+`dev/isotropy_check.py` gained `--rotate-sigma` and `--sigma-x`.  The old
+script rotated the prior draws but held `Sigma_X` FIXED, which is only a
+symmetry while it is isotropic.  `rot_sigma` rotates it properly: `X` is a
+position, so `Sigma_X -> R Sigma_X R^T` with the ORDINARY angle, not the
+doubled one the spin-2 moments turn through.  At `k = 1` that maps `e2p`'s
+`[12676.665, 1084.720, 12676.665]` exactly onto `[11591.944, 0, 13761.385]`,
+which is the RENDERED `e1m` value -- so the identity is checkable against an
+independent catalog rather than only against itself.
+
+Through the FULL chained flow, 65536 draws:
+
+| | isotropic `Sigma_X` | `e2p`, `C01 != 0` |
+|---|---|---|
+| `\|dlogP\|` p50 / p99 | 7.11e-15 / 2.01e-12 | 7.11e-15 / 2.01e-12 |
+| `\|dQ\|/\|Q\|` p50 / p99 | 5.64e-15 / 3.80e-12 | 5.69e-15 / 3.63e-12 |
+
+The float64 floor, identical with and without the off-diagonal.
+
+**The control that makes this non-vacuous was run.**  At fixed moments,
+switching `C01` from 0 to 1084.72 moves `log P` by 1.5e-03 (p50, on
+`|logP| ~ 37`) and `Q` by 1.3e-02 (p50, on `|Q| ~ 4.9`) -- comparable to
+changing the whole `Sigma_X` trace (3.3e-03 and 9.6e-03).  The path is
+exercised and it is exactly equivariant.
+
+This was predictable from `_transport` and the code reads correctly:
+`Sigma_u`'s traceless part `s = s1 + i s2` (spin 2) is contracted against the
+spin-4 bracket as `conj(s) K` and against the spin-2 bracket as `conj(s) N`,
+which is the only spin-consistent pairing available.
+
+### Two numbers on the record were wrong
+
+**1.  `psfe1m` is one galaxy.**  Inside the quoted window the top-1 share of
+`sum |R11|` is:
+
+| config | top-1 share | max/median |
+|---|---|---|
+| plain, psfe00, psfe1p, psfe2p | 0.13-0.14% | 8.5-9.7 |
+| **psfe1m** | **7.87%** | **572** |
+
+`sane_targets` fires at 1000x the median, so at 572x it keeps this target.
+Effect (`dev/psfe_compare.py --drop-top 1`, and `dev/window_scan.py
+--drop-top 1`):
+
+| psfe1m | with | without |
+|---|---|---|
+| `dm1` vs psfe00, uncorrected | -8.37e-02 +/- 6.1e-02 | **-8.95e-03 +/- 4.6e-03** |
+| corrected `m1` at 2^24 | -0.0722 +/- 0.0692 | **+0.0093 +/- 0.0084** |
+| in-window Fisher ratio | 0.893 | -- |
+
+Do NOT fix this by loosening the guard's factor: that is a tuned constant, and
+the concentration report is the right net.  `--drop-top` is now on both
+scripts and both numbers should be quoted.
+
+**2.  "The `dc2` signal does not rotate" was quoted off two uncorrelated
+bars.**  `A_c1` (the `e1p`/`e1m` antisymmetric part) and `dc2[e2p]` share the
+`psfe00` baseline and the same galaxies, so their errors are correlated.
+Bootstrapping the DIFFERENCE, 800 paired resamples:
+
+    A_c1     = -2.776e-04 +/- 1.5e-04
+    dc2[e2p] = -7.571e-04 +/- 2.1e-04
+    gap      = -4.795e-04 +/- 2.7e-04   =  -1.8 sigma
+
+Stable under `--drop-top 100 --drop-by Q2` (-1.7 sigma).  **There is no
+measured failure to rotate.**  What survives is that `dc2` at `e2p` is real
+(-3.4 sigma from zero, an uncorrected difference whose MC floor is 2e-10) and
+consistent with an ordinary rotating leak of a few 1e-04 that 20k targets
+cannot pin down.
+
+The spin-0 counterpart PASSES outright.  `m1` can depend only on `|e_psf|^2`,
+so all three orientations must agree; pairwise, outlier dropped, they do
+(-0.8, +0.4, +1.2 sigma), and averaging them gives the bound
+
+    dm1(|e_psf| = 0.2) = -5.6e-03 +/- 3.4e-03    (-1.7 sigma)
+
+### B2: the Fisher identity's 24% violation is entirely outside the window
+
+`sum q1^2 / sum(-R11)`, forced to 1.  Per flux quintile the shape is the same
+on all six pqr files: q1 1.22-1.27, q2 0.97-1.00, q3 0.95-0.96, q4 0.92-0.97,
+q5 0.98.  But q1's ceiling is `Mf ~ 1040` and q2's ~1435, both below the
+`Mf > 2500` cut -- **nothing in q1 or q2 is ever quoted.**  Re-evaluated
+INSIDE the window:
+
+    plain 0.965   psfe00 0.940   psfe1p 0.940   psfe2p 0.940   psfe1m 0.893
+
+a standing 3.5-6% deviation, not 24%.  `dev/fisher_split.py` bins by quintile
+of the whole catalog and does not apply the window; the in-window number is
+the one that is the precondition for trusting an `m1`.
+
+Same run re-confirms 3.1's per-target convergence claim: `v11_psfe00` vs
+`v11_psfe00_s7` (the MC null) differ by 1.1e-07 relative on `Q` and 6.1e-07 on
+`R`, with `obs` bit-identical.
+
+### A1/A3: everything re-quoted at 2^24
+
+`dev/window_scan.py`.  `plain` and `psfe00` are bit-identical in BOTH `C_M`
+and `Sigma_X`, so one pass over the draws serves all three circular-PSF pqr
+files.  ~10 min per config, not the 40 estimated.
+
+| config | corrected `m1` at 2^24 | `c1` | `c2` |
+|---|---|---|---|
+| plain | -0.00352 +/- 0.00966 | -1.93e-03 +/- 3.5e-03 | -5.07e-03 +/- 3.5e-03 |
+| psfe00 | +0.01860 +/- 0.00799 | +3.50e-03 +/- 3.5e-03 | +1.84e-03 +/- 3.7e-03 |
+| psfe1p | +0.01224 +/- 0.00787 | +3.30e-03 | +1.61e-03 |
+| psfe2p | +0.01659 +/- 0.00705 | +3.74e-03 | +1.05e-03 |
+| psfe1m (drop 1) | +0.00926 +/- 0.00839 | +3.85e-03 | +1.84e-03 |
+
+Monitors at 2^24: traceless +2.2e-04 to +3.5e-04, `R_s12` +1.0e-03 to
++1.2e-03.  **The v10 headline `-0.00368` at 2^20 was fine** -- the 2^24 value
+is -0.00352, a move of 1.2e-04 against the +/-4e-03 that was feared.
+
+**A3 (`c = 0`)**: 1.4 sigma, not the 2 sigma on the record.  But the sample
+floor is 3.5e-03, i.e. 3.5x `tau`, so this BOUNDS `c` rather than testing it
+at `tau`.  Note `plain` and `psfe00` disagree by ~7e-03 in `c2` -- different
+galaxies, and that gap IS the floor being visible.
+
+**`R_s12` is a bigger MC channel than the traceless part, and section 3.1
+quotes the wrong one.**  At seed 7, traceless is -5.9e-04 but `R_s12` is
+-6.5e-03, 6x larger than at seed 0.  It evidently does not propagate strongly
+into `m1` (see the null below), but the traceless part alone understates the
+selection-term MC error.
+
+### A2: local window stability -- no drift, but the test does not reach `tau`
+
+Perturb each boundary by +/-5% and +/-10%, one at a time, 13 windows sharing
+ONE pass over the draws (`selection_terms_score(windows=)`: the flow's `Q`,
+`R` per draw do not depend on the window, only the cheap `window_prob`
+quadrature does).  That also makes the scan PAIRED -- every window sees the
+identical draw set -- and the re-solve uses one bootstrap index shared across
+all windows, so the difference against nominal is paired galaxy for galaxy.
+That mattered: a +/-10% move swaps a few hundred galaxies in or out, and the
+unpaired +/-0.008 bar cannot tell that from a defect in the correction.
+
+`d m1` per +/-10% of the boundary, with a bar from refitting the line inside
+each paired resample:
+
+| boundary | plain, seed 0 | plain, seed 7 | psfe00, seed 0 | psfe00, seed 7 |
+|---|---|---|---|---|
+| `size_lo` (2.2) | +6.5e-04 +/-3.5e-03 | +8.8e-04 +/-3.5e-03 | +1.67e-03 +/-3.6e-03 | +1.93e-03 +/-3.9e-03 |
+| `flux_lo` (2500) | +4.20e-03 +/-5.3e-03 | +4.31e-03 +/-5.4e-03 | +4.84e-03 +/-4.9e-03 | +4.95e-03 +/-5.2e-03 |
+| `flux_hi` (50000) | -2.7e-04 +/-1.7e-03 | -2.1e-04 +/-1.9e-03 | +7.0e-04 +/-1.5e-03 | +7.7e-04 +/-1.3e-03 |
+
+**No slope is above 1.0 sigma.**  But every bar is 1.3e-03 to 5.4e-03, i.e.
+1.3x to 5.4x `tau`, so by section 1 this has BOUNDED the window systematic at
+roughly +/-5e-03, not shown it below `tau`.  Say that, not "it passed".
+
+**The null run says the limit is galaxies, not draws.**  Re-running the whole
+scan at draw seed 7 (`dev/phase_a_null.sh`) was not optional: `plain` and
+`psfe00` are independent in their GALAXIES but share `Sigma_X` and `C_M` bit
+for bit, so they were re-solved against IDENTICAL selection terms and a
+term-side error would reproduce across them exactly.  Result:
+
+* nominal corrected `m1` moves 7.3e-04 (plain) and 7.4e-04 (psfe00) between
+  the seeds -- **the 7.41e-04 selection MC floor at 2^24 is confirmed to two
+  digits, independently**;
+* but the SLOPES move by only ~1e-04, far under their own +/-5e-03 bars.
+
+So the slope is not selection-term MC error at all; its bar is pure galaxy
+sample variance and falls as `1/sqrt(N)`.  The `flux_lo` central value
+(+4.2e-03 to +5.0e-03, same sign in two independent galaxy samples, ~1.25
+sigma combined) is the one to watch, and only more targets can resolve it.
+
+**A free finding from the scan.**  At `size_lo -5%` and `-10%` the `R_s12`
+monitor jumps to +0.0113 / +0.0131 against +0.0011 at nominal, and the
+traceless part to -6.1e-03 / -3.0e-03 against +3.1e-04.  The selection terms
+LOSE CONVERGENCE when the size floor is loosened -- a different failure from
+window instability, and it explains why only that side of the size scan moves.
+It is also the size-edge/support channel showing up in the selection machinery
+for free.
+
+### B3: amplitude-scan catalogs rendered, and the channel structure confirmed
+
+`bash dev/render_psfe.sh 0.1` and `0.05`, 24 catalogs.  `render_psfe.sh` had
+the missing-`pipefail` bug in another form -- a bare `wait` returns 0 whatever
+the jobs did, so `set -e` never fired on a failed render; it now waits on each
+pid.
+
+Read off the catalogs alone, no bias run:
+
+| quantity | 0.05 | 0.10 | 0.20 | fitted exponent |
+|---|---|---|---|---|
+| `Sigma_X` spin-2 split | 2.089e-02 | 4.198e-02 | 8.557e-02 | **+1.017** |
+| `C_M` spin-2 split | 5.03e-04 | 2.03e-03 | 8.38e-03 | **+2.030** |
+
+Clean separation, so Phase C2's fitted `d log|dc| / d log e_psf` localises the
+channel: near 1 is `Sigma_X`, near 2 is `C_M`.  `e1p` and `e2p` give identical
+`|Sigma_X spin-2|` at each amplitude with `e2p` purely off-diagonal -- the
+exact 45-degree rotation.
+
+**The scan is 4 runs, not 6.**  With `e_psf = 0` the amplitude does nothing,
+and the `e00` catalogs at tags 05/10 are byte-identical in `moments` to tag
+20, so `pqr/v11_psfe00.npz` is the baseline for every point.
+`dev/bias_amplitude.sh` is written and ready.
+
+### Tooling changes
+
+* `bias.selection_terms_score(..., windows=[...])` -- many windows in one pass
+  over the draws.  Returns a list; the single-window signature is unchanged.
+* `dev/window_scan.py` -- A1/A2/A3 in one tool.  Caches the selection terms to
+  `logs/phase_a/terms_*.npz` (they depend on the flow, `C_M`, `Sigma_X`, the
+  window and the draw seed, and on nothing about the targets), and the flow is
+  built INSIDE the cache-miss branch so a cached re-solve never touches the
+  GPU.  `--drop-top`, `--pqr` takes several files.
+* `dev/isotropy_check.py` -- `--rotate-sigma`, `--sigma-x`, `rot_sigma`.
+* `dev/psfe_compare.py` -- `--drop-top`/`--drop-by`, and the rotation test with
+  a PAIRED bar on the gap.
+* `dev/phase_a.sh`, `dev/phase_a_null.sh`, `dev/bias_amplitude.sh`.
+* `bias.CATALOGS`/`TRAIN_DATA` -- the four amplitude-scan configs.
+
+### Traps paid for this session
+
+* **Two JAX processes do not fit on the 16 GB card at 2^24.**  A concurrent
+  `pytest` run killed a `window_scan` with `RESOURCE_EXHAUSTED ... 9 alive
+  graphs`.  Both drivers now serialise, and cached re-solves avoid the GPU.
+* **`pgrep -f "dev/phase_a.sh"` in a waiter matches the waiter's OWN command
+  line** -- `[[background-hang-is-pgrep-selfmatch]]` again, and it cost 2.5
+  hours of an idle GPU: the queued null run never started.  Guard on the
+  PYTHON process, or on a marker string in the log, never on the script name.
+* A bare `wait` in a shell script masks failed background jobs exactly the way
+  a missing `pipefail` masks a failed pipeline.
+
+## 2026-09-05 (cont.): Phase C2 -- the leak is the `Sigma_X` channel, and the
+three-point scan would have said "artifact"
+
+Four `bias.py` runs at `e_psf` 0.05 and 0.10 (`dev/bias_amplitude.sh`), then a
+fifth at 0.02 added after the first fit came back wrong-looking.  All against
+`pqr/v11_psfe00.npz`, which is the baseline for every amplitude because the
+`e00` catalogs are byte-identical across tags.
+
+### The result
+
+`dc2`, `e2p` orientation, paired, `--drop-top 3`:
+
+| `e_psf` | `dc2` | +/- paired | sigma |
+|---|---|---|---|
+| 0.02 | -1.921e-05 | 4.6e-05 | -0.4 |
+| 0.05 | -5.118e-04 | 1.6e-04 | -3.2 |
+| 0.10 | -5.773e-04 | 2.1e-04 | -2.7 |
+| 0.20 | -7.577e-04 | 2.2e-04 | -3.4 |
+
+`dc = A e^p` gives **p = 1.07 (1-sigma 0.85-1.34)**.  At fixed `p`, chi2 over
+3 dof: constant 23.8, **linear 6.24**, quadratic 11.4.
+
+* **no leak / `e_psf`-independent artifact (p = 0): excluded at 4.2 sigma**
+* **`Sigma_X` (linear; the split runs as `e^1.017`): this is the channel**
+* `C_M` (quadratic, `e^2.030`): disfavoured at 2.3 sigma
+
+`dm1` is consistent with zero at every amplitude (all under 1 sigma), so the
+spin-0 channel is bounded but not detected.
+
+### The methodological point, which is the more valuable half
+
+**The 0.05/0.10/0.20 scan ALONE gives p = 0.29 and reads as an artifact.**
+That was the first conclusion off this data and it was wrong.  Leave-one-out on
+the free-`p` fit:
+
+| dropped | p | 1-sigma |
+|---|---|---|
+| e = 0.02 | **0.29** | 0.00-0.61 |
+| e = 0.05 | 1.27 | 0.97-1.78 |
+| e = 0.10 | 1.10 | 0.86-1.45 |
+| e = 0.20 | 1.52 | 1.14-2.04 |
+
+Three points spanning one decade at ~30% errors do not constrain an exponent.
+A power law needs an anchor near zero, and the anchor is CHEAP here for a
+reason worth remembering: the paired bar shrinks with the perturbation (4.6e-05
+at 0.02 against 2.2e-04 at 0.20) because the two catalogs converge to identical
+as `e_psf -> 0`.  One 40-minute run at small amplitude outweighed the three
+that preceded it.
+
+Both sanity checks that make the scan interpretable were run first and passed:
+
+* the arms are genuinely paired -- target `|dM2|` p50 against the `e = 0`
+  baseline is linear in `e_psf` to 5% (95.2, 95.5, 96.7, 100.6 per unit `e`),
+  so the noise field is shared and the input really is a clean linear
+  perturbation;
+* the sim has no discrete switch -- `psf_cov` and galsim's `.shear(e1, e2)` are
+  smooth in `e`, so "something turns on when `e_psf != 0`" had no mechanism.
+
+### Bound at DES-like ellipticity
+
+Directly measured at `e_psf = 0.05`: `dc2 = -5.1e-04 +/- 1.6e-04`.  The fitted
+linear law would put it at -2.0e-04.  Either way below `tau = 1e-3` -- but it
+is a 3.2-sigma DETECTION, not a null, and `chi2/dof = 2.08` for the linear fit
+(the 0.05 point sits 2 sigma above it), so a sub-leading second component is
+not excluded.
+
+### What this closes
+
+Section 5 axis 1's channel question, WITHOUT the no-centroid bisect: the
+ellipticity reaches the estimator through `Sigma_X`, i.e. through the centroid
+layer's conditioning, not through the noise covariance.  Taken with
+[[c01-path-is-clean]] (the flow is exactly equivariant in `C01`) and
+[[dc2-rotation-gap-is-1p8-sigma]] (the signal does rotate, 1.8 sigma), the
+whole "mysterious non-rotating `e2p` anomaly" is resolved into an ordinary
+linear `Sigma_X` leak of a few 1e-04.
+
+### Tooling
+
+* `dev/psfe_compare.py` -- `amplitude()`, and the amplitude-scan fit.  It fits
+  `dc = A e^p` in the SIGNED variable, scanning `p` and least-squares-solving
+  the single linear `A` at each step weighted by the paired bars.  A `log|dc|`
+  fit was rejected: it discards the sign, cannot use a point consistent with
+  zero (which is the most constraining one here), and is biased by the bar.
+* `catalog_rows` now takes its path from `bias.CATALOGS` instead of rebuilding
+  it with a hard-coded `20` tag -- verified a no-op on the original triplet.
+* `bias.CATALOGS`/`TRAIN_DATA` -- `psfe2p02` and the four 05/10 configs.

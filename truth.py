@@ -4,21 +4,24 @@ truth.py
 Exact P(m | g), Q and R for the gauss2 analytic population -- ground truth to
 difference a trained flow against.
 
-`imsims.sim.sample_population_gauss2` draws the LATENT (unsheared) moments
-from a chosen density P0 (`sim.GAUSS2_MU`, `sim.GAUSS2_COV`, in the chart
-`bulk.to_coords` builds -- see `to_coords` below) and solves for the galaxy
-realising them (`analytic.theta_of_m`).  A galaxy observed under shear g has
-that SAME theta, and moments m = analytic.moments(theta, g) that are a
-deterministic, invertible function of theta -- so P(m | g) is a plain change
-of variables, with NO marginalisation:
+`imsims.sim.sample_population_gauss2_fwd` FORWARD-samples the galaxy
+parameters theta = [log F, log sigma, logit rho, e1, e2] from a chosen box
+(`truth.log_p_theta` is its closed form) and renders them.  A galaxy observed
+under shear g has that SAME theta, and moments m = analytic.moments(theta, g)
+that are a deterministic, invertible function of theta -- so P(m | g) is a
+plain change of variables, with NO marginalisation:
 
-    log P(m | g) = log P0(m0) + logdet J0(theta) - logdet Jg(theta)
+    log P(m | g) = log P_theta(theta) - logdet Jg(theta)
 
-where theta solves analytic.moments(theta, g) == m, m0 = analytic.moments
-(theta, 0) is the latent (unsheared) moments of that same galaxy, J0 = d/dtheta
-analytic.moments(theta, 0) and Jg = d/dtheta analytic.moments(theta, g).  At
-g = 0 the two Jacobians are the same function evaluated at the same point, so
-this collapses to exactly log P0(m) -- `test_log_prob_at_zero_shear_is_log_p0`.
+where theta solves analytic.moments(theta, g) == m and Jg = d/dtheta
+analytic.moments(theta, g).  At g = 0 this is exactly log P0(m) --
+`test_log_prob_at_zero_shear_is_log_p0`.
+
+This replaced a P0 that was Gaussian in a moment-space chart, drawn there and
+inverted to a galaxy (2026-09-05).  That direction rejects ~80% of draws
+because the reachable set is curved, so the realised population was a
+TRUNCATED Gaussian -- 0.41 sd on the size axis against the 0.84 it was fitted
+to -- and no P0 tuning fixed it.  Forward sampling has no rejection at all.
 
 Solving theta without a g-dependent Newton solve
 -------------------------------------------------
@@ -57,17 +60,16 @@ targets.  Detect them where it matters: at generation time theta is known, so
 `allclose(theta_of_m(moments(theta, g))[0], sheared_theta(theta, g))` flags the
 affected galaxies and they can be dropped from a comparison.
 
-The additive constant
-----------------------
-`sample_population_gauss2` keeps a drawn galaxy only if the Newton solve
-converges and lands in a physical parameter range (about 30% of P0's mass;
-see that function's docstring), so the population actually realised is P0
-RESTRICTED to that reachable set and renormalised by an unknown constant Z.
-Nothing here computes Z.  `log_p0`, `log_prob`, `pqr` all return or
-differentiate the density up to an additive -log Z.  That is harmless: Q =
-d/dg log P and R = d2/dg2 log P (Bernstein & Armstrong 2014 eq. 12-13) are
-g-derivatives of a quantity offset by a g-INDEPENDENT constant, so -log Z
-drops out of both exactly, and with it out of any bias built from them.
+No additive constant, and that is not just tidiness
+----------------------------------------------------
+Every block of `log_p_theta` is normalised, so these are absolute log
+densities.  The old rejection-sampled P0 carried an unknown -log Z and argued
+it was harmless because Q and R are g-derivatives of a quantity offset by a
+g-INDEPENDENT constant.  The premise was wrong in one respect worth recording:
+the accepted set was a set of GALAXIES, so its image in moment space moves
+with g, i.e. the truncation's support boundary was g-dependent and not
+something a constant can absorb.  It was never measured how much that mattered
+-- forward sampling removes the question instead.
 """
 
 from __future__ import annotations
@@ -77,6 +79,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+from jax.scipy.special import ndtri
 import numpy as np
 
 jax.config.update("jax_enable_x64", True)   # exactness is the whole point
@@ -89,58 +92,120 @@ except ImportError as exc:                                  # pragma: no cover
     raise SystemExit("truth.py needs ../bfd_cnf_imsims on the path: "
                      f"{exc}") from None
 
-# sim.py only duplicates the slot-1 ceiling (POINT_SOURCE) as its own literal;
-# slot 2's has no imsims-side twin to match, so pull it straight from the
-# source of truth rather than add one.
-from models.bijections import POINT_SOURCE_MC
+def folded(thetas, g=(0.0, 0.0), atol=1e-6):
+    """Mask of galaxies whose moments `theta_of_m` inverts to the WRONG root.
 
+    `theta_of_m` returns SOME preimage and the two-Gaussian moment map is not
+    injective (see the module docstring).  Under the old moment-space P0 that
+    was nearly harmless -- the density was chosen in m, so any preimage gave
+    the same number, and only the g != 0 Jacobian ratio was perturbed.  Under
+    the pushforward it is NOT harmless: the density is evaluated AT the galaxy
+    the solve finds, and the second root usually lies outside the box, where
+    `log_p_theta` is correctly -inf.  Such a target then contributes nothing
+    (`jnp.where`'s gradient is zero on the dead branch), which biases any sum
+    over the population.
 
-def to_coords(m):
-    """Raw moments -> SIM's chart t = [log10 Mf, logit(Mr/(POINT_SOURCE Mf)),
-    Mc/Mr, M1/Mr, M2/Mr].
+    Measured on `gauss2_fwd`: 2.8% at g = 0, ~4% at |g| = 0.02.  Dropping them
+    takes the shear-recovery check from ghat = 0.01959 to 0.020039 against a
+    true 0.02, i.e. the density is right and this is the whole residual.
 
-    This must track `imsims.sim`, NOT `bulk.to_coords`, and that is the whole
-    point: `log_p0` evaluates a Gaussian whose mean and covariance are
-    `sim.GAUSS2_MU`/`GAUSS2_COV`, and those are defined in sim's chart (see
-    `sim._gauss2_m_of_t`, whose inverse this is).  `bulk.to_coords` differs in
-    slot 2 -- it uses `logit(Mc/(POINT_SOURCE_MC Mr))` where sim uses the raw
-    ratio `Mc/Mr` -- so matching `bulk` instead, as this did until
-    2026-08-28, evaluated `mu[2] = 5.974` (an Mc/Mr value) against a
-    coordinate worth about 2.16.  That is what made `truth.py` unusable as
-    ground truth: `log_prob` was a Gaussian in the wrong variable, and every
-    `Q`, `R` derived from it was wrong with it.
-
-    The old docstring called `bulk` agreement an invariant and
-    `tests/test_truth.py::test_to_coords_matches_bulk` enforced it.  It was
-    exactly backwards; the test now checks sim's chart instead.
+    Needs the GENERATING theta, so it is only available where the population is
+    known -- which is every use truth.py has, since it exists to score a
+    catalog we rendered.  `sheared_theta(theta, g)` is what the solve should
+    return; anything else is a different root.
     """
-    u = m[..., 1] / (sim.POINT_SOURCE * m[..., 0])
-    return jnp.stack([jnp.log10(m[..., 0]), jnp.log(u) - jnp.log1p(-u),
-                      m[..., 4] / m[..., 1], m[..., 2] / m[..., 1],
-                      m[..., 3] / m[..., 1]], axis=-1)
+    g = jnp.asarray(g, dtype=jnp.float64)
+    thetas = jnp.asarray(thetas, dtype=jnp.float64)
+    want = jax.vmap(lambda t: analytic.sheared_theta(t, g))(thetas)
+    ms = jax.vmap(lambda t: analytic.moments(t, g))(thetas)
+    got, _residual = analytic.theta_of_m_batch(ms)
+    return ~np.isclose(np.asarray(got), np.asarray(want), atol=atol).all(axis=1)
+
+
+def log_p_theta(theta):
+    """log P(theta) for the `gauss2_fwd` box, EXACTLY.
+
+    `theta` is `analytic`'s galaxy vector [log F, log sigma, logit rho, e1, e2]
+    and this is the closed form of `sim.sample_population_gauss2_fwd`, block by
+    block.  No normalising constant is dropped -- every block is normalised --
+    though `log_prob` still carries no -log Z of its own because there is now
+    no rejection to renormalise (see the module docstring).
+
+      * (log F, log sigma): a Gaussian copula of correlation
+        `SIZE_FLUX_RHO` over a bounded power-law flux and a log-normal size.
+        The copula density is evaluated at x = Phi^-1(F's CDF) and
+        y = (log sigma - median) / spread, which IS Phi^-1 of sigma's CDF.
+      * logit rho: rho ~ U(a, b), so the logit carries a rho(1-rho) Jacobian.
+      * (e1, e2): P(e) ~ e exp(-e^2/2 sigma_e^2) on [0, 1) with a uniform
+        orientation, so the JOINT density in the plane drops the radial `e`
+        (it is the polar Jacobian) and is flat in angle.
+
+    Outside any block's support the density is zero, returned as -inf rather
+    than clipped: a target that could not have been drawn must not be given a
+    finite prior, or the estimator silently invents support.
+    """
+    log_f, log_sigma, logit_rho, e1, e2 = (theta[..., 0], theta[..., 1],
+                                           theta[..., 2], theta[..., 3],
+                                           theta[..., 4])
+
+    # --- flux x size, coupled by a Gaussian copula -------------------------
+    lo, hi = sim.FLUX_RANGE
+    b = 1.0 - sim.FLUX_ALPHA
+    f = jnp.exp(log_f)
+    # p(F) ~ F^-alpha normalised on [lo, hi]; in log F that is F^b / Zf.
+    z_f = (hi**b - lo**b) / b
+    log_p_logf = b * log_f - jnp.log(z_f)
+    u = (f**b - lo**b) / (hi**b - lo**b)
+    x = ndtri(jnp.clip(u, 1e-12, 1.0 - 1e-12))
+
+    s = sim.SIZE_LOGSTD
+    y = (log_sigma - sim.GAUSS2_FWD_SIZE_LOGMEDIAN) / s
+    log_p_logsigma = -0.5 * y * y - jnp.log(s) - 0.5 * jnp.log(2.0 * jnp.pi)
+
+    r = sim.SIZE_FLUX_RHO
+    one_m = 1.0 - r * r
+    log_c = -(r * r * (x * x + y * y) - 2.0 * r * x * y) / (2.0 * one_m) \
+        - 0.5 * jnp.log(one_m)
+
+    # --- bulge/disc size ratio ---------------------------------------------
+    a_rho, b_rho = sim.GAUSS2_FWD_RHO_RANGE
+    rho = jax.nn.sigmoid(logit_rho)
+    log_p_rho = jnp.log(rho) + jnp.log1p(-rho) - jnp.log(b_rho - a_rho)
+
+    # --- ellipticity --------------------------------------------------------
+    se = sim.GAUSS2_FWD_ELLIP_SIGMA
+    e_sq = e1 * e1 + e2 * e2
+    # Z_e = int_0^1 e exp(-e^2/2 se^2) de, so the plane density is
+    # exp(-e^2/2 se^2) / (2 pi Z_e).
+    z_e = se * se * (1.0 - jnp.exp(-0.5 / (se * se)))
+    log_p_e = -0.5 * e_sq / (se * se) - jnp.log(2.0 * jnp.pi * z_e)
+
+    total = log_p_logf + log_p_logsigma + log_c + log_p_rho + log_p_e
+    in_support = ((f > lo) & (f < hi) & (rho > a_rho) & (rho < b_rho)
+                  & (e_sq < 1.0))
+    return jnp.where(in_support, total, -jnp.inf)
 
 
 def log_p0(m):
-    """log P0(m), the LATENT (unsheared) moment density, up to -log Z (see the
-    module docstring).  `m` is a single (5,) target.
+    """log P0(m), the LATENT (unsheared) moment density.  `m` is a (5,) target.
 
-    P0 is Gaussian in the chart `to_coords` builds, so this is that Gaussian's
-    log density plus the change-of-variables log|det dt/dm| -- a Cholesky
-    solve rather than an explicit inverse of `sim.GAUSS2_COV`, the usual
-    numerically stable way to get a quadratic form and a log-det together.
+    The population is FORWARD-sampled in galaxy parameters, so the moment
+    density is a pushforward: solve for the galaxy, evaluate the box density
+    there, and divide by |det dm/dtheta|.
+
+    This replaced a Gaussian-in-chart-coordinates P0 on 2026-09-05.  That P0
+    was drawn in MOMENT space and inverted, which rejects ~80% of draws and
+    leaves the realised population a truncated Gaussian rather than the fitted
+    one -- 0.41 sd on the size axis against 0.84 (see
+    `sim.sample_population_gauss2_fwd`).  The pushforward also removes the
+    unknown `Z` and the g-DEPENDENT support boundary that truncation carried:
+    the accepted set was a set of galaxies, so its image in moment space moved
+    with g, which is not something a g-independent constant can absorb.
     """
-    t = to_coords(m)
-    mu = jnp.asarray(sim.GAUSS2_MU)
-    cov = jnp.asarray(sim.GAUSS2_COV)
-    L = jnp.linalg.cholesky(cov)
-    y = jax.scipy.linalg.solve_triangular(L, t - mu, lower=True)
-    quad = jnp.dot(y, y)
-    log_det_cov = 2.0 * jnp.sum(jnp.log(jnp.diag(L)))
-    log_norm = -0.5 * (quad + log_det_cov + 5.0 * jnp.log(2.0 * jnp.pi))
-
-    jac = jax.jacfwd(to_coords)(m)
-    _, logdet_j = jnp.linalg.slogdet(jac)
-    return log_norm + logdet_j
+    theta, _residual = analytic.theta_of_m(m)
+    j0 = jax.jacfwd(lambda th: analytic.moments(th, jnp.zeros(2)))(theta)
+    _, ld0 = jnp.linalg.slogdet(j0)
+    return log_p_theta(theta) - ld0
 
 
 def log_prob(m, g):
@@ -156,12 +221,12 @@ def log_prob(m, g):
     theta_g0, _residual = analytic.theta_of_m(m)   # solves moments(., 0) == m
     theta = analytic.sheared_theta(theta_g0, -g)    # the g-shear solution
 
-    m0 = analytic.moments(theta, zero)
-    j0 = jax.jacfwd(lambda th: analytic.moments(th, zero))(theta)
     jg = jax.jacfwd(lambda th: analytic.moments(th, g))(theta)
-    _, ld0 = jnp.linalg.slogdet(j0)
     _, ldg = jnp.linalg.slogdet(jg)
-    return log_p0(m0) + ld0 - ldg
+    # log_p0(m0) + ld0 - ldg, with log_p0's own solve and its -ld0 cancelled
+    # against the +ld0: theta_of_m(m0) IS this theta, so the pushforward
+    # collapses to one term and saves the second 30-step Newton solve.
+    return log_p_theta(theta) - ldg
 
 
 def log_prob_batch(ms, gs, batch_size=512):

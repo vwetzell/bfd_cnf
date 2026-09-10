@@ -73,6 +73,14 @@ def _rotate_sigma(sx, phi):
     return jnp.array([out[0, 0], out[0, 1], out[1, 1]])
 
 
+def _assert_rotation_equivariant(layer, z, sigma_x):
+    """Rotating the galaxy AND Sigma_X must rotate `unmarginalize`'s answer."""
+    for phi in (0.3, 1.1, 2.7):
+        a = _rotate(layer.unmarginalize(z, sigma_x), phi)
+        b = layer.unmarginalize(_rotate(z, phi), _rotate_sigma(sigma_x, phi))
+        assert float(jnp.abs(a - b).max()) < 1e-8, phi
+
+
 def test_identity_at_zero_sigma():
     """No centroid uncertainty, no marginalisation.  Exact within `_transport`
     itself (P = 0 makes every term in it trivially exact) -- but this layer
@@ -112,10 +120,42 @@ def test_rotation_equivariance():
     part, and R (built the same way from the galaxy's own M1, M2) rotates the
     same way, so the whole transport commutes with a joint rotation.
     """
-    for phi in (0.3, 1.1, 2.7):
-        a = _rotate(LAYER.unmarginalize(Z, SIGMA_X_ANISO), phi)
-        b = LAYER.unmarginalize(_rotate(Z, phi), _rotate_sigma(SIGMA_X_ANISO, phi))
-        assert float(jnp.abs(a - b).max()) < 1e-8, phi
+    _assert_rotation_equivariant(LAYER, Z, SIGMA_X_ANISO)
+
+
+def test_equivariance_survives_asymmetric_stored_chart_constants():
+    """The layer must symmetrise its OWN frozen chart, not trust what it was given.
+
+    Every other rotation test here hands the layer a chart that is already
+    isotropic (`MEAN`, `STD` above), so none of them can see the failure this
+    guards: `bulk.build_flow` and `bulk.sync_chart_constants` both copy
+    `chart.mean`/`chart.std` RAW, while `RawMomentStandardize` only ever reads
+    `_effective()` -- and a trained checkpoint's raw spin-2 pair DRIFTS APART
+    (1.00133 at init, 1.01458 on `centroid_v10.eqx`).  Left raw, the layer
+    decoded M1 and M2 with two different scales and a nonzero mean, and its map
+    was not rotation-equivariant: 4.3e-5 at p50 against a 8.6e-7 float32 floor.
+
+    The stored values here are exaggerated (5% apart) so the assertion has
+    headroom over the tolerance rather than sitting on it.
+    """
+    skew_mean = MEAN.at[3].set(0.004).at[4].set(-0.011)
+    skew_std = STD.at[3].set(0.041).at[4].set(0.039)
+    layer = CentroidMarginalize(mean=skew_mean, std=skew_std)
+
+    # `chart()` is `_effective`: zero spin-2 mean, one shared spin-2 scale.
+    mean, std = layer.chart()
+    assert float(jnp.abs(mean[3:]).max()) == 0.0
+    assert float(std[3]) == float(std[4])
+    assert abs(float(std[3]) - float(jnp.sqrt(0.5 * (skew_std[3] ** 2
+                                                     + skew_std[4] ** 2)))) < 1e-12
+    # and the spin-0 slots are untouched.
+    assert bool(jnp.array_equal(mean[:3], skew_mean[:3]))
+    assert bool(jnp.array_equal(std[:3], skew_std[:3]))
+
+    # The map is equivariant DESPITE the asymmetric stored constants, which is
+    # the property the fix exists for.
+    z = _to_z(M)
+    _assert_rotation_equivariant(layer, z, SIGMA_X_ANISO)
 
 
 def test_isotropic_sigma_x_leaves_no_preferred_direction():
@@ -402,63 +442,125 @@ def test_sampler_is_the_weighted_distribution():
     assert abs(share - w2[:per_gal].sum() / w2.sum()) < 2e-3, share
 
 
-if __name__ == "__main__":
-    for name, fn in sorted(list(globals().items())):
-        if name.startswith("test_"):
-            fn()
-            print(f"  {name} ok")
-    print("ok")
+def test_spin2_coeff_is_a_no_op_at_one_and_is_linear_in_the_departure():
+    """`c_spin2` moves dM1/dM2 through tr(Sigma_u) and dMr through its traceless
+    part -- the two contractions of the SAME k^4 spin-2 bracket.
 
-
-def test_gain_is_a_no_op_at_one_and_scales_the_spin2_shift():
-    """`gain` amplifies the ellipticity shift and leaves Mf, Mr untouched.
-
-    The layer's ansatz undershoots the ellipticity response ~30% on realistic
-    populations (see `_transport`'s docstring); the gain is the population
-    calibration that closes it.  Default 1.0 must reproduce the old numbers
-    exactly, so every checkpoint written before it existed still means what it
-    used to.
+    1.0 is the Gaussian/Wick value, so it must reproduce the bare ansatz bit
+    for bit.  Away from it the correction is first order by construction, so
+    the shift must be exactly linear in (c - 1): a quadratic term would mean
+    the bracket had been wired into the resummed backbone by mistake.
     """
     base = _transport(M, SIGMA_X, 1.0)
     assert float(jnp.abs(_transport(M, SIGMA_X, 1.0, 1.0) - base).max()) == 0.0
 
-    e = lambda m: jnp.stack([m[2] / m[1], m[3] / m[1]])
-    e0, e1 = e(M), e(base)
-    for gain in (0.5, 1.38, 2.0):
-        got = _transport(M, SIGMA_X, 1.0, gain)
-        # spin-0 channels are deliberately untouched by the gain
-        assert float(jnp.abs(got[0] - base[0]) / base[0]) < 1e-7, gain
-        assert float(jnp.abs(got[1] - base[1]) / base[1]) < 1e-7, gain
-        # and the ellipticity SHIFT is scaled by exactly the gain
-        want = e0 + gain * (e1 - e0)
-        assert float(jnp.abs(e(got) - want).max()) < 1e-6, gain
+    d1 = _transport(M, SIGMA_X_ANISO, 1.0, 1.5) - _transport(M, SIGMA_X_ANISO, 1.0)
+    d2 = _transport(M, SIGMA_X_ANISO, 1.0, 2.0) - _transport(M, SIGMA_X_ANISO, 1.0)
+    assert float(jnp.abs(d2 - 2.0 * d1).max()) < 1e-6 * float(jnp.abs(M).max())
+    # Mf carries no k^4 bracket at all, so it must not move.
+    assert float(jnp.abs(d2[0]) / M[0]) < 1e-12
+    # Mr and the spin-2 pair must all move, or the contraction is wired wrong.
+    # Mr's leverage is ~35x weaker than the spin-2 pair's: it sees the bracket
+    # only through Sigma_u's traceless part, which is |s|/s0 ~ 2|e| of the
+    # trace the spin-2 channels see.
+    for j in (1, 2, 3):
+        assert float(jnp.abs(d2[j]) / jnp.abs(M[j])) > 1e-8, j
 
 
-def test_round_trip_survives_a_gain():
-    """A gain leaves the layer invertible to well under the tanh cap.
+def test_spin2_coeff_is_real_so_the_layer_stays_parity_even():
+    """A reflection must commute with the layer.
 
-    The two directions are exact inverses only for the bare ansatz; scaling
-    the displacement breaks that at second order in a shift that is itself
-    ~1e-2, so the residual must stay far below the 1e-5 the bare layer holds
-    to be harmless.  Checked at an anisotropic Sigma_X, where R and Sigma_u do
-    not commute.
+    `c_spin2` is real precisely so it cannot rotate the k^4 spin-2 moment away
+    from the k^2 one; a complex coefficient would survive this only for a
+    parity-violating population.  Reflect about the x axis: M2 -> -M2 and
+    Sigma_X's off-diagonal flips.
     """
-    for gain in (0.7, 1.38):
-        layer = CentroidMarginalize(mean=MEAN, std=STD, gain=gain)
+    flip = lambda z: z.at[4].multiply(-1.0)
+    sx = jnp.array([SIGMA_X_ANISO[0], -SIGMA_X_ANISO[1], SIGMA_X_ANISO[2]])
+    layer = CentroidMarginalize(mean=MEAN, std=STD)
+    a = flip(layer.unmarginalize(Z, SIGMA_X_ANISO))
+    b = layer.unmarginalize(flip(Z), sx)
+    assert float(jnp.abs(a - b).max()) < 1e-8
+
+
+def test_round_trip_survives_a_spin2_coefficient():
+    """A departure from the Gaussian bracket leaves the layer invertible.
+
+    The two directions were never EXACT inverses -- Sigma_u is re-solved from
+    whichever point is handed in -- so what matters is that the correction adds
+    nothing on top of the round-trip error the bare ansatz already carries.
+    Checked at an anisotropic Sigma_X, where R and Sigma_u do not commute.
+    """
+    layer = CentroidMarginalize(mean=MEAN, std=STD)
+    import equinox as _eqx
+    for c in (0.5, 2.0):
+        bumped = _eqx.tree_at(lambda l: l.coeff.layers[-1].bias, layer,
+                              jnp.full((1,), c - 1.0))
         for sx in (SIGMA_X, SIGMA_X_ANISO):
-            y, ld = layer.inverse_and_log_det(Z, sx)
-            x, ld2 = layer.transform_and_log_det(y, sx)
-            assert float(jnp.abs(x - Z).max()) < 1e-3, (gain, sx)
-            assert abs(float(ld + ld2)) < 1e-3, (gain, sx)
+            y, ld = bumped.inverse_and_log_det(Z, sx)
+            x, ld2 = bumped.transform_and_log_det(y, sx)
+            assert float(jnp.abs(x - Z).max()) < 1e-3, (c, sx)
+            assert abs(float(ld + ld2)) < 1e-3, (c, sx)
 
 
-def test_gain_keeps_the_rotation_equivariance():
-    """The gain scales a spin-2 vector, so it cannot introduce a direction."""
-    layer = CentroidMarginalize(mean=MEAN, std=STD, gain=1.38)
-    for phi in (0.3, 1.1, 2.7):
-        a = _rotate(layer.unmarginalize(Z, SIGMA_X_ANISO), phi)
-        b = layer.unmarginalize(_rotate(Z, phi), _rotate_sigma(SIGMA_X_ANISO, phi))
-        assert float(jnp.abs(a - b).max()) < 1e-8, phi
+def test_coeff_net_starts_at_the_gaussian_value():
+    """Zeroed output layer => both coefficients are 1 exactly, whatever the
+    hidden init."""
+    layer = CentroidMarginalize(mean=MEAN, std=STD)
+    m = raw_from_standard(Z, MEAN, STD)
+    assert [float(v) for v in layer.bracket_coeffs(m, MEAN, STD)] == [1.0, 1.0]
+
+
+def test_spin4_moves_only_the_spin2_channels():
+    """`c_spin4` may touch M1 and M2 and nothing else.
+
+    A trace cannot see a spin-4 moment, so `K` appears in neither dMf nor dMr.
+    If it moves either, the bracket has been contracted with the wrong part of
+    Sigma_u.  It also has to vanish on a ROUND galaxy, where `K` itself is 0.
+
+    Mc is the one exception, and only at second order: it is corrected
+    DIFFERENTIALLY through `mc_ansatz_out`, which is a function of M1_out and
+    M2_out, so moving the spin-2 channels drags it by O(|e| dM1 / Mf).  That is
+    the ansatz staying self-consistent, not a spin-4 bracket of its own, so it
+    is bounded well below the spin-2 move rather than pinned at zero.
+    """
+    base = _transport(M, SIGMA_X_ANISO, 1.0)
+    got = _transport(M, SIGMA_X_ANISO, 1.0, 1.0, 2.5)
+    assert float(jnp.abs(got[0] - base[0]) / base[0]) < 1e-12
+    assert float(jnp.abs(got[1] - base[1]) / base[1]) < 1e-12
+    assert float(jnp.abs(got[4] - base[4]) / base[4]) < 1e-6
+    for j in (2, 3):
+        assert float(jnp.abs(got[j] - base[j]) / jnp.abs(M[j])) > 1e-9, j
+
+    round_m = M.at[2].set(0.0).at[3].set(0.0)
+    a = _transport(round_m, SIGMA_X_ANISO, 1.0)
+    b = _transport(round_m, SIGMA_X_ANISO, 1.0, 1.0, 2.5)
+    assert float(jnp.abs(a - b).max()) == 0.0
+
+
+def test_spin4_leverage_is_e_squared_below_spin2():
+    """`K`'s pull on the spin-2 channels is |e|^2 times `N`'s, up to O(1).
+
+    This is why the two coefficients are near-degenerate on a circular-PSF
+    population, and it is worth pinning: if a refactor ever gave `K` the
+    trace contraction by mistake, this ratio would jump by ~1/|e|^2.
+    """
+    d2 = _transport(M, SIGMA_X_ANISO, 1.0, 2.0) - _transport(M, SIGMA_X_ANISO, 1.0)
+    d4 = (_transport(M, SIGMA_X_ANISO, 1.0, 1.0, 2.0)
+          - _transport(M, SIGMA_X_ANISO, 1.0))
+    e2 = float((M[2] ** 2 + M[3] ** 2) / M[1] ** 2)
+    ratio = float(jnp.abs(d4[2]) / jnp.abs(d2[2]))
+    assert 0.05 * e2 < ratio < 20.0 * e2, (ratio, e2)
+
+
+def test_spin2_coeff_keeps_the_rotation_equivariance():
+    """The coefficient sees only rotation-invariant inputs, so it cannot
+    introduce a direction."""
+    layer = CentroidMarginalize(mean=MEAN, std=STD)
+    import equinox as _eqx
+    layer = _eqx.tree_at(lambda l: l.coeff.layers[-1].bias, layer,
+                         jnp.full((1,), 0.4))
+    _assert_rotation_equivariant(layer, Z, SIGMA_X_ANISO)
 
 
 def test_flux_sas_is_the_identity_by_default_and_inverts_when_set():
@@ -508,3 +610,11 @@ def test_flux_sas_log_det_matches_autodiff():
         _, ld = ch.transform_and_log_det(m)
         j = jax.jacfwd(lambda v: ch.transform_and_log_det(v)[0])(m)
         assert abs(float(jnp.linalg.slogdet(j)[1] - ld)) < 1e-6, scale
+
+
+if __name__ == "__main__":
+    for name, fn in sorted(list(globals().items())):
+        if name.startswith("test_"):
+            fn()
+            print(f"  {name} ok")
+    print("ok")

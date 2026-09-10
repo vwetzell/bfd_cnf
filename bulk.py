@@ -52,8 +52,10 @@ from flowjax.bijections import Chain, Invert, Permute
 from flowjax.distributions import MultivariateNormal, Transformed
 from paramax import non_trainable
 
-from models.bijections import EquivariantAutoregressiveLayer, RawMomentStandardize
-from models.centroid import CentroidMarginalize
+from models.bijections import (EquivariantAutoregressiveLayer,
+                               RawMomentStandardize, SigmaXBlockLayer,
+                               in_support)
+from models.centroid import CentroidMarginalize  # noqa: F401 -- kept importable, see build_flow
 from models.shear import ShearResponse
 
 # All six permutations of the three spin-0 slots.  These are the orderings each
@@ -93,9 +95,15 @@ LAYERS = 8
 NN_WIDTH = 64
 NN_DEPTH = 2
 
-# The flow works in t = [log10(Mf), Mr/Mf, Mc/Mr, M1/Mr, M2/Mr]
-# (RawMomentStandardize), standardised by the training set's own mean/std --
-# spin-0 first, spin-2 last.  Label the corner plot in it.
+# The flow works in t = [log10(Mf), logit(Mr/Mf / r*), logit(Mc/Mr / rc*),
+# M1/Mr, M2/Mr] (RawMomentStandardize), standardised by the training set's own
+# mean/std -- spin-0 first, spin-2 last.  Label the corner plot in it.
+#
+# Slots 1 and 2 are the BARE RATIOS.  They were logits once, and these labels
+# went on saying so after `_forward_transform` dropped them -- so a reader
+# comparing a plotted 3.15 against a catalog's Mr/Mf of 3.15 was told the axis
+# was a logit.  Read `RawMomentStandardize._forward_transform`, not this
+# comment, if they ever disagree again: that function IS the chart.
 COORD_LABELS = [r"$\log_{10}M_f$", r"$M_r / M_f$", r"$M_c / M_r$",
                 r"$M_1 / M_r$", r"$M_2 / M_r$"]
 LABEL_FONTSIZE, TICK_LABELSIZE = 34, 24
@@ -137,15 +145,12 @@ def to_coords(m, flux_sas=None):
     2's logits: this is what fixes the standardisation's mean/std, so the two
     must not drift apart.
     """
-    u = m[:, 1] / (POINT_SOURCE * m[:, 0])
-    v = m[:, 4] / (POINT_SOURCE_MC * m[:, 1])
     f = np.log10(m[:, 0])
     if flux_sas is not None:
         mu, sig, a, b = flux_sas
         f = np.sinh((np.arcsinh((f - mu) / sig) - a) / b)
-    return np.stack([f, np.log(u) - np.log1p(-u),
-                     np.log(v) - np.log1p(-v), m[:, 2] / m[:, 1], m[:, 3] / m[:, 1]],
-                    axis=-1)
+    return np.stack([f, m[:, 1] / m[:, 0], m[:, 4] / m[:, 1],
+                     m[:, 2] / m[:, 1], m[:, 3] / m[:, 1]], axis=-1)
 
 
 def coeff_stats(t, mean=None, std=None):
@@ -175,7 +180,7 @@ def coeff_stats(t, mean=None, std=None):
 
 
 def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH,
-               shear=False, centroid=False, centroid_gain=1.0,
+               shear=False, centroid=False,
                flux_sas=None):
     """Bulk flow standardised against `m_train`; conditioned on g and/or Sigma_X.
 
@@ -195,24 +200,23 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
     # a training set containing such a row would produce NaNs several layers
     # away from the cause.  Noisy moments DO reach up there -- they must be fed
     # through the convolution as latent draws, never straight into `log_prob`.
-    bad = int((m_train[:, 1] >= POINT_SOURCE * m_train[:, 0]).sum())
-    if bad:
-        raise ValueError(
-            f"{bad} training moments are at or above the point-source ceiling "
-            f"Mr/Mf = {POINT_SOURCE}, where the flow's chart is undefined. "
-            "The bound is on the LATENT moment; if these are noisy "
-            "measurements they need a deconvolving objective, not this one.")
     t = to_coords(m_train, flux_sas)
     raw2standard = RawMomentStandardize(mean=t.mean(0), std=t.std(0),
                                         flux_sas=flux_sas)
     _u_stats = coeff_stats(t)
 
-    key, k_shear = jr.split(key, 2)
+    key, k_shear, k_centroid = jr.split(key, 3)
     keys = jr.split(key, layers)
     _incs = _spin0_increments(layers)
     bulk = []
     for i, k in enumerate(keys):
-        bulk.append(EquivariantAutoregressiveLayer(k, nn_width, nn_depth, jax.nn.silu))
+        # Exactly ONE layer gets the spin-2 radial bend, the last one: the tail
+        # index composes multiplicatively across layers, so a stack of them
+        # bounds nothing (see `Spin2CouplingLayer`).  Last rather than first
+        # because it acts on coordinates already close to the standard normal
+        # base, where the map it has to make is the most predictable.
+        bulk.append(EquivariantAutoregressiveLayer(
+            k, nn_width, nn_depth, jax.nn.silu, bend=(i == 0)))
         # Cycle through all six orderings of the three SPIN-0 coordinates, so no
         # one of them is permanently the unconditional head of the autoregression
         # and every pairwise dependence gets modelled in both directions.  The
@@ -258,14 +262,128 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
         u_mean=_u_stats[0], u_white=_u_stats[1],
         chart_loc=t.mean(0)[:3], chart_scale=t.std(0)[:3])
         if shear else None)
-    head = ([CentroidMarginalize(cond_dim=cond or 3,
-                                 mean=t.mean(0), std=t.std(0),
-                                 gain=centroid_gain, flux_sas=flux_sas)]
+    # SigmaXBlockLayer (models/bijections.py) replaces CentroidMarginalize here:
+    # a closed-form, invertible-by-construction block on the standardised
+    # z-coordinates, conditioned on the same [g1, g2, C00, C01, C11] vector
+    # (it converts C00/C01/C11 -> [log_scale, e1, e2] internally, see its
+    # `_unpack`). `log_scale_mean`/`e_max` are calibrated to this population's
+    # own Sigma_X (see `bulk.build_flow`'s docstring / HANDOFF for the
+    # measurement) -- do not copy them to a different population without
+    # re-checking `cov_odd`.
+    # `size_loc` anchors net_size's multiplicative kappa at the chart's OWN
+    # pre-standardisation mean/std of slot 1 (Mr/Mf logit), same `t` used to
+    # build `raw2standard` a few lines above -- see `SigmaXCouplingLayer`'s
+    # docstring ("c1 = mu1/sigma1 ... equals kappa x (Mr/Mf) on the
+    # un-centred ratio").  Without it, `y1 = kappa*x1` is a pure scaling
+    # through zero, and since `x1` is chart-standardised to zero population
+    # mean, no constant kappa can produce a net population-level size shift
+    # -- exactly why net_size never moved off its zero-shift plateau.
+    head = ([SigmaXBlockLayer(k_centroid, full_cond_dim=cond or 3,
+                              log_scale_mean=10.8, e_max=0.1,
+                              size_loc=float(t.mean(0)[1] / t.std(0)[1]))]
             if centroid else []) + \
            ([shear_layer] if shear else [])
     bijection = Invert(Chain([raw2standard, *head, *bulk]).merge_chains())
     base = non_trainable(MultivariateNormal(jnp.zeros(5), jnp.eye(5)))
     return Transformed(base, bijection)
+
+
+def chart_of(flow):
+    """The `RawMomentStandardize` at the data boundary of a built flow.
+
+    `build_flow` puts it first in the data -> base chain, and `Invert` wraps the
+    chain, so it is `bijections[0]` whether or not the conditional layers are
+    present.
+    """
+    return flow.bijection.bijection.bijections[0]
+
+
+class SupportedFlow(eqx.Module):
+    """A prior with an explicit physical support and a defensive density floor.
+
+    Two independent corrections to what `flow.log_prob` returns, both of which
+    exist because NLL training says NOTHING about regions with no training data,
+    while the estimator's kernel draws visit them constantly:
+
+    1. **Support indicator** (`models.bijections.in_support`).  The integration
+       variable is a NOISELESS template moment, so the prior is exactly zero
+       past the point-source bounds.  Measured: 99.9% of out-of-support draws
+       were already being discarded as poisoned, so this barely moves the
+       numbers -- what it buys is that the boundary is now the physical surface
+       at an analytically known place, instead of wherever the flow's learned
+       extrapolation happened to fall off a cliff.
+
+    2. **Defensive floor**: `(1 - eps) P_flow + eps P_broad`, with `P_broad` a
+       wide Gaussian in the chart's standardised coordinates -- "a galaxy could
+       be anywhere physically allowed".  This is the part that carries weight.
+       For targets far from the boundary, 30.7% of kernel draws were poisoned
+       while comfortably INSIDE the support (0.08% outside): the flow answering
+       `log p ~ -1e7` in supported regions it simply never saw in training.  The
+       floor converts that into a controlled, smooth, tiny number.
+
+       It also fixes the gradient, which is the part that actually reaches the
+       shear estimate: where the flow's garbage dominates, `d(mixed)/d(lp)` is
+       `(1-eps) e^lp / (...)`, which is ~0.  So a nonsense score contributes
+       nothing to Q and R instead of contributing nonsense.
+
+    This is a REGULARISED PRIOR, not an importance-sampling trick -- the
+    estimand moves by O(eps), deliberately and computably, in exchange for
+    removing values that were wrong by many orders of magnitude.  `eps` is a
+    knob to be scanned, not a fitted parameter.
+
+    `P_broad`'s normalisation is not corrected for the support truncation.  It
+    does not need to be: an error of a factor `c` there is exactly equivalent to
+    using `eps * c`, so it is absorbed into the knob.
+    """
+
+    flow: eqx.Module
+    eps: float = eqx.field(static=True)
+    broad_std: float = eqx.field(static=True)
+    support: bool = eqx.field(static=True)
+
+    def __init__(self, flow, eps=1e-3, broad_std=4.0, support=True):
+        self.flow = flow
+        self.eps = float(eps)
+        self.broad_std = float(broad_std)
+        self.support = bool(support)
+
+    def __getattr__(self, name):
+        # Forward `.bijection`, `.sample`, `.base_dist`, ... to the wrapped
+        # flow.  Guarded against the fields themselves so unflattening, which
+        # touches attributes before they are all set, cannot recurse.
+        if name.startswith("__") or name in ("flow", "eps", "broad_std",
+                                             "support"):
+            raise AttributeError(name)
+        return getattr(self.flow, name)
+
+    def _log_broad(self, x):
+        """log of a wide Gaussian on the chart's standardised coordinates,
+        pushed back to raw-moment space by the chart's own log-det.
+
+        flowjax's bijections assert their declared `shape`, so the chart has to
+        be vmapped over leading axes by hand -- `flow.log_prob` does the same
+        internally, which is why it accepts batches and this would not.
+        """
+        flat = x.reshape(-1, 5)
+        z, lad = jax.vmap(chart_of(self.flow).transform_and_log_det)(flat)
+        s = self.broad_std
+        lb = (-0.5 * jnp.sum((z / s) ** 2, axis=-1)
+              - 5.0 * jnp.log(s) - 2.5 * jnp.log(2.0 * jnp.pi) + lad)
+        return lb.reshape(x.shape[:-1])
+
+    def log_prob(self, x, condition=None):
+        lp = self.flow.log_prob(x, condition=condition)
+        # A non-finite flow value is garbage, not information; let the floor
+        # carry those rows rather than propagating a NaN through the mixture.
+        lp = jnp.where(jnp.isfinite(lp), lp, -jnp.inf)
+        if self.eps <= 0.0:
+            mixed = lp
+        else:
+            mixed = jnp.logaddexp(jnp.log1p(-self.eps) + lp,
+                                  jnp.log(self.eps) + self._log_broad(x))
+        if not self.support:
+            return mixed
+        return jnp.where(in_support(x), mixed, -jnp.inf)
 
 
 def sync_chart_constants(flow, m_train=None):
@@ -327,6 +445,11 @@ def sync_chart_constants(flow, m_train=None):
                 values += [non_trainable(jnp.asarray(u_stats[0], jnp.float32)),
                            non_trainable(jnp.asarray(u_stats[1], jnp.float32))]
             flow = eqx.tree_at(lambda f: [g(f) for g in getters], flow, values)
+    # SigmaXBlockLayer (build_flow's current centroid layer) has no frozen
+    # chart mean/std of its own -- it operates on already-standardised z, so
+    # there is nothing to resync for it and this loop is a no-op on a flow
+    # built after this port.  It still matters for a warm-start graft of an
+    # OLDER flow that still carries a CentroidMarginalize layer.
     for i, b in enumerate(flow.bijection.bijection.bijections):
         if isinstance(b, CentroidMarginalize):
             flow = eqx.tree_at(

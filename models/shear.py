@@ -219,8 +219,10 @@ _LOGIT_MAX = 6.9
 def _chart_spin0_jac(z, loc, scale):
     """dz_i/d(raw log X) for the three spin-0 slots: the M above, shape (3, 3)."""
     # 1/(1 - u) = 1 + exp(logit u), and slots 1 and 2 carry logit u, logit v.
-    logit = jnp.clip(scale[1:3] * z[1:3] + loc[1:3], -_LOGIT_MAX, _LOGIT_MAX)
-    d1, d2 = (1.0 + jnp.exp(logit)) / scale[1:3]
+    # Bare-ratio chart: z1 = (Mr/Mf - loc1)/scale1, so
+    # dz1/d ln Mr = (Mr/Mf)/scale1, and likewise dz2/d ln Mc = (Mc/Mr)/scale2.
+    # No 1/(1-u): the coordinate no longer diverges at the point-source limit.
+    d1, d2 = (scale[1:3] * z[1:3] + loc[1:3]) / scale[1:3]
     d0 = 1.0 / (scale[0] * jnp.log(10.0))
     zero = jnp.zeros_like(d0)
     return jnp.stack([jnp.stack([d0, zero, zero]),
@@ -398,6 +400,20 @@ class ShearResponse(AbstractBijection):
         return response(self.coeffs(f, a, b, q), x, g, unwrap(self.e_scale),
                         unwrap(self.chart_loc), unwrap(self.chart_scale))
 
+    def response_tensors(self, x):
+        """`(Q, R)` at `x`: `unshear`'s own first and second g-derivatives.
+
+        `response` IS `z + Q @ g + 0.5 g.R.g` and `project_to_physics` builds
+        `Q`, `R` at `jnp.zeros(2)` from `x` alone -- its `g` argument is dead,
+        never read.  So these tensors are exactly `d unshear/dg` and
+        `d2 unshear/dg2` at g = 0, available in closed form, and there is no
+        reason to recover them by differentiating `unshear` with respect to g.
+        """
+        f, a, b, q, _ = _invariants(x)
+        return project_to_physics(
+            self.coeffs(f, a, b, q), x, jnp.zeros(2), unwrap(self.e_scale),
+            unwrap(self.chart_loc), unwrap(self.chart_scale))
+
     def shear(self, y, condition):
         """Invert `unshear` in closed form, by inverting its g-series.
 
@@ -408,7 +424,16 @@ class ShearResponse(AbstractBijection):
             X = y - A.g + (1/2) g.[ (C + C^T) - B ].g,   C_iab = d_j A_ia A_jb
 
         with A, B and dA/dx all evaluated at y.  No iteration, no solve, no
-        convergence criterion -- three nested jacfwd calls of fixed cost.
+        convergence criterion.
+
+        A and B are READ OFF `response_tensors`, not differentiated out of
+        `unshear`.  They are `Q` and `R`, which `project_to_physics` already
+        builds in closed form; recovering them with `jacfwd(unshear, argnums=1)`
+        and its double meant differentiating THROUGH `project_to_physics` --
+        which itself contains a `jacfwd` and a `hessian` -- so the old `a`, `b`,
+        `B` stack ran three and four levels of nesting deep to reproduce
+        tensors already in hand.  Only `dA/dx` is a real derivative and it stays
+        one `jacfwd`.  Identical to float32 roundoff (`tests/test_shear.py`).
 
         The residual is O(g^3), which is the order at which `response` stops
         modelling anything: the layer IS a second-order shear response, so
@@ -421,11 +446,10 @@ class ShearResponse(AbstractBijection):
         `unshear`, so the residual biases nothing, it only costs ESS.
         """
         g = condition[:2]
-        zero = jnp.zeros(2)
-        A = lambda x: jax.jacfwd(self.unshear, argnums=1)(x, zero)
-        a = A(y)                                                # (5, 2)
-        b = jax.jacfwd(A)(y)                                    # (5, 2, 5)
-        B = jax.jacfwd(jax.jacfwd(self.unshear, argnums=1), argnums=1)(y, zero)
+        a, B = self.response_tensors(y)                         # (5,2), (5,2,2)
+        # The one genuine derivative: dQ/dx.  `response_tensors`' R is unused
+        # inside here and XLA drops it.
+        b = jax.jacfwd(lambda x: self.response_tensors(x)[0])(y)  # (5, 2, 5)
         C = jnp.einsum("iaj,jb->iab", b, a)                     # (5, 2, 2)
         quad = C + C.transpose(0, 2, 1) - B
         return y - a @ g + 0.5 * jnp.einsum("iab,a,b->i", quad, g, g)

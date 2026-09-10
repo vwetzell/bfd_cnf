@@ -18,6 +18,9 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
+import bias  # noqa: E402
+import bulk  # noqa: E402
+import jax.random as jr  # noqa: E402
 from bias import (  # noqa: E402  (after the x64 flag)
     ess, kernel_draws, log_conv, log_conv_is, mixture_draws, pqr_streamed)
 from models.bijections import in_domain  # noqa: E402
@@ -105,30 +108,37 @@ def exact(M, g):
             - 0.5 * np.linalg.slogdet(2 * np.pi * S)[1])
 
 
-def test_convolution_and_its_shear_derivatives():
-    M = MU0 + np.array([2.0e2, -8.0e2, 3.0e2, -2.0e2, 5.0e3])   # a target
-    eps = kernel_draws(COV, 1, 400_000, seed=7)[0]
-    f = lambda g: log_conv(GaussPrior(), jnp.asarray(M), jnp.asarray(eps), g)
+def _assert_matches_exact_conv(f, M, tol_logp, tol_q=3e-3, tol_r=4e-3):
+    """Shared check for `test_convolution_and_its_shear_derivatives`,
+    `test_mixture_is_unbiased_against_the_exact_convolution` and
+    `test_mismatched_proposal_is_still_unbiased`: logP, Q and R at g = 0 must
+    match the closed-form Gaussian convolution, and logP must still match away
+    from zero shear, where mu(g) has moved."""
+    A = np.linalg.inv(S0 + COV)
+    q_true = DMU @ A @ (M - MU0)
+    r_true = -DMU @ A @ DMU.T
 
     zero = jnp.zeros(2)
     logP = float(f(zero))
     q = np.asarray(jax.grad(f)(zero))
     r = np.asarray(jax.hessian(f)(zero))
 
-    # Exact values.  R is constant for a Gaussian, so it is the sharpest test.
-    A = np.linalg.inv(S0 + COV)
-    q_true = DMU @ A @ (M - MU0)
-    r_true = -DMU @ A @ DMU.T
+    assert abs(logP - exact(M, np.zeros(2))) < tol_logp, (logP, exact(M, np.zeros(2)))
+    assert np.max(np.abs(q - q_true) / np.abs(q_true)) < tol_q, (q, q_true)
+    assert np.max(np.abs(r - r_true) / np.abs(r_true)) < tol_r, (r, r_true)
 
-    # Tolerances are ~2x the Monte Carlo scatter measured over seeds at this S;
-    # every structural way of getting the convolution wrong misses by far more.
-    assert abs(logP - exact(M, np.zeros(2))) < 6e-3, (logP, exact(M, np.zeros(2)))
-    assert np.max(np.abs(q - q_true) / np.abs(q_true)) < 3e-3, (q, q_true)
-    assert np.max(np.abs(r - r_true) / np.abs(r_true)) < 4e-3, (r, r_true)
-
-    # ...and at a shear well away from zero, where mu(g) has moved.
     g = jnp.array([0.05, -0.03])
-    assert abs(float(f(g)) - exact(M, np.asarray(g))) < 6e-3
+    assert abs(float(f(g)) - exact(M, np.asarray(g))) < tol_logp
+
+
+def test_convolution_and_its_shear_derivatives():
+    M = MU0 + np.array([2.0e2, -8.0e2, 3.0e2, -2.0e2, 5.0e3])   # a target
+    eps = kernel_draws(COV, 1, 400_000, seed=7)[0]
+    f = lambda g: log_conv(GaussPrior(), jnp.asarray(M), jnp.asarray(eps), g)
+
+    # Tolerance is ~2x the Monte Carlo scatter measured over seeds at this S;
+    # every structural way of getting the convolution wrong misses by far more.
+    _assert_matches_exact_conv(f, M, tol_logp=6e-3)
 
 
 def test_zero_kernel_is_the_point_evaluation():
@@ -175,27 +185,12 @@ def test_mixture_is_unbiased_against_the_exact_convolution():
     f = lambda g: log_conv_is(GaussPrior(), jnp.asarray(M), jnp.asarray(draws[0]),
                               jnp.asarray(log_wt[0]), g)
 
-    zero = jnp.zeros(2)
-    logP = float(f(zero))
-    q = np.asarray(jax.grad(f)(zero))
-    r = np.asarray(jax.hessian(f)(zero))
-
-    A = np.linalg.inv(S0 + COV)
-    q_true = DMU @ A @ (M - MU0)
-    r_true = -DMU @ A @ DMU.T
-
-    # Tolerances ~2x the scatter measured over 20 seeds at this S (half the
+    # Tolerance ~2x the scatter measured over 20 seeds at this S (half the
     # draws going to the flow component costs some precision relative to the
     # all-kernel test above): logP std 1.7e-3 (max 4.6e-3), q rel std 4e-4
-    # (max 1.5e-3), r rel std 4e-4 (max 1.6e-3).
-    assert abs(logP - exact(M, np.zeros(2))) < 8e-3, (logP, exact(M, np.zeros(2)))
-    assert np.max(np.abs(q - q_true) / np.abs(q_true)) < 3e-3, (q, q_true)
-    assert np.max(np.abs(r - r_true) / np.abs(r_true)) < 4e-3, (r, r_true)
-
-    # ...and at a shear well away from zero, where mu(g) has moved.  Measured
-    # scatter there: std 1.5e-3, max 3.8e-3 over 20 seeds.
-    g = jnp.array([0.05, -0.03])
-    assert abs(float(f(g)) - exact(M, np.asarray(g))) < 8e-3
+    # (max 1.5e-3), r rel std 4e-4 (max 1.6e-3); away from zero, std 1.5e-3,
+    # max 3.8e-3.
+    _assert_matches_exact_conv(f, M, tol_logp=8e-3)
 
 
 def test_mismatched_proposal_is_still_unbiased():
@@ -213,27 +208,12 @@ def test_mismatched_proposal_is_still_unbiased():
     f = lambda g: log_conv_is(GaussPrior(), jnp.asarray(M), jnp.asarray(draws[0]),
                               jnp.asarray(log_wt[0]), g)
 
-    zero = jnp.zeros(2)
-    logP = float(f(zero))
-    q = np.asarray(jax.grad(f)(zero))
-    r = np.asarray(jax.hessian(f)(zero))
-
-    A = np.linalg.inv(S0 + COV)
-    q_true = DMU @ A @ (M - MU0)
-    r_true = -DMU @ A @ DMU.T
-
-    # Tolerances ~2x the scatter measured over 20 seeds at this S: logP std
+    # Tolerance ~2x the scatter measured over 20 seeds at this S: logP std
     # 1.7e-3 (max 4.7e-3), q rel std 3.7e-4 (max 1.5e-3), r rel std 4.3e-4
     # (max 1.7e-3) -- close to the matched-proposal test's own numbers, because
-    # MismatchedPrior's offset (300) and width (1.5x) are both mild next to S0.
-    assert abs(logP - exact(M, np.zeros(2))) < 1e-2, (logP, exact(M, np.zeros(2)))
-    assert np.max(np.abs(q - q_true) / np.abs(q_true)) < 3e-3, (q, q_true)
-    assert np.max(np.abs(r - r_true) / np.abs(r_true)) < 4e-3, (r, r_true)
-
-    # ...and at a shear well away from zero, where mu(g) has moved.  Measured
-    # scatter there: std 1.5e-3, max 4.0e-3 over 20 seeds.
-    g = jnp.array([0.05, -0.03])
-    assert abs(float(f(g)) - exact(M, np.asarray(g))) < 1e-2
+    # MismatchedPrior's offset (300) and width (1.5x) are both mild next to S0;
+    # away from zero, std 1.5e-3, max 4.0e-3.
+    _assert_matches_exact_conv(f, M, tol_logp=1e-2)
 
 
 def test_pqr_streamed_proposal_draws_from_proposal_evaluates_with_flow():
@@ -331,6 +311,171 @@ def test_mixture_rescues_the_starved_kernel():
                              jnp.asarray(log_wt[0]), jnp.zeros(2)))
     # Scatter measured over 15 seeds at this (factor, S): std 5e-4, max 1.1e-3.
     assert abs(logP - exact_wide(M, np.zeros(2))) < 3e-3, (logP, exact_wide(M, np.zeros(2)))
+
+
+def test_gauge_k_is_the_same_convolution():
+    """`log_conv_is_kernel` is a change of variables inside ONE integral, not a
+    different estimator of a different thing.
+
+    `GaussPrior` is a pure translation, `P(m|g) = N(m; MU0 + g.DMU, S0)`, so its
+    pushforward map is exactly `Psi_g(u) = u + g.DMU` and every step of the gauge
+    algebra is checkable against a closed form.  Two claims are pinned here:
+
+    1. At g = 0 the two gauges are BIT-IDENTICAL on the same draws -- the
+       substitution is the identity there, so any sign slip, missing Jacobian or
+       confusion about which coordinate `c` lives in shows up as a nonzero diff.
+    2. With a kernel WIDE next to the prior -- the faint-end regime this exists
+       for, where `d_g log p` is large and `d_g log L` is not -- gauge K is the
+       better-conditioned one, by ~3x on Q and ~9x on R.
+
+    Note the module's own narrow `COV` is the OPPOSITE regime (S/N ~ 50), where
+    gauge P wins by 30x.  Neither gauge is universally better conditioned; what
+    makes gauge K necessary on real faint targets is that gauge P's `Var[d_g
+    log p]` does not exist there at all (Hill index 1.20), which no toy with a
+    Gaussian prior can exhibit.
+    """
+    M = MU0 + np.array([2.0e2, -8.0e2, 3.0e2, -2.0e2, 5.0e3])   # same target
+    psi = lambda u, g, sigma_x: u + g @ jnp.asarray(DMU)
+    assert np.allclose(np.asarray(psi(jnp.asarray(MU0), jnp.zeros(2), None)),
+                       MU0), "Psi must be the identity at g = 0"
+
+    def gauges(cov, seed=7):
+        draws, log_wt = mixture_draws(GaussPrior(), jnp.asarray([M]), cov,
+                                      400_000, 0.5, seed=seed)
+        x, lw = jnp.asarray(draws[0]), jnp.asarray(log_wt[0])
+        cinv = jnp.asarray(np.linalg.inv(cov))
+        ok = jnp.ones(x.shape[0], dtype=bool)
+        c = bias._gauge_k_c(GaussPrior(), x, lw, jnp.asarray(M), None, ok,
+                            peeled=False)
+        r0 = jnp.asarray(M) - x
+        return (lambda g: bias.log_conv_is_kernel(psi, r0, x, x, c, g, None,
+                                                  cinv, ok),
+                lambda g: log_conv_is(GaussPrior(), jnp.asarray(M), x, lw, g))
+
+    zero = jnp.zeros(2)
+    err = lambda got, want: float(np.max(np.abs(np.asarray(got) - want)
+                                         / np.abs(want)))
+
+    # (1) identical at g = 0, on this module's own narrow kernel.
+    fk, fp = gauges(COV)
+    assert float(fk(zero)) == float(fp(zero)), (float(fk(zero)), float(fp(zero)))
+    assert abs(float(fk(zero)) - exact(M, np.zeros(2))) < 8e-3
+
+    # (2) the wide-kernel regime, against the closed form.  Tolerances are 2x
+    # the max seen over five seeds (K: Q 1.0e-2, R 8.1e-3).
+    cov = 3.0 * S0
+    fk, fp = gauges(cov)
+    A = np.linalg.inv(S0 + cov)
+    q_true, r_true = DMU @ A @ (M - MU0), -DMU @ A @ DMU.T
+    qk, rk = jax.grad(fk)(zero), jax.hessian(fk)(zero)
+    assert err(qk, q_true) < 2.0e-2, (qk, q_true)
+    assert err(rk, r_true) < 1.6e-2, (rk, r_true)
+    # ...and better conditioned than gauge P on the same draws.
+    assert err(rk, r_true) < 0.5 * err(jax.hessian(fp)(zero), r_true)
+
+    # (3) still the same integral away from g = 0.
+    g = jnp.array([0.05, -0.03])
+    d = M - (MU0 + np.asarray(g) @ DMU)
+    S = S0 + cov
+    want = -0.5 * d @ np.linalg.solve(S, d) - 0.5 * np.linalg.slogdet(2 * np.pi * S)[1]
+    assert abs(float(fk(g)) - want) < 8e-3, (float(fk(g)), want)
+
+
+def test_psi_is_the_identity_at_zero_shear():
+    """`make_psi` builds `Psi_g = Phi^-1 . shear(., g) . Phi`, so at g = 0 it
+    must return its input EXACTLY -- it is a round trip through the chart and
+    the centroid layer with an identity in between.
+
+    Written after applying `cen.inverse` on the way out without `cen.transform`
+    on the way in, which left `chart^-1 . cen^-1 . chart`: still smooth, still
+    finite, still the identity in shape, and wrong by a median 0.76% of the
+    moment.  Nothing else in the estimator would have caught that -- log P and
+    the g = 0 value are unaffected, only Q and R move.
+
+    An untrained flow is enough: the identity is structural, not learned.
+    """
+    key = jr.key(0)
+    m_train = np.asarray(
+        jr.uniform(key, (256, 5), minval=jnp.asarray([2e3, 6e3, -5e2, -5e2, 3e4]),
+                   maxval=jnp.asarray([9e3, 2.4e4, 5e2, 5e2, 1.2e5])), np.float64)
+    # in_domain also bounds Mr/Mf and Mc/Mr; keep only rows the chart accepts.
+    m_train = m_train[np.asarray(in_domain(jnp.asarray(m_train)))]
+    assert len(m_train) > 32, len(m_train)
+
+    for centroid in (False, True):
+        flow = bulk.build_flow(key, m_train, shear=True, centroid=centroid)
+        psi = bias.make_psi(flow, peeled=False)
+        x = jnp.asarray(m_train[:16], jnp.float32)
+        # The catalogs' own Sigma_X (`cov_odd` ~ 1.15e4), not a token value:
+        # the centroid layer's shift scales with it, so at a small Sigma_X the
+        # layer is near-identity and the round trip passes either way -- the
+        # bug this pins was invisible at 4e-3 and is a clean 10x at the real one.
+        sigma_x = (jnp.tile(jnp.asarray([1.155e4, 0.0, 1.155e4]), (16, 1))
+                   if centroid else None)
+        got = jax.vmap(psi, in_axes=(0, None, 0 if centroid else None))(
+            x, jnp.zeros(2), sigma_x)
+        rel = np.max(np.abs(np.asarray(got) - np.asarray(x)) / np.abs(np.asarray(x)))
+        # float32 round trip through chart (+ centroid) leaves 3.3e-4; the
+        # dropped `cen.transform` leaves 3.5e-3.
+        assert rel < 1e-3, (f"centroid={centroid}", rel)
+
+
+def test_blend_is_exact_at_every_lambda():
+    """`log_conv_is_blend` is a rigid translation `m = u + t(g)` inside eq. (38),
+    so it is exact for ANY lambda -- that is what makes lambda free to be chosen
+    for variance alone, and it is the one property that must not be traded away.
+
+    Exercised in the WIDE-kernel regime, where every lambda is well conditioned,
+    so one tolerance covers all three.  (In the module's own narrow `COV` the
+    errors just track the regime: lambda = 0 lands at 1.5e-3 and lambda = 1 at
+    4.8e-2 on Q, with no lambda showing a bias that fails to shrink.)  A wrong
+    Jacobian, a mis-signed kernel term, or a lambda that leaked into the
+    estimand rather than only into its variance are all O(1) here.
+    """
+    M = MU0 + np.array([2.0e2, -8.0e2, 3.0e2, -2.0e2, 5.0e3])
+    # `log_conv_is_blend` takes a `make_psi_ld`-style map: (point, log-det).
+    # A rigid translation has unit Jacobian, hence log-det 0.
+    psi = lambda u, g, sigma_x: (u + g @ jnp.asarray(DMU), jnp.zeros(()))
+    zero = jnp.zeros(2)
+
+    def blend(cov, lam):
+        draws, log_wt = mixture_draws(GaussPrior(), jnp.asarray([M]), cov,
+                                      400_000, 0.5, seed=7)
+        x, lw = jnp.asarray(draws[0]), jnp.asarray(log_wt[0])
+        ok = jnp.ones(x.shape[0], dtype=bool)
+        return lambda g: bias.log_conv_is_blend(
+            GaussPrior(), psi, jnp.asarray(M), x, jnp.asarray(M) - x, lw, g,
+            None, jnp.asarray(np.linalg.inv(cov)), lam, ok)
+
+    cov = 3.0 * S0
+    A = np.linalg.inv(S0 + cov)
+    q_true, r_true = DMU @ A @ (M - MU0), -DMU @ A @ DMU.T
+    S = S0 + cov
+    # `exact` is hardcoded to the module's own COV, so the wide-kernel closed
+    # form has to be written out here.
+    logN = lambda g: (lambda d: -0.5 * d @ np.linalg.solve(S, d)
+                      - 0.5 * np.linalg.slogdet(2 * np.pi * S)[1])(
+                          M - (MU0 + np.asarray(g) @ DMU))
+    at_zero, away = logN(np.zeros(2)), logN(np.array([0.05, -0.03]))
+
+    for lam in (0.0, 0.5, 1.0):
+        f = blend(cov, lam)
+        # 2x the max over five seeds (worst lambda: Q 3.0e-2, R 7.3e-2).
+        assert abs(float(f(zero)) - at_zero) < 8e-3, lam
+        q, r = jax.grad(f)(zero), jax.hessian(f)(zero)
+        assert np.max(np.abs(np.asarray(q) - q_true) / np.abs(q_true)) < 6e-2, (lam, q)
+        assert np.max(np.abs(np.asarray(r) - r_true) / np.abs(r_true)) < 1.6e-1, (lam, r)
+        # away from zero too, where t(g) has actually moved the draws
+        assert abs(float(f(jnp.array([0.05, -0.03]))) - away) < 8e-3, lam
+
+    # lambda = 0 is `log_conv_is` to the bit, on this module's own kernel.
+    draws, log_wt = mixture_draws(GaussPrior(), jnp.asarray([M]), COV,
+                                  400_000, 0.5, seed=7)
+    x, lw = jnp.asarray(draws[0]), jnp.asarray(log_wt[0])
+    got = float(bias.log_conv_is_blend(
+        GaussPrior(), psi, jnp.asarray(M), x, jnp.asarray(M) - x, lw, zero, None,
+        jnp.asarray(np.linalg.inv(COV)), 0.0, jnp.ones(x.shape[0], dtype=bool)))
+    assert got == float(log_conv_is(GaussPrior(), jnp.asarray(M), x, lw, zero))
 
 
 if __name__ == "__main__":

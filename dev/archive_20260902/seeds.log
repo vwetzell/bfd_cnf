@@ -1,0 +1,126 @@
+##### SEED=0
+pushforward residual at g=(0.02,-0.01): median |d log p| = 1.16e-03, max 1.23e+03 nats over 29 targets
+
+gauge-K weight dropped for a non-finite dPsi/dg: median 0.00e+00, max 3.28e-04 of 1.0
+
+=== bulgedisc_deep_v2  flows/centroid_bulgedisc_v2.eqx   n=600, 4096 draws, alpha=0.5
+
+--- gauge P (current: g moves the prior)   median ESS 268
+ Mf quintile            A            B        R=A+B  Fisher R
+          q1   -6.085e+01    2.227e+02    1.618e+02    -0.057
+          q2   -4.683e+01    8.542e+01    3.859e+01    -0.224
+          q3   -4.988e+01    3.593e+01   -1.395e+01     0.912
+          q4   -2.118e+01    6.503e+00   -1.468e+01     1.154
+          q5   -1.851e+01    1.763e+00   -1.675e+01     1.200
+         ALL   -3.945e+01    7.046e+01    3.101e+01    -0.437
+
+--- gauge K (g moves the kernel, as BFD)   median ESS 268
+ Mf quintile            A            B        R=A+B  Fisher R
+          q1   -4.755e+01    2.627e+02    2.151e+02    -0.049
+          q2   -2.472e+01    1.796e+01   -6.765e+00     1.082
+          q3   -7.843e+01    6.712e+01   -1.131e+01     0.997
+          q4   -3.806e+02    3.968e+02    1.617e+01    -1.043
+          q5   -4.412e+05    4.370e+05   -4.185e+03     0.006
+         ALL   -8.834e+04    8.755e+04   -7.944e+02     0.018
+
+Q agreement between gauges (should be exact-ish): median |dQ1/Q1| = 2.003e-01
+##### SEED=1
+pushforward residual at g=(0.02,-0.01): median |d log p| = 1.16e-03, max 1.23e+03 nats over 29 targets
+
+gauge-K weight dropped for a non-finite dPsi/dg: median 0.00e+00, max 1.71e-03 of 1.0
+
+=== bulgedisc_deep_v2  flows/centroid_bulgedisc_v2.eqx   n=600, 4096 draws, alpha=0.5
+
+--- gauge P (current: g moves the prior)   median ESS 266
+ Mf quintile            A            B        R=A+B  Fisher R
+          q1   -4.985e+01    1.825e+02    1.327e+02    -0.068
+          q2   -4.202e+01    6.825e+01    2.623e+01    -0.255
+          q3   -4.391e+01    3.220e+01   -1.170e+01     1.036
+          q4   -2.132e+01    6.961e+00   -1.436e+01     1.180
+          q5   -1.699e+01    1.801e+00   -1.519e+01     1.304
+         ALL   -3.482e+01    5.835e+01    2.353e+01    -0.549
+
+--- gauge K (g moves the kernel, as BFD)   median ESS 266
+ Mf quintile            A            B        R=A+B  Fisher R
+          q1   -1.491e+01    4.039e+01    2.548e+01    -0.377
+          q2   -2.863e+01    9.915e+01    7.052e+01    -0.101
+          q3   -7.828e+01    6.600e+01   -1.228e+01     0.955
+          q4   -6.096e+02    2.046e+04    1.985e+04    -0.002
+          q5   -4.412e+05    4.180e+05   -2.313e+04     0.001
+         ALL   -8.838e+04    8.774e+04   -6.408e+02     0.028
+
+Q agreement between gauges (should be exact-ish): median |dQ1/Q1| = 2.005e-01
+##### SEED=2
+pushforward residual at g=(0.02,-0.01): median |d log p| = 1.17e-03, max 1.23e+03 nats over 29 targets
+
+gauge-K weight dropped for a non-finite dPsi/dg: median 0.00e+00, max 1.25e-03 of 1.0
+
+=== bulgedisc_deep_v2  flows/centroid_bulgedisc_v2.eqx   n=600, 4096 draws, alpha=0.5
+
+--- gauge P (current: g moves the prior)   median ESS 265
+ Mf quintile            A            B        R=A+B  Fisher R
+          q1   -6.046e+01    2.393e+02    1.788e+02    -0.050
+          q2   -4.681e+01    9.437e+01    4.756e+01    -0.140
+          q3   -4.206e+01    2.997e+01   -1.209e+01     0.948
+          q4   -2.103e+01    6.364e+00   -1.467e+01     1.153
+          q5   -1.784e+01    2.135e+00   -1.571e+01     1.271
+         ALL   -3.764e+01    7.443e+01    3.679e+01    -0.348
+
+--- gauge K (g moves the kernel, as BFD)   median ESS 265
+ Mf quintile            A            B        R=A+B  Fisher R
+          q1   -1.593e+01    1.154e+02    9.946e+01    -0.100
+          q2   -2.618e+01    8.651e+01    6.032e+01    -0.118
+          q3   -7.896e+01    6.757e+01   -1.139e+01     1.030
+          q4   -3.730e+02    5.256e+02    1.527e+02    -0.110
+          q5   -4.412e+05    4.349e+05   -6.284e+03     0.004
+         ALL   -8.833e+04    8.714e+04   -1.197e+03     0.012
+
+Q agreement between gauges (should be exact-ish): median |dQ1/Q1| = 1.886e-01
+##### GAUSS2 CONTROL
+Traceback (most recent call last):
+  File "/home/vwetzell/miniconda3/lib/python3.13/site-packages/equinox/_serialisation.py", line 57, in _f
+    return f(*xs)
+  File "/home/vwetzell/miniconda3/lib/python3.13/site-packages/equinox/_serialisation.py", line 347, in __deserialise
+    return spec(f, y)
+  File "/home/vwetzell/miniconda3/lib/python3.13/site-packages/equinox/_serialisation.py", line 159, in default_deserialise_filter_spec
+    return type(x)(out.item())  # pyright: ignore[reportCallIssue]
+                   ~~~~~~~~^^
+ValueError: can only convert an array of size 1 to a Python scalar
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/vwetzell/miniconda3/lib/python3.13/site-packages/equinox/_serialisation.py", line 57, in _f
+    return f(*xs)
+  File "/home/vwetzell/miniconda3/lib/python3.13/site-packages/equinox/_serialisation.py", line 349, in _deserialise
+    return _ordered_tree_map(__deserialise, x, is_leaf=is_leaf)
+  File "/home/vwetzell/miniconda3/lib/python3.13/site-packages/equinox/_serialisation.py", line 68, in _ordered_tree_map
+    return treedef.unflatten(_f(*xs) for xs in zip(*all_leaves))
+           ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/vwetzell/miniconda3/lib/python3.13/site-packages/equinox/_serialisation.py", line 68, in <genexpr>
+    return treedef.unflatten(_f(*xs) for xs in zip(*all_leaves))
+                             ~~^^^^^
+  File "/home/vwetzell/miniconda3/lib/python3.13/site-packages/equinox/_serialisation.py", line 66, in _f
+    raise exc from e
+equinox._serialisation.TreePathError: Error at leaf with path (GetAttrKey(name='bijection'), GetAttrKey(name='bijection'), GetAttrKey(name='bijections'), SequenceKey(idx=4), GetAttrKey(name='shape'), SequenceKey(idx=0))
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/vwetzell/gitrepos/bfd_cnf/gauge.py", line 195, in <module>
+    flow, m, sx, cov = prep(pop, fp, gain)
+                       ~~~~^^^^^^^^^^^^^^^
+  File "/home/vwetzell/gitrepos/bfd_cnf/gauge.py", line 66, in prep
+    return eqx.tree_deserialise_leaves(flow_path, flow), m, sx, cov
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/vwetzell/miniconda3/lib/python3.13/site-packages/equinox/_serialisation.py", line 351, in tree_deserialise_leaves
+    out = _ordered_tree_map(_deserialise, filter_spec, like)
+  File "/home/vwetzell/miniconda3/lib/python3.13/site-packages/equinox/_serialisation.py", line 68, in _ordered_tree_map
+    return treedef.unflatten(_f(*xs) for xs in zip(*all_leaves))
+           ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/vwetzell/miniconda3/lib/python3.13/site-packages/equinox/_serialisation.py", line 68, in <genexpr>
+    return treedef.unflatten(_f(*xs) for xs in zip(*all_leaves))
+                             ~~^^^^^
+  File "/home/vwetzell/miniconda3/lib/python3.13/site-packages/equinox/_serialisation.py", line 62, in _f
+    raise exc from e
+equinox._serialisation.TreePathError: Error at leaf with path (GetAttrKey(name='bijection'), GetAttrKey(name='bijection'), GetAttrKey(name='bijections'), SequenceKey(idx=4), GetAttrKey(name='shape'), SequenceKey(idx=0))
