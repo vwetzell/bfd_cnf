@@ -37,34 +37,64 @@
 # localises the channel for free -- Sigma_X's split is linear in e_psf
 # (measured +17.1% at 0.2), C_M's spin-2 split quadratic (+1.68% at 0.2).
 #
-# Usage:  bash dev/render_psfe.sh [amplitude]     (default 0.2)
+# Usage:  bash dev/render_psfe.sh [amplitude] [pop] [noise_sigma]
+#         default pop=bulgedisc, noise_sigma=0.93 (the original grid, filenames
+#         unchanged for that default so it doesn't collide with what's already
+#         on disk).  A non-default pop/sigma gets a suffix tag on every
+#         filename instead, e.g. gauss2_fwd/1.86 -> ..._gauss2fwd_d186_...
 set -e
 cd "$(dirname "$0")/.."
 
 S=../bfd_cnf_imsims
 E=${1:-0.2}
+POP=${2:-bulgedisc}
+SIGMA=${3:-0.93}
 TAG=$(python -c "print(f'{$E:.2f}'.replace('.','')[1:])")   # 0.2 -> 20
-SIGMA=0.93
 N=20000
 SEED=1
+if [ "$POP" = "bulgedisc" ] && [ "$SIGMA" = "0.93" ]; then
+    PTAG=""
+else
+    PTAG="_$(echo $POP | tr -d '_')_d$(python -c "print(f'{$SIGMA:.2f}'.replace('.',''))")"
+fi
 
-pids=()
-for cfg in "e00 0.0 0.0" "e1p $E 0.0" "e2p 0.0 $E" "e1m -$E 0.0"; do
-    set -- $cfg
-    name=$1; e1=$2; e2=$3
-    for arm in "g0 0.0" "g1p02 0.02" "g1m02 -0.02"; do
-        set -- $arm
-        ( cd $S && OMP_NUM_THREADS=2 python -u -m imsims.sim \
-            --n $N --seed $SEED --pop bulgedisc --noise-sigma $SIGMA \
-            --psf-e1 $e1 --psf-e2 $e2 --g1 $2 --add-noise \
-            --out data/targets_v3psf${name}${TAG}_$1_20k.fits ) &
-        pids+=($!)
-    done
-done
-# Bare `wait` returns 0 regardless of what the jobs did, so `set -e` does NOT
-# catch a failed render -- same class of silent pass-through as a missing
-# `pipefail`.  Wait on each pid and keep its status.
+# bulgedisc's render is a CPU pixel loop, so 12-way parallel is free lunch.
+# Any other population (gauss2_fwd included) goes through JAX/GPU for the
+# moment map: 12 concurrent processes each PREALLOCATING their own ~75% GPU
+# slab blows out a 16GB card (measured: CUDA_ERROR_OUT_OF_MEMORY at 20k), but
+# going fully serial just leaves the GPU idle between each short job's
+# python/JAX startup -- cap each process's slab so a handful fit at once.
+GPU_PAR=4
 fail=0
-for p in "${pids[@]}"; do wait "$p" || fail=1; done
+if [ "$POP" = "bulgedisc" ]; then
+    pids=()
+    for cfg in "e00 0.0 0.0" "e1p $E 0.0" "e2p 0.0 $E" "e1m -$E 0.0"; do
+        set -- $cfg
+        name=$1; e1=$2; e2=$3
+        for arm in "g0 0.0" "g1p02 0.02" "g1m02 -0.02"; do
+            set -- $arm
+            ( cd $S && OMP_NUM_THREADS=2 python -u -m imsims.sim \
+                --n $N --seed $SEED --pop $POP --noise-sigma $SIGMA \
+                --psf-e1 $e1 --psf-e2 $e2 --g1 $2 --add-noise \
+                --out data/targets_v3psf${name}${TAG}${PTAG}_$1_20k.fits ) &
+            pids+=($!)
+        done
+    done
+    # Bare `wait` returns 0 regardless of what the jobs did, so `set -e` does
+    # NOT catch a failed render -- same class of silent pass-through as a
+    # missing `pipefail`.  Wait on each pid and keep its status.
+    for p in "${pids[@]}"; do wait "$p" || fail=1; done
+else
+    jobs=()
+    for cfg in "e00 0.0 0.0" "e1p $E 0.0" "e2p 0.0 $E" "e1m -$E 0.0"; do
+        set -- $cfg
+        name=$1; e1=$2; e2=$3
+        for arm in "g0 0.0" "g1p02 0.02" "g1m02 -0.02"; do
+            set -- $arm
+            jobs+=("cd $S && XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=$(python -c "print(0.9/$GPU_PAR)") python -u -m imsims.sim --n $N --seed $SEED --pop $POP --noise-sigma $SIGMA --psf-e1 $e1 --psf-e2 $e2 --g1 $2 --add-noise --out data/targets_v3psf${name}${TAG}${PTAG}_$1_20k.fits")
+        done
+    done
+    printf '%s\n' "${jobs[@]}" | xargs -P $GPU_PAR -I{} bash -c '{}' || fail=1
+fi
 [ $fail -eq 0 ] || { echo "RENDER FAILED" >&2; exit 1; }
-echo "render done (e_psf = $E, tag $TAG)"
+echo "render done (e_psf = $E, tag $TAG, pop $POP, sigma $SIGMA)"

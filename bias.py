@@ -261,6 +261,53 @@ CATALOGS = {
     "bulgedisc_v3_psfe2p10": {"plus": "targets_v3psfe2p10_g1p02_20k",
                               "minus": "targets_v3psfe2p10_g1m02_20k",
                               "zero": "targets_v3psfe2p10_g0_20k"},
+    # Same PSF-anisotropy test, but on gauss2_v3d (gauss2_fwd, noise_sigma
+    # 1.86) instead of bulgedisc_v3 -- see PSFE_PROVENANCE.md and
+    # NEXT_SESSION_psfe_rerender.md.  The bulgedisc_v3_psfe* catalogs above are
+    # at noise_sigma 0.93, below the trained floor of the only anisotropic
+    # SigmaXBlockLayer flow (`flows/centroid_g2v3d_sigmaxblock_multiscale.eqx`,
+    # trained on gauss2_v3d at noise_sigma in [1.33, 2.60]); these match its
+    # own population and depth exactly.  e00 baseline taken from the 0.10
+    # amplitude's own render (e_psf=0 is amplitude-independent, verified for
+    # the bulgedisc set above).
+    "gauss2_v3d_psfe00": {"plus": "targets_v3psfe0010_gauss2fwd_d186_g1p02_20k",
+                          "minus": "targets_v3psfe0010_gauss2fwd_d186_g1m02_20k",
+                          "zero": "targets_v3psfe0010_gauss2fwd_d186_g0_20k"},
+    "gauss2_v3d_psfe1p02": {"plus": "targets_v3psfe1p02_gauss2fwd_d186_g1p02_20k",
+                            "minus": "targets_v3psfe1p02_gauss2fwd_d186_g1m02_20k",
+                            "zero": "targets_v3psfe1p02_gauss2fwd_d186_g0_20k"},
+    "gauss2_v3d_psfe2p02": {"plus": "targets_v3psfe2p02_gauss2fwd_d186_g1p02_20k",
+                            "minus": "targets_v3psfe2p02_gauss2fwd_d186_g1m02_20k",
+                            "zero": "targets_v3psfe2p02_gauss2fwd_d186_g0_20k"},
+    "gauss2_v3d_psfe1m02": {"plus": "targets_v3psfe1m02_gauss2fwd_d186_g1p02_20k",
+                            "minus": "targets_v3psfe1m02_gauss2fwd_d186_g1m02_20k",
+                            "zero": "targets_v3psfe1m02_gauss2fwd_d186_g0_20k"},
+    "gauss2_v3d_psfe1p05": {"plus": "targets_v3psfe1p05_gauss2fwd_d186_g1p02_20k",
+                            "minus": "targets_v3psfe1p05_gauss2fwd_d186_g1m02_20k",
+                            "zero": "targets_v3psfe1p05_gauss2fwd_d186_g0_20k"},
+    "gauss2_v3d_psfe2p05": {"plus": "targets_v3psfe2p05_gauss2fwd_d186_g1p02_20k",
+                            "minus": "targets_v3psfe2p05_gauss2fwd_d186_g1m02_20k",
+                            "zero": "targets_v3psfe2p05_gauss2fwd_d186_g0_20k"},
+    "gauss2_v3d_psfe1m05": {"plus": "targets_v3psfe1m05_gauss2fwd_d186_g1p02_20k",
+                            "minus": "targets_v3psfe1m05_gauss2fwd_d186_g1m02_20k",
+                            "zero": "targets_v3psfe1m05_gauss2fwd_d186_g0_20k"},
+    "gauss2_v3d_psfe1p10": {"plus": "targets_v3psfe1p10_gauss2fwd_d186_g1p02_20k",
+                            "minus": "targets_v3psfe1p10_gauss2fwd_d186_g1m02_20k",
+                            "zero": "targets_v3psfe1p10_gauss2fwd_d186_g0_20k"},
+    "gauss2_v3d_psfe2p10": {"plus": "targets_v3psfe2p10_gauss2fwd_d186_g1p02_20k",
+                            "minus": "targets_v3psfe2p10_gauss2fwd_d186_g1m02_20k",
+                            "zero": "targets_v3psfe2p10_gauss2fwd_d186_g0_20k"},
+    "gauss2_v3d_psfe1m10": {"plus": "targets_v3psfe1m10_gauss2fwd_d186_g1p02_20k",
+                            "minus": "targets_v3psfe1m10_gauss2fwd_d186_g1m02_20k",
+                            "zero": "targets_v3psfe1m10_gauss2fwd_d186_g0_20k"},
+    # A second, independent psf_e=0 20k draw (seed 2, everything else identical
+    # to gauss2_v3d_psfe00) -- to characterise galaxy-sample MC scatter at
+    # n=20k directly, after psfe00's own corrected m1 (+0.0275 at 2^24) ran
+    # ~0.02-0.04 above three prior 20k draws from a different session (which
+    # spanned -0.011 to +0.006). See PSFE_PROVENANCE.md.
+    "gauss2_v3d_psfe00_s2": {"plus": "targets_v3psfe00_gauss2fwd_d186_s2_g1p02_20k",
+                             "minus": "targets_v3psfe00_gauss2fwd_d186_s2_g1m02_20k",
+                             "zero": "targets_v3psfe00_gauss2fwd_d186_s2_g0_20k"},
     # The analytic population: two co-elliptical Gaussians whose moments were
     # DRAWN from a chosen density rather than pushed forward from galaxy
     # parameters, so P(m|g), Q and R are known in closed form -- `truth.py`.
@@ -351,6 +398,19 @@ TRAIN_DATA = {
     "gauss2_v3d": "moments_gauss2_fwd_g2v3d.fits",
     "gauss2_v3e": "moments_gauss2_fwd_g2v3d.fits",   # deliberate: see CATALOGS
     "gauss2_deep": "gauss2_g0_1M.fits",
+    # Same reasoning as bulgedisc_v3_psfe*: PSF ellipticity doesn't touch the
+    # latent moments, so g2v3d's own prior serves every psfe config unchanged.
+    "gauss2_v3d_psfe00": "moments_gauss2_fwd_g2v3d.fits",
+    "gauss2_v3d_psfe1p02": "moments_gauss2_fwd_g2v3d.fits",
+    "gauss2_v3d_psfe2p02": "moments_gauss2_fwd_g2v3d.fits",
+    "gauss2_v3d_psfe1m02": "moments_gauss2_fwd_g2v3d.fits",
+    "gauss2_v3d_psfe1p05": "moments_gauss2_fwd_g2v3d.fits",
+    "gauss2_v3d_psfe2p05": "moments_gauss2_fwd_g2v3d.fits",
+    "gauss2_v3d_psfe1m05": "moments_gauss2_fwd_g2v3d.fits",
+    "gauss2_v3d_psfe1p10": "moments_gauss2_fwd_g2v3d.fits",
+    "gauss2_v3d_psfe2p10": "moments_gauss2_fwd_g2v3d.fits",
+    "gauss2_v3d_psfe1m10": "moments_gauss2_fwd_g2v3d.fits",
+    "gauss2_v3d_psfe00_s2": "moments_gauss2_fwd_g2v3d.fits",
 }
 
 
@@ -2884,12 +2944,19 @@ def main():
                         "of it is a bounded-term mean and converges. Use 0.02, "
                         "the |g| the estimator actually solves at; do NOT "
                         "shrink it, that walks back toward the divergence.")
-    p.add_argument("--window-draws", type=int, default=1 << 20,
+    p.add_argument("--window-draws", type=int, default=1 << 24,
                    help="prior draws for --window-terms score. 262144 is NOT "
                         "converged: R_s11 moves -0.182 -> -0.168 from 2^18 to "
                         "2^20 and the exact R_s11 = R_s22 identity goes from "
                         "17%% violated to 2%%. Only this estimator has finite "
-                        "variance, so only it rewards more draws.")
+                        "variance, so only it rewards more draws. 2^20 itself "
+                        "is not converged either -- corrected m1 moves 9.0e-03 "
+                        "between draw seeds at 2^24, per dev/g2v3d_500k.sh's "
+                        "own note -- so 2^24 (matching that run) is now the "
+                        "default; a cheaper in-run scan can still override "
+                        "this and be re-quoted later via dev/window_scan.py's "
+                        "offline resolve off --save-pqr, since ghat is affine "
+                        "in the selection terms.")
     # DEFAULT IS `score`, AND THE SELECTION CORRECTION IS FLOW-BASED ONLY.
     # `templates` lenses the training catalog by its own exact dm/dg, which is
     # what eq. (40) literally is -- but it is not a method that exists on real
