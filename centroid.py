@@ -568,6 +568,20 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
     state = opt.init(params)
     rng = np.random.default_rng(int(jr.randint(key, (), 0, 2**30)))
     n_grid = len(grid)
+    # EMA of the trained params, not just the raw final step. Each step's
+    # gradient comes from ONE randomly-drawn scale out of `n_grid` (see the
+    # loop below), so the raw params at any single step reflect whatever
+    # that step's scale happened to need most recently, not a converged
+    # optimum across all of them -- exactly why check_sigmax's response
+    # ratio bounced around a wide range (0.76-0.82) run to run/step to step.
+    # Averaging over the tail of training (decay tuned so the window is a
+    # sizeable fraction of `steps`, so every scale gets visited many times
+    # within it) is the standard fix for exactly this kind of per-step
+    # snapshot noise. Zero-initialized nets make the early-training EMA
+    # bias negligible in practice (no bias correction needed) as long as
+    # `steps` isn't tiny.
+    ema_decay = 1.0 - 5.0 / max(steps, 5)
+    ema_params = params
 
     @eqx.filter_jit
     def step(params, state, idx, g):
@@ -592,11 +606,13 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
         idx = jnp.asarray(rng.integers(0, len(m0), batch))
         g = int(rng.integers(0, n_grid))
         params, state, loss, aux = step(params, state, idx, g)
+        ema_params = jax.tree_util.tree_map(
+            lambda e, p: ema_decay * e + (1.0 - ema_decay) * p, ema_params, params)
         if i % REPORT == 0 or i == steps - 1:
             a = [float(x) for x in aux]
             print(f"step {i:6d}  scale#{g}  loss {float(loss):.5f}  " +
                   "  ".join(f"z{j} {a[j]:.5f}" for j in range(5)), flush=True)
-    return eqx.combine(params, static)
+    return eqx.combine(ema_params, static)
 
 
 def check_sigmax(flow, copies, galaxies, sigma_x, n=4000, skip=0):
