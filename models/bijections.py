@@ -1605,6 +1605,41 @@ def _bound_coeff_input(x):
     return jnp.clip(x, -_SIGMAX_COEFF_INPUT_CLIP, _SIGMAX_COEFF_INPUT_CLIP)
 
 
+def _ell_gal_invariants(x3, x4, e1, e2):
+    """Two `net_dipquad` invariants built from the galaxy's own ellipticity
+    `(x3,x4)`: its magnitude and its alignment with the PSF's `(e1,e2)`.
+
+    First cut at this (committed, then found to regress the ellipticity-
+    response check from ~0.82 to ~0.77 across two seeds and 6k/12k steps --
+    reproducible, not undertraining or noise) normalized both by
+    `_e_mag_sq_scale`, i.e. the PSF's OWN `e_max^2` calibration bound. That's
+    the wrong scale for a GALAXY ellipticity: real `|e_gal|` runs much larger
+    than PSF `|e_psf|` ever does (median/p95/p99 of `|e_gal|^2/e_max^2` on
+    the training population: 0.58 / 4.2 / 8.3 -- the far tail was sitting
+    right at `_bound_coeff_input`'s clip). Worse, `check_sigmax`'s response
+    ratio is an `|e_gal|^2`-weighted average, so it's dominated by exactly
+    the high-|e_gal| galaxies whose input was most distorted/clipped --
+    matching the regression being isolated to that one metric while the
+    (unweighted) moment residuals stayed flat.
+
+    Fixed with the same SATURATING, scale-free construction this file
+    already uses for an "own final ellipticity" invariant elsewhere
+    (`_s0`'s `log1p(|e_final|^2)`, mirroring `ShearTaylorLast`): `log1p` of
+    the magnitude, sign-preserving `log1p` of the (already small,
+    PSF-suppressed) dot product. Grows without an arbitrary scale constant,
+    saturates gracefully rather than clipping hard, and -- as `log1p(|y|^2)`
+    does for `_s0` -- has a gradient that vanishes as its argument grows, so
+    an off-manifold `(x3,x4)` mid-Picard-iteration still can't blow up
+    `net_dipquad`'s input. `_bound_coeff_input` stays on top as the same
+    cheap redundant backstop the rest of this class's inputs get.
+    """
+    mag_sq = x3**2 + x4**2
+    dot = x3 * e1 + x4 * e2
+    e_gal_mag_sq_n = _bound_coeff_input(jnp.log1p(mag_sq))
+    e_gal_dot_psf_n = _bound_coeff_input(jnp.sign(dot) * jnp.log1p(jnp.abs(dot)))
+    return e_gal_mag_sq_n, e_gal_dot_psf_n
+
+
 class SigmaXBlockLayer(AbstractBijection):
     """Centroid-covariance (C_X) conditioned bijection -- flux shift is aware
     of the galaxy's own (final) ellipticity, closed-form throughout.
@@ -1719,6 +1754,7 @@ class SigmaXBlockLayer(AbstractBijection):
     _size_loc: float = eqx.field(static=True)
     _g_s_max: float = eqx.field(static=True)
     _s0_e_max: float = eqx.field(static=True)
+    _D_max: float = eqx.field(static=True)
 
     def __init__(
         self,
@@ -1732,6 +1768,7 @@ class SigmaXBlockLayer(AbstractBijection):
         size_loc=0.0,
         g_s_max=1.0,
         s0_e_max=1.0,
+        D_max=5.0,
     ):
         self._cond_dim = full_cond_dim
         self._log_scale_mean = float(log_scale_mean)
@@ -1739,6 +1776,21 @@ class SigmaXBlockLayer(AbstractBijection):
         self._size_loc = float(size_loc)
         self._g_s_max = float(g_s_max)
         self._s0_e_max = float(s0_e_max)
+        # Unlike `c` (already tanh-bounded via `_size_loc`... no -- via its
+        # own tanh below), `D` was originally left UNBOUNDED: the one-shot
+        # closed-form inverse this class used before `_solve_ell`'s Picard
+        # iteration was exact algebra for ANY `D` (affine map, always
+        # invertible). The Picard fixed point has no such guarantee -- an
+        # unbounded `D` under off-nominal weights (e.g.
+        # `test_block_survives_large_weights_and_outliers`'s scale=3.0
+        # stress case) blew up the iteration even with `_ell_gal_invariants`
+        # already bounding net_dipquad's INPUT, since large weights alone
+        # can still produce a large OUTPUT for any bounded input. `D_max`
+        # generous enough (5.0) to be far above any value trained checkpoints
+        # actually produce (empirically small dipole shifts, see
+        # `check_sigmax`'s "layer shift" printout) -- this should not change
+        # trained behavior, only cap the untrained/adversarial-weight case.
+        self._D_max = float(D_max)
         k0, k1, k2, k3, k4 = jr.split(key, 5)
         nets = [
             CoeffNet(k0, 3, 1, nn_width, nn_depth, activation),  # net_flux (x0, log_scale_n, ehat2)
@@ -1786,9 +1838,8 @@ class SigmaXBlockLayer(AbstractBijection):
         it is still safe to compute before the flux transform in BOTH
         directions (forward: x0,x1 given; inverse: recovered first, see
         below) -- but ``net_dipquad`` itself now ALSO reads the galaxy's own
-        ellipticity ``(x3,x4)`` (via two bounded invariants,
-        ``e_gal_mag_sq_n``/``e_gal_dot_psf_n``, normalized the same way
-        ``e_mag_sq_n`` already is), closing a diagnosed leak:
+        ellipticity ``(x3,x4)`` (via two saturating invariants, see
+        :func:`_ell_gal_invariants`), closing a diagnosed leak:
         ``dc2 ~ e_gal.e_psf`` and a ``|e_gal|^2`` term the isotropic-in-
         e_gal-only ``D,c`` of the old version could not structurally
         reproduce. The bilinear composition below (``m3,m4``) is already a
@@ -1807,23 +1858,15 @@ class SigmaXBlockLayer(AbstractBijection):
             T_n * self.net_size(jnp.array([_bound_coeff_input(x0), log_scale_n, e_mag_sq_n]))[0]
         )
         kappa = jnp.exp(g_s)
-        # Bounded the same way x0,x1 already are: x3,x4 are UNBOUNDED here
-        # (unlike x0,x1, nothing upstream clips them), and during the
-        # inverse's Picard iteration (`_solve_ell`) intermediate estimates
-        # can wander far off-manifold before converging -- an unbounded
-        # invariant feeding `net_dipquad` let D blow up on those iterates and
-        # broke the fixed point's contraction (caught by
-        # `test_block_survives_large_weights_and_outliers`'s off-manifold
-        # stress case). `_bound_coeff_input` keeps net_dipquad's input in its
-        # trained range regardless of how far (x3,x4) strays mid-iteration.
-        e_gal_mag_sq_n = _bound_coeff_input(
-            (x3**2 + x4**2) / (self._e_mag_sq_scale + 1e-8))
-        e_gal_dot_psf_n = _bound_coeff_input(
-            (x3 * e1 + x4 * e2) / (self._e_mag_sq_scale + 1e-8))
+        # See `_ell_gal_invariants` for what these are and why the saturating
+        # log1p form replaced a first cut that reused the PSF's own
+        # `_e_mag_sq_scale` -- wrong scale for a galaxy ellipticity, and it
+        # regressed the response-ratio check.
+        e_gal_mag_sq_n, e_gal_dot_psf_n = _ell_gal_invariants(x3, x4, e1, e2)
         dq_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n,
                             e_gal_mag_sq_n, e_gal_dot_psf_n])
         D_raw, c_raw = self.net_dipquad(dq_in)
-        D = T_n * D_raw
+        D = self._D_max * jnn.tanh(T_n * D_raw / self._D_max)
         c = jnn.tanh(T_n**2 * c_raw)
         m3 = (1.0 + c * e1) * x3 + c * e2 * x4 + D * e1
         m4 = c * e2 * x3 + (1.0 - c * e1) * x4 + D * e2
@@ -1955,21 +1998,16 @@ class SigmaXBlockLayer(AbstractBijection):
         )
         kappa = jnp.exp(g_s)
         if isotropic_init:
+            # log1p(0)=0 and sign(0)*log1p(0)=0, so this is still the same
+            # "evaluate D,c as isotropic-in-e_gal" starting point.
             e_gal_mag_sq_n = 0.0 * x3
             e_gal_dot_psf_n = 0.0 * x3
         else:
-            # Bounded for the same reason `_ellipticity` bounds them: mid-
-            # iteration (x3,x4) guesses can be far off-manifold before the
-            # Picard map contracts, and an unbounded invariant here broke
-            # that contraction (see `_ellipticity`'s comment).
-            e_gal_mag_sq_n = _bound_coeff_input(
-                (x3**2 + x4**2) / (self._e_mag_sq_scale + 1e-8))
-            e_gal_dot_psf_n = _bound_coeff_input(
-                (x3 * e1 + x4 * e2) / (self._e_mag_sq_scale + 1e-8))
+            e_gal_mag_sq_n, e_gal_dot_psf_n = _ell_gal_invariants(x3, x4, e1, e2)
         dq_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n,
                             e_gal_mag_sq_n, e_gal_dot_psf_n])
         D_raw, c_raw = self.net_dipquad(dq_in)
-        D = T_n * D_raw
+        D = self._D_max * jnn.tanh(T_n * D_raw / self._D_max)
         c = jnn.tanh(T_n**2 * c_raw)
         e_mag_sq = e1**2 + e2**2
         r3 = kappa * y3 - D * e1
