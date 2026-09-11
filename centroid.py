@@ -672,7 +672,7 @@ def net_saturation(flow, m0, sigma_x, n=20000):
         log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n = layer._unpack(cond)
         x0, x1, x2, x3, x4 = chart.transform(row)
         y3, y4, kappa, _, _ = layer._ellipticity(
-            x0, x1, x3, x4, e1, e2, log_scale_n, e_mag_sq_n, T_n)
+            x0, x1, x2, x3, x4, e1, e2, log_scale_n, e_mag_sq_n, T_n)
         s0 = layer._s0(x0, y3, y4, log_scale_n, e_mag_sq_n, T_n)
         s0_base = T_n * layer.net_flux(
             jnp.array([_bound_coeff_input(x0), log_scale_n, e_mag_sq_n]))[0]
