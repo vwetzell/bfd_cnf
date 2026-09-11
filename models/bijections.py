@@ -1741,7 +1741,11 @@ class SigmaXBlockLayer(AbstractBijection):
         nets = [
             CoeffNet(k0, 3, 1, nn_width, nn_depth, activation),  # net_flux (x0, log_scale_n, ehat2)
             CoeffNet(k1, 3, 1, nn_width, nn_depth, activation),  # net_size
-            CoeffNet(k2, 4, 2, nn_width, nn_depth, activation),  # net_dipquad
+            # ponytail: net_dipquad gets 2x width -- it's the coefficient
+            # net behind the PSF-anisotropy c1/c2 leak
+            # ([[psfe-leak-not-a-training-density-gap]]); doubling capacity
+            # here first, before touching the shared loss structure.
+            CoeffNet(k2, 4, 2, nn_width * 2, nn_depth, activation),  # net_dipquad
             CoeffNet(k3, 1, 1, nn_width, nn_depth, activation),  # net_flux_e
             CoeffNet(k4, 3, 1, nn_width, nn_depth, activation),  # net_mc (5-D extension)
         ]

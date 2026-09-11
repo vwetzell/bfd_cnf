@@ -398,7 +398,7 @@ REPORT = 500
 # own ellipticity actually needs.  Magnitudes match the class docstring's
 # calibration bound (`e_max=0.1` in `bulk.build_flow`'s SigmaXBlockLayer
 # construction) with margin on both sides.
-ANISO_TRAIN_POINTS = ((0.05, 0.0), (0.07, np.pi / 4))
+ANISO_TRAIN_POINTS = ((0.05, 0.0), (0.07, np.pi / 4), (0.02, np.pi / 8))
 
 
 def _aniso_sigma_x(sigma_x, e_mag, theta):
@@ -458,8 +458,40 @@ def sigmax_dm_dsigma(layer, m, full_cond, chart):
     return chart.inverse(z2) - m
 
 
+def _sigmax_inverse_decoupled(layer, y, condition):
+    """Same algebra as `SigmaXBlockLayer.inverse_and_log_det`, except `kappa`
+    (net_size's output) is stop-gradiented before it multiplies into the
+    ellipticity slots' r3/r4. `kappa` legitimately appears in both z1 (size)
+    and z3/z4 (ellipticity) -- see `_raw_transform`/`inverse_and_log_det` --
+    so any net_size fit error distorts what the z3/z4 loss term sees as
+    net_dipquad (D/c) error, and vice versa. This isolates net_dipquad's own
+    gradient from net_size's, for the leak-hunt in
+    [[psfe-leak-not-a-training-density-gap]]. No log-det needed (training
+    loss doesn't use it), so this skips the jacfwd `inverse_and_log_det` pays."""
+    log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n = layer._unpack(condition)
+    y0, y1, y2, y3, y4 = y
+    x0 = layer._solve_x0(y0, y3, y4, log_scale_n, e_mag_sq_n, T_n)
+    g_s = layer._g_s_max * jax.nn.tanh(
+        T_n * layer.net_size(jnp.array([_bound_coeff_input(x0), log_scale_n, e_mag_sq_n]))[0])
+    kappa = jnp.exp(g_s)
+    c1 = layer._size_loc
+    x1 = (y1 - c1 * (kappa - 1.0)) / kappa
+    kappa_sg = jax.lax.stop_gradient(kappa)
+    dq_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n])
+    D_raw, c_raw = layer.net_dipquad(dq_in)
+    D = T_n * D_raw
+    c = jax.nn.tanh(T_n**2 * c_raw)
+    r3 = kappa_sg * y3 - D * e1
+    r4 = kappa_sg * y4 - D * e2
+    det_e = 1.0 - c**2 * e_mag_sq
+    x3 = ((1.0 - c * e1) * r3 - c * e2 * r4) / det_e
+    x4 = (-c * e2 * r3 + (1.0 + c * e1) * r4) / det_e
+    x2 = y2 - layer._mc_shift(x0, log_scale_n, e_mag_sq_n, T_n)
+    return jnp.stack([x0, x1, x2, x3, x4])
+
+
 def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
-                 extra_scales=None):
+                 extra_scales=None, decouple_kappa=False):
     """Fit `SigmaXBlockLayer`'s five coefficient nets by SUPERVISED regression
     against `imsims.copies`' own weighted copy mean, directly in the CHART's
     z-space -- not plain NLL, and not `relative_channels`' raw-moment ratios
@@ -544,7 +576,10 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
             layer = _sigmax_layer(model)
             zb = zj[idx]
             cond = jnp.tile(cond_grid_j[g], (zb.shape[0], 1))
-            z_pred = jax.vmap(lambda zz, cc: layer.inverse_and_log_det(zz, cc)[0])(zb, cond)
+            inv = ((lambda zz, cc: _sigmax_inverse_decoupled(layer, zz, cc))
+                   if decouple_kappa else
+                   (lambda zz, cc: layer.inverse_and_log_det(zz, cc)[0]))
+            z_pred = jax.vmap(inv)(zb, cond)
             dz_pred = z_pred - zb
             terms = jnp.mean(((dz_pred - dz_true_j[g, idx]) / scales_j) ** 2, axis=0)
             return jnp.sum(terms), terms
@@ -695,6 +730,13 @@ def main():
                         "and train_sigmax's `extra_scales` mechanism, which "
                         "this generalises the identical way --multi-scale "
                         "does for pure noise-level changes.")
+    p.add_argument("--decouple-kappa", action="store_true",
+                   help="train-sigmax only: stop-gradient net_size's kappa "
+                        "before it multiplies into net_dipquad's r3/r4, so "
+                        "net_size fit error can't masquerade as net_dipquad "
+                        "(D/c) error in the z3/z4 loss term. Experiment for "
+                        "the PSF-anisotropy c-leak, see "
+                        "[[psfe-leak-not-a-training-density-gap]].")
     a = p.parse_args()
     sigmax = a.mode.endswith("-sigmax")
 
@@ -780,7 +822,8 @@ def main():
                                 sigma_x, jr.key(a.seed + 1),
                                 steps=a.steps, batch=a.batch,
                                 lr=a.lr if a.lr is not None else 3e-3,
-                                extra_scales=extra_scales)
+                                extra_scales=extra_scales,
+                                decouple_kappa=a.decouple_kappa)
         else:
             flow = train(flow, m0[:n_train], (target - m0)[:n_train], sigma_x,
                         jr.key(a.seed + 1), steps=a.steps, batch=a.batch)
