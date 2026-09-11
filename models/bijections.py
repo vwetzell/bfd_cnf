@@ -1708,7 +1708,9 @@ class SigmaXBlockLayer(AbstractBijection):
 
     net_flux: CoeffNet     # (x0, log_scale_n, ehat2)      -> (1,)  s0 base (now reads the galaxy's own flux, see _s0/_solve_x0)
     net_size: CoeffNet     # (x0, log_scale_n, ehat2)      -> (1,)  g_s (UNCHANGED, no owne correction)
-    net_dipquad: CoeffNet  # (x0, x1, log_scale_n, ehat2)  -> (2,)  D, c (UNCHANGED)
+    net_dipquad: CoeffNet  # (x0, x1, log_scale_n, ehat2, e_gal_mag_sq_n, e_gal_dot_psf_n) -> (2,)  D, c
+                           # (NO LONGER unchanged -- now sees the galaxy's own ellipticity, see
+                           # the class docstring's PSF-leak-vs-own-ellipticity note and _solve_ell)
     net_flux_e: CoeffNet   # (log1p(|e_final|^2),)         -> (1,)  s0 "own final ellipticity" correction (NEW)
     net_mc: CoeffNet       # (x0, log_scale_n, ehat2)      -> (1,)  Mc additive shift (NEW, 5-D extension)
     _cond_dim: int = eqx.field(static=True)
@@ -1745,7 +1747,7 @@ class SigmaXBlockLayer(AbstractBijection):
             # net behind the PSF-anisotropy c1/c2 leak
             # ([[psfe-leak-not-a-training-density-gap]]); doubling capacity
             # here first, before touching the shared loss structure.
-            CoeffNet(k2, 4, 2, nn_width * 2, nn_depth, activation),  # net_dipquad
+            CoeffNet(k2, 6, 2, nn_width * 2, nn_depth, activation),  # net_dipquad
             CoeffNet(k3, 1, 1, nn_width, nn_depth, activation),  # net_flux_e
             CoeffNet(k4, 3, 1, nn_width, nn_depth, activation),  # net_mc (5-D extension)
         ]
@@ -1780,9 +1782,22 @@ class SigmaXBlockLayer(AbstractBijection):
         return log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n
 
     def _ellipticity(self, x0, x1, x3, x4, e1, e2, log_scale_n, e_mag_sq_n, T_n):
-        """UNCHANGED from SigmaXCouplingLayer: reads only the RAW (x0,x1), so it
-        is safe to compute before the flux transform in BOTH directions
-        (forward: x0,x1 given; inverse: recovered first, see below).
+        """The (x0,x1)->D,c map is UNCHANGED from SigmaXCouplingLayer in that
+        it is still safe to compute before the flux transform in BOTH
+        directions (forward: x0,x1 given; inverse: recovered first, see
+        below) -- but ``net_dipquad`` itself now ALSO reads the galaxy's own
+        ellipticity ``(x3,x4)`` (via two bounded invariants,
+        ``e_gal_mag_sq_n``/``e_gal_dot_psf_n``, normalized the same way
+        ``e_mag_sq_n`` already is), closing a diagnosed leak:
+        ``dc2 ~ e_gal.e_psf`` and a ``|e_gal|^2`` term the isotropic-in-
+        e_gal-only ``D,c`` of the old version could not structurally
+        reproduce. The bilinear composition below (``m3,m4``) is already a
+        proper rotation-covariant map; only ``D,c``'s OWN isotropy in
+        ``e_gal`` was the gap.
+
+        On the FORWARD path ``x3,x4`` are given directly, so this is still a
+        single closed-form evaluation, no circularity. The INVERSE is not so
+        lucky -- see :meth:`_solve_ell`.
 
         Operates on the ellipticity pair, which is ``(x3,x4)`` in THIS chart
         (``z3=M1/Mr``, ``z4=M2/Mr`` -- see the class docstring), not
@@ -1792,7 +1807,21 @@ class SigmaXBlockLayer(AbstractBijection):
             T_n * self.net_size(jnp.array([_bound_coeff_input(x0), log_scale_n, e_mag_sq_n]))[0]
         )
         kappa = jnp.exp(g_s)
-        dq_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n])
+        # Bounded the same way x0,x1 already are: x3,x4 are UNBOUNDED here
+        # (unlike x0,x1, nothing upstream clips them), and during the
+        # inverse's Picard iteration (`_solve_ell`) intermediate estimates
+        # can wander far off-manifold before converging -- an unbounded
+        # invariant feeding `net_dipquad` let D blow up on those iterates and
+        # broke the fixed point's contraction (caught by
+        # `test_block_survives_large_weights_and_outliers`'s off-manifold
+        # stress case). `_bound_coeff_input` keeps net_dipquad's input in its
+        # trained range regardless of how far (x3,x4) strays mid-iteration.
+        e_gal_mag_sq_n = _bound_coeff_input(
+            (x3**2 + x4**2) / (self._e_mag_sq_scale + 1e-8))
+        e_gal_dot_psf_n = _bound_coeff_input(
+            (x3 * e1 + x4 * e2) / (self._e_mag_sq_scale + 1e-8))
+        dq_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n,
+                            e_gal_mag_sq_n, e_gal_dot_psf_n])
         D_raw, c_raw = self.net_dipquad(dq_in)
         D = T_n * D_raw
         c = jnn.tanh(T_n**2 * c_raw)
@@ -1902,6 +1931,100 @@ class SigmaXBlockLayer(AbstractBijection):
         return T_n * self.net_mc(
             jnp.array([_bound_coeff_input(x0), log_scale_n, e_mag_sq_n]))[0]
 
+    def _ell_step(self, x3, x4, x0, x1, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n,
+                  isotropic_init=False):
+        """One Picard iteration for the ellipticity inverse: given a CURRENT
+        guess `(x3,x4)`, recompute `D,c` (now reading the galaxy's own
+        ellipticity through it -- see `_ellipticity`) and re-run the EXIST-
+        ING closed-form Moebius-inverse algebra (`r3,r4`/`det_e`/`x3,x4`,
+        algebraically identical to what `inverse_and_log_det` used to do in
+        one shot) to produce the NEXT guess. `isotropic_init` is a Python
+        (not traced) flag used only to build the starting point: it forces
+        the two new invariants to 0, i.e. evaluates `D,c` as if they were
+        still isotropic-in-`e_gal` -- the OLD closed form -- which is exactly
+        `_solve_ell_picard`'s initial guess, since the new dependence is a
+        perturbation on top of it.
+
+        Used both inside `_solve_ell_picard`'s `lax.scan` (primal, no
+        gradient needed) and, unrolled a single step, inside
+        `_solve_ell_ift_jvp`'s IFT (where its Jacobian/jvp AT the converged
+        root is what actually gets differentiated -- see that function).
+        """
+        g_s = self._g_s_max * jnn.tanh(
+            T_n * self.net_size(jnp.array([_bound_coeff_input(x0), log_scale_n, e_mag_sq_n]))[0]
+        )
+        kappa = jnp.exp(g_s)
+        if isotropic_init:
+            e_gal_mag_sq_n = 0.0 * x3
+            e_gal_dot_psf_n = 0.0 * x3
+        else:
+            # Bounded for the same reason `_ellipticity` bounds them: mid-
+            # iteration (x3,x4) guesses can be far off-manifold before the
+            # Picard map contracts, and an unbounded invariant here broke
+            # that contraction (see `_ellipticity`'s comment).
+            e_gal_mag_sq_n = _bound_coeff_input(
+                (x3**2 + x4**2) / (self._e_mag_sq_scale + 1e-8))
+            e_gal_dot_psf_n = _bound_coeff_input(
+                (x3 * e1 + x4 * e2) / (self._e_mag_sq_scale + 1e-8))
+        dq_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n,
+                            e_gal_mag_sq_n, e_gal_dot_psf_n])
+        D_raw, c_raw = self.net_dipquad(dq_in)
+        D = T_n * D_raw
+        c = jnn.tanh(T_n**2 * c_raw)
+        e_mag_sq = e1**2 + e2**2
+        r3 = kappa * y3 - D * e1
+        r4 = kappa * y4 - D * e2
+        det_e = 1.0 - c**2 * e_mag_sq
+        x3_new = ((1.0 - c * e1) * r3 - c * e2 * r4) / det_e
+        x4_new = (-c * e2 * r3 + (1.0 + c * e1) * r4) / det_e
+        return x3_new, x4_new
+
+    #: Fixed Picard-iteration count for :meth:`_solve_ell_picard`. There is
+    #: no 1-D bracket/monotonicity argument available here (this is a 2x2
+    #: fixed point, not a scalar root), so unlike `_S0_BISECT_STEPS` this
+    #: is not "resolves a bracket to float eps" but "enough contraction
+    #: steps" -- contraction itself relies on `D,c` staying small (`D` is
+    #: `T_n` times a raw net output, `c` is tanh-bounded, and BOTH nets are
+    #: zero-init, see `__init__`) rather than being analytically proven,
+    #: mirroring `_solve_x0_bisect`'s own "not analytically excluded" caveat
+    #: for its monotonicity assumption.
+    _ELL_FIXEDPOINT_STEPS = 20
+
+    def _solve_ell_picard(self, x0, x1, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n):
+        """Numeric fixed point only, no gradient guarantees -- see
+        `_solve_ell_ift`. Initializes `(x3,x4)` from the OLD closed form
+        (`_ell_step` with `isotropic_init=True`, i.e. `D,c` evaluated as if
+        isotropic in the galaxy's own ellipticity) and Picard-iterates
+        `_ell_step` `_ELL_FIXEDPOINT_STEPS` times. There is no natural
+        bracket to bisect on in 2D (unlike `_solve_x0_bisect`'s scalar
+        `f`), so this is fixed-point (Picard) iteration, not bisection."""
+        x3_0, x4_0 = self._ell_step(0.0 * y3, 0.0 * y4, x0, x1, y3, y4, e1, e2,
+                                     log_scale_n, e_mag_sq_n, T_n, isotropic_init=True)
+
+        def step(carry, _):
+            x3, x4 = carry
+            x3n, x4n = self._ell_step(x3, x4, x0, x1, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n)
+            return (x3n, x4n), None
+
+        (x3, x4), _ = jax.lax.scan(step, (x3_0, x4_0), None, length=self._ELL_FIXEDPOINT_STEPS)
+        return x3, x4
+
+    def _solve_ell(self, x0, x1, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n):
+        """Invert `_ellipticity`'s `(x3,x4) -> (y3,y4)` map for `(x3,x4)`,
+        now that `D,c` depend on `(x3,x4)` themselves (see the class
+        docstring / `_ellipticity`) -- a genuine 2x2 implicit equation,
+        solved the same way `_solve_x0` solves ITS implicit equation:
+        `_solve_ell_picard`'s `lax.scan` fixed point is differentiated via
+        `_solve_ell_ift`'s implicit-function-theorem `custom_jvp`, not by
+        autodiff-through-the-loop -- the scan carries no useful gradient for
+        the identical reason `_solve_x0`'s bisection doesn't (branching /
+        loop-carried numerics, not a differentiable closed form).
+
+        `self` is split into `(params, static)` for the same reason
+        `_solve_x0` does -- see its docstring."""
+        params, static = eqx.partition(self, eqx.is_inexact_array)
+        return _solve_ell_ift(static, params, x0, x1, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n)
+
     def _raw_transform(self, x, condition):
         log_scale_n, e1, e2, _, e_mag_sq_n, T_n = self._unpack(condition)
         x0, x1, x2, x3, x4 = x
@@ -1920,10 +2043,12 @@ class SigmaXBlockLayer(AbstractBijection):
         return y, log_det
 
     def inverse_and_log_det(self, y, condition=None):
-        # Fully closed-form (no iteration anywhere): y3,y4 (ellipticity) are
-        # GIVEN, so s0 (and hence x0) is immediately computable; x1 follows
-        # from x0; x3,x4 invert the SAME closed-form ellipticity block
-        # SigmaXCouplingLayer uses; x2 (Mc/Mr) is a plain subtraction.
+        # y3,y4 (ellipticity) are GIVEN, so s0 (and hence x0) is immediately
+        # computable; x1 follows from x0; x2 (Mc/Mr) is a plain subtraction.
+        # x3,x4 are NOT closed-form any more -- net_dipquad's D,c now read
+        # the galaxy's own ellipticity (see the class docstring /
+        # `_ellipticity`), so inverting them is a 2x2 implicit equation,
+        # solved by `_solve_ell` (Picard fixed point + IFT `custom_jvp`).
         log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n = self._unpack(condition)
         y0, y1, y2, y3, y4 = y
 
@@ -1939,15 +2064,7 @@ class SigmaXBlockLayer(AbstractBijection):
         c1 = self._size_loc
         x1 = (y1 - c1 * (kappa - 1.0)) / kappa
 
-        dq_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n])
-        D_raw, c_raw = self.net_dipquad(dq_in)
-        D = T_n * D_raw
-        c = jnn.tanh(T_n**2 * c_raw)
-        r3 = kappa * y3 - D * e1
-        r4 = kappa * y4 - D * e2
-        det_e = 1.0 - c**2 * e_mag_sq
-        x3 = ((1.0 - c * e1) * r3 - c * e2 * r4) / det_e
-        x4 = (-c * e2 * r3 + (1.0 + c * e1) * r4) / det_e
+        x3, x4 = self._solve_ell(x0, x1, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n)
         # x0 is already recovered above, so this is a plain subtraction (no
         # circularity -- see `_mc_shift`'s docstring).
         x2 = y2 - self._mc_shift(x0, log_scale_n, e_mag_sq_n, T_n)
@@ -1996,6 +2113,57 @@ def _solve_x0_ift_jvp(static, primals, tangents):
         (params_dot, y3_dot, y4_dot, ls_dot, ems_dot, tn_dot))
     x0_dot = (y0_dot - f_dot_rest) / f_x0
     return x0, x0_dot
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(0,))
+def _solve_ell_ift(static, params, x0, x1, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n):
+    """`SigmaXBlockLayer._solve_ell`'s numeric fixed point, `custom_jvp`-
+    wrapped -- the 2x2 generalization of `_solve_x0_ift`'s scalar IFT.
+
+    `static`/`params` split for the identical reason `_solve_x0_ift` does.
+    The primal is exactly `eqx.combine(params, static)._solve_ell_picard(...)`;
+    the JVP rule below replaces "differentiate through the Picard scan"
+    (whose gradient would be dominated by however many steps happened to run,
+    not the true fixed-point derivative -- same failure mode as
+    `_solve_x0_ift`'s bisection, see its docstring) with the IFT derivative
+    of the SINGLE-STEP map `Phi` (`SigmaXBlockLayer._ell_step`) evaluated AT
+    the converged root `x* = (x3,x4)`.
+    """
+    layer = eqx.combine(params, static)
+    return layer._solve_ell_picard(x0, x1, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n)
+
+
+@_solve_ell_ift.defjvp
+def _solve_ell_ift_jvp(static, primals, tangents):
+    (params, x0, x1, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n) = primals
+    (params_dot, x0_dot, x1_dot, y3_dot, y4_dot, e1_dot, e2_dot,
+     ls_dot, ems_dot, tn_dot) = tangents
+    layer = eqx.combine(params, static)
+    x3, x4 = layer._solve_ell_picard(x0, x1, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n)
+
+    def Phi(params_, x_vec, x0_, x1_, y3_, y4_, e1_, e2_, ls_, ems_, tn_):
+        layer_ = eqx.combine(params_, static)
+        x3_new, x4_new = layer_._ell_step(x_vec[0], x_vec[1], x0_, x1_, y3_, y4_, e1_, e2_,
+                                           ls_, ems_, tn_)
+        return jnp.stack([x3_new, x4_new])
+
+    x_vec = jnp.array([x3, x4])
+    # dPhi/dx at the root -- the 2x2 Jacobian of ONE Picard step (`_ell_step`),
+    # NOT the whole scan, exactly like `_solve_x0_ift_jvp`'s scalar `f_x0`
+    # but a matrix here since there are two coupled unknowns.
+    dPhi_dx = jax.jacobian(Phi, argnums=1)(params, x_vec, x0, x1, y3, y4, e1, e2,
+                                            log_scale_n, e_mag_sq_n, T_n)
+    # Phi's directional derivative w.r.t. everything EXCEPT (x3,x4), held
+    # fixed at the root -- the numerator, via a single jvp (mirrors
+    # `_solve_x0_ift_jvp`'s `f_dot_rest`).
+    _, Phi_dot_rest = jax.jvp(
+        lambda p, a, b, c, d, e, f, g, h, i: Phi(p, x_vec, a, b, c, d, e, f, g, h, i),
+        (params, x0, x1, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n),
+        (params_dot, x0_dot, x1_dot, y3_dot, y4_dot, e1_dot, e2_dot, ls_dot, ems_dot, tn_dot))
+    # IFT for a 2x2 fixed point: x* = Phi(x*, theta) => (I - dPhi/dx) dx_dot
+    # = dPhi/dtheta . theta_dot -- a 2x2 linear solve, not a division.
+    dx_dot = jnp.linalg.solve(jnp.eye(2) - dPhi_dx, Phi_dot_rest)
+    return (x3, x4), (dx_dot[0], dx_dot[1])
 
 
 # ---------------------------------------------------------------------------
