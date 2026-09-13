@@ -69,7 +69,13 @@ def test_psi_ld_matches_jacfwd():
 
             # 2. the log-det agrees.  At g != 0 the O(g^3) series-inversion gap
             # is real and is allowed a loose bound; at g = 0 it is roundoff.
-            tol = 1e-9 if not np.any(np.asarray(g)) else 1e-4
+            # 2e-4, not 1e-4: models.shear's point-source _edge_factor rescales
+            # Q, R by a function of z1, so `shear`'s inverted-series Q, R (read
+            # off at y) and `unshear`'s exact ones (at the true x) now disagree
+            # by slightly more than before at the same O(g^3) order -- still
+            # the same truncation gap this test already allows for, just a
+            # bigger constant in front of it.
+            tol = 1e-9 if not np.any(np.asarray(g)) else 2e-4
             err = np.max(np.abs(np.asarray(ld_new - ld_old)))
             assert err < tol, (f"logdet centroid={centroid} g={g}", err)
 

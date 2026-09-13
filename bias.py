@@ -2106,7 +2106,7 @@ def window_prob(m, cov, size, flux, nodes=64):
 
 
 def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
-                    kind="draw"):
+                    kind="draw", density=None):
     """(P_s, Q_s, R_s, Q_s_err) -- eq. (40)'s selection probability and its
     first two shear derivatives at g = 0, as float64 (), (2,), (2, 2), (2,).
 
@@ -2233,6 +2233,7 @@ def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
     ps_acc, qs_acc, rs_acc, w_acc = 0.0, np.zeros(2), np.zeros((2, 2)), 0
     qs_chunks = []
     n_dropped = 0
+    n_guarded = 0
     d2_top = (0.0, None)     # (max |d2F/dg1^2|, that DRAW's m).  "Draw", not
                              # "template": with `--window-terms flow` these are
                              # flow samples, and the warning below said
@@ -2256,6 +2257,17 @@ def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
         # analytic Gaussian population, half of which is off-chart).  Adding
         # `in_domain` here silently redefined P_s and failed that test.
         ok = np.asarray(keep_at_zero(z_chunk))
+        if density is not None:
+            # Same test as `selection_terms_score`'s density guard: is this
+            # draw's shape at least as close to a real template as that
+            # template is to its own nearest neighbour?  Unlike the
+            # finiteness check above this IS an `in_domain`-style
+            # restriction, but a deliberate one here -- `density` is only
+            # ever passed by `bias.py`'s own callers, never by the
+            # generic-`draw` tests `selection_terms` also serves.
+            sane = in_support_density(draw(zero, z_chunk), density)
+            n_guarded += int(ok.sum() - (ok & sane).sum())
+            ok = ok & sane
         if not ok.all():
             n_dropped += int((~ok).sum())
             z_chunk = z_chunk[jnp.asarray(ok)]
@@ -2282,8 +2294,11 @@ def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
             d2_top = (top, np.asarray(draw(zero, z_chunk[j:j + 1]))[0])
 
     if n_dropped:
-        print(f"  selection_terms: dropped {n_dropped}/{n} non-finite prior "
-              f"draws ({n_dropped / n:.1e})")
+        print(f"  selection_terms: dropped {n_dropped}/{n} non-finite/"
+              f"low-density prior draws ({n_dropped / n:.1e})")
+    if n_guarded:
+        print(f"  support density dropped {n_guarded}/{n} draws off the "
+              f"training catalog's shape ({n_guarded / n:.2e})")
     ps, qs, rs = ps_acc / w_acc, qs_acc / w_acc, rs_acc / w_acc
     qs_stack = np.stack(qs_chunks)
     # Standard error of the mean from the chunk-to-chunk scatter -- the same
@@ -2315,47 +2330,118 @@ def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
     return np.float64(ps), qs, rs, qs_err
 
 
-def _score_guard(chunked, m, pilot, factor, batch):
-    """Threshold on |Q|, |R| for the selection draws -- `sane_targets` for the
-    prior sample instead of the targets, and the same `factor`.
+def _shape_invariants(m):
+    """(log10 Mf, Mr/Mf, Mc/Mr, M1/Mr, M2/Mr) from raw moments `m`, (..., 5).
 
-    WHY (2026-09-05, `[[rs-tail-is-unphysical-draws]]`).  `in_support` is a BOX
-    -- Mf>0, Mr>0, and the two point-source ratio ceilings -- but the reachable
-    set of a real galaxy family is a CURVED subset of it, much smaller.  The
-    flow puts mass in the gap, and its extrapolated Q, R there are garbage: on
-    gauss2, 91% of the draws carrying `R_s11` invert to NO galaxy (against 1.6%
-    of real ones) and the flow's |R11| runs 87x the exact value where the exact
-    value exists at all.  That is the whole heavy tail -- Hill 1.01, one draw
-    owning 42% of `R_s11`, and getting WORSE with more draws.
-
-    The threshold comes from a PILOT of the first `pilot` draws rather than a
-    full first pass: Q, R for every draw is the expensive part and at 2^24 a
-    second pass would double the run.  A median is what is being estimated, so
-    a 2^16 pilot is ample, and it is computed on the UNWINDOWED |Q|, |R| -- the
-    same threshold then serves every window in a `windows=` scan, which is what
-    keeps that scan paired.
+    The flux-blind SHAPE of a template, not its raw moments: two galaxies at
+    different flux but the same size/concentration/ellipticity/orientation
+    are the same point here, which is what lets one density estimate, built
+    once from the training catalog, bound the support at every flux the
+    window admits.  Keeps the FULL spin-2 pair rather than collapsing to
+    |e|^2 -- collapsing throws away exactly the information that would tell
+    two same-|e| points apart, and measured on the known `gauss2_v3d` R_s
+    leader (2026-09-12) it makes no difference anyway: even with (e1, e2)
+    kept, that leader's shape sits well inside the real templates' own
+    nearest-neighbour spacing, so nothing gained here is lost either.  Plain
+    numpy, not `jnp`: only ever called on host arrays feeding a
+    `scipy.spatial.cKDTree` query, never inside a jit trace.
     """
-    # In `batch`-sized pieces, NOT one vmap over the whole pilot: `one` is a
-    # forward-over-reverse Hessian, so a 65536-wide call asks for 11.7 GiB and
-    # the 16 GB card OOMs.  The main loop below batches for the same reason.
-    aq, ar = [], []
-    for i in range(0, pilot, batch):
-        q, r = chunked(jnp.asarray(m[i:min(i + batch, pilot)]))
-        q = np.abs(np.asarray(q, dtype=np.float64)).max(axis=-1)
-        aq.append(q)
-        ar.append(np.abs(np.asarray(r, dtype=np.float64))
-                  .reshape(len(q), -1).max(axis=-1))
-    aq, ar = np.concatenate(aq), np.concatenate(ar)
-    aq, ar = aq[np.isfinite(aq)], ar[np.isfinite(ar)]
-    tq, tr = factor * np.median(aq), factor * np.median(ar)
-    print(f"  score guard: |Q| > {tq:.4g} or |R| > {tr:.4g} "
-          f"(median {np.median(aq):.4g} / {np.median(ar):.4g} over a "
-          f"{len(aq)}-draw pilot, factor {factor:g})")
-    return tq, tr
+    Mf, Mr, M1, M2, Mc = (np.asarray(m)[..., i] for i in range(5))
+    return np.stack([np.log10(Mf), Mr / Mf, Mc / Mr, M1 / Mr, M2 / Mr],
+                    axis=-1)
+
+
+def build_support_density(m_train, n_max=100_000, seed=0, k=10):
+    """A NEAREST-NEIGHBOUR density estimate from the TRAINING CATALOG's own
+    shape invariants -- the margin-free replacement for a magnitude
+    threshold on Q, R (superseding both that and the convex-hull version,
+    `[[rs-tail-is-unphysical-draws]]` and 2026-09-12's follow-up).
+
+    WHY NOT a magnitude threshold on Q, R.  It tests the SYMPTOM: a draw just
+    past the reachable manifold with an unremarkable-looking Q, R gets
+    through, and the factor is a number to pick.
+
+    WHY NOT the convex hull tried first.  It tests the CAUSE (is this draw's
+    shape anywhere near a real template) with no free parameter, but a
+    convex hull is only a NECESSARY test: a concave dimple in the true
+    manifold -- and `gauss2`'s reachable set is exactly that shape, not
+    convex -- hides inside the hull.
+
+    WHY THE CUTOFF IS GLOBAL, NOT LOCAL (per-nearest-template).  A per-
+    template version was tried and is WRONG: comparing a draw's k-NN
+    distance against ONE specific template's own k-NN distance is comparing
+    two samples of the same random variable (if the flow matches the
+    population, a draw's local spacing and a random template's local spacing
+    are identically distributed), so roughly half of all draws fail purely
+    by chance -- measured 42-43% rejection on `gauss2_v3d`, regardless of
+    `k`. The GLOBAL max over every template's own k-NN spacing has no such
+    problem: every real template trivially satisfies it, and a draw fails
+    only if it is sparser than the SPARSEST point anywhere in the real
+    population, not sparser than whichever one template happened to be
+    nearest.
+
+    What this test CANNOT do, measured directly and not fixable by any
+    choice here: `gauss2`'s worst `R_s` leader (`dev`-equivalent check,
+    2026-09-12) sits at a k-NN distance of 0.46 against a global cutoff of
+    4.6 -- deep inside dense, entirely real template territory -- despite its
+    exact preimage being unphysical (`log_p_theta = -inf`, only checkable
+    because `gauss2` HAS a known closed-form generative model; no other
+    population does).  A point can be both "close to real templates" and
+    "not itself real" when the reachable manifold folds near enough to
+    itself, and no density estimate over any invariant set sees that. This
+    filter is a real, template-only, population-agnostic improvement -- it
+    is not, and cannot be made into, a complete one.
+
+    Distances are in the STANDARDISED invariant space (each axis divided by
+    the catalog's own std) so no one coordinate's units dominate; that
+    standardisation is read off `m_train`, not chosen.
+
+    `n_max` subsamples the catalog before building the tree: a training
+    catalog is typically 100k-1M rows and the nearest-neighbour statistics
+    stop moving well before that.
+
+    `k`: the 1st-nearest-neighbour distance alone is a single sample and a
+    high-variance estimate of local spacing -- the k-th-nearest-neighbour
+    distance is the standard adaptive-bandwidth fix (as in variable-
+    bandwidth KDE), averaging over `k` neighbours.  Chosen for robustness,
+    not to hit a target rejection rate.
+    """
+    from scipy.spatial import cKDTree
+
+    pts = _shape_invariants(m_train)
+    pts = pts[np.isfinite(pts).all(-1)]
+    if len(pts) > n_max:
+        rng = np.random.default_rng(seed)
+        pts = pts[rng.choice(len(pts), n_max, replace=False)]
+    scale = pts.std(0)
+    pts_n = pts / scale
+    tree = cKDTree(pts_n)
+    # k+1: index 0 of a self-query is the zero self-match, so the k-th OTHER
+    # template is at index k.
+    self_dist, _ = tree.query(pts_n, k=k + 1)
+    # GLOBAL: the worst (largest) spacing seen ANYWHERE among real templates,
+    # not each template's own -- see the docstring's "WHY THE CUTOFF IS
+    # GLOBAL" section.
+    cutoff = self_dist[:, k].max()
+    print(f"  support density: {len(pts)} templates, {k}-NN spacing "
+          f"median {np.median(self_dist[:, k]):.3g}, cutoff {cutoff:.3g}")
+    return tree, scale, cutoff, k
+
+
+def in_support_density(m, density):
+    """Boolean mask, `m` shape (..., 5): for each draw, is its own k-NN
+    distance to the training catalog no larger than the WORST such spacing
+    seen anywhere among real templates (`build_support_density`)?  Host-side
+    (numpy + scipy), called outside any jit trace.
+    """
+    tree, scale, cutoff, k = density
+    x = _shape_invariants(m) / scale
+    dist, _ = tree.query(x, k=k)
+    return dist[:, -1] <= cutoff
 
 
 def selection_terms_score(flow, m, cov, size, flux, sigma_x=None, batch=4096,
-                          windows=None, guard=0.0, guard_pilot=1 << 16):
+                          windows=None, density=None):
     """(P_s, Q_s, R_s, Q_s_err) by the SCORE-FUNCTION estimator -- eq. (40)'s
     selection probability and its first two shear derivatives at g = 0.
 
@@ -2423,12 +2509,7 @@ def selection_terms_score(flow, m, cov, size, flux, sigma_x=None, batch=4096,
     fprobs = [eqx.filter_jit(lambda mm, s=s, f=f: window_prob(mm, cov, s, f))
               for s, f in wins]
 
-    tq = tr = np.inf
     n_guarded = 0
-    if guard > 0.0:
-        tq, tr = _score_guard(chunked, m, min(guard_pilot, len(m)), guard,
-                              batch)
-
     n = len(m)
     nw = len(wins)
     ps_acc = np.zeros(nw)
@@ -2448,11 +2529,12 @@ def selection_terms_score(flow, m, cov, size, flux, sigma_x=None, batch=4096,
         # so this mask is shared -- every window keeps the SAME draws, which is
         # what makes the scan paired.
         okqr = jnp.isfinite(q).all(-1) & jnp.isfinite(r).all(-1).all(-1)
-        if guard > 0.0:
+        if density is not None:
             # Window-INDEPENDENT, like the finiteness mask above, so every
-            # window in a scan keeps the identical draw set.
-            sane = ((jnp.abs(q).max(-1) <= tq)
-                    & (jnp.abs(r).reshape(len(q), -1).max(-1) <= tr))
+            # window in a scan keeps the identical draw set.  Tests the DRAW
+            # ITSELF against the training catalog's local density, not its
+            # Q, R -- see `in_support_density`.
+            sane = in_support_density(mm, density)
             n_guarded += int(okqr.sum() - (okqr & sane).sum())
             okqr = okqr & sane
         for w, fprob in enumerate(fprobs):
@@ -2481,9 +2563,8 @@ def selection_terms_score(flow, m, cov, size, flux, sigma_x=None, batch=4096,
         print(f"  selection_terms_score: dropped {n_dropped}/{n} non-finite "
               f"prior draws ({n_dropped / n:.1e})")
     if n_guarded:
-        print(f"  score guard dropped {n_guarded}/{n} draws "
-              f"({n_guarded / n:.2e}) -- REPORT R_s's sensitivity to `guard`, "
-              f"it is a truncation and the estimand moves with it")
+        print(f"  support density dropped {n_guarded}/{n} draws off the "
+              f"training catalog's shape ({n_guarded / n:.2e})")
     out = []
     for w, (s, f) in enumerate(wins):
         ps = ps_acc[w] / w_acc[w]
@@ -2968,13 +3049,26 @@ def main():
     # [[rs-flow-vs-templates-is-draw-count]].  Keep `templates` reachable for
     # dev/rs_agree.py, which cross-checks the two; do not correct a bias with
     # it.
+    p.add_argument("--no-window-density-filter", action="store_true",
+                   help="skip the support-density filter on selection draws "
+                        "(see `build_support_density`): by default a draw is "
+                        "excluded from P_s, Q_s, R_s unless it sits at least "
+                        "as close (in the training catalog's own shape "
+                        "invariants -- log Mf, Mr/Mf, Mc/Mr, |e|^2) to a real "
+                        "template as that template sits to its own nearest "
+                        "neighbour, on the grounds that anything sparser has "
+                        "no real galaxy behind it -- superseded both the "
+                        "magnitude-threshold `--window-guard` (took a factor "
+                        "to pick, only caught draws extreme enough to blow "
+                        "Q, R up) and an earlier convex-hull version (a "
+                        "concave gap in the reachable manifold can hide "
+                        "inside a hull; this local test cannot miss one).")
     p.add_argument("--window-guard", type=float, default=0.0,
-                   help="drop selection draws whose |Q| or |R| exceeds this "
-                        "factor times the pilot median -- `sane_targets` for "
-                        "the prior sample. 1000 is the same factor the target "
-                        "guard uses. OFF by default because it is a "
-                        "TRUNCATION: R_s moves with it, so scan it and quote "
-                        "the sensitivity rather than one value.")
+                   help="DEPRECATED, IGNORED: the support-density filter "
+                        "(see --no-window-density-filter) replaces it, needs "
+                        "no factor, and is on by default. Kept only so "
+                        "existing scripts that pass this do not fail to "
+                        "parse.")
     p.add_argument("--window-terms", choices=["templates", "flow", "score"],
                    default="score",
                    help="where eq. (40)'s P_s, Q_s, R_s come from. 'score' "
@@ -3370,6 +3464,19 @@ def main():
                       f"{deadmask[s_a].mean():.2%}, out-of-window "
                       f"{deadmask[~s_a].mean():.2%}")
 
+        if a.window_guard:
+            print("  --window-guard is deprecated and ignored -- the support "
+                  "density filter (see --no-window-density-filter) "
+                  "replaces it")
+        # A draw sparser (in the training catalog's own shape invariants)
+        # than any real template's own nearest-neighbour spacing cannot
+        # correspond to a real galaxy (`build_support_density`), so it is
+        # excluded from P_s, Q_s, R_s below regardless of which estimator
+        # produces them.  Built once, from the SAME catalog the flow was
+        # trained on, not the draws being filtered.
+        density = (None if a.no_window_density_filter
+                  else build_support_density(np.asarray(m_train_full)))
+
         # P_s, Q_s, R_s are a property of the MODEL (the flow's prior at
         # g = 0), not of which arm's catalog is being corrected, so one
         # `selection_terms` call serves both arms -- only N_ns (a property of
@@ -3445,12 +3552,12 @@ def main():
             m_draw = jnp.concatenate(
                 [tr(zs[i:i + 16384]) for i in range(0, len(zs), 16384)])
             ps, qs, rs, qs_err = selection_terms_score(
-                flow, m_draw, cov, size, flux, sigma_x=sx1,
-                guard=a.window_guard)
+                flow, m_draw, cov, size, flux, sigma_x=sx1, density=density)
         else:
             ps, qs, rs, qs_err = selection_terms(
                 draw, z, cov, size, flux, fd=a.window_fd,
-                kind=("template" if a.window_terms == "templates" else "draw"))
+                kind=("template" if a.window_terms == "templates" else "draw"),
+                density=None if a.window_terms == "templates" else density)
         print(f"  selection terms from the {a.window_terms}"
               + (f", central differences at h = {a.window_fd}" if a.window_fd
                  else ""))

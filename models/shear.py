@@ -102,7 +102,7 @@ from flowjax.bijections import AbstractBijection
 
 from paramax import non_trainable, unwrap
 
-from .bijections import CoeffNet
+from .bijections import CoeffNet, POINT_SOURCE
 
 # Coefficients are bounded so the map stays a diffeomorphism for any g the
 # network might see.
@@ -142,6 +142,24 @@ from .bijections import CoeffNet
 # physical range is [-2, 7].  The paragraphs above are kept because the trap is
 # easy to walk back into -- read them before touching this constant.
 _COEFF_MAX = 12.0
+
+# `project_to_physics` multiplies the coefficients' OUTPUT -- Q, R -- by
+# `_edge_factor`'s `s`, which is not a per-coefficient rescaling but an outer
+# factor applied after `_Coeffs` has already squashed to `_COEFF_MAX`.  Near
+# the point-source ceiling `s` legitimately runs small (it is exact zero AT
+# the ceiling, by the same physics `_edge_factor` documents), so recovering
+# the correct post-multiplication Q, R there means the network's raw spin-0
+# output must reach `true_coefficient / s` -- on `gauss2_v3d`, 1/s runs up to
+# 273 and exceeds 12 for 21% of templates.  That is the same trap the comment
+# above describes (a bound the true response cannot fit under), reintroduced
+# by `s` rather than by the chart.  Spin-2 (`A, B, mu, nu, rho`) needs no such
+# headroom -- its physical scale is O(1), so `_COEFF_MAX` already covers
+# `true_coefficient / s` for nearly all templates -- and raising the SHARED
+# bound to cover spin-0 is what broke it in `dev/combined_test.py` (spin-2
+# alpha 0.95 -> 0.44 at C=100): a larger bound also frees the small-|e|
+# direction spin-2's `B` is undetermined along.  So the bound is split: only
+# the nine spin-0 outputs get the larger one, spin-2 keeps 12.
+_COEFF_MAX_SPIN0 = 1e4
 
 # Radius of the training shear disc, and the operating point of the bias
 # measurement.  It lives here rather than in shear.py because
@@ -315,7 +333,39 @@ class _Coeffs(eqx.Module):
         u = jnp.stack([f, a, b, (q - _Q_LOC) / _Q_SCALE])
         u = unwrap(self.u_white) @ (u - unwrap(self.u_mean))
         x = self.net(u)
-        return x * jax.lax.rsqrt(1.0 + (x / _COEFF_MAX) ** 2)
+        # First 9 outputs are the spin-0 s0 matrix, last 5 are spin-2
+        # (A, B, mu, nu, rho) -- see `_COEFF_MAX_SPIN0`'s docstring for why
+        # they need different bounds.
+        bound = jnp.concatenate([jnp.full(9, _COEFF_MAX_SPIN0),
+                                 jnp.full(5, _COEFF_MAX)])
+        return x * jax.lax.rsqrt(1.0 + (x / bound) ** 2)
+
+
+def _edge_factor(z, chart_loc, chart_scale):
+    """Exact zero at the Mr/Mf point-source ceiling, where a template carries
+    no shape at all and so cannot respond to shear -- z1, z2 and e are all
+    fixed at their pure-weight-function values there regardless of g, and the
+    physical claim goes no further than that: it says nothing about the RATE
+    the response vanishes at, which `_Coeffs` -- already conditioned on this
+    same ratio via its `a` invariant, and bounded so it cannot blow up to
+    cancel a small prefactor -- remains free to shape.  z1 is the STANDARDISED
+    bare ratio (`_chart_spin0_jac`'s docstring), so this undoes that one
+    affine map to recover the raw Mr/Mf ratio the ceiling is defined on.
+
+    Plain linear taper over the WHOLE domain, `1` at ratio=0 down to `0` at
+    `POINT_SOURCE` -- no transition-width knob.  An earlier version confined
+    the ramp to a hand-picked margin below the ceiling on the theory that it
+    would then be a no-op everywhere the estimator windows on; that margin was
+    calibrated against one population's Mr/Mf distribution and silently broke
+    on `gauss2_v3d`, whose ratio sits packed against the ceiling (median 3.15
+    against `POINT_SOURCE` 3.69), so the "no-op" band covered ~45% of the
+    population and suppressed its mean response by ~17%.  A per-population
+    tuning constant that does not transfer is worse than the saturation this
+    plain form costs -- see `_Coeffs`, which is conditioned on this same
+    ratio and free to compensate for a taper it knows the shape of.
+    """
+    ratio = z[1] * chart_scale[1] + chart_loc[1]
+    return jnp.clip(1.0 - ratio / POINT_SOURCE, 0.0, 1.0)
 
 
 def project_to_physics(coeffs, z, g, e_scale, chart_loc, chart_scale):
@@ -343,7 +393,10 @@ def project_to_physics(coeffs, z, g, e_scale, chart_loc, chart_scale):
     Q = jax.jacfwd(shift_func)(jnp.zeros(2))
     # R (5, 2, 2)
     R = jax.hessian(shift_func)(jnp.zeros(2))
-    return Q, R
+    # `s` does not depend on g, so scaling the g-independent Q, R by it is
+    # exactly the same as scaling `shift_func` itself before differentiating.
+    s = _edge_factor(z, chart_loc, chart_scale)
+    return s * Q, s * R
 
 
 def response(coeffs, z, g, e_scale, chart_loc, chart_scale):
