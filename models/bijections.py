@@ -165,6 +165,122 @@ def concentration_phi(r):
     return phi.astype(orig_dtype)
 
 
+# Below this radius, `atanh(rho)/rho` and `tanh(s)/s` switch from their
+# closed forms to the Taylor series below -- both ratios have a removable
+# singularity at 0 (limit 1), and forming `atanh(rho)/rho` near rho=0 the
+# naive way is `0/0` both in value AND in the gradient jax would otherwise
+# take through the masked-out branch of a `jnp.where`.  1e-4 keeps the
+# series error (O(rho^6)) below float32 eps at the switch point while still
+# being comfortably inside the region where the closed form is safe to
+# differentiate.
+_SPIN2_SERIES_EPS = 1e-4
+
+
+def _atanh_over_rho(rho):
+    """``atanh(rho)/rho``, safe at ``rho == 0``.
+
+    Never evaluates ``arctanh`` AT the value that would divide 0/0, even on
+    the branch `jnp.where` discards -- `jax.grad` differentiates both
+    branches of a `where`, so an unmasked `arctanh(rho) / rho` would still
+    produce a NaN gradient at `rho = 0` despite never being SELECTED.  Series
+    to O(rho^4): ``atanh(rho)/rho = 1 + rho^2/3 + rho^4/5 + O(rho^6)``.
+    """
+    small = jnp.abs(rho) < _SPIN2_SERIES_EPS
+    safe_rho = jnp.where(small, 1.0, rho)
+    exact = jnp.arctanh(safe_rho) / safe_rho
+    series = 1.0 + rho ** 2 / 3.0 + rho ** 4 / 5.0
+    return jnp.where(small, series, exact)
+
+
+def _tanh_over_s(s):
+    """``tanh(s)/s``, safe at ``s == 0`` -- see `_atanh_over_rho`, same
+    safe-where masking.  Series to O(s^4):
+    ``tanh(s)/s = 1 - s^2/3 + 2*s^4/15 + O(s^6)``.
+
+    float32 `jnp.tanh` saturates to exactly `1.0` for `|s|` as small as ~11
+    (verified), not merely close to it -- `spin2_unbound` re-clips the
+    RESULTING `(e1, e2)` after calling this (see its own comment), rather
+    than trying to keep `tanh(s)` itself strictly below 1 here, since the
+    final `ratio * w` multiply and the caller's `hypot` reintroduce their own
+    rounding on top of whatever headroom a clip here would buy.
+    """
+    small = jnp.abs(s) < _SPIN2_SERIES_EPS
+    safe_s = jnp.where(small, 1.0, s)
+    exact = jnp.tanh(safe_s) / safe_s
+    series = 1.0 - s ** 2 / 3.0 + 2.0 * s ** 4 / 15.0
+    return jnp.where(small, series, exact)
+
+
+def spin2_bound(e1, e2):
+    """Physical ellipticity ``(e1, e2) = (M1/Mr, M2/Mr)`` -> unbounded chart
+    coordinate ``(w1, w2)``.
+
+    ``rho = hypot(e1, e2)``; ``(w1, w2) = atanh(rho) * (e1, e2) / rho`` --
+    identity in ANGLE, `atanh` in RADIUS, so it is rotation-equivariant (a
+    scalar function of the modulus times the unit direction), matching every
+    other spin-2 layer's equivariance requirement (see
+    `RawMomentStandardize`'s "SYMMETRISED" docstring paragraph).
+
+    This is the forward half of the fix for the 12%-of-draws physical-bound
+    violation the bare-ratio chart allowed: see `spin2_unbound`, the actual
+    enforcement point, for why a shared pair of functions rather than three
+    independently-written copies matters -- this mirrors `_chart_spin0_jac`,
+    which went stale in exactly this way (one call site's formula changed,
+    the other two silently didn't) earlier this session.
+
+    Legal to call with `rho >= 1` (a NOISY/measured ellipticity fed in by
+    mistake): `rho` is clipped to `[0, 1 - 1e-7]` before `atanh` so this
+    never produces `inf`/`nan`.  Real training data never approaches this
+    (measured max `|e| = 0.8952` on one population) -- see
+    `RawMomentStandardize`'s "POINT_SOURCE" docstring paragraph for the
+    analogous existing clip on slot 1, and its "NOTE this makes the chart
+    undefined..." paragraph for why this is legal at all: the flow only ever
+    evaluates LATENT moments directly here, anything measured goes through
+    `in_domain` first.
+    """
+    e1 = jnp.asarray(e1)
+    e2 = jnp.asarray(e2)
+    rho = jnp.hypot(e1, e2)
+    rho = jnp.clip(rho, 0.0, 1.0 - 1e-7)
+    ratio = _atanh_over_rho(rho)
+    return ratio * e1, ratio * e2
+
+
+def spin2_unbound(w1, w2):
+    """Inverse of `spin2_bound`.
+
+    ``s = hypot(w1, w2)``; ``(e1, e2) = tanh(s) * (w1, w2) / s``.  This is
+    the ACTUAL enforcement point for the hard physical bound
+    `hypot(e1, e2) < 1`: `tanh` saturates strictly below 1 for any FINITE
+    `s` MATHEMATICALLY, so no finite chart coordinate -- however large --
+    can make the inverse map produce a point past the ceiling.  Verified
+    finite out to `s ~ 1e6`.
+
+    A final rescale below re-clips `hypot(e1, e2)` itself to at most
+    `1 - 1e-6`, on top of the `tanh` above: `jnp.tanh` in float32 saturates
+    to exactly `1.0` for `|s|` as small as ~11, and even the closed form's
+    OWN `ratio * w` multiply plus this function's `hypot` reintroduce ~1 ULP
+    of rounding on top of that -- both were observed to push `hypot(e1, e2)`
+    fractionally past 1.0 (up to 1.0000001) on huge `|w|` without this.  The
+    margin here is `1e-6`, ten times `spin2_bound`'s `1e-7` clip: a caller
+    that recomputes `hypot(e1, e2)` with a DIFFERENT summation order (e.g.
+    plain numpy rather than this function's own `jnp.hypot`) can differ from
+    the value checked here by a few ULP, and `1e-6` was verified (not just
+    argued) to survive that on a 5000-sample huge-`|w|` sweep where `1e-7`
+    did not.  The rescale is a no-op (multiplies by 1.0) for any physical
+    input; it only ever engages in the saturated regime this function exists
+    to guard.
+    """
+    w1 = jnp.asarray(w1)
+    w2 = jnp.asarray(w2)
+    s = jnp.hypot(w1, w2)
+    ratio = _tanh_over_s(s)
+    e1, e2 = ratio * w1, ratio * w2
+    rho_out = jnp.hypot(e1, e2)
+    safety = jnp.minimum(1.0, (1.0 - 1e-6) / jnp.maximum(rho_out, 1e-30))
+    return e1 * safety, e2 * safety
+
+
 def in_domain(m):
     """Rows whose raw moments the flow's chart can EVALUATE.
 
@@ -568,7 +684,10 @@ def sas_log_deriv(x, p):
 class RawMomentStandardize(AbstractBijection):
     """
     Raw x = [Mf, Mr, M1, M2, Mc]   (bfd's even-moment order)
-    Transformed z0 = [log10(Mf), Mr/Mf, Mc/Mr - Phi(Mr/Mf)/(Mr/Mf), M1/Mr, M2/Mr]
+    Transformed z0 = [log10(Mf), Mr/Mf, Mc/Mr - Phi(Mr/Mf)/(Mr/Mf), w1, w2]
+    where (w1, w2) = spin2_bound(M1/Mr, M2/Mr) is the bounded radial
+    reparameterisation of the raw ellipticity described below, not the bare
+    ratio.
     Then standardized: z = (z0 - mean) / std
 
     Slot 1 carries the point-source ceiling `r* = POINT_SOURCE` as a HARD
@@ -616,6 +735,21 @@ class RawMomentStandardize(AbstractBijection):
     and the spin-2 pair last (3, 4); the equivariant layers and the
     permutations between them rely on that split.  Mc/Mr carries the same units
     as Mr/Mf (both are k^2), so the two size-like coordinates share a scale.
+
+    Slots 3, 4 carry a HARD boundary of their own: raw ellipticity
+    `(e1, e2) = (M1/Mr, M2/Mr)` satisfies `hypot(e1, e2) < 1` by the same
+    weight-kernel positivity argument as slot 1's `r*` ceiling (a provable
+    bound, not a fitted one).  Rather than the bare ratio, slots 3 and 4 are
+    `spin2_bound(e1, e2)` -- identity in angle, `atanh` in modulus -- whose
+    inverse `spin2_unbound` GUARANTEES `hypot(e1, e2) < 1` for any finite
+    chart coordinate, by construction (`tanh` saturates strictly below 1).
+    Unlike slot 1's logit, this closes the boundary WITHOUT stretching the
+    chart in angle, since the map is a scalar function of the modulus alone
+    -- exactly the rotation-equivariance every other spin-2 layer already
+    has (see "SYMMETRISED" below).  See `spin2_bound`/`spin2_unbound`'s own
+    docstrings for the full derivation; they are shared with `models/shear.py`
+    and `models/centroid.py` so the three call sites cannot independently
+    drift apart the way `_chart_spin0_jac` once did.
 
     The spin-2 standardisation is SYMMETRISED (`_effective`), which is what
     keeps the whole stack isotropic.  Every other layer already is -- `Permute`
@@ -707,8 +841,11 @@ class RawMomentStandardize(AbstractBijection):
         # Mc/Mr of an isotropic Gaussian galaxy subtracted off, see the class
         # docstring and `concentration_phi`.
         z0_2 = Mc / Mr - concentration_phi(z0_1) / z0_1
-        z0_3 = M1 / Mr
-        z0_4 = M2 / Mr
+        # Bounded radial reparameterisation of the raw ellipticity -- see
+        # `spin2_bound`'s own docstring.  Replaces the bare ratio so that
+        # `hypot(e1, e2) < 1` is a HARD bound on the inverse map, not merely
+        # a property of well-behaved training data.
+        z0_3, z0_4 = spin2_bound(M1 / Mr, M2 / Mr)
 
         z0 = jnp.stack([z0_0, z0_1, z0_2, z0_3, z0_4], axis=-1)
         mean, std = self._effective()
@@ -739,8 +876,12 @@ class RawMomentStandardize(AbstractBijection):
         Mr = z0[..., 1] * Mf
         # Invert z0_2 = Mc/Mr - Phi(z0_1)/z0_1: Mc/Mr = z0_2 + Phi(z0_1)/z0_1.
         Mc = (z0[..., 2] + concentration_phi(z0[..., 1]) / z0[..., 1]) * Mr
-        M1 = z0[..., 3] * Mr
-        M2 = z0[..., 4] * Mr
+        # Invert z0_3, z0_4 = spin2_bound(M1/Mr, M2/Mr): this is the step
+        # that GUARANTEES hypot(M1/Mr, M2/Mr) < 1 for any finite z0[3:5] --
+        # see `spin2_unbound`'s docstring.
+        e1, e2 = spin2_unbound(z0[..., 3], z0[..., 4])
+        M1 = e1 * Mr
+        M2 = e2 * Mr
         x = jnp.stack([Mf, Mr, M1, M2, Mc], axis=-1).astype(z0.dtype)
         return x, z0
 
@@ -763,12 +904,37 @@ class RawMomentStandardize(AbstractBijection):
         z, _ = self._forward_transform(x)
         Mf = x[..., 0]
         Mr = x[..., 1]
+        M1 = x[..., 2]
+        M2 = x[..., 3]
         Mc = x[..., 4]
         ln10 = jnp.log(jnp.array(10.0, dtype=Mf.dtype))
-        # Triangular in the order (Mf, Mr, M1, M2, Mc) for the bare-ratio
-        # chart [log10 Mf, Mr/Mf, Mc/Mr, M1/Mr, M2/Mr]: the only nonzero
-        # permutation gives 1/(ln10 Mf) * 1/Mf * 1/Mr * 1/Mr * 1/Mr.
+        # Triangular in the order (Mf, Mr, M1, M2, Mc) for the base map
+        # [log10 Mf, Mr/Mf, Mc/Mr - Phi/r, M1/Mr, M2/Mr] (i.e. BEFORE the
+        # spin-2 radial bound below): the only nonzero permutation gives
+        # 1/(ln10 Mf) * 1/Mf * 1/Mr * 1/Mr * 1/Mr.
         lad_geom = -(2.0 * jnp.log(Mf) + 3.0 * jnp.log(Mr) + jnp.log(ln10))
+        # `spin2_bound` composes onto the last two factors of 1/Mr above
+        # (the (M1, M2) -> (M1/Mr, M2/Mr) step is untouched, still 1/Mr
+        # each): multiply the un-standardised Jacobian by
+        # `det d(w1,w2)/d(e1,e2)`, the standard 2-D radial-map determinant
+        # `f'(rho) * (f(rho)/rho)^(n-1)` with `f = atanh`, `n = 2`:
+        #   f'(rho) = 1/(1-rho^2)                    (derivative of atanh)
+        #   f(rho)/rho = atanh(rho)/rho = ratio       (same safe helper as
+        #                                              spin2_bound itself)
+        #   det = ratio / (1 - rho^2)
+        #   log(det) = log(ratio) - log1p(-rho^2)
+        # Uses the ORIGINAL x's (M1, M2, Mr), clipped the same way as
+        # `spin2_bound` before `atanh` for consistency (this only matters
+        # for `rho >= 1`, which never occurs on latent training data -- see
+        # `spin2_bound`'s docstring).  Cheap closed form, not autodiff:
+        # this runs per training row.  Checked against `jax.jacfwd` +
+        # `slogdet` over the whole method by
+        # `tests/test_bounded_chart.py::test_round_trip_and_log_det`.
+        rho = jnp.hypot(M1 / Mr, M2 / Mr)
+        rho = jnp.clip(rho, 0.0, 1.0 - 1e-7)
+        ratio = _atanh_over_rho(rho)
+        lad_radial = jnp.log(ratio) - jnp.log1p(-rho ** 2)
+        lad_geom = lad_geom + lad_radial
         if self.flux_sas is not None:
             # Slot 0's own factor is now d sas(log10 Mf)/dMf, i.e. the plain
             # 1/(Mf ln10) already counted above TIMES dS/d(log10 Mf).

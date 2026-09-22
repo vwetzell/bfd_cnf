@@ -74,6 +74,45 @@ def test_chart_admits_moments_past_the_point_source_limits():
     assert bool(in_domain(m).all()), "in_domain must not reimpose the ceiling"
 
 
+def test_chart_inverse_cannot_violate_the_spin2_ellipticity_bound():
+    """`hypot(M1/Mr, M2/Mr) < 1` must hold on the chart's inverse for ANY
+    finite latent input, however extreme.
+
+    Mirrors `test_chart_admits_moments_past_the_point_source_limits`'s
+    structure, but the assertion is the OPPOSITE: slots 1 and 2 are legally
+    representable past their (soft) ceilings, while slots 3 and 4's ceiling
+    is a hard bound `spin2_bound`/`spin2_unbound` enforce by construction --
+    see their docstrings in `models/bijections.py`.  Before this fix, slots
+    3 and 4 were the bare ratio and the inverse could put a point arbitrarily
+    far past `hypot(e1, e2) = 1`.
+    """
+    rng = np.random.default_rng(2)
+    n = 500
+    b = RawMomentStandardize(mean=jnp.zeros(5), std=jnp.ones(5) * 0.7)
+    # Slots 0, 1, 2 come from physically plausible moments (via the forward
+    # chart) -- only slots 3, 4 (the ones this test targets) are pushed to
+    # extreme values.  Random slots 0-2 can land at Mr <= 0, which is a
+    # different, unrelated failure (`concentration_phi` is undefined there)
+    # this test has no business exercising.
+    z, _ = jax.vmap(b.transform_and_log_det)(sample_moments(n, seed=3))
+    z = np.array(z)
+    # Huge in standardised units -- the actual stress test.
+    z[:, 3:] = rng.normal(0, 50, (n, 2))
+    z = jnp.asarray(z)
+
+    back = jax.vmap(b.inverse)(z)
+    assert bool(jnp.isfinite(back).all()), "inverse produced a NaN/inf"
+    Mr, M1, M2 = back[:, 1], back[:, 2], back[:, 3]
+    e = jnp.hypot(M1 / Mr, M2 / Mr)
+    assert bool((e < 1.0).all()), f"BOUND VIOLATED: max |e| = {float(e.max())}"
+
+    # And the forward-then-back round trip stays finite on realistic data.
+    m = sample_moments()
+    z2, _ = jax.vmap(b.transform_and_log_det)(m)
+    back2 = jax.vmap(b.inverse)(z2)
+    assert bool(jnp.isfinite(z2).all()) and bool(jnp.isfinite(back2).all())
+
+
 def test_in_domain_is_only_positivity():
     """Mf > 0 and Mr > 0 are all the chart needs: Mr/Mf and Mc/Mr are plain
     ratios, and Mr is the only denominator. Mc may be any sign."""

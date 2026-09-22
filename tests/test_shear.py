@@ -141,6 +141,25 @@ def test_derivatives_match_finite_differences():
     fd11 = (f([h, 0]) - 2 * f([0, 0]) + f([-h, 0])) / h**2
     assert jnp.max(jnp.abs(fd11 - r[0]) / jnp.abs(r[0])) < 1e-3
 
+    # Same check, but SPIN-2 HEAVY: |e| ~= 0.6 puts `spin2_bound`'s atanh well
+    # into its nonlinear regime, where a wrong `J_spin2` in
+    # `project_to_physics` (e.g. forgetting to hoist it before differentiating
+    # `g_vec`, or using the wrong point to linearise it at) would show up as a
+    # large mismatch here even though the M1=1e3 case above -- |e| ~= 0.05,
+    # near enough the origin that `spin2_bound` is close to the identity --
+    # would still pass.
+    m2 = jnp.array([1.0e4, 2.0e4, 1.2e4, -6.0e3, 4.2e4])
+    q2, r2 = dm_dg(layer, m2, chart)
+    f2 = lambda g: chart.inverse(
+        layer.shear(chart.transform(m2), jnp.array(g, dtype=float)))
+    h = 1e-5
+    fd1_2 = [(f2([h, 0]) - f2([-h, 0])) / (2 * h),
+             (f2([0, h]) - f2([0, -h])) / (2 * h)]
+    assert jnp.max(jnp.abs(jnp.stack(fd1_2) - q2) / jnp.abs(q2)) < 1e-5
+    h = 1e-3
+    fd11_2 = (f2([h, 0]) - 2 * f2([0, 0]) + f2([-h, 0])) / h**2
+    assert jnp.max(jnp.abs(fd11_2 - r2[0]) / jnp.abs(r2[0])) < 1e-3
+
 
 def test_flow_isotropy():
     """The WHOLE stack must be isotropic, not just the shear layer.
@@ -384,12 +403,21 @@ def test_e_scale_is_the_charts_effective_spin2_std():
     the wrong one scales every physical-unit quantity in `response` by the
     ratio, which was 0.67% on the bulgedisc training set: small, absorbable by
     training, and silently wrong in every comparison against bfd.
+
+    Under the old bare-ratio chart, `layer.e_scale` alone recovered the
+    chart's std (a plain affine un-standardisation).  Under the bounded chart
+    that is no longer meaningful on its own -- `project_to_physics`
+    un-standardises `z[3], z[4]` with `e_scale` and THEN inverts
+    `spin2_bound` -- so the functional equivalent is asserted instead: that
+    exact two-step un-standardisation reproduces the same physical
+    `(M1/Mr, M2/Mr)` the chart's own `inverse` recovers from the same `z`.
     """
     import numpy as np
     import bulk
     import equinox as eqx
     import shear
     from paramax import unwrap
+    from models.bijections import spin2_unbound
 
     rng = np.random.default_rng(2)
     n = 3000
@@ -404,8 +432,15 @@ def test_e_scale_is_the_charts_effective_spin2_std():
     layer = [b for b in flow.bijection.bijection.bijections
              if type(b).__name__ == "ShearResponse"][0]
     chart = flow.bijection.bijection.bijections[0]
-    want = float(chart._effective()[1][3])
-    assert abs(float(unwrap(layer.e_scale)) - want) < 1e-9 * want
+    e_scale = float(unwrap(layer.e_scale))
+
+    zsub = jax.vmap(chart.transform)(jnp.asarray(m[:200], jnp.float32))
+    w1, w2 = zsub[:, 3] * e_scale, zsub[:, 4] * e_scale
+    e1, e2 = spin2_unbound(w1, w2)
+    back = jax.vmap(chart.inverse)(zsub)
+    want_e1, want_e2 = back[:, 2] / back[:, 1], back[:, 3] / back[:, 1]
+    assert float(jnp.max(jnp.abs(e1 - want_e1))) < 1e-5
+    assert float(jnp.max(jnp.abs(e2 - want_e2))) < 1e-5
 
 
 def test_catalog_derivative_layout_is_g_index_first():

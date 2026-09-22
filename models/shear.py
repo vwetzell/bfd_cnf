@@ -102,7 +102,8 @@ from flowjax.bijections import AbstractBijection
 
 from paramax import non_trainable, unwrap
 
-from .bijections import CoeffNet, POINT_SOURCE, concentration_phi
+from .bijections import (CoeffNet, POINT_SOURCE, concentration_phi,
+                          spin2_bound, spin2_unbound)
 
 # Coefficients are bounded so the map stays a diffeomorphism for any g the
 # network might see.
@@ -172,8 +173,15 @@ G_MAX = 0.02
 # minus mean over std, i.e. downstream of `RawMomentStandardize` rather than on
 # raw moments.  Three things get simpler and one gets harder.
 #
-#   * z3, z4 ARE M1/Mr and M2/Mr up to the shared spin-2 std, so the complex
-#     shape e needs no division by Mr.
+#   * z3, z4 are no longer the bare ratios M1/Mr, M2/Mr up to the shared
+#     spin-2 std -- `RawMomentStandardize` now runs them through
+#     `spin2_bound` (bijections.py) first, an unbounded radial
+#     reparameterisation that makes `hypot(M1/Mr, M2/Mr) < 1` a hard bound
+#     on the chart's inverse.  `project_to_physics` recovers the physical
+#     e = M1/Mr + i M2/Mr via `spin2_unbound` before applying the response
+#     algebra below, and converts the resulting physical-e-space response
+#     back to chart units via that map's own local Jacobian -- see its
+#     comments for the derivation.
 #   * z0, z1, z2 are unbounded, so the spin-0 response is ADDITIVE.  The raw
 #     version had to exponentiate to keep Mf, Mr, Mc positive; here there is
 #     nothing to keep positive and nothing to overflow.
@@ -406,11 +414,31 @@ def project_to_physics(coeffs, z, g, e_scale, chart_loc, chart_scale):
     Project 14 basis coefficients into the physical Q (5,2) and R (5,2,2) tensors,
     based on the shift defined in response().
     """
+    # Un-standardise z[3], z[4] to the un-standardised chart coordinate
+    # (w1, w2) -- the spin-2 mean is always 0 (`RawMomentStandardize._effective`
+    # forces it), so this is a pure scaling, unlike the spin-0 slots -- then
+    # invert `spin2_bound` to recover the physical ellipticity e = (e1, e2)
+    # this coefficient algebra is written in terms of.  Both hoisted out of
+    # `shift_func`: neither depends on `g_vec`, so recomputing them inside the
+    # function `jax.jacfwd`/`jax.hessian` differentiate over would be wasted
+    # work at best and, since `J_spin2` below is itself an autodiff call,
+    # nested-autodiff hazard at worst -- same reasoning as `_chart_spin0_jac`'s
+    # call one line below.
+    w1, w2 = z[3] * e_scale, z[4] * e_scale
+    e1, e2 = spin2_unbound(w1, w2)
+    e = jax.lax.complex(e1, e2)
+    # Local Jacobian of spin2_bound at this point, d(w1,w2)/d(e1,e2), 2x2.
+    # Computed by autodiff through the SAME function the chart itself uses for
+    # its forward transform -- deliberately not hand-derived, so it is
+    # provably impossible for this to drift from the actual chart the way
+    # `_chart_spin0_jac`'s did.
+    J_spin2 = jax.jacfwd(
+        lambda ee: jnp.stack(spin2_bound(ee[0], ee[1])))(jnp.array([e1, e2]))
+
     # The shift function that defines the physics
     def shift_func(g_vec):
         s0, A, B, mu, nu, rho = (coeffs[:9].reshape(3, 3), coeffs[9], coeffs[10],
                                  coeffs[11], coeffs[12], coeffs[13])
-        e = e_scale * jax.lax.complex(z[3], z[4])
         gc = jax.lax.complex(g_vec[0], g_vec[1])
         ec, gcc = jnp.conj(e), jnp.conj(gc)
         p1 = (ec * gc).real
@@ -418,9 +446,17 @@ def project_to_physics(coeffs, z, g, e_scale, chart_loc, chart_scale):
         p3 = (ec * ec * gc * gc).real
         spin0 = (_chart_spin0_jac(z, chart_loc, chart_scale)
                          @ (s0 @ jnp.stack([p1, p2, p3])))
-        de = (A * gc + B * e * e * gcc + mu * ec * gc * gc
-              + nu * e * p2 + rho * e * e * e * gcc * gcc) / e_scale
-        return jnp.concatenate([spin0, jnp.array([de.real, de.imag])])
+        # Response in PHYSICAL ellipticity space, then pushed through the
+        # local `spin2_bound` Jacobian to un-standardised chart units (the
+        # bounded map is nonlinear, so this is no longer a plain division by
+        # `e_scale` the way it was under the old bare-ratio chart), and only
+        # THEN down to standardised units -- same order as the spin-0 path,
+        # which applies `_chart_spin0_jac` and divides by scale inside that
+        # function.
+        de_phys = (A * gc + B * e * e * gcc + mu * ec * gc * gc
+                   + nu * e * p2 + rho * e * e * e * gcc * gcc)
+        dz34 = (J_spin2 @ jnp.array([de_phys.real, de_phys.imag])) / e_scale
+        return jnp.concatenate([spin0, dz34])
 
     # Q (5, 2)
     Q = jax.jacfwd(shift_func)(jnp.zeros(2))

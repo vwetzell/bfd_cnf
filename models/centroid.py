@@ -161,7 +161,8 @@ import jax.random as jr
 from flowjax.bijections import AbstractBijection
 from paramax import non_trainable, unwrap
 
-from .bijections import sas, sas_inv, sas_log_deriv
+from .bijections import (concentration_phi, sas, sas_inv, sas_log_deriv,
+                          spin2_bound, spin2_unbound)
 
 # The tail's OUTPUT magnitude, in standardised-z units -- not a physics bound,
 # a numerical/estimator-stability one.  `_transport` is exact within the
@@ -256,19 +257,27 @@ def split_condition(condition):
 def raw_from_standard(z, mean, std, flux_sas=None):
     """Undo `RawMomentStandardize`: the inverse chart, [Mf, Mr, M1, M2, Mc].
 
-    Exactly `RawMomentStandardize._inverse_transform` (`models/bijections.py`)
+    Matches `RawMomentStandardize._inverse_transform` (`models/bijections.py`)
     -- duplicated rather than imported because this layer only ever needs a
     FROZEN copy of the chart's constants, never the trainable chart itself
-    (see `CentroidMarginalize.mean/std`).
+    (see `CentroidMarginalize.mean/std`).  Slot 2 subtracts off
+    `concentration_phi(z1)/z1` (the exact weight-kernel Mc/Mr prediction, see
+    `concentration_phi`'s docstring) rather than using the bare ratio, and
+    slots 3, 4 go through `spin2_unbound` -- both must track
+    `RawMomentStandardize` exactly, since a divergence here is invisible
+    until it shows up as a bias (this was caught stale in both respects while
+    adding the spin-2 bound: it was still on the bare `Mc/Mr` for slot 2).
     """
     z0 = std[0] * z[0] + mean[0]
     z1 = std[1] * z[1] + mean[1]
     z2 = std[2] * z[2] + mean[2]
     Mf = jnp.power(10.0, z0 if flux_sas is None else sas_inv(z0, flux_sas))
     Mr = z1 * Mf
-    Mc = z2 * Mr
-    M1 = (std[3] * z[3] + mean[3]) * Mr
-    M2 = (std[4] * z[4] + mean[4]) * Mr
+    # z2 = Mc/Mr - Phi(z1)/z1  (matches RawMomentStandardize._inverse_transform)
+    Mc = (z2 + concentration_phi(z1) / z1) * Mr
+    w1, w2 = std[3] * z[3] + mean[3], std[4] * z[4] + mean[4]
+    e1, e2 = spin2_unbound(w1, w2)
+    M1, M2 = e1 * Mr, e2 * Mr
     return jnp.stack([Mf, Mr, M1, M2, Mc])
 
 
@@ -276,18 +285,18 @@ def standard_from_raw(m, mean, std, flux_sas=None):
     """The chart, forward: [Mf, Mr, M1, M2, Mc] -> standardised z.
 
     Matches `RawMomentStandardize._forward_transform`, exactly inverting
-    `raw_from_standard` EXCEPT where `_safe_logit`'s clip is active -- see its
-    docstring.
+    `raw_from_standard` EXCEPT where its clips (`concentration_phi`'s
+    r-domain and `spin2_bound`'s rho clip to `[0, 1 - 1e-7]`) are active --
+    see `raw_from_standard` and `spin2_bound`'s own docstrings.
     """
     Mf, Mr, M1, M2, Mc = m[0], m[1], m[2], m[3], m[4]
     z0 = jnp.log10(Mf)
     if flux_sas is not None:
         z0 = sas(z0, flux_sas)
     z1 = Mr / Mf
-    z2 = Mc / Mr
-    z3 = M1 / Mr
-    z4 = M2 / Mr
-    z = jnp.stack([z0, z1, z2, z3, z4])
+    z2 = Mc / Mr - concentration_phi(z1) / z1
+    w1, w2 = spin2_bound(M1 / Mr, M2 / Mr)
+    z = jnp.stack([z0, z1, z2, w1, w2])
     return (z - mean) / std
 
 
