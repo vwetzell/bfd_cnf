@@ -29,6 +29,7 @@ channel.  See `GUIDING_PRINCIPLES.md` section 3.4.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 
@@ -96,6 +97,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--flow", default="flows/centroid_v11.eqx")
     p.add_argument("--pop", default="bulgedisc_v3")
+    p.add_argument("--stage", choices=["bulk", "shear", "centroid"], default="centroid",
+                   help="which training stage's flow --flow is; bulk/shear drop the "
+                        "centroid layer (and Sigma_X conditioning) so a stage can "
+                        "be health-checked before the next one is trained")
     # `plain` and `psfe00` are bit-identical in BOTH C_M and Sigma_X (checked
     # 2026-09-04), so one selection-term pass serves every pqr taken under a
     # circular PSF -- including the MC null `v11_psfe00_s7.npz`.
@@ -161,7 +166,8 @@ def main():
     # The chunked path draws a different stream, so it must not collide with
     # an unchunked cache of the same (pop, draws, seed).
     cache = a.cache or (f"logs/phase_a/terms_{a.pop}_{a.log2_draws}_"
-                        f"s{a.seed}_{len(wins)}w"
+                        f"s{a.seed}_{len(wins)}w_"
+                        f"{hashlib.md5(repr((a.flow, [w[4] for w in wins])).encode()).hexdigest()[:8]}"
                         f"{f'_c{a.draw_chunk}' if a.draw_chunk else ''}"
                         f"{f'_g{a.window_guard:g}' if a.window_guard else ''}"
                         ".npz")
@@ -177,8 +183,11 @@ def main():
         # from the checkpoint either way, but the base distribution's shape
         # does not.)
         m_train = shear.load(f"{a.data_dir}/{B.TRAIN_DATA[a.pop]}")[0]
-        flow = bulk.build_flow(jr.key(0), m_train, shear=True, centroid=True)
+        flow = bulk.build_flow(jr.key(0), m_train, shear=a.stage != "bulk",
+                               centroid=a.stage == "centroid")
         flow = eqx.tree_deserialise_leaves(a.flow, flow)
+        if a.stage != "centroid":
+            sigma_x = None
         jax.config.update("jax_enable_x64", True)
         flow = jax.tree_util.tree_map(
             lambda x: x.astype(jnp.float64) if eqx.is_inexact_array(x) else x,
@@ -231,14 +240,17 @@ def main():
             m0 = np.concatenate(
                 [np.asarray(tr(zs[i:i + 16384])) for i in range(0, n, 16384)])
             del zs
-        # `bias.py` passes `guard=a.window_guard` here (the runs use 100);
-        # this path passed nothing, so the offline re-solve was a DIFFERENT,
-        # unguarded estimator from the in-run one.  It survived 2^24 and 2^26
-        # on luck: at 2^28 seed 0 a single draw of 268M (Mf = 1999,
-        # Mr/Mf = 1.741) took 100% of R_s11, R_s11 = 3.4e8, m1 = -0.61.
+        # `selection_terms_score` dropped `guard` for the support-density
+        # filter (`--window-guard` is now deprecated/ignored in bias.py
+        # itself, see its --help) -- this call site was never updated to
+        # match, so it was passing a kwarg that no longer exists.  Build the
+        # same density `bias.py`'s own `main()` does, from the training
+        # catalog, unconditionally (there is no `--no-window-density-filter`
+        # equivalent flag here).
+        density = B.build_support_density(np.asarray(m_train))
         terms = B.selection_terms_score(
             flow, m0, cov, None, None, sigma_x=sigma_x, batch=a.batch,
-            windows=[w[4] for w in wins], guard=a.window_guard)
+            windows=[w[4] for w in wins], density=density)
         del m0
         os.makedirs(os.path.dirname(cache) or ".", exist_ok=True)
         np.savez(cache, n_windows=len(wins),

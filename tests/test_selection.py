@@ -227,6 +227,11 @@ def test_selection_correction_removes_the_bias():
     assert abs(m1_corrected) < 0.01, m1_corrected
 
 
+def test_n_out_from_npop():
+    from bias import n_out_from_npop
+    assert n_out_from_npop(1000, 250) == 750
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

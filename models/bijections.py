@@ -24,12 +24,13 @@ import jax
 import jax.numpy as jnp
 import jax.nn as jnn
 import jax.random as jr
+import numpy as np
 import equinox as eqx
 from flowjax.bijections import AbstractBijection, Chain, Invert, Permute
 from flowjax.distributions import AbstractDistribution, Transformed
 from flowjax.utils import arraylike_to_array
 from jaxtyping import Array, ArrayLike, Shaped
-from paramax import Parameterize, AbstractUnwrappable
+from paramax import Parameterize, AbstractUnwrappable, non_trainable, unwrap
 
 # Mr/Mf ceiling: a point source, i.e. the PSF itself.  Anything at or above it
 # is unresolved and carries no shape information.  It lives here rather than in
@@ -63,6 +64,105 @@ POINT_SOURCE = 3.692575
 # the weight changes, same as POINT_SOURCE above -- see that comment for what
 # happens when it goes stale.
 POINT_SOURCE_MC = 6.662089
+
+# ---------------------------------------------------------------------------
+# Exact weight-kernel concentration slot: Phi(r) = Mc/Mf at the isotropic
+# Gaussian galaxy whose Mr/Mf equals r, for the REAL (Blackman-Harris) weight,
+# replacing the old Gaussian-weight shortcut Mc/Mf = 2 r^2.
+#
+# For an isotropic Gaussian galaxy of size tau (=sigma_gal^2), Itilde(k) =
+# F exp(-k^2 tau/2), so Mf, Mr, Mc are the 0th/1st/2nd tau-derivatives (up to
+# sign) of A(tau) = 2*pi INT_0^kmax kr w(kr) exp(-kr^2 tau/2) dkr.  Writing
+# L = log A: Mr/Mf = -2 L', Mc/Mf = 4 L'' + (Mr/Mf)^2.  Given r = Mr/Mf, invert
+# r = -2 L'(tau) for tau by Newton, then Phi(r) := 4 L''(tau(r)) + r^2 is the
+# slot's exact zero-noise prediction for Mc/Mf, replacing the Gaussian-weight
+# `2 r^2`.
+#
+# Coefficients and kmax are `bfd/weightfunction.py`'s `KBlackmanHarris` at
+# `imsims.sim.WEIGHT_SIGMA` -- frozen HERE as literals, same as POINT_SOURCE
+# above, so this module never imports the sibling imsims/bfd repos.
+_CONC_C = np.array([0.349792, 0.487396, 0.150208, 0.012604])
+_CONC_SIGMA_W = 0.65
+_CONC_KMAX = 1.07635 * np.pi / _CONC_SIGMA_W
+
+# Fixed 64-point Gauss-Legendre quadrature on [0, kmax], computed once at
+# import time -- mirrors `bias.py`'s `_GL_NODES, _GL_WEIGHTS =
+# np.polynomial.legendre.leggauss(64)`, duplicated locally rather than
+# imported from `bias.py` to avoid any import-cycle risk.
+_conc_x, _conc_w = np.polynomial.legendre.leggauss(64)
+_CONC_KR = 0.5 * _CONC_KMAX * (_conc_x + 1.0)
+_CONC_DKR = 0.5 * _CONC_KMAX * _conc_w
+_conc_u = _CONC_KR * np.pi / _CONC_KMAX
+_CONC_WK = (_CONC_C[0] + _CONC_C[1] * np.cos(_conc_u)
+            + _CONC_C[2] * np.cos(2 * _conc_u) + _CONC_C[3] * np.cos(3 * _conc_u))
+# Per-node coefficient of exp(-kr^2 tau/2) in A(tau): 2*pi * dkr * kr * w(kr).
+# The 2*pi is carried for fidelity to the definition but is an additive
+# constant in L = log A and drops out of L', L'' -- kept anyway since it costs
+# nothing.  Built from plain numpy (double precision by default) and handed to
+# `jnp.asarray` WITHOUT an explicit dtype: with x64 on this stays float64, with
+# it off jax's own promotion silently downcasts it, same as the `jnp.asarray`
+# in `bias.py`'s `kernel_draws`/`log_conv_is` -- an explicit `dtype=jnp.float64`
+# instead triggers a UserWarning on every import when x64 is off.
+_CONC_COEF = jnp.asarray(2.0 * np.pi * _CONC_DKR * _CONC_KR * _CONC_WK)
+_CONC_KR2 = jnp.asarray(_CONC_KR ** 2)
+
+# Floor on the Newton solve's internal tau iterate: keeps it from running away
+# to a negative or huge value when `r` is fed a value outside the physical
+# range (0, POINT_SOURCE) -- which happens, since this is evaluated on latent
+# flow draws, not just physical moments.  `r` itself is never clipped, so the
+# returned Phi(r) stays smooth in `r` on either side of the floor.
+_CONC_TAU_FLOOR = 1e-8
+_CONC_NEWTON_ITERS = 40
+
+
+def _conc_log_A(tau):
+    """log A(tau), tau a scalar (float64).  Plain sum, not logsumexp: the
+    per-node coefficients `_CONC_COEF` need not be positive (the weight
+    kernel can dip slightly negative near kmax), only their sum is."""
+    return jnp.log(jnp.sum(_CONC_COEF * jnp.exp(-0.5 * _CONC_KR2 * tau)))
+
+
+_conc_Lp = jax.grad(_conc_log_A)
+_conc_Lpp = jax.grad(_conc_Lp)
+
+
+def _conc_tau_of_r(r):
+    """Newton solve of `r = -2 L'(tau)` for tau, scalar in, scalar out,
+    float64 internally (see module docstring above `_CONC_TAU_FLOOR`)."""
+    tau0 = 2.0 / jnp.clip(r, 1e-6, None)
+
+    def body(_, tau):
+        tau = jnp.maximum(tau, _CONC_TAU_FLOOR)
+        f = -2.0 * _conc_Lp(tau) - r
+        fp = -2.0 * _conc_Lpp(tau)
+        return jnp.maximum(tau - f / fp, _CONC_TAU_FLOOR)
+
+    return jax.lax.fori_loop(0, _CONC_NEWTON_ITERS, body, tau0)
+
+
+def concentration_phi(r):
+    """Exact weight-kernel prediction Phi(r) = Mc/Mf for an isotropic Gaussian
+    galaxy with Mr/Mf = r, replacing the Gaussian-weight shortcut `2 r^2`.
+
+    Works under `jax.grad`/`jax.vmap`/`jax.jit`, any input shape, float32 or
+    float64 input (internal Newton solve is requested in float64; with x64
+    off this silently degrades to float32 like every other float64 request in
+    this codebase -- see `bias.py`'s note next to `m64 = np.asarray(...,
+    dtype=np.float64)`).
+    """
+    r = jnp.asarray(r)
+    orig_dtype = r.dtype
+    # Promote to whatever precision `_CONC_KR2` carries (float64 with x64 on,
+    # float32 otherwise -- see its own comment) via `result_type` rather than
+    # an explicit `dtype=jnp.float64`, which warns when x64 is off; this also
+    # keeps every `tau` iterate inside the Newton loop below at ONE dtype, as
+    # `lax.fori_loop` requires of its carry.
+    work_dtype = jnp.result_type(r, _CONC_KR2)
+    flat = r.reshape(-1).astype(work_dtype)
+    tau = jax.vmap(_conc_tau_of_r)(flat)
+    lpp = jax.vmap(_conc_Lpp)(tau)
+    phi = (flat ** 2 + 4.0 * lpp).reshape(r.shape)
+    return phi.astype(orig_dtype)
 
 
 def in_domain(m):
@@ -468,7 +568,7 @@ def sas_log_deriv(x, p):
 class RawMomentStandardize(AbstractBijection):
     """
     Raw x = [Mf, Mr, M1, M2, Mc]   (bfd's even-moment order)
-    Transformed z0 = [log10(Mf), logit(Mr/Mf/r*), logit(Mc/Mr/rc*), M1/Mr, M2/Mr]
+    Transformed z0 = [log10(Mf), Mr/Mf, Mc/Mr - Phi(Mr/Mf)/(Mr/Mf), M1/Mr, M2/Mr]
     Then standardized: z = (z0 - mean) / std
 
     Slot 1 carries the point-source ceiling `r* = POINT_SOURCE` as a HARD
@@ -481,10 +581,28 @@ class RawMomentStandardize(AbstractBijection):
     that stretch turns out to cost more resolution than the closure buys,
     the map to try next is gentler (a power, or `-log(1 - r/r*)`), not absent.
 
-    Slot 2 carries the identical treatment for `Mc/Mr` against its own
-    point-source ceiling `rc* = POINT_SOURCE_MC`: the same argument that makes
-    `r*` a hard boundary on `Mr/Mf` makes `rc*` one on `Mc/Mr`, since both are
-    the pure-weight-moment ratio a point source (Itilde/T = 1) would produce.
+    Slot 2 is `Mc/Mr - Phi(Mr/Mf)/(Mr/Mf)`, not the bare ratio, where `Phi(r)`
+    (`concentration_phi` above) is the EXACT Mc/Mf an isotropic Gaussian
+    galaxy of Mr/Mf = r would have under the real weight kernel (Blackman-
+    Harris, `KBlackmanHarris`'s coefficients, via a fixed 64-point
+    Gauss-Legendre quadrature -- see `concentration_phi`'s own comment for the
+    derivation).  This supersedes the earlier Gaussian-WEIGHT shortcut
+    `Mc/Mr = 2*(Mr/Mf)`, which was only exact for a Gaussian weight of any
+    width and was off by ~10% at the point-source ceiling against the real
+    kernel (it predicted `Mc/Mr|ps = 2*POINT_SOURCE = 7.385` against the true
+    `POINT_SOURCE_MC = 6.662`).  `Phi` removes that mismatch by construction:
+    at `r = POINT_SOURCE`, `Phi(r)/r = POINT_SOURCE_MC` exactly (the tau -> 0
+    limit of the same derivation that gives `POINT_SOURCE`/`POINT_SOURCE_MC`
+    their values).  Like the shortcut it replaces, this removes the dominant
+    near-degenerate correlation between slots 1 and 2 that the bare-ratio
+    chart left for the coupling layers to learn -- see the corner plot in
+    `dev/leader_corner_plot.py`, where the templates trace a thin ridge from
+    the bulk to the point-source corner in (Mr/Mf, Mc/Mr).  `POINT_SOURCE_MC`
+    is therefore still no longer a simple bound on this slot alone (it is now
+    the curve `z0_2 = POINT_SOURCE_MC - Phi(Mr/Mf)/(Mr/Mf)`, which vanishes at
+    `Mr/Mf = POINT_SOURCE`); nothing here enforces it as a boundary -- see
+    slot 1's note above, which already applies (this chart has no logit
+    closure on either slot, just the affine standardisation below).
 
     NOTE this makes the chart undefined for `Mr/Mf >= r*` or `Mc/Mr >= rc*`,
     which real NOISY moments do reach (~1.8% of the deep targets for slot 1).
@@ -585,7 +703,10 @@ class RawMomentStandardize(AbstractBijection):
         if self.flux_sas is not None:
             z0_0 = sas(z0_0, self.flux_sas)
         z0_1 = Mr / Mf
-        z0_2 = Mc / Mr
+        # Mc/Mr - Phi(Mr/Mf)/(Mr/Mf): the exact weight-kernel prediction for
+        # Mc/Mr of an isotropic Gaussian galaxy subtracted off, see the class
+        # docstring and `concentration_phi`.
+        z0_2 = Mc / Mr - concentration_phi(z0_1) / z0_1
         z0_3 = M1 / Mr
         z0_4 = M2 / Mr
 
@@ -616,7 +737,8 @@ class RawMomentStandardize(AbstractBijection):
                else sas_inv(z0[..., 0], self.flux_sas))
         Mf = jnp.exp(l10 * log10_const)
         Mr = z0[..., 1] * Mf
-        Mc = z0[..., 2] * Mr
+        # Invert z0_2 = Mc/Mr - Phi(z0_1)/z0_1: Mc/Mr = z0_2 + Phi(z0_1)/z0_1.
+        Mc = (z0[..., 2] + concentration_phi(z0[..., 1]) / z0[..., 1]) * Mr
         M1 = z0[..., 3] * Mr
         M2 = z0[..., 4] * Mr
         x = jnp.stack([Mf, Mr, M1, M2, Mc], axis=-1).astype(z0.dtype)
@@ -1640,6 +1762,21 @@ def _ell_gal_invariants(x3, x4, e1, e2):
     return e_gal_mag_sq_n, e_gal_dot_psf_n
 
 
+def _g_psf_invariants(g1, g2, e1, e2):
+    """Same construction as `_ell_gal_invariants`, for the SHEAR `g` instead
+    of the galaxy's own ellipticity -- see `_g_shift`'s docstring for why
+    `net_dip_g` needs this. `g` is tiny (|g| <~ 0.05) so the saturating
+    log1p form never actually saturates in practice; kept for the same
+    reason `_ell_gal_invariants` uses it -- one bounded, scale-free
+    construction for every coefficient-net input in this class, so a
+    stress-tested weight configuration can't blow this one up either."""
+    g_mag_sq = g1**2 + g2**2
+    g_dot = g1 * e1 + g2 * e2
+    g_mag_sq_n = _bound_coeff_input(jnp.log1p(g_mag_sq))
+    g_dot_psf_n = _bound_coeff_input(jnp.sign(g_dot) * jnp.log1p(jnp.abs(g_dot)))
+    return g_mag_sq_n, g_dot_psf_n
+
+
 class SigmaXBlockLayer(AbstractBijection):
     """Centroid-covariance (C_X) conditioned bijection -- flux shift is aware
     of the galaxy's own (final) ellipticity, closed-form throughout.
@@ -1743,15 +1880,47 @@ class SigmaXBlockLayer(AbstractBijection):
 
     net_flux: CoeffNet     # (x0, log_scale_n, ehat2)      -> (1,)  s0 base (now reads the galaxy's own flux, see _s0/_solve_x0)
     net_size: CoeffNet     # (x0, log_scale_n, ehat2)      -> (1,)  g_s (UNCHANGED, no owne correction)
-    net_dipquad: CoeffNet  # (x0, x1, log_scale_n, ehat2, e_gal_mag_sq_n, e_gal_dot_psf_n, x2) -> (2,)  D, c
-                           # (NO LONGER unchanged -- now sees the galaxy's own ellipticity, see
-                           # the class docstring's PSF-leak-vs-own-ellipticity note and _solve_ell)
+    net_dip: CoeffNet      # (x0, x1, log_scale_n, ehat2, x2) -> (1,)  D (dipole).
+                           # Deliberately BLIND to the galaxy's own ellipticity --
+                           # see `[[sigma-x-response-tensor-split]]` /
+                           # `dev/sigma_x_shift_probe.py`: the empirical dipole
+                           # response (Sigma_X's own trace-free anisotropy times a
+                           # scalar gain) is uncorrelated with the galaxy's own
+                           # (e1,e2) (r~0.03) and well predicted (R^2~0.75) by
+                           # (x0,x1,x2) alone -- adding e_gal invariants here was
+                           # the wrong conditioning for D specifically, which is
+                           # why more net_dipquad capacity never closed the leak
+                           # ([[psfe-leak-is-not-an-optimization-problem]]).
+    net_quad: CoeffNet     # (x0, x1, log_scale_n, ehat2, e_gal_mag_sq_n, e_gal_dot_psf_n, x2) -> (1,)  c (quadrupole).
+                           # UNCHANGED from the old net_dipquad's c half -- c's
+                           # bilinear coupling to the galaxy's OWN (x3,x4) is the
+                           # empirically-real "isotropic Sigma_X dilutes the
+                           # galaxy's own ellipticity" effect (measured corr -0.46
+                           # against the galaxy's own e1), so keeping e_gal
+                           # invariants here is correct, unlike for D.
     net_flux_e: CoeffNet   # (log1p(|e_final|^2),)         -> (1,)  s0 "own final ellipticity" correction (NEW)
     net_mc: CoeffNet       # (x0, log_scale_n, ehat2)      -> (1,)  Mc additive shift (NEW, 5-D extension)
+    net_dip_g: CoeffNet    # (log_scale_n, ehat2, g_mag_sq_n, g_dot_psf_n) -> (1,)  Dg, a SEPARATE,
+                           # g-coupled dipole gain along the SAME Sigma_X axis (e1,e2) `net_dip`'s D
+                           # already shifts along -- see `_g_shift`'s docstring for why this exists.
     _cond_dim: int = eqx.field(static=True)
     _log_scale_mean: float = eqx.field(static=True)
     _e_mag_sq_scale: float = eqx.field(static=True)
-    _size_loc: float = eqx.field(static=True)
+    # NOT static, unlike the other constants here: `_size_loc` is a chart
+    # statistic (`chart.mean[1] / chart.std[1]`, see `bulk.build_flow`'s
+    # docstring), and `RawMomentStandardize.mean/std` are TRAINABLE and move
+    # substantially during `bulk.train` -- the same staleness
+    # `bulk.sync_chart_constants` already fixes for `ShearResponse`'s
+    # `chart_loc`/`chart_scale`.  A `static` python float can't be resynced
+    # after a warm-start graft (it isn't a pytree leaf, so it never reaches
+    # the serialized checkpoint at all -- reloading a checkpoint always
+    # reconstructs it from whatever `size_loc=` a FRESH `build_flow` call
+    # passed at construction, silently discarding any later fix). Making it
+    # a genuine (non-trainable) array leaf, exactly the pattern `chart_loc`/
+    # `chart_scale`/`e_scale` already use in `models/shear.py`, is what lets
+    # `sync_chart_constants` fix it with a normal `eqx.tree_at` and lets the
+    # fixed value actually survive a save/load round trip.
+    _size_loc: jax.Array = eqx.field(default=None)
     _g_s_max: float = eqx.field(static=True)
     _s0_e_max: float = eqx.field(static=True)
     _D_max: float = eqx.field(static=True)
@@ -1773,7 +1942,7 @@ class SigmaXBlockLayer(AbstractBijection):
         self._cond_dim = full_cond_dim
         self._log_scale_mean = float(log_scale_mean)
         self._e_mag_sq_scale = float(e_max**2)
-        self._size_loc = float(size_loc)
+        self._size_loc = non_trainable(jnp.asarray(size_loc, dtype=jnp.float32))
         self._g_s_max = float(g_s_max)
         self._s0_e_max = float(s0_e_max)
         # Unlike `c` (already tanh-bounded via `_size_loc`... no -- via its
@@ -1791,23 +1960,28 @@ class SigmaXBlockLayer(AbstractBijection):
         # `check_sigmax`'s "layer shift" printout) -- this should not change
         # trained behavior, only cap the untrained/adversarial-weight case.
         self._D_max = float(D_max)
-        k0, k1, k2, k3, k4 = jr.split(key, 5)
+        k0, k1, k2, k3, k4, k5, k6 = jr.split(key, 7)
         nets = [
             CoeffNet(k0, 3, 1, nn_width, nn_depth, activation),  # net_flux (x0, log_scale_n, ehat2)
             CoeffNet(k1, 3, 1, nn_width, nn_depth, activation),  # net_size
-            # ponytail: net_dipquad gets 2x width -- it's the coefficient
-            # net behind the PSF-anisotropy c1/c2 leak
-            # ([[psfe-leak-not-a-training-density-gap]]); doubling capacity
-            # here first, before touching the shared loss structure.
-            CoeffNet(k2, 7, 2, nn_width * 2, nn_depth, activation),  # net_dipquad
+            # net_dip: small on purpose -- (x0,x1,x2) alone gets R^2~0.75 on
+            # the true dipole gain (see net_dip's field comment), so this is
+            # a scalar-invariant-only function, not the harder galaxy-
+            # orientation-dependent job net_quad still has.
+            CoeffNet(k2, 5, 1, nn_width, nn_depth, activation),  # net_dip
+            # net_quad keeps the old net_dipquad's extra capacity -- it's
+            # the half of the old shared trunk that legitimately needs the
+            # galaxy's own ellipticity ([[psfe-leak-not-a-training-density-gap]]).
+            CoeffNet(k5, 7, 1, nn_width * 2, nn_depth, activation),  # net_quad
             CoeffNet(k3, 1, 1, nn_width, nn_depth, activation),  # net_flux_e
             CoeffNet(k4, 3, 1, nn_width, nn_depth, activation),  # net_mc (5-D extension)
+            CoeffNet(k6, 4, 1, nn_width, nn_depth, activation),  # net_dip_g (NEW)
         ]
         # Zero each net's final layer -> all coefficients start at 0, so the
         # layer is the identity at init (same convention as SigmaXCouplingLayer).
         nets = [_zero_last_layer(n) for n in nets]
-        (self.net_flux, self.net_size, self.net_dipquad, self.net_flux_e,
-         self.net_mc) = nets
+        (self.net_flux, self.net_size, self.net_dip, self.net_quad, self.net_flux_e,
+         self.net_mc, self.net_dip_g) = nets
 
     @property
     def shape(self):
@@ -1831,7 +2005,12 @@ class SigmaXBlockLayer(AbstractBijection):
         e_mag_sq = e1**2 + e2**2
         e_mag_sq_n = e_mag_sq / (self._e_mag_sq_scale + 1e-8)
         T_n = jnp.exp(log_scale_n)  # analytic C_X scaling factored out, as in SigmaXCouplingLayer
-        return log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n
+        # `g` itself, when available (off > 0, i.e. chained with shear) -- see
+        # `_g_shift`. A standalone (3,)-conditioned layer never sees g, so this
+        # degrades to (0,0), and `_g_shift` below is then exactly zero.
+        g1 = condition[0] if off > 0 else jnp.zeros_like(log_scale_n)
+        g2 = condition[1] if off > 0 else jnp.zeros_like(log_scale_n)
+        return log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n, g1, g2
 
     def _ellipticity(self, x0, x1, x2, x3, x4, e1, e2, log_scale_n, e_mag_sq_n, T_n):
         """The (x0,x1)->D,c map is UNCHANGED from SigmaXCouplingLayer in that
@@ -1859,9 +2038,28 @@ class SigmaXBlockLayer(AbstractBijection):
         quick regression of the response residual against it, controlling
         for the invariants `net_dipquad` already saw, found 6.4 sigma.
 
-        The bilinear composition below (``m3,m4``) is already a proper
-        rotation-covariant map; only ``D,c``'s OWN isotropy in ``e_gal``
-        (and blindness to ``Mc/Mr``) was the gap.
+        The bilinear composition below (``m3,m4``) is ``x + D*E + c*proj*E``,
+        ``proj = e1*x3 + e2*x4 = Re[E * conj(X)]`` -- the unique rotation-
+        covariant form. Two spin-2 fields (``E``, the Sigma_X ellipticity, and
+        ``X=(x3,x4)``, the galaxy shape) admit no bilinear combination linear
+        in each that is itself spin-2: ``E*X`` is spin+4, ``E*conj(X)`` and
+        ``conj(E)*X`` are spin 0, ``conj(E)*conj(X)`` is spin-4. A term
+        proportional to ``E*conj(X)`` -- i.e. adding the raw complex product
+        directly to ``X``, as an earlier version of this code did -- adds a
+        spin-0 quantity to a spin-2 one and is NOT covariant (confirmed
+        numerically: a coordinate rotation by theta produces a residual
+        ~O(c*|E||X|) that does not vanish). The fix keeps the alignment-
+        dependent scalar (``proj``, real and rotation-invariant, spin 0) but
+        multiplies it onto ``E`` (spin 2) rather than adding the raw complex
+        product to ``X`` -- same structure as the already-correct ``D*E``
+        term, differing only in which invariant scalar multiplies ``E``.
+        This bug was live in production (not just this docstring's stale
+        claim) and is believed to be the mechanism behind the PSFE additive
+        (``c1``/``c2``) leak: old BFD's own template/PQR formalism shows
+        ZERO additive bias from PSF anisotropy at any tested shear/alignment
+        (see PSFE_PROVENANCE.md), so a leak that vanishes when this layer is
+        removed entirely (``--no-centroid``) was always this layer's own
+        defect, not real physics the flow needed to learn.
 
         On the FORWARD path ``x2,x3,x4`` are given directly, so this is
         still a single closed-form evaluation, no circularity. `x2` is
@@ -1883,13 +2081,17 @@ class SigmaXBlockLayer(AbstractBijection):
         # `_e_mag_sq_scale` -- wrong scale for a galaxy ellipticity, and it
         # regressed the response-ratio check.
         e_gal_mag_sq_n, e_gal_dot_psf_n = _ell_gal_invariants(x3, x4, e1, e2)
-        dq_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n,
-                            e_gal_mag_sq_n, e_gal_dot_psf_n, _bound_coeff_input(x2)])
-        D_raw, c_raw = self.net_dipquad(dq_in)
+        d_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n,
+                           _bound_coeff_input(x2)])
+        q_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n,
+                           e_gal_mag_sq_n, e_gal_dot_psf_n, _bound_coeff_input(x2)])
+        D_raw = self.net_dip(d_in)[0]
+        c_raw = self.net_quad(q_in)[0]
         D = self._D_max * jnn.tanh(T_n * D_raw / self._D_max)
         c = jnn.tanh(T_n**2 * c_raw)
-        m3 = (1.0 + c * e1) * x3 + c * e2 * x4 + D * e1
-        m4 = c * e2 * x3 + (1.0 - c * e1) * x4 + D * e2
+        proj = e1 * x3 + e2 * x4          # Re[E * conj(X)], real, rotation-invariant
+        m3 = x3 + D * e1 + c * proj * e1
+        m4 = x4 + D * e2 + c * proj * e2
         return m3 / kappa, m4 / kappa, kappa, D, c
 
     def _s0(self, x0, y3, y4, log_scale_n, e_mag_sq_n, T_n):
@@ -1994,14 +2196,52 @@ class SigmaXBlockLayer(AbstractBijection):
         return T_n * self.net_mc(
             jnp.array([_bound_coeff_input(x0), log_scale_n, e_mag_sq_n]))[0]
 
+    def _g_shift(self, g1, g2, e1, e2, log_scale_n, e_mag_sq_n, T_n):
+        """A SEPARATE, g-coupled dipole term added to (y3,y4) on top of
+        `_ellipticity`'s existing D*e1/D*e2 shift.
+
+        The paper's own eq.-36 centroid marginalisation sums a template's
+        copies weighted by L(X(g)|Sigma_X) -- the LENSED odd moment, since a
+        sheared galaxy's own X responds to g exactly like its even moments do
+        (`imsims/copies.py`'s `dxy_dg`/`d2xy_dg2`). A pre-rebuild version of
+        this codebase (`models/flows.py`, before 2026-08-07) trained the whole
+        prior jointly this way -- reweighting training copies by L(X(g)|C_X)
+        recomputed AT EACH g from the copy's OWN sheared centroid -- and
+        explicitly flagged (`freeze_centroid_reweight_at_g0`) that WHICH
+        copies dominate the batch average shifts with g, something a pure
+        bijective transport "has no mechanism to represent" (that docstring,
+        verbatim). `SigmaXBlockLayer` replaced that reweighting-based
+        marginalisation with a bijection conditioned on `Sigma_X` alone --
+        `_unpack` never read `g` at all until this term was added -- so it
+        structurally could not carry this effect, no matter how it was
+        trained: not a training gap, an architecture gap (see
+        NEXT_SESSION_PSFE_FORMALISM_AUDIT.md, 2026-09-17 session).
+
+        This term is the best a bijection CAN do for it: not the true
+        reweighting (which changes the SHAPE of the distribution, not just
+        its mean), but the mean-shift consequence of that reweighting,
+        expressed as an explicit, closed-form, g-coupled ADDITIVE term along
+        the SAME Sigma_X axis (e1,e2) `net_dip`'s own D already uses --
+        deliberately NOT reading (x0,x1,x2) or the galaxy's own ellipticity,
+        so it is a pure Sigma_X x g coupling, trivially invertible (depends
+        only on `condition`, never on `x`/`y`), and its Jacobian contribution
+        is EXACTLY the identity (a pure translation in (y3,y4)) -- no new
+        log-det term needed, `_raw_transform`'s existing `jax.jacfwd` gets it
+        for free.
+        """
+        g_mag_sq_n, g_dot_psf_n = _g_psf_invariants(g1, g2, e1, e2)
+        Dg_raw = self.net_dip_g(jnp.array([log_scale_n, e_mag_sq_n, g_mag_sq_n, g_dot_psf_n]))[0]
+        Dg = self._D_max * jnn.tanh(T_n * Dg_raw / self._D_max)
+        return Dg * e1, Dg * e2
+
     def _ell_step(self, x3, x4, x0, x1, x2, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n,
                   isotropic_init=False):
         """One Picard iteration for the ellipticity inverse: given a CURRENT
         guess `(x3,x4)`, recompute `D,c` (now reading the galaxy's own
-        ellipticity through it -- see `_ellipticity`) and re-run the EXIST-
-        ING closed-form Moebius-inverse algebra (`r3,r4`/`det_e`/`x3,x4`,
-        algebraically identical to what `inverse_and_log_det` used to do in
-        one shot) to produce the NEXT guess. `isotropic_init` is a Python
+        ellipticity through it -- see `_ellipticity`) and re-run the closed-
+        form Sherman-Morrison inverse of `_ellipticity`'s `I + c*outer(E,E)`
+        map (`r3,r4`/`denom`/`x3,x4`) to produce the NEXT guess.
+        `isotropic_init` is a Python
         (not traced) flag used only to build the starting point: it forces
         the two new invariants to 0, i.e. evaluates `D,c` as if they were
         still isotropic-in-`e_gal` -- the OLD closed form -- which is exactly
@@ -2024,17 +2264,24 @@ class SigmaXBlockLayer(AbstractBijection):
             e_gal_dot_psf_n = 0.0 * x3
         else:
             e_gal_mag_sq_n, e_gal_dot_psf_n = _ell_gal_invariants(x3, x4, e1, e2)
-        dq_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n,
-                            e_gal_mag_sq_n, e_gal_dot_psf_n, _bound_coeff_input(x2)])
-        D_raw, c_raw = self.net_dipquad(dq_in)
+        d_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n,
+                           _bound_coeff_input(x2)])
+        q_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n,
+                           e_gal_mag_sq_n, e_gal_dot_psf_n, _bound_coeff_input(x2)])
+        D_raw = self.net_dip(d_in)[0]
+        c_raw = self.net_quad(q_in)[0]
         D = self._D_max * jnn.tanh(T_n * D_raw / self._D_max)
         c = jnn.tanh(T_n**2 * c_raw)
         e_mag_sq = e1**2 + e2**2
         r3 = kappa * y3 - D * e1
         r4 = kappa * y4 - D * e2
-        det_e = 1.0 - c**2 * e_mag_sq
-        x3_new = ((1.0 - c * e1) * r3 - c * e2 * r4) / det_e
-        x4_new = (-c * e2 * r3 + (1.0 + c * e1) * r4) / det_e
+        # invert (r3,r4) = (I + c*outer(E,E)) @ (x3,x4) via Sherman-Morrison:
+        # (I + c*E E^T)^-1 = I - c*E E^T / (1 + c|E|^2), matching the new
+        # covariant `_ellipticity` (proj*E, not the old antisymmetric form).
+        denom = 1.0 + c * e_mag_sq
+        proj_r = e1 * r3 + e2 * r4
+        x3_new = r3 - c * e1 * proj_r / denom
+        x4_new = r4 - c * e2 * proj_r / denom
         return x3_new, x4_new
 
     #: Fixed Picard-iteration count for :meth:`_solve_ell_picard`. There is
@@ -2088,11 +2335,13 @@ class SigmaXBlockLayer(AbstractBijection):
         return _solve_ell_ift(static, params, x0, x1, x2, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n)
 
     def _raw_transform(self, x, condition):
-        log_scale_n, e1, e2, _, e_mag_sq_n, T_n = self._unpack(condition)
+        log_scale_n, e1, e2, _, e_mag_sq_n, T_n, g1, g2 = self._unpack(condition)
         x0, x1, x2, x3, x4 = x
         y3, y4, kappa, _, _ = self._ellipticity(x0, x1, x2, x3, x4, e1, e2, log_scale_n, e_mag_sq_n, T_n)
+        dg3, dg4 = self._g_shift(g1, g2, e1, e2, log_scale_n, e_mag_sq_n, T_n)
+        y3, y4 = y3 + dg3, y4 + dg4
         s0 = self._s0(x0, y3, y4, log_scale_n, e_mag_sq_n, T_n)
-        c1 = self._size_loc
+        c1 = unwrap(self._size_loc)
         y0 = x0 + s0
         y1 = kappa * x1 + c1 * (kappa - 1.0)
         y2 = x2 + self._mc_shift(x0, log_scale_n, e_mag_sq_n, T_n)
@@ -2111,8 +2360,18 @@ class SigmaXBlockLayer(AbstractBijection):
         # the galaxy's own ellipticity (see the class docstring /
         # `_ellipticity`), so inverting them is a 2x2 implicit equation,
         # solved by `_solve_ell` (Picard fixed point + IFT `custom_jvp`).
-        log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n = self._unpack(condition)
+        log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n, g1, g2 = self._unpack(condition)
         y0, y1, y2, y3, y4 = y
+
+        # `_s0` (below, via `_solve_x0`) is defined in `_raw_transform` on the
+        # FINAL (post-`_g_shift`) y3,y4 -- same convention there, so `y3,y4`
+        # stay as given for it. `_solve_ell` inverts `_ellipticity`'s OWN map
+        # only, which never sees `_g_shift`'s term (see `_raw_transform`), so
+        # it needs the term undone first -- a plain subtraction, no
+        # circularity, exactly like `_mc_shift`'s (depends only on
+        # `condition`, never on `x`/`y`).
+        dg3, dg4 = self._g_shift(g1, g2, e1, e2, log_scale_n, e_mag_sq_n, T_n)
+        y3_ell, y4_ell = y3 - dg3, y4 - dg4
 
         # `s0` now reads the galaxy's OWN flux `x0` (FIX ONE, see the class
         # docstring / `_s0`), so `x0` can no longer be recovered by a plain
@@ -2123,7 +2382,7 @@ class SigmaXBlockLayer(AbstractBijection):
             T_n * self.net_size(jnp.array([_bound_coeff_input(x0), log_scale_n, e_mag_sq_n]))[0]
         )
         kappa = jnp.exp(g_s)
-        c1 = self._size_loc
+        c1 = unwrap(self._size_loc)
         x1 = (y1 - c1 * (kappa - 1.0)) / kappa
 
         # x0 is already recovered above, so this is a plain subtraction (no
@@ -2132,7 +2391,7 @@ class SigmaXBlockLayer(AbstractBijection):
         # can be passed in as one more (fixed, non-iterated) conditioning
         # value -- see `_ellipticity`'s docstring.
         x2 = y2 - self._mc_shift(x0, log_scale_n, e_mag_sq_n, T_n)
-        x3, x4 = self._solve_ell(x0, x1, x2, y3, y4, e1, e2, log_scale_n, e_mag_sq_n, T_n)
+        x3, x4 = self._solve_ell(x0, x1, x2, y3_ell, y4_ell, e1, e2, log_scale_n, e_mag_sq_n, T_n)
 
         x = jnp.stack([x0, x1, x2, x3, x4])
         jac = jax.jacfwd(self._raw_transform, argnums=0)(x, condition)

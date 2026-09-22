@@ -30,7 +30,7 @@ import bias as B
 
 SIZE, FLUX = (2.2, 3.2), (1500.0, 20000.0)
 G = 0.02
-FLOW_PATH = "flows/centroid_g2v3d_full2_jac.eqx"
+FLOW_PATH = "flows/centroid_g2v3d_sizefix.eqx"
 DATA_DIR = "../bfd_cnf_imsims/data"
 SEED = 0            # bias.py's --seed default; unused for any psfe config
 N_TARGETS = 20000   # matches dev/bias_psfe_g2v3d.sh's --n-targets
@@ -112,7 +112,7 @@ def compute_selection_terms(tag, flow_path=FLOW_PATH):
 
 
 def load(tag):
-    d = np.load(f"pqr/g2v3d_full2_jac_{tag}.npz")
+    d = np.load(f"pqr/g2v3d_sizefix_{tag}.npz")
     return d, compute_selection_terms(tag)
 
 

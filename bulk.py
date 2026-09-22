@@ -94,6 +94,7 @@ def _spin0_increments(n_layers):
 LAYERS = 8
 NN_WIDTH = 64
 NN_DEPTH = 2
+REPORT = 500  # training print cadence, reused as train()'s scan chunk size
 
 # The flow works in t = [log10(Mf), logit(Mr/Mf / r*), logit(Mc/Mr / rc*),
 # M1/Mr, M2/Mr] (RawMomentStandardize), standardised by the training set's own
@@ -583,7 +584,6 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
     # iterate is one noisy draw -- see [[health-gate-every-stage-and-track-jobs]]).
     ema_params = params
 
-    @eqx.filter_jit
     def step(params, state, idx):
         def loss_fn(p):
             model = eqx.combine(p, static)
@@ -596,15 +596,44 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
         updates, state = opt.update(grads, state, params)
         return eqx.apply_updates(params, updates), state, nll
 
-    for i in range(steps):
-        key, sk = jr.split(key)
-        idx = jr.randint(sk, (batch,), 0, data.shape[0])
-        params, state, loss = step(params, state, idx)
+    # The plain-Python `for i in range(steps)` loop this replaced dispatched ONE
+    # tiny jitted `step` call per iteration, with an RNG draw (`jr.split` +
+    # `jr.randint`) and -- when `ema > 0` -- an un-jitted `tree_map` EMA update
+    # interleaved in between: each of those is a host round-trip the GPU sits
+    # idle across, which is what pinned jac-weighted runs at ~38% utilisation.
+    # Folding `REPORT` steps into one `jax.lax.scan`, wrapped in a single
+    # `eqx.filter_jit`, means the host only round-trips once per chunk --
+    # `REPORT` back-to-back GPU kernels get queued from ONE dispatch, and the
+    # EMA update moves inside the jit too. `REPORT` also sets the print
+    # cadence, so reporting stays essentially unchanged (one line per chunk).
+    #
+    # `idx` is now drawn as a single on-device `jr.randint(key, (n, batch), ...)`
+    # per chunk rather than one `jr.randint` per step -- scan's per-step inputs
+    # must already be on-device arrays, so drawing them one at a time would
+    # reintroduce the same host round-trip this is meant to remove. This draws
+    # the same DISTRIBUTION (uniform batch indices) but not the same SEQUENCE
+    # as the old per-step draws, so training is no longer bit/value identical
+    # to the pre-change code for a given `key` -- expected, not a bug.
+    def scan_body(carry, idx):
+        params, state, ema_params = carry
+        params, state, nll = step(params, state, idx)
         if ema:
             ema_params = jax.tree_util.tree_map(
                 lambda e, q: ema * e + (1.0 - ema) * q, ema_params, params)
-        if i % 500 == 0 or i == steps - 1:
-            print(f"step {i:5d}  nll {loss:.4f}")
+        return (params, state, ema_params), nll
+
+    @eqx.filter_jit
+    def run_chunk(params, state, ema_params, idx_chunk):
+        return jax.lax.scan(scan_body, (params, state, ema_params), idx_chunk)
+
+    i = 0
+    while i < steps:
+        n = min(REPORT, steps - i)
+        key, sk = jr.split(key)
+        idx_chunk = jr.randint(sk, (n, batch), 0, data.shape[0])
+        (params, state, ema_params), nlls = run_chunk(params, state, ema_params, idx_chunk)
+        i += n
+        print(f"step {i - 1:5d}  nll {float(nlls[-1]):.4f}")
     return eqx.combine(ema_params if ema else params, static)
 
 

@@ -40,6 +40,8 @@
 # ponytail: POP/TAG/N are env overrides so the SAME recipe builds the gauss2
 # chain -- one script, one provenance record, no second copy to drift.
 #   POP=gauss2 TAG=g2v3 NTARGET=500000 SIZE=500k bash rebuild_v3.sh render
+#   REGION="3000 20000 2.2 3.2" POP=gauss2_fwd TAG=g2v4 NTARGET=22000 SIZE=22k \
+#       bash rebuild_v3.sh render      # DES-matched sigma_e, region-limited targets
 #   SIGMA=1.86 POP=gauss2_fwd TAG=g2v3d NTARGET=500000 SIZE=500k \
 #       bash rebuild_v3.sh render      # the 2x-deeper arm, median S/N 9.5
 set -e -o pipefail
@@ -64,6 +66,11 @@ SIZE=${SIZE:-200k}
 # so NPROC=8 is the box.  The catalog is byte-identical at any NPROC
 # (tests/test_sim_nproc.py), so this is a speed knob and nothing else.
 NPROC=${NPROC:-8}
+# REGION="FLO FHI RLO RHI" renders only targets whose NOISELESS moments lie in
+# that (unpadded) noisy window padded by 1000 in flux / 0.2 in Mr/Mf; NPOP in
+# the header carries the full-population count for N_ns.  Targets only -- the
+# prior and copies are always the full population.
+REGION=${REGION:-}
 SEED_PRIOR=0
 SEED_TARGET=1
 
@@ -90,6 +97,7 @@ render() {
         ( cd $S && OMP_NUM_THREADS=1 JAX_PLATFORMS=cpu python -u -m imsims.sim \
             --n $NTARGET --seed $SEED_TARGET --pop $POP --noise-sigma $SIGMA \
             --g1 $2 --add-noise --nproc $NPROC \
+            ${REGION:+--region $REGION} \
             --out data/targets_${TAG}_$1_${SIZE}.fits ) &
         pids+=($!)
     done
@@ -108,7 +116,7 @@ copies() {
     # copies run and a CPU-backend prior run disagree at ~3e-14 -- different
     # galaxies, and near the acceptance tolerance a DIFFERENT SET of them.
     # Measured; `check_provenance`'s POPULATION check is what caught it.
-    ( cd $S && OMP_NUM_THREADS=1 JAX_PLATFORMS=cpu python -u -m imsims.copies \
+    ( cd $S && OMP_NUM_THREADS=1 JAX_PLATFORMS=cpu python -u -m imsims.copies build \
         --n $NPRIOR --seed $SEED_PRIOR --pop $POP --noise-sigma $SIGMA \
         --out data/copies_${POP}_${TAG}.fits )
     echo "copies done"

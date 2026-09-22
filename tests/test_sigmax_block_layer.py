@@ -106,7 +106,7 @@ def _block_layer(key, zero_init=True, scale=0.3, only=None):
     if zero_init:
         return lay
     names = (only,) if only is not None else \
-        ("net_flux", "net_size", "net_dipquad", "net_flux_e", "net_mc")
+        ("net_flux", "net_size", "net_dip", "net_quad", "net_flux_e", "net_mc")
     nets = []
     for i, n in enumerate(names):
         sub = getattr(lay, n)

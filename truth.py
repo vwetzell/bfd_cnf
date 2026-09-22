@@ -136,9 +136,9 @@ def log_p_theta(theta):
         The copula density is evaluated at x = Phi^-1(F's CDF) and
         y = (log sigma - median) / spread, which IS Phi^-1 of sigma's CDF.
       * logit rho: rho ~ U(a, b), so the logit carries a rho(1-rho) Jacobian.
-      * (e1, e2): P(e) ~ e exp(-e^2/2 sigma_e^2) on [0, 1) with a uniform
-        orientation, so the JOINT density in the plane drops the radial `e`
-        (it is the polar Jacobian) and is flat in angle.
+      * (e1, e2): BFD eq. 58, P(e) ~ e (1-e^2)^2 exp(-e^2/2 sigma_e^2) on
+        [0, 1) with a uniform orientation, so the JOINT density in the plane
+        drops the radial `e` (it is the polar Jacobian) and is flat in angle.
 
     Outside any block's support the density is zero, returned as -inf rather
     than clipped: a target that could not have been drawn must not be given a
@@ -175,10 +175,14 @@ def log_p_theta(theta):
     # --- ellipticity --------------------------------------------------------
     se = sim.GAUSS2_FWD_ELLIP_SIGMA
     e_sq = e1 * e1 + e2 * e2
-    # Z_e = int_0^1 e exp(-e^2/2 se^2) de, so the plane density is
-    # exp(-e^2/2 se^2) / (2 pi Z_e).
-    z_e = se * se * (1.0 - jnp.exp(-0.5 / (se * se)))
-    log_p_e = -0.5 * e_sq / (se * se) - jnp.log(2.0 * jnp.pi * z_e)
+    # BFD eq. 58: P(e) ~ e (1-e^2)^2 exp(-e^2/2 se^2), uniform angle, so the
+    # plane density is (1-e^2)^2 exp(-e^2/2 se^2) / (2 pi Z_e) with
+    # Z_e = int_0^1 e (1-e^2)^2 exp(-a e^2) de = I/2, a = 1/(2 se^2),
+    # I = int_0^1 (1-u)^2 exp(-a u) du = 1/a - 2/a^2 + 2 (1-exp(-a))/a^3.
+    a_e = 0.5 / (se * se)
+    z_e = 0.5 * (1.0 / a_e - 2.0 / a_e**2 + 2.0 * (-jnp.expm1(-a_e)) / a_e**3)
+    log_p_e = (2.0 * jnp.log1p(-jnp.minimum(e_sq, 1.0 - 1e-12)) - a_e * e_sq
+               - jnp.log(2.0 * jnp.pi * z_e))
 
     total = log_p_logf + log_p_logsigma + log_c + log_p_rho + log_p_e
     in_support = ((f > lo) & (f < hi) & (rho > a_rho) & (rho < b_rho)
@@ -263,3 +267,117 @@ def pqr_batch(ms, batch_size=512):
     """`pqr` over a leading axis, at flat memory cost (see `log_prob_batch`)."""
     ms = jnp.asarray(ms, dtype=jnp.float64)
     return jax.lax.map(pqr, ms, batch_size=batch_size)
+
+
+# ---------------------------------------------------------------------------
+# Centroid marginalisation: exact P(m | g, Sigma_X), no trained flow anywhere
+# ---------------------------------------------------------------------------
+#
+# `models.centroid._transport` is a CLOSED-FORM, ZERO-PARAMETER map between a
+# galaxy's base (pre-centroid-error) and data (post-marginalisation) moments,
+# exact within a Gaussian-in-k profile ansatz -- and gauss2 literally is a
+# Gaussian mixture, so this composes with the exact P(m|g) above with no new
+# approximation beyond what `_transport` already carries (see
+# `models/centroid.py`'s module docstring, "An exact, zero-parameter
+# marginalisation integral"). `c_spin2 = c_spin4 = 1.0` (the defaults) is the
+# untrained ansatz -- no fitted coefficients, matching this module's own
+# no-free-parameters standard; `CentroidMarginalize`'s trained k^4 bracket is
+# a further refinement this deliberately does NOT use.
+#
+# `_transport` works on RAW moments directly, so it needs neither the
+# standardised-z round trip nor the `_EXP_MAX` tanh clamp that
+# `CentroidMarginalize.unmarginalize` applies for a trained flow's benefit
+# (see that method's docstring: the clamp exists only because a large exact
+# shift can land the FROZEN, never-retrained bulk+shear flow in a steep
+# region of ITS density -- there is no such flow here to protect).
+#
+# The transport does not depend on g (centroid marginalisation is the last
+# thing that happens to a galaxy, after shear -- `models/centroid.py`'s "No
+# shear-conditioning"), so `m_base` and its log-det are both g-free and Q, R
+# come from differentiating `log_prob(m_base, g)` alone, exactly as `pqr`
+# does at fixed m.
+from models.centroid import _transport  # noqa: E402
+
+
+def log_prob_sigma(m, g, sigma_x):
+    """log P(m | g, Sigma_X), composing the exact prior with the exact
+    zero-parameter centroid-marginalisation transport. `m` is (5,), `g` a
+    2-vector, `sigma_x` the 3 unique values [C00, C01, C11]."""
+    m = jnp.asarray(m, dtype=jnp.float64)
+    g = jnp.asarray(g, dtype=jnp.float64)
+    sigma_x = jnp.asarray(sigma_x, dtype=jnp.float64)
+    unmarg = lambda mm: _transport(mm, sigma_x, -1.0)
+    m_base = unmarg(m)
+    _, logdet = jnp.linalg.slogdet(jax.jacfwd(unmarg)(m))
+    return log_prob(m_base, g) + logdet
+
+
+def log_prob_sigma_batch(ms, gs, sigma_x, batch_size=512):
+    """`log_prob_sigma` over a leading axis, at flat memory cost."""
+    ms = jnp.asarray(ms, dtype=jnp.float64)
+    gs = jnp.broadcast_to(jnp.asarray(gs, dtype=jnp.float64),
+                          ms.shape[:-1] + (2,))
+    return jax.lax.map(lambda args: log_prob_sigma(args[0], args[1], sigma_x),
+                       (ms, gs), batch_size=batch_size)
+
+
+def pqr_sigma(m, sigma_x):
+    """Exact (Q, R) at g = 0 for one target, given Sigma_X -- `pqr`'s
+    centroid-marginalised twin. Shapes (2,) and (2,2)."""
+    m = jnp.asarray(m, dtype=jnp.float64)
+    zero = jnp.zeros(2)
+    f = lambda g: log_prob_sigma(m, g, sigma_x)
+    return jax.grad(f)(zero), jax.hessian(f)(zero)
+
+
+def pqr_sigma_batch(ms, sigma_x, batch_size=512):
+    """`pqr_sigma` over a leading axis, at flat memory cost."""
+    ms = jnp.asarray(ms, dtype=jnp.float64)
+    return jax.lax.map(lambda m: pqr_sigma(m, sigma_x), ms,
+                       batch_size=batch_size)
+
+
+class _EmptyBijections:
+    bijections = ()
+
+
+class _EmptyBijection:
+    bijection = _EmptyBijections()
+
+
+class BiasFlow:
+    """Duck-typed drop-in for `bias.py`'s trained-flow argument, backed by
+    `log_prob_sigma` -- no trained flow anywhere.  Pass `--flow truth` to
+    `bias.py` to use it.
+
+    Only supports what `--alpha 1.0 --window-terms templates --gauge prior`
+    need: `flow.log_prob(m, condition)`, called with `m` a batch of moments
+    (leading axis) and `condition` a SINGLE (non-batched) `[g1, g2, C00, C01,
+    C11]` vector -- exactly `log_conv_is`'s calling convention, the only one
+    this class implements.  `bias.split_centroid`'s one piece of
+    introspection (`flow.bijection.bijection.bijections`) is satisfied by
+    `_EmptyBijection`'s length-0 stand-in, which makes it return
+    `(flow, None)` -- correct, since `log_prob_sigma` already folds the
+    centroid transform in, so there is nothing left for `bias.py` to peel.
+
+    Deliberately does NOT support `.sample`/`.base_dist` (needed by
+    `mixture_draws` at `--alpha < 1`, and by `--window-terms score`/`flow`'s
+    prior sampling for the selection term) or `--gauge auto`/`kernel`
+    (needs `models.shear`-specific machinery). A run must avoid all three --
+    `--window-terms templates` computes the selection term directly from
+    `--train-data`'s own exact response, which needs no flow at all.
+    """
+    bijection = _EmptyBijection()
+
+    def log_prob(self, m, condition=None):
+        m = jnp.asarray(m, dtype=jnp.float64)
+        single = m.ndim == 1
+        if single:
+            m = m[None]
+        if condition is None:
+            g, sigma_x = jnp.zeros(2), jnp.zeros(3)
+        else:
+            condition = jnp.asarray(condition, dtype=jnp.float64)
+            g, sigma_x = condition[:2], condition[2:]
+        lp = jax.vmap(lambda mi: log_prob_sigma(mi, g, sigma_x))(m)
+        return lp[0] if single else lp

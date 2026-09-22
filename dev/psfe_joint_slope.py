@@ -24,9 +24,88 @@ from scipy.spatial import cKDTree
 
 import bias as B
 
-SIZE, FLUX = (2.2, 3.2), (2500.0, 50000.0)
+SIZE, FLUX = (2.2, 3.2), (1500.0, 20000.0)
 G = 0.02
 N_BOOT = 400
+FLOW_PATH = "flows/centroid_g2v3d_full2_jac.eqx"
+DATA_DIR = "../bfd_cnf_imsims/data"
+SEED = 0            # bias.py's --seed default; unused for any psfe config
+N_TARGETS = 20000   # matches dev/bias_psfe_g2v3d.sh's --n-targets
+WINDOW_DRAWS = 1 << 24
+
+_terms_cache = {}
+
+
+def compute_selection_terms(tag, flow_path=FLOW_PATH):
+    """(ps, qs, rs) exactly as bias.py's own `main()` computes them for
+    `--window-terms score --window-draws 16777216 --support --floor-eps 0
+    --window-size 2.2 3.2 --window-flux 1500 20000 --flow <flow_path>
+    --pop gauss2_v3d_<tag>` (see dev/bias_psfe_g2v3d.sh) -- there is no
+    terms-cache file for this flow/window, so this reproduces the relevant
+    slice of `main()` inline rather than reading a stale one.
+    """
+    if tag in _terms_cache:
+        return _terms_cache[tag]
+
+    pop = f"gauss2_v3d_{tag}"
+    path = lambda v: f"{DATA_DIR}/{v}.fits"
+    cat = B.CATALOGS[pop]
+
+    img_noise = bool(
+        B.fitsio.read_header(path(cat["zero"]), ext=1).get("IMGNOISE", False))
+    use_centroid = img_noise  # no --centroid override in bias_psfe_g2v3d.sh
+
+    train_data = f"{DATA_DIR}/{B.TRAIN_DATA[pop]}"
+    m_train_full = B.shear.load(train_data)[0]
+    slice90 = lambda arr: arr[:int(0.9 * len(arr))]
+    m_train = m_train_full if use_centroid else slice90(m_train_full)
+
+    # This function may run more than once per process (one call per tag),
+    # and jax_enable_x64 is process-global -- force it off here so a flow
+    # built/deserialised on a LATER call still matches its on-disk float32
+    # checkpoint, exactly as it would on bias.py's first (and only) call.
+    B.jax.config.update("jax_enable_x64", False)
+    flow = B.bulk.build_flow(B.jr.key(SEED), m_train, shear=True,
+                             centroid=use_centroid, flux_sas=None)
+    flow = B.eqx.tree_deserialise_leaves(flow_path, flow)
+    flow = B.bulk.SupportedFlow(flow, eps=0.0, broad_std=4.0, support=True)
+
+    n = slice(0, N_TARGETS)
+    rows = {k: B.fitsio.read(path(v))[n] for k, v in cat.items()}
+    keep = np.ones(len(rows["zero"]), dtype=bool)
+    if img_noise:
+        for v in rows.values():
+            keep &= ~v["badcenter"]
+        rows = {k: v[keep] for k, v in rows.items()}
+    sigma_x_all = np.asarray(rows["zero"]["cov_odd"], dtype=np.float64)
+
+    cov = B.load_cov(path(cat["zero"]))
+    density = B.build_support_density(np.asarray(m_train_full))
+
+    # Same float64 promotion `main()` does before any --window-terms branch,
+    # and BEFORE building sx1 -- otherwise jnp.asarray(..., dtype=float64)
+    # silently truncates back to float32 with x64 still off.
+    B.jax.config.update("jax_enable_x64", True)
+    sx1 = (B.jnp.asarray(sigma_x_all[0], dtype=B.jnp.float64)
+           if use_centroid else None)
+    flow = B.jax.tree_util.tree_map(
+        lambda x: (x.astype(B.jnp.float64) if B.eqx.is_inexact_array(x) else x),
+        flow)
+
+    zero2 = B.jnp.zeros(2)
+    zs = flow.base_dist.sample(B.jr.key(SEED + 31),
+                               (WINDOW_DRAWS,)).astype(B.jnp.float64)
+    tr = B.eqx.filter_jit(B.jax.vmap(
+        lambda z1: flow.bijection.transform(z1, B.condition(zero2, sx1))))
+    m_draw = B.jnp.concatenate(
+        [tr(zs[i:i + 16384]) for i in range(0, len(zs), 16384)])
+
+    ps, qs, rs, qs_err = B.selection_terms_score(
+        flow, m_draw, cov, SIZE, FLUX, sigma_x=sx1, density=density)
+
+    result = (float(ps), qs, rs)
+    _terms_cache[tag] = result
+    return result
 
 CONFIGS = {
     "psfe1p02": (0.02, 0.0), "psfe2p02": (0.0, 0.02), "psfe1m02": (-0.02, 0.0),
@@ -36,9 +115,8 @@ CONFIGS = {
 
 
 def load(tag):
-    d = np.load(f"pqr/g2v3d_{tag}.npz")
-    terms = np.load(f"logs/phase_a/terms_gauss2_v3d_{tag}_24_s0_1w_g100.npz")
-    return d, (float(terms["ps"][0]), terms["qs"][0], terms["rs"][0])
+    d = np.load(f"pqr/g2v3d_full2_jac_{tag}.npz")
+    return d, compute_selection_terms(tag)
 
 
 def pairwise_match(base_moments, other_moments):

@@ -418,6 +418,71 @@ this session — recommended next step.
   `logs/phase_a/terms_gauss2_v3d_psfe*_24_*.npz` — the corresponding logs
   and selection-term caches.
 
+## 9. Rerun on the fixed flow (`full2_jac`) and restricted window — 2026-09-14
+
+Thread 2's `--jac-weight` fix and Thread 3's window-restriction work
+(`NEXT_SESSION.md`) both postdate §§7-8 above, which used the pre-fix flow
+(`centroid_g2v3d_sigmaxblock_multiscale.eqx`) and the old, since-shown-biased
+window `(2.2,3.2) x (2500,50000)`. This section reruns the PSFE leak test on
+`flows/centroid_g2v3d_full2_jac.eqx` with the validated-null window
+`(2.2,3.2) x (1500,20000)` (`NEXT_SESSION.md`'s "Thread 1 -- RESUME CONFIG"),
+to check whether either fix incidentally suppressed the leak.
+
+**Rerun**: `dev/bias_psfe_g2v3d.sh`, updated in place for the new flow/window
+(old version in git history) and trimmed to `psfe00` + `psfe1`/`psfe2p`/`psfe1m`
+at all 3 amplitudes (10 configs total). Naive per-config corrected c1/c2 show
+no clean trend with amplitude (all overlap within ~1sigma) — expected and NOT
+informative on its own, since the naive bootstrap error (~4e-3) is the same
+order as the leak magnitude found below; per §8d this leak is invisible
+without paired-config matching.
+
+**`dev/psfe_paired_diff.py`/`dev/psfe_joint_slope.py` updated for the new
+flow/window**: both scripts previously read a stale terms-cache npz
+(`logs/phase_a/terms_gauss2_v3d_{tag}_24_s0_1w_g100.npz`) built against the
+OLD flow/window. Since no equivalent cache exists for `full2_jac`/the
+restricted window, both scripts now compute `(ps, qs, rs)` fresh inline via a
+`compute_selection_terms(tag)` helper that reproduces `bias.py main()`'s own
+`--window-terms score --window-draws 16777216 --support --floor-eps 0`
+code path exactly (flow load + `SupportedFlow` wrap, catalog load, support
+density, `2**24`-draw prior sample, `B.selection_terms_score`) — see git
+history for the diff. Two subtle bugs surfaced and were fixed during this:
+`jax_enable_x64` is process-global and the helper runs once per tag per
+process, so a second call's flow-deserialisation would mismatch the on-disk
+float32 checkpoint unless x64 is explicitly forced off before
+`build_flow`/`tree_deserialise_leaves` and back on afterward (matching what
+`bias.py`'s own single-call-per-process path never had to handle); and the
+anisotropic `Sigma_X` array must be cast to float64 only *after* x64 is
+turned on, or JAX silently truncates it back to float32.
+
+**Verification**: `psfe00` vs itself gives an exact zero diff (self-
+consistency check on `compute_selection_terms`). `psfe00`'s own standalone
+recompute lands within ~1sigma of `logs/bias_g2v3d_full2_jac_psfe00.log`'s
+ground truth (same sign, same order of magnitude; the residual offset is
+expected since the paired script evaluates on a pairwise-matched subset,
+~14061/19938 rows, not the full catalog).
+
+**Result: the leak survives on the fixed flow, and is comparable or a bit
+stronger, not suppressed:**
+
+  - dc1/d(psf_e1) = **-0.0293 +/- 0.0032 (-9.1 sigma)**
+  - dc2/d(psf_e2) = **-0.0141 +/- 0.0055 (-2.6 sigma)**
+
+vs. §8d's old-flow numbers at the same amplitude subset (dropping the
+degraded-match 0.10-amplitude configs): -0.0156 +/- 0.0030 (5.3 sigma) for
+c1, -0.0115 +/- 0.0036 (3.2 sigma) for c2. Same sign, same order of
+magnitude, and now MORE significant in c1 (a stronger effective SNR from more
+targets/tighter selection terms, not necessarily a larger leak per se — the
+point estimates are within ~1.5x of each other). **Conclusion**: neither
+Thread 2's Jacobian-penalty fix nor Thread 3's window restriction touches
+this leak — it is not an artifact of the pre-fix R_s instability or the
+biased flux-tail window, consistent with `[[psf-leak-is-the-sigma-x-channel]]`
+being a genuine, flow-independent effect. The `--no-centroid` bisection
+proposed at the end of §8d (does the leak get WORSE without the
+`SigmaXBlockLayer`, proving partial suppression, or stay the SAME, proving
+none) is still the open next step and is now more clearly worth running,
+since this session ruled out both candidate "already fixed by something
+else" explanations.
+
 ## How this was recovered
 
 `git log` and `dev/psfe_compare.py`/`dev/render_psfe.sh`'s own comments

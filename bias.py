@@ -349,6 +349,12 @@ CATALOGS = {
     # Its prior is g2v3d's file unchanged (TRAIN_DATA below): RawMomentStandardize
     # is frozen at training time, so the new targets MUST be standardised against
     # the file the flows were trained on.  Do not retrain, do not re-render it.
+    # v4: the same fixed-size isotropic-PSF gauss2_fwd chain (noise 0.93, image
+    # noise), but only galaxies in the padded window region are rendered; the
+    # catalog header's NPOP carries the full-population count for N_ns.
+    "gauss2_v4": {"plus": "targets_g2v4_g1p02_22k",
+                  "minus": "targets_g2v4_g1m02_22k",
+                  "zero": "targets_g2v4_g0_22k"},
     "gauss2_v3e": {"plus": "targets_g2v3e_g1p02_4600k",
                    "minus": "targets_g2v3e_g1m02_4600k",
                    "zero": "targets_g2v3e_g0_4600k"},
@@ -396,6 +402,7 @@ TRAIN_DATA = {
     "gauss2": "gauss2_g0_1M.fits", "gauss2_2k": "gauss2_g0_2k.fits",
     "gauss2_v3": "moments_gauss2_fwd_g2v3.fits",
     "gauss2_v3d": "moments_gauss2_fwd_g2v3d.fits",
+    "gauss2_v4": "moments_gauss2_fwd_g2v4.fits",
     "gauss2_v3e": "moments_gauss2_fwd_g2v3d.fits",   # deliberate: see CATALOGS
     "gauss2_deep": "gauss2_g0_1M.fits",
     # Same reasoning as bulgedisc_v3_psfe*: PSF ellipticity doesn't touch the
@@ -2012,6 +2019,11 @@ def ess(flow, m, draws, log_wt, batch=20000, sigma_x=None):
 _GL_NODES, _GL_WEIGHTS = np.polynomial.legendre.leggauss(64)
 
 
+def n_out_from_npop(npop, n_in):
+    """N_ns for a region-limited catalog: full-population count minus in-window."""
+    return int(npop) - int(n_in)
+
+
 def window_mask(m, size, flux):
     """Boolean mask of the rows of `m` (n, 5) inside the target window:
     `size[0] < Mr/Mf < size[1]` and `flux[0] < Mf < flux[1]`.
@@ -3131,10 +3143,21 @@ def main():
     m_train_full = shear.load(train_data)[0]
     slice90 = lambda arr: arr[:int(0.9 * len(arr))]
     m_train = m_train_full if use_centroid else slice90(m_train_full)
-    flow = bulk.build_flow(jr.key(a.seed), m_train, shear=True,
-                           centroid=use_centroid,
-                           flux_sas=a.flux_sas)
-    flow = eqx.tree_deserialise_leaves(a.flow, flow)
+    if a.flow == "truth":
+        # No trained flow anywhere: `truth.BiasFlow` backs `.log_prob` with
+        # the exact analytic gauss2 density composed with the exact
+        # zero-parameter centroid-marginalisation transport
+        # (`truth.log_prob_sigma`). Only supports what --alpha 1.0 (no flow
+        # sampling) and --window-terms templates (no flow-based selection
+        # term) need -- see BiasFlow's own docstring for what is
+        # deliberately NOT implemented and why a run must use those flags.
+        import truth
+        flow = truth.BiasFlow()
+    else:
+        flow = bulk.build_flow(jr.key(a.seed), m_train, shear=True,
+                               centroid=use_centroid,
+                               flux_sas=a.flux_sas)
+        flow = eqx.tree_deserialise_leaves(a.flow, flow)
     # The physical support indicator and the defensive floor are EVALUATION-time
     # properties of the prior, not of the trained weights: the checkpoint is
     # unchanged, and --floor-eps 0 --no-support reproduces the raw flow exactly.
@@ -3204,8 +3227,15 @@ def main():
     if a.window_size is not None or a.window_flux is not None:
         _size = tuple(a.window_size) if a.window_size is not None else (-np.inf, np.inf)
         _flux = tuple(a.window_flux) if a.window_flux is not None else (-np.inf, np.inf)
-        n_out_full = {k: int((~window_mask(m[k], _size, _flux)).sum())
-                      for k in ("plus", "minus")}
+        n_out_full = {}
+        for k in ("plus", "minus"):
+            n_in = int(window_mask(m[k], _size, _flux).sum())
+            npop = fitsio.read_header(path(cat[k]), ext=1).get("NPOP")
+            if npop is not None:
+                n_out_full[k] = n_out_from_npop(npop, n_in)
+                print(f"  region fraction ({k}) = {len(m[k])/int(npop):.4f}")
+            else:
+                n_out_full[k] = int((~window_mask(m[k], _size, _flux)).sum())
 
     prefilter = None
     prefilter_w = None

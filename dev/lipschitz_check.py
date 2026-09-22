@@ -51,10 +51,10 @@ def main():
         _, h1 = lin(e1)
         return q, jnp.stack([h0, h1], axis=-1)
 
-    chunked = eqx.filter_jit(jax.vmap(one))
+    one_jit = eqx.filter_jit(one)
 
     def qr_vec(m_i):
-        q, r = one(jnp.asarray(m_i))
+        q, r = one_jit(jnp.asarray(m_i))
         return np.concatenate([np.asarray(q).ravel(), np.asarray(r).ravel()])
 
     # Standardised shape-invariant space, same convention as

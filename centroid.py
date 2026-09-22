@@ -54,7 +54,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ctypes
+import multiprocessing as mp
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import equinox as eqx
@@ -65,6 +69,8 @@ import jax.random as jr
 import numpy as np
 import optax
 
+from paramax import unwrap
+
 import bulk
 from models.bijections import SigmaXBlockLayer, _bound_coeff_input
 from models.centroid import dm_dsigma
@@ -74,7 +80,7 @@ from models.centroid import dm_dsigma
 # that would drift.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bfd_cnf_imsims"))
 try:
-    from imsims.copies import log_weights
+    from imsims.copies import log_weights, log_weights_base
 except ImportError as exc:                                  # pragma: no cover
     raise SystemExit("centroid.py needs ../bfd_cnf_imsims on the path: "
                      f"{exc}") from None
@@ -325,19 +331,138 @@ def train(flow, m0, truth, sigma_x, key, steps=3000, batch=8192, lr=1e-2):
     return flow
 
 
-def weighted_copy_mean(copies, galaxies, sigma_x):
+# Row-chunk size for `weighted_copy_mean`'s pass over `copies`. Each call's
+# transient arrays (lensed xy, chisq, w, w*moments) are O(chunk)-length
+# instead of O(len(copies))-length, which is what decouples one worker's
+# peak memory from catalog size -- see the call site's comment for the
+# worker-count reasoning this enables.
+_WEIGHTED_COPY_MEAN_CHUNK = 2_000_000
+
+
+def weighted_copy_mean(copies, galaxies, sigma_x, base=None, g=None,
+                        chunk_size=_WEIGHTED_COPY_MEAN_CHUNK):
     """Per-galaxy w-weighted mean of the copy moments -- the layer's target.
 
     This is what the marginalisation does to each galaxy, straight from the
-    catalog and with no flow involved.
+    catalog and with no flow involved. `base`, if given, is `log_weights_
+    base(copies)` precomputed by the caller -- see that docstring.
+
+    `g`, if given, is passed straight to `log_weights` -- it shears the
+    DETECTION WEIGHT (which copies dominate the sum), not the moments in the
+    numerator, which stay at their g=0 values (`copies["moments"]`). This is
+    deliberate: `ShearResponse` already carries "how does the moment ITSELF
+    shift with g", trained separately and elsewhere. Re-lensing the
+    numerator here too would double-count that response. What this
+    isolates, and what `ShearResponse` cannot see at all, is the OTHER
+    effect -- WHICH copies the eq.-36 sum weights most heavily shifts with g
+    (because a copy's own centroid response `dX/dg` differs from its
+    neighbours'), independent of any single copy's own moment response. See
+    `models.bijections.SigmaXBlockLayer._g_shift`'s docstring for where this
+    feeds into the trained layer, and NEXT_SESSION_PSFE_FORMALISM_AUDIT.md
+    (2026-09-17) for why this was missing.
+
+    `chunk_size` processes `copies` in row-slices of this many rows at a
+    time, accumulating `den`/`num` incrementally, so peak transient memory
+    is O(chunk_size) rather than O(len(copies)) -- this is a pure memory/
+    perf change: the returned `(mean, keep)` is numerically the same as the
+    single-shot computation (up to floating-point summation-order noise,
+    since each chunk's own partial `bincount` is now added into the running
+    total instead of every row being accumulated in one pass -- see
+    NEXT_SESSION.md's equivalence check). `chunk_size=None` disables
+    chunking and reproduces the previous single-pass behaviour bit for bit.
     """
-    w = np.exp(log_weights(copies, sigma_x))
+    n_rows = len(copies)
+    if chunk_size is None or chunk_size >= n_rows:
+        starts = [0]
+        chunk_size = n_rows
+    else:
+        starts = range(0, n_rows, chunk_size)
     n = len(galaxies)
-    den = np.bincount(copies["gal"], weights=w, minlength=n)
-    num = np.stack([np.bincount(copies["gal"], weights=w * copies["moments"][:, j],
-                                minlength=n) for j in range(5)], axis=1)
+    den = np.zeros(n, dtype=np.float64)
+    num = np.zeros((n, 5), dtype=np.float64)
+    sigma_x_arr = np.asarray(sigma_x, dtype=float)
+    per_copy_sigma = sigma_x_arr.ndim > 1
+    for start in starts:
+        stop = min(start + chunk_size, n_rows)
+        c = copies[start:stop]
+        b = None if base is None else base[start:stop]
+        sx = sigma_x_arr[start:stop] if per_copy_sigma else sigma_x_arr
+        w = np.exp(log_weights(c, sx, base=b, g=g))
+        den += np.bincount(c["gal"], weights=w, minlength=n)
+        for j in range(5):
+            num[:, j] += np.bincount(c["gal"], weights=w * c["moments"][:, j],
+                                     minlength=n)
     keep = den > 0
     return num[keep] / den[keep, None], keep
+
+
+# `weighted_copy_mean` is a single-threaded numpy pass over the whole copy
+# catalog (tens of millions of rows) -- fine for a handful of grid points,
+# but at `--n-aniso` in the hundreds it dominates wall time with the GPU
+# sitting idle. Each point is independent, so fork workers compute them in
+# parallel; `_par_copies`/`_par_galaxies`/`_par_base` are set in the PARENT
+# just before the pool is created so forked children inherit them via
+# copy-on-write -- passing the (tens-of-GB-scale) arrays through `initargs`/
+# pickling instead would multiply, not divide, the memory and time cost.
+# `_par_base` matters here for more than speed: `sigma_x` never affects
+# `log_weights_base`, so computing it once in the parent (one float64
+# upcast of the whole moments array, COW-shared read-only by every worker)
+# instead of once per worker per point is what keeps each worker's own
+# per-call footprint down to the small chisq/det arrays -- the actual cause
+# of a previous run's OOM was this ~1GB-per-call redundant work times
+# `os.cpu_count()` workers, not core count by itself.
+_par_copies = None
+_par_galaxies = None
+_par_base = None
+_par_chunk = _WEIGHTED_COPY_MEAN_CHUNK
+
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+except OSError:
+    _libc = None    # non-glibc platform (e.g. macOS) -- trim is a no-op there
+
+
+def _weighted_copy_mean_task(args):
+    sigma_x, g = args
+    result = weighted_copy_mean(_par_copies, _par_galaxies, sigma_x, base=_par_base, g=g,
+                                chunk_size=_par_chunk)
+    # Measured (see NEXT_SESSION_PSFE_FORMALISM_AUDIT.md / repro script): each
+    # call's own transient arrays (lens_xy's shifted X, chisq, w, w*moments --
+    # each a full copy-catalog-length float64 array) leave a few tens of MB of
+    # glibc-arena memory behind per call that the allocator doesn't hand back
+    # to the OS on its own, growing this worker's RSS/PSS over its ~150-call
+    # sequence even though nothing is referenced across calls. malloc_trim
+    # forces the return; it touches no data, so it cannot change any returned
+    # value.
+    if _libc is not None:
+        _libc.malloc_trim(0)
+    return result
+
+
+def weighted_copy_mean_many(copies, galaxies, sigma_x_list, workers=None, g_list=None,
+                             chunk_size=_WEIGHTED_COPY_MEAN_CHUNK):
+    """`weighted_copy_mean` at every point in `sigma_x_list`, in parallel.
+
+    `g_list`, if given, is a same-length list of shears -- one per
+    `sigma_x_list` entry, passed straight through as `weighted_copy_mean`'s
+    `g` -- so a caller can build a joint `(Sigma_X, g)` training grid without
+    paying for the whole-catalog float64 upcast (`_par_base`) more than
+    once. Defaults to all-zero, reproducing the previous behaviour exactly.
+
+    `chunk_size` is passed straight through to each worker's own `weighted_
+    copy_mean` call (see that docstring) -- it is what keeps one worker's
+    peak transient memory at O(chunk_size) instead of O(len(copies)), which
+    is what makes raising `workers` beyond a handful safe.
+    """
+    global _par_copies, _par_galaxies, _par_base, _par_chunk
+    _par_copies, _par_galaxies = copies, galaxies
+    _par_base = log_weights_base(copies)
+    _par_chunk = chunk_size
+    g_list = g_list if g_list is not None else [None] * len(sigma_x_list)
+    workers = min(workers or os.cpu_count() or 1, len(sigma_x_list))
+    ctx = mp.get_context("fork")
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+        return list(ex.map(_weighted_copy_mean_task, zip(sigma_x_list, g_list)))
 
 
 def check(flow, copies, galaxies, sigma_x, n=4000, skip=0):
@@ -391,6 +516,15 @@ def check(flow, copies, galaxies, sigma_x, n=4000, skip=0):
 # for reasons that motivated this replacement).
 REPORT = 500
 
+# `full_loss` (inside `train_sigmax`) evaluates every (grid scale, eval
+# galaxy) pair; chunking the grid axis into batches of this size caps its
+# peak memory (see the comment at its definition) instead of letting it grow
+# with `n_grid` (hundreds to low thousands for `--anisotropic --n-aniso`
+# grids). Picked as "small enough to bound memory at the largest grids
+# tried so far, large enough that `jax.lax.map`'s per-batch overhead stays
+# negligible" -- not tuned further; lower it if a future grid still OOMs.
+_FULL_LOSS_CHUNK = 32
+
 # `--anisotropic`'s training grid: (|e|, position angle in radians).  Two
 # DIFFERENT angles are required -- a single angle would let the nets learn a
 # direction-specific shortcut (e.g. "M1 only") that happens to work there and
@@ -399,6 +533,29 @@ REPORT = 500
 # calibration bound (`e_max=0.1` in `bulk.build_flow`'s SigmaXBlockLayer
 # construction) with margin on both sides.
 ANISO_TRAIN_POINTS = ((0.05, 0.0), (0.07, np.pi / 4), (0.02, np.pi / 8))
+
+# `net_dip_g`'s (`SigmaXBlockLayer._g_shift`) training grid: crossed with
+# EVERY anisotropic Sigma_X point above (isotropic Sigma_X has e1=e2=0, so
+# `_g_shift`'s Dg*e1/Dg*e2 vanishes identically there regardless of g -- no
+# gradient signal, not worth the extra weighted_copy_mean calls).
+#
+# |g|=0.08, not the real catalogs' own 0.02 (`dev/bias_psfe_g2v3d.sh`):
+# measured directly (2026-09-17 session) that the TRUE g-coupling z-space
+# signal at 0.02 is ~0.0036 against a ~0.05 z3/z4 training-loss scale --
+# ~7%, swamped by net_dip/net_quad's own ~15-20% per-galaxy residual, so
+# net_dip_g came out real but undertrained (session's own end-to-end test:
+# dc1 moved the right way, -2.6e-3 -> -1.1e-3, but at a reduced-scale run's
+# noise floor). `_g_shift` is built from a 2nd-order Taylor expansion in g
+# (`dxy_dg`/`d2xy_dg2`), so it stays valid well past 0.02 -- training at 4x
+# the real amplitude gives ~4x the z-space SNR (roughly linear in g at
+# leading order) while the RELATIONSHIP being fit (Dg as a function of the
+# SAME g-invariants) is unchanged, so the trained net should still be
+# correct at the real, smaller g -- this is not fabricating a target, it's
+# evaluating the identical eq.-36 formula at a point where its signal
+# clears the noise floor. Validate held-out AT THE REAL 0.02 scale before
+# trusting this, same as every other grid point in this file.
+G_TRAIN_POINTS = ((0.08, 0.0), (-0.08, 0.0), (0.0, 0.08), (0.0, -0.08),
+                  (0.08, 0.08), (-0.08, -0.08), (0.08, -0.08), (-0.08, 0.08))
 
 
 def _aniso_sigma_x(sigma_x, e_mag, theta):
@@ -427,7 +584,9 @@ def _sigmax_layer(flow):
 
 
 def _sigmax_trainable(flow):
-    """Filter spec selecting only the SigmaXBlockLayer's five coefficient nets.
+    """Filter spec selecting only the SigmaXBlockLayer's coefficient nets
+    (generic over `eqx.is_inexact_array` leaves of the layer, so this needed
+    no change when `net_dip_g` was added).
 
     Same mechanism as `shear._trainable`/`_trainable` above: freezing bulk AND
     shear matters for the same reason shear's docstring gives for freezing the
@@ -468,47 +627,71 @@ def _sigmax_inverse_decoupled(layer, y, condition):
     gradient from net_size's, for the leak-hunt in
     [[psfe-leak-not-a-training-density-gap]]. No log-det needed (training
     loss doesn't use it), so this skips the jacfwd `inverse_and_log_det` pays."""
-    log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n = layer._unpack(condition)
+    log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n, g1, g2 = layer._unpack(condition)
     y0, y1, y2, y3, y4 = y
+    # `_s0` (inside `_solve_x0`) needs the given (post-`_g_shift`) y3,y4, same
+    # as `inverse_and_log_det` -- only the ellipticity solve below needs the
+    # term undone first. See that method's own comment for why.
+    dg3, dg4 = layer._g_shift(g1, g2, e1, e2, log_scale_n, e_mag_sq_n, T_n)
+    y3_ell, y4_ell = y3 - dg3, y4 - dg4
     x0 = layer._solve_x0(y0, y3, y4, log_scale_n, e_mag_sq_n, T_n)
     g_s = layer._g_s_max * jax.nn.tanh(
         T_n * layer.net_size(jnp.array([_bound_coeff_input(x0), log_scale_n, e_mag_sq_n]))[0])
     kappa = jnp.exp(g_s)
-    c1 = layer._size_loc
+    c1 = unwrap(layer._size_loc)
     x1 = (y1 - c1 * (kappa - 1.0)) / kappa
     kappa_sg = jax.lax.stop_gradient(kappa)
-    dq_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n])
-    D_raw, c_raw = layer.net_dipquad(dq_in)
+    x2 = y2 - layer._mc_shift(x0, log_scale_n, e_mag_sq_n, T_n)
+    # ponytail: net_dipquad -> net_dip/net_quad split (see bijections.py);
+    # this single-shot solve already used the isotropic-in-e_gal form (no
+    # x3,x4 available yet), so e_gal invariants are 0 here same as before.
+    d_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n,
+                       _bound_coeff_input(x2)])
+    q_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n, e_mag_sq_n,
+                       0.0, 0.0, _bound_coeff_input(x2)])
+    D_raw = layer.net_dip(d_in)[0]
+    c_raw = layer.net_quad(q_in)[0]
     D = T_n * D_raw
     c = jax.nn.tanh(T_n**2 * c_raw)
-    r3 = kappa_sg * y3 - D * e1
-    r4 = kappa_sg * y4 - D * e2
+    r3 = kappa_sg * y3_ell - D * e1
+    r4 = kappa_sg * y4_ell - D * e2
     det_e = 1.0 - c**2 * e_mag_sq
     x3 = ((1.0 - c * e1) * r3 - c * e2 * r4) / det_e
     x4 = (-c * e2 * r3 + (1.0 + c * e1) * r4) / det_e
-    x2 = y2 - layer._mc_shift(x0, log_scale_n, e_mag_sq_n, T_n)
     return jnp.stack([x0, x1, x2, x3, x4])
 
 
 def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
-                 extra_scales=None, decouple_kappa=False):
-    """Fit `SigmaXBlockLayer`'s five coefficient nets by SUPERVISED regression
-    against `imsims.copies`' own weighted copy mean, directly in the CHART's
-    z-space -- not plain NLL, and not `relative_channels`' raw-moment ratios
-    either (both tried first, both superseded; see below).
+                 extra_scales=None, decouple_kappa=False, g0=(0.0, 0.0)):
+    """Fit `SigmaXBlockLayer`'s five (now six) coefficient nets by SUPERVISED
+    regression against `imsims.copies`' own weighted copy mean, directly in
+    the CHART's z-space -- not plain NLL, and not `relative_channels`'
+    raw-moment ratios either (both tried first, both superseded; see below).
 
-    `extra_scales`: optional list of `(sigma_x_i, truth_i)` pairs (same `m0`,
-    a DIFFERENT Sigma_X and its own `weighted_copy_mean` target) to train
-    across alongside the base `(sigma_x, truth)`, one drawn uniformly per
-    batch.  Added because a layer trained at a single Sigma_X was measured to
-    NOT generalise across the catalog's own documented valid `sigma_scale`
-    margin ([1/1.4, 1.4], `main`'s `--sigma-scale` help text): the ellipticity
-    -response ratio went 0.79 (trained scale) -> 1.63 (0.8x) -> -0.09 (1.2x),
-    i.e. the analytic `T_n` prefactor alone does not carry the nets across
-    scales they never saw.  Cheap to fix because `weighted_copy_mean` is
-    exact and instant (~3s/scale) -- no new simulation, just a few more
-    calls to it at different Sigma_X, done ONCE up front by the caller
-    (`main`), not resampled per step.
+    `extra_scales`: optional list of `(sigma_x_i, truth_i)` or
+    `(sigma_x_i, truth_i, g_i)` triples (same `m0`, a DIFFERENT Sigma_X --
+    and now optionally a different `g`, see below -- and its own
+    `weighted_copy_mean` target) to train across alongside the base
+    `(sigma_x, truth, g0)`, one drawn uniformly per batch. Two-tuples default
+    `g_i = g0`, so existing callers that never pass `g` keep training a
+    g-independent layer exactly as before. Added because a layer trained at
+    a single Sigma_X was measured to NOT generalise across the catalog's own
+    documented valid `sigma_scale` margin ([1/1.4, 1.4], `main`'s
+    `--sigma-scale` help text): the ellipticity-response ratio went 0.79
+    (trained scale) -> 1.63 (0.8x) -> -0.09 (1.2x), i.e. the analytic `T_n`
+    prefactor alone does not carry the nets across scales they never saw.
+    Cheap to fix because `weighted_copy_mean` is exact and instant (~3s/
+    scale) -- no new simulation, just a few more calls to it at different
+    Sigma_X (and now `g`), done ONCE up front by the caller (`main`), not
+    resampled per step.
+
+    `g0`/each grid point's own `g_i`: passed to `weighted_copy_mean` as its
+    `g` -- the target then reflects the eq.-36 detection weight L(X(g)|Sigma_X)
+    at THAT g, not g=0 (see `weighted_copy_mean`'s own docstring for why this
+    was missing and what it isolates). The training CONDITION vector passed
+    to the layer is `[g_i, sigma_x_i]` accordingly -- previously always
+    `[0, 0, sigma_x_i]`, which is why `net_dip_g` (`models.bijections.
+    SigmaXBlockLayer._g_shift`) never had a gradient before this existed.
 
     First attempt was plain NLL of the frozen bulk+shear's `flow.log_prob` on
     lensed copy draws.  Measured result: NLL flat at ~80 nats for 6000 steps,
@@ -539,34 +722,39 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
     reporting-only diagnostics in human-readable (raw-moment) units, but the
     training loss itself is in z-space.
 
-    No lensing/g-sampling either: `weighted_copy_mean` is the UNLENSED g=0
-    marginalisation, and `SigmaXBlockLayer` has no g-dependence at all
-    (`_unpack` never reads `condition[:2]`).
+    `g0`/`extra_scales`' own `g_i` (see above): now DOES sample/train across
+    `g`, which is exactly what `net_dip_g` (`_g_shift`) needs a gradient at
+    all -- until this, `weighted_copy_mean` was always called at the
+    UNLENSED g=0 detection weight, and `SigmaXBlockLayer` had no g-dependence
+    for it to learn (`_unpack` never read `condition[:2]`). See
+    NEXT_SESSION_PSFE_FORMALISM_AUDIT.md, 2026-09-17 session, for why.
     """
+    grid = [(sigma_x, truth, g0)] + [
+        e if len(e) == 3 else (e[0], e[1], g0) for e in (extra_scales or [])
+    ]
     chart = _chart(flow)
     tf = lambda a: np.asarray(jax.vmap(chart.transform)(jnp.asarray(a, dtype=jnp.float32)))
     z = tf(m0)
-    grid = [(sigma_x, truth)] + list(extra_scales or [])
-    dz_true_grid = [tf(m0 + t) - z for _, t in grid]
+    dz_true_grid = [tf(m0 + t) - z for _, t, _ in grid]
     # One shared normalisation (mean over scales), so a step at any grid
     # scale is on the same loss footing as the base-scale run this was
     # tuned against.
     scales = np.mean([np.std(dz, axis=0) for dz in dz_true_grid], axis=0)
     print("targets (z-space dz): " +
           "  ".join(f"z{i} rms {scales[i]:.3e}" for i in range(5)) +
-          (f"  ({len(grid)} Sigma_X scales)" if len(grid) > 1 else ""))
+          (f"  ({len(grid)} (Sigma_X, g) scales)" if len(grid) > 1 else ""))
 
     zj = jnp.asarray(z, dtype=jnp.float32)
     dz_true_j = jnp.stack([jnp.asarray(dz, dtype=jnp.float32) for dz in dz_true_grid])
     scales_j = jnp.asarray(scales, dtype=jnp.float32)
-    cond_grid_j = jnp.stack([jnp.concatenate([jnp.zeros(2), jnp.asarray(sx, dtype=jnp.float32)])
-                             for sx, _ in grid])
+    cond_grid_j = jnp.stack([jnp.concatenate([jnp.asarray(gi, dtype=jnp.float32),
+                                              jnp.asarray(sx, dtype=jnp.float32)])
+                             for sx, _, gi in grid])
 
     opt = optax.chain(optax.clip_by_global_norm(1.0),
                       optax.adam(optax.cosine_decay_schedule(lr, steps)))
     params, static = eqx.partition(flow, _sigmax_trainable(flow))
     state = opt.init(params)
-    rng = np.random.default_rng(int(jr.randint(key, (), 0, 2**30)))
     n_grid = len(grid)
     # EMA of the trained params, not just the raw final step. Each step's
     # gradient comes from ONE randomly-drawn scale out of `n_grid` (see the
@@ -583,7 +771,6 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
     ema_decay = 1.0 - 5.0 / max(steps, 5)
     ema_params = params
 
-    @eqx.filter_jit
     def step(params, state, idx, g):
         def loss_fn(p):
             model = eqx.combine(p, static)
@@ -602,16 +789,107 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
         updates, state = opt.update(grads, state, params)
         return eqx.apply_updates(params, updates), state, loss, aux
 
-    for i in range(steps):
-        idx = jnp.asarray(rng.integers(0, len(m0), batch))
-        g = int(rng.integers(0, n_grid))
+    # The per-step `loss` printed below is whichever ONE of `n_grid` scales
+    # was randomly drawn that step -- different scales have different
+    # intrinsic difficulty/magnitude, so that trajectory isn't even
+    # measuring the same quantity step to step and looking "unstable" in it
+    # doesn't mean the underlying fit is. `full_loss` below is the TRUE
+    # convergence diagnostic: the EMA params' loss averaged over EVERY grid
+    # scale on a fixed eval subsample, so it tracks the same quantity at
+    # every checkpoint and should decrease (or plateau) monotonically if
+    # training is genuinely converging, unlike the noisy per-step number.
+    n_full_eval = min(2000, len(m0))
+    zb_eval = zj[:n_full_eval]
+    dz_true_eval = dz_true_j[:, :n_full_eval, :]
+
+    # `full_loss` needs `inv` (a jacfwd + Picard/bisection solve per element,
+    # see `SigmaXBlockLayer.inverse_and_log_det`) evaluated at every
+    # (grid scale, eval galaxy) pair. A single `vmap` over BOTH axes at once
+    # compiles ONE XLA program that must hold `n_grid * n_full_eval`
+    # in-flight instances of that whole per-element computation
+    # simultaneously -- peak memory scales with `n_grid` (900 at
+    # `--n-aniso 100`, 2700 at `--n-aniso 300`), which is what pinned the
+    # card at 94% and OOM'd at the larger grid, NOT `step`'s `g` handling
+    # (see below). `jax.lax.map(..., batch_size=_FULL_LOSS_CHUNK)` compiles
+    # the grid axis as a sequential loop of `vmap`-batches of size
+    # `_FULL_LOSS_CHUNK` instead of one `vmap` of size `n_grid`, capping
+    # peak memory to (roughly) `_FULL_LOSS_CHUNK / n_grid` of the original
+    # while producing the exact same per-scale sums (summed then divided by
+    # the total count at the end, rather than `jnp.mean` over both axes at
+    # once -- same value, associativity of the sum makes the chunking
+    # invisible to the result).
+    def full_loss(params):
+        model = eqx.combine(params, static)
+        layer = _sigmax_layer(model)
+        inv = ((lambda zz, cc: _sigmax_inverse_decoupled(layer, zz, cc))
+               if decouple_kappa else
+               (lambda zz, cc: layer.inverse_and_log_det(zz, cc)[0]))
+
+        def per_scale(args):
+            cond_i, dz_true_i = args
+            z_pred_i = jax.vmap(inv, in_axes=(0, None))(zb_eval, cond_i)
+            dz_pred_i = z_pred_i - zb_eval
+            return jnp.sum(((dz_pred_i - dz_true_i) / scales_j) ** 2, axis=0)
+
+        sums = jax.lax.map(per_scale, (cond_grid_j, dz_true_eval),
+                            batch_size=min(_FULL_LOSS_CHUNK, n_grid))
+        terms = jnp.sum(sums, axis=0) / (n_grid * n_full_eval)
+        return jnp.sum(terms)
+
+    full_loss = eqx.filter_jit(full_loss)
+
+    # The plain-Python `for i in range(steps)` loop this replaced dispatched
+    # ONE tiny jitted `step` call per iteration, with numpy-RNG draws and a
+    # host-side EMA `tree_map` interleaved in between -- each of those is a
+    # host round-trip the GPU sits idle across, which is exactly the
+    # "periodically spikey, not sustained" utilisation the profiling for this
+    # change showed (bursts at each `step` dispatch, idle the rest of the
+    # time). Folding `SCAN_CHUNK` steps into one `jax.lax.scan`, wrapped in a
+    # single `eqx.filter_jit`, means the host only round-trips once per
+    # chunk -- `SCAN_CHUNK` back-to-back GPU kernels get queued from ONE
+    # dispatch. `SCAN_CHUNK = REPORT` keeps the printed reporting cadence
+    # essentially unchanged (one print per chunk, same as the old one print
+    # per `REPORT` steps) while bounding the chunk's `idx`/`g` draw arrays to
+    # a few tens of MB regardless of `steps`.
+    #
+    # The `idx`/`g` draws move from numpy's `rng.integers` to `jax.random.
+    # randint` here -- scan's per-step inputs must already be on-device
+    # arrays, so drawing them host-side in numpy would reintroduce the same
+    # host round-trip this is meant to remove. Both draw the same
+    # DISTRIBUTIONS (uniform galaxy index, uniform grid scale), so training
+    # is statistically equivalent, but the realised draw SEQUENCE is not the
+    # same as the old numpy-RNG version's (different RNG source/stream) --
+    # unlike this session's earlier chunking fixes, this one is NOT bit/value
+    # identical to the pre-change code for a given `key`.
+    def scan_body(carry, xs):
+        params, state, ema_params = carry
+        idx, g = xs
         params, state, loss, aux = step(params, state, idx, g)
         ema_params = jax.tree_util.tree_map(
             lambda e, p: ema_decay * e + (1.0 - ema_decay) * p, ema_params, params)
-        if i % REPORT == 0 or i == steps - 1:
-            a = [float(x) for x in aux]
-            print(f"step {i:6d}  scale#{g}  loss {float(loss):.5f}  " +
-                  "  ".join(f"z{j} {a[j]:.5f}" for j in range(5)), flush=True)
+        return (params, state, ema_params), (loss, aux)
+
+    @eqx.filter_jit
+    def run_chunk(params, state, ema_params, idx_chunk, g_chunk):
+        return jax.lax.scan(scan_body, (params, state, ema_params),
+                             (idx_chunk, g_chunk))
+
+    SCAN_CHUNK = min(REPORT, steps)
+    rng_key = key
+    i = 0
+    while i < steps:
+        n = min(SCAN_CHUNK, steps - i)
+        rng_key, k_idx, k_g = jr.split(rng_key, 3)
+        idx_chunk = jr.randint(k_idx, (n, batch), 0, len(m0))
+        g_chunk = jr.randint(k_g, (n,), 0, n_grid)
+        (params, state, ema_params), (losses, auxs) = run_chunk(
+            params, state, ema_params, idx_chunk, g_chunk)
+        i += n
+        a = [float(x) for x in auxs[-1]]
+        fl = float(full_loss(ema_params))
+        print(f"step {i - 1:6d}  scale#{int(g_chunk[-1])}  loss {float(losses[-1]):.5f}  " +
+              "  ".join(f"z{j} {a[j]:.5f}" for j in range(5)) +
+              f"  |  EMA full-loss (all {n_grid} scales) {fl:.5f}", flush=True)
     return eqx.combine(ema_params, static)
 
 
@@ -669,7 +947,7 @@ def net_saturation(flow, m0, sigma_x, n=20000):
         (m_raw.shape[0], 1))
 
     def one(row, cond):
-        log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n = layer._unpack(cond)
+        log_scale_n, e1, e2, e_mag_sq, e_mag_sq_n, T_n, _, _ = layer._unpack(cond)
         x0, x1, x2, x3, x4 = chart.transform(row)
         y3, y4, kappa, _, _ = layer._ellipticity(
             x0, x1, x2, x3, x4, e1, e2, log_scale_n, e_mag_sq_n, T_n)
@@ -736,16 +1014,48 @@ def main():
                         "at scale 1.0 -> 0.8 -> 1.2 -- so this is not "
                         "optional if the layer needs to see varying noise.")
     p.add_argument("--anisotropic", action="store_true",
-                   help="train-sigmax only: also train against a few "
-                        "ANISOTROPIC Sigma_X points (ANISO_TRAIN_POINTS), "
-                        "same trace as --sigma-scale's base but with |e| in "
-                        "[0.03, 0.08] at two different position angles. "
-                        "Training so far has always been at e1=e2=0 exactly, "
-                        "so the layer never saw Sigma_X's own anisotropy; "
-                        "see SigmaXBlockLayer's net_flux/net_flux_e docstring "
+                   help="train-sigmax only: also train against ANISOTROPIC "
+                        "Sigma_X points, same trace as --sigma-scale's base. "
+                        "Default is ANISO_TRAIN_POINTS (3 hand-picked "
+                        "|e|/angle pairs); pass --n-aniso to instead draw "
+                        "that many random (|e|, theta) points up to "
+                        "--aniso-max, one weighted_copy_mean call each, "
+                        "for denser coverage than the fixed grid. Training "
+                        "so far has always been at e1=e2=0 exactly, so the "
+                        "layer never saw Sigma_X's own anisotropy; see "
+                        "SigmaXBlockLayer's net_flux/net_flux_e docstring "
                         "and train_sigmax's `extra_scales` mechanism, which "
                         "this generalises the identical way --multi-scale "
                         "does for pure noise-level changes.")
+    p.add_argument("--n-aniso", type=int, default=0,
+                   help="--anisotropic only: draw this many random "
+                        "(|e|, theta) Sigma_X points instead of using the "
+                        "fixed ANISO_TRAIN_POINTS grid. 0 (default) keeps "
+                        "the fixed grid.")
+    p.add_argument("--aniso-max", type=float, default=0.10,
+                   help="--n-aniso only: max |e| to sample, uniform in "
+                        "[0, this] x theta uniform in [0, pi).")
+    p.add_argument("--scale-margin", type=float, default=1.4,
+                   help="--multi-scale and --anisotropic --n-aniso only: the "
+                        "noise-scale margin to train across, i.e. Sigma_X * "
+                        "(1/this)^2 through Sigma_X * this^2. Default 1.4 "
+                        "matches the catalog's originally documented valid "
+                        "margin (see --sigma-scale's help) and reproduces prior "
+                        "behavior exactly. Pass a larger value to cover a wider "
+                        "noise range at retrain time.")
+    p.add_argument("--extra-copies", default=None,
+                   help="train-sigmax only: path to a SEPARATE copies+galaxies "
+                        "FITS file (same format as --copies) representing a "
+                        "genuinely different noise depth of the SAME underlying "
+                        "galaxy population, row-aligned with --copies' own "
+                        "galaxies (verified by an assertion on galaxies[\"moments\"]"
+                        "). Added as one more extra_scales training point at "
+                        "its own native Sigma_X, rather than reweighting the "
+                        "--copies pool via --scale-margin -- use this when the "
+                        "target depth is far enough from --copies' own depth "
+                        "that --scale-margin would need an infeasibly large "
+                        "copies rebuild instead (grid size scales as "
+                        "sigma_range^4).")
     p.add_argument("--decouple-kappa", action="store_true",
                    help="train-sigmax only: stop-gradient net_size's kappa "
                         "before it multiplies into net_dipquad's r3/r4, so "
@@ -807,11 +1117,11 @@ def main():
         print(f"fitting on galaxies [0, {n_train}) of {len(m0)}")
         if sigmax:
             extra_scales = None
-            if a.multi_scale or a.anisotropic:
+            if a.multi_scale or a.anisotropic or a.extra_copies:
                 extra_scales = []
 
-            def _add_point(sx_, label):
-                tgt_, keep_ = weighted_copy_mean(copies, galaxies, sx_)
+            def _add_point(sx_, label, g_=(0.0, 0.0)):
+                tgt_, keep_ = weighted_copy_mean(copies, galaxies, sx_, g=g_)
                 # `keep` (den > 0, i.e. detected) should be scale-invariant
                 # in the no-selection sims this trains on (every galaxy's
                 # copy weights sum to detection prob 1.00000, see
@@ -820,20 +1130,97 @@ def main():
                 assert np.array_equal(keep_, keep), \
                     f"keep mask differs at {label} -- rows would misalign"
                 m0_ = np.asarray(galaxies["moments"][keep_], dtype=np.float64)
-                extra_scales.append((sx_, (tgt_ - m0_)[:n_train]))
+                extra_scales.append((sx_, (tgt_ - m0_)[:n_train], g_))
 
             if a.multi_scale:
-                for s_ in (1.0 / 1.4, 1.4):
+                for s_ in (1.0 / a.scale_margin, a.scale_margin):
                     _add_point(galaxies["cov_odd"][0] * s_**2, f"scale {s_}")
                 print(f"training across {1 + len(extra_scales)} Sigma_X scales "
-                      f"(base + {[round(s_, 3) for s_ in (1/1.4, 1.4)]})")
+                      f"(base + {[round(s_, 3) for s_ in (1.0 / a.scale_margin, a.scale_margin)]})")
+            if a.extra_copies:
+                copies2, galaxies2 = load_copies(a.extra_copies)
+                assert np.array_equal(galaxies2["moments"], galaxies["moments"]), \
+                    (f"--extra-copies {a.extra_copies} is not row-aligned with "
+                     f"--copies {a.copies} -- different underlying galaxy "
+                     f"population, refusing to combine")
+                sigma_x2 = galaxies2["cov_odd"][0]
+                tgt2, keep2 = weighted_copy_mean(copies2, galaxies2, sigma_x2)
+                assert np.array_equal(keep2, keep), \
+                    f"keep mask differs at {a.extra_copies} -- rows would misalign"
+                m0_2 = np.asarray(galaxies2["moments"][keep2], dtype=np.float64)
+                extra_scales.append((sigma_x2, (tgt2 - m0_2)[:n_train], (0.0, 0.0)))
+                print(f"training an extra native-depth Sigma_X point from {a.extra_copies}")
             if a.anisotropic:
                 n_before = len(extra_scales)
-                for e_mag, theta in ANISO_TRAIN_POINTS:
-                    _add_point(_aniso_sigma_x(sigma_x, e_mag, theta),
-                              f"e={e_mag}, theta={theta:.3f}")
+                if a.n_aniso > 0:
+                    # Joint (scale, |e|, theta) cloud, not just |e|/theta at
+                    # one fixed trace -- the catalog's own documented valid
+                    # scale margin ([1/1.4, 1.4], see --multi-scale) combined
+                    # with ellipticity, so the layer sees anisotropy across
+                    # the same noise-level range it must generalise over,
+                    # not only at the base Sigma_X's trace.
+                    rng_aniso = np.random.default_rng(a.seed + 2)
+                    scales_ = np.exp(rng_aniso.uniform(
+                        np.log(1.0 / a.scale_margin), np.log(a.scale_margin), a.n_aniso))
+                    e_mags = rng_aniso.uniform(0.0, a.aniso_max, a.n_aniso)
+                    thetas = rng_aniso.uniform(0.0, np.pi, a.n_aniso)
+                    aniso_points = list(zip(e_mags, thetas, scales_))
+                    sx_list = [_aniso_sigma_x(sigma_x * s_**2, e_mag, theta)
+                               for e_mag, theta, s_ in aniso_points]
+                    # Cross every anisotropic point with G_TRAIN_POINTS (see
+                    # its own comment: isotropic Sigma_X gives net_dip_g no
+                    # gradient, so only these need it) -- one parallel batch
+                    # of (1 + len(G_TRAIN_POINTS)) calls per point.
+                    sx_full = [sx for sx in sx_list for _ in range(1 + len(G_TRAIN_POINTS))]
+                    g_full = [g for _ in sx_list for g in ((0.0, 0.0),) + G_TRAIN_POINTS]
+                    print(f"computing {len(sx_list)} anisotropic Sigma_X points x "
+                          f"{1 + len(G_TRAIN_POINTS)} g-values in parallel...")
+                    # RE-DIAGNOSED 2026-09-17: the actual mechanism was never
+                    # COW page duplication -- it's each single `log_weights`
+                    # call materialising several full `len(copies)`-length
+                    # float64 temporaries (lensed xy, chisq, w, w*moments) at
+                    # once, so `workers` concurrent tasks each transiently
+                    # peak at ~O(len(copies)) bytes, and at the 24M-row scale
+                    # that's ~1-2GB/task x `workers` all at once -- which is
+                    # what actually saturated the box at `workers=32` before
+                    # (21GiB -> 62GiB/maxed + full swap in under 90s).
+                    # `weighted_copy_mean`'s `chunk_size` (default
+                    # `_WEIGHTED_COPY_MEAN_CHUNK` = 2e6 rows) now bounds one
+                    # task's peak transient footprint to O(chunk_size)
+                    # regardless of catalog size, which decouples worker
+                    # count from row count. Re-tested live at the real
+                    # 24M-row catalog with this fix in place, under a 0.5s-
+                    # poll memory watchdog (30s polling was too slow to catch
+                    # the old blowup): `workers=32` (`os.cpu_count()`) held
+                    # `MemAvailable` >= ~40GB throughout a 200-point run (down
+                    # from a ~50GB baseline, on a 62GB box) -- no growth trend
+                    # over the run, comfortably safe. Left uncapped here
+                    # (`workers=None` -> `os.cpu_count()`) on the strength of
+                    # that measurement; re-test at scale before raising
+                    # `chunk_size` or dropping this cap on a smaller box.
+                    results = weighted_copy_mean_many(copies, galaxies, sx_full,
+                                                      g_list=g_full)
+                    for (e_mag, theta, s_), sx_, gs in zip(
+                            aniso_points,
+                            [sx_full[i] for i in range(0, len(sx_full), 1 + len(G_TRAIN_POINTS))],
+                            [results[i:i + 1 + len(G_TRAIN_POINTS)]
+                             for i in range(0, len(results), 1 + len(G_TRAIN_POINTS))]):
+                        g_vals = ((0.0, 0.0),) + G_TRAIN_POINTS
+                        for g_, (tgt_, keep_) in zip(g_vals, gs):
+                            label = f"e={e_mag:.3f}, theta={theta:.3f}, scale={s_:.3f}, g={g_}"
+                            assert np.array_equal(keep_, keep), \
+                                f"keep mask differs at {label} -- rows would misalign"
+                            m0_ = np.asarray(galaxies["moments"][keep_], dtype=np.float64)
+                            extra_scales.append((sx_, (tgt_ - m0_)[:n_train], g_))
+                else:
+                    aniso_points = ANISO_TRAIN_POINTS
+                    for e_mag, theta in aniso_points:
+                        sx_ = _aniso_sigma_x(sigma_x, e_mag, theta)
+                        _add_point(sx_, f"e={e_mag}, theta={theta:.3f}")
+                        for g_ in G_TRAIN_POINTS:
+                            _add_point(sx_, f"e={e_mag}, theta={theta:.3f}, g={g_}", g_=g_)
                 print(f"training across {len(extra_scales) - n_before} "
-                      f"anisotropic Sigma_X points {ANISO_TRAIN_POINTS}")
+                      f"anisotropic Sigma_X points {aniso_points}")
             flow = train_sigmax(flow, m0[:n_train], (target - m0)[:n_train],
                                 sigma_x, jr.key(a.seed + 1),
                                 steps=a.steps, batch=a.batch,
