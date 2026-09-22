@@ -2541,12 +2541,20 @@ def selection_terms_score(flow, m, cov, size, flux, sigma_x=None, batch=4096,
         # so this mask is shared -- every window keeps the SAME draws, which is
         # what makes the scan paired.
         okqr = jnp.isfinite(q).all(-1) & jnp.isfinite(r).all(-1).all(-1)
+        okqr = okqr & jnp.isfinite(mm).all(-1)
         if density is not None:
             # Window-INDEPENDENT, like the finiteness mask above, so every
             # window in a scan keeps the identical draw set.  Tests the DRAW
             # ITSELF against the training catalog's local density, not its
-            # Q, R -- see `in_support_density`.
-            sane = in_support_density(mm, density)
+            # Q, R -- see `in_support_density`.  Only query the KDTree on
+            # already-finite rows: a non-finite `mm` (the flow's tail can
+            # produce one) crashes `cKDTree.query` outright, and okqr's own
+            # finiteness mask above is exactly what screens those out.
+            mm_np = np.asarray(mm)
+            fin = np.asarray(okqr)
+            sane = np.zeros(len(mm_np), dtype=bool)
+            if fin.any():
+                sane[fin] = in_support_density(mm_np[fin], density)
             n_guarded += int(okqr.sum() - (okqr & sane).sum())
             okqr = okqr & sane
         for w, fprob in enumerate(fprobs):

@@ -102,7 +102,7 @@ from flowjax.bijections import AbstractBijection
 
 from paramax import non_trainable, unwrap
 
-from .bijections import CoeffNet, POINT_SOURCE
+from .bijections import CoeffNet, POINT_SOURCE, concentration_phi
 
 # Coefficients are bounded so the map stays a diffeomorphism for any g the
 # network might see.
@@ -202,50 +202,83 @@ N_COEFFS = 14
 # The chart's spin-0 Jacobian is applied ANALYTICALLY, so the network's spin-0
 # outputs are raw-moment response coefficients again.
 #
-# Since 16ece5c the layer acts on z, and z1 = (logit(Mr/(r* Mf)) - mu)/sd has a
-# Jacobian that diverges at the point-source ceiling.  Writing the raw response
-# as dX/dg = X c_X Re(ebar.g) for X in (Mf, Mr, Mc) and pushing it through the
-# chart gives
+# Since 16ece5c the layer acts on z.  z1 used to be logit(Mr/(r* Mf)) and
+# diverge at the point-source ceiling; `RawMomentStandardize` now carries z1
+# as the BARE ratio Mr/Mf, so that divergence is gone and z1's row below is
+# unchanged from the bare-ratio derivation: dz1/d ln Mr = (Mr/Mf)/sd1,
+# dz1/d ln Mf = -(Mr/Mf)/sd1, no dependence on Mc.
 #
-#     dz0/dg = c_Mf / (sd0 ln10)               . p1
-#     dz1/dg = (c_Mr - c_Mf) / (sd1 (1 - u))   . p1,   u = Mr/(r* Mf)
-#     dz2/dg = (c_Mc - c_Mr) / (sd2 (1 - v))   . p1,   v = Mc/(rc* Mr)
+# z2 is not a bare ratio, though: `RawMomentStandardize._forward_transform`
+# sets, with r = Mr/Mf,
 #
-# i.e. M = D L with L the difference matrix and D the diagonal above.  Asking
-# the network for the left-hand side is what broke the layer: measured on the
-# bulgedisc catalog the physical c stay inside [-2, 7] (c_Mf 0.98 -> 2.11, c_Mr
-# 0.84 -> 3.63, c_Mc 0.16 -> 4.74) while the same physics in z needs |a_Mr|
-# median 32 and p99 253, above `_COEFF_MAX` for 76.5% of templates -- so the
-# bound forbade the true response over three quarters of the resolution axis,
-# and the fitted net sat pinned at it for 61% of them.  It also made the target
-# STEEP: a_Mr climbs 0.84 -> 61 along z1 where c_Mr climbs 0.84 -> 3.63, and
-# that steepness is what buys the unphysical log-det
-# (`dev/flexibility_audit.py`: even part 0.509 nats against a physical 0.00033).
+#     z0_2 = Mc/Mr - Phi(r)/r
 #
-# `M` is lower triangular with nonzero diagonal, so this is a change of
-# coordinates on coefficient space -- nothing representable is lost, the target
-# function is just O(1) and flat now.  Its (-1, +1) rows also decorrelate z1 and
-# z2, which the whitening in `_Coeffs` could only partly fix: those two are
-# correlated at 0.997, and it was their DIFFERENCE that carried the physics.
+# where `Phi` is `concentration_phi` -- the exact weight-kernel prediction for
+# Mc/Mf of an isotropic Gaussian at that r (see its own docstring in
+# bijections.py; this file only calls it).  Writing the raw response as
+# dX/dg = X c_X Re(ebar.g) for X in (Mf, Mr, Mc), let `g_r = Phi(r)/r` and
+# `mc_over_mr = Mc/Mr = z0_2 + g_r` (recovered from the standardised z, same
+# pattern the d0, d1 rows already use).  Differentiating z0_2 with
+# `dr = r (dlnMr - dlnMf)` and the chain rule through `Phi` gives, per unit
+# (dlnMf, dlnMr, dlnMc):
 #
-# u -> 1 is a real divergence of the coordinate, not an artifact, but a draw can
-# land arbitrarily close to the ceiling where the population never goes, so the
-# logit is clipped.  6.9 is u = 0.999; the bulgedisc catalog tops out at 0.975.
+#     d(z0_2)/dlnMf =  Phi'(r) - g_r
+#     d(z0_2)/dlnMr = -mc_over_mr - Phi'(r) + g_r
+#     d(z0_2)/dlnMc =  mc_over_mr
+#
+# (`Phi'` is `jax.grad(concentration_phi)` evaluated at the scalar `r` -- no
+# finite difference, no re-derivation of `Phi`'s own Newton solve.)  Dividing
+# by sd2 converts each into dz2/d(ln X), same as every other row.
+#
+# Unlike the old bare-ratio z2, this row is NOT zero in the Mf column: Mc/Mr's
+# response to a pure Mf shift is only zero once `Phi(r)/r` is subtracted off,
+# and `Phi(r)/r` itself moves with r, hence with Mf.  The Jacobian below is no
+# longer lower triangular -- nothing downstream relies on that, it is only
+# ever used as `M @ vector`.
+#
+# `_LOGIT_MAX` is a fossil of the pre-16ece5c logit chart; kept as a name in
+# case other code still imports it, unused by `_chart_spin0_jac` itself.
 _LOGIT_MAX = 6.9
+
+# `concentration_phi`'s Newton solve (bijections.py, `_conc_tau_of_r`) only
+# floors its internal `tau` iterate from below, not above, so a `r` fed at or
+# below ~1e-6 sends the initial `tau0 = 2/r` so large that `exp(-kr^2 tau/2)`
+# underflows every quadrature node and the solve returns NaN -- and any `r
+# <= 0` hits the same path once the unclamped residual can't be driven to
+# zero above the tau floor.  A real chart's r = Mr/Mf is always in
+# `(0, POINT_SOURCE)`, so this never engages there; it only guards the
+# architecture-only tests in `tests/test_shear.py` (rotation/parity/round-trip
+# equivariance) that exercise `_chart_spin0_jac` at a fixed, physically
+# meaningless `Z` under the layer's default identity chart_loc/chart_scale.
+# 1e-4 sits two orders of magnitude above the observed instability and three
+# below the smallest r these tests, or a real catalog, ever probe.
+_CONC_R_EPS = 1e-4
 
 
 def _chart_spin0_jac(z, loc, scale):
-    """dz_i/d(raw log X) for the three spin-0 slots: the M above, shape (3, 3)."""
-    # 1/(1 - u) = 1 + exp(logit u), and slots 1 and 2 carry logit u, logit v.
-    # Bare-ratio chart: z1 = (Mr/Mf - loc1)/scale1, so
-    # dz1/d ln Mr = (Mr/Mf)/scale1, and likewise dz2/d ln Mc = (Mc/Mr)/scale2.
-    # No 1/(1-u): the coordinate no longer diverges at the point-source limit.
-    d1, d2 = (scale[1:3] * z[1:3] + loc[1:3]) / scale[1:3]
+    """dz_i/d(raw log X) for the three spin-0 slots: shape (3, 3)."""
     d0 = 1.0 / (scale[0] * jnp.log(10.0))
     zero = jnp.zeros_like(d0)
+
+    # z1 is the bare ratio Mr/Mf, standardised.
+    r = scale[1] * z[1] + loc[1]
+    d1 = r / scale[1]
+
+    # z2 = (Mc/Mr - Phi(r)/r - loc2)/scale2; see the comment block above.
+    c = scale[2] * z[2] + loc[2]
+    r_safe = jnp.clip(r, _CONC_R_EPS, None)
+    g_r = concentration_phi(r_safe) / r_safe
+    mc_over_mr = c + g_r
+    phi_prime = jax.grad(concentration_phi)(r_safe)
+    row2 = jnp.stack([
+        (phi_prime - g_r) / scale[2],
+        (-mc_over_mr - phi_prime + g_r) / scale[2],
+        mc_over_mr / scale[2],
+    ])
+
     return jnp.stack([jnp.stack([d0, zero, zero]),
                       jnp.stack([-d1, d1, zero]),
-                      jnp.stack([zero, -d2, d2])])
+                      row2])
 
 
 def _invariants(z):
