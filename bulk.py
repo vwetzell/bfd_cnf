@@ -54,7 +54,7 @@ from paramax import non_trainable
 
 from models.bijections import (EquivariantAutoregressiveLayer,
                                RawMomentStandardize, SigmaXBlockLayer,
-                               in_support)
+                               concentration_phi, in_support)
 from models.centroid import CentroidMarginalize  # noqa: F401 -- kept importable, see build_flow
 from models.shear import ShearResponse
 
@@ -104,7 +104,8 @@ NN_DEPTH = 2
 # comparing a plotted 3.15 against a catalog's Mr/Mf of 3.15 was told the axis
 # was a logit.  Read `RawMomentStandardize._forward_transform`, not this
 # comment, if they ever disagree again: that function IS the chart.
-COORD_LABELS = [r"$\log_{10}M_f$", r"$M_r / M_f$", r"$M_c / M_r$",
+COORD_LABELS = [r"$\log_{10}M_f$", r"$M_r / M_f$",
+                r"$M_c/M_r - \Phi(M_r/M_f)/(M_r/M_f)$",
                 r"$M_1 / M_r$", r"$M_2 / M_r$"]
 LABEL_FONTSIZE, TICK_LABELSIZE = 34, 24
 # Mr/Mf ceiling: a point source, i.e. the PSF itself.  Anything at or above it is
@@ -114,6 +115,7 @@ LABEL_FONTSIZE, TICK_LABELSIZE = 34, 24
 # Mc/Mr ceiling, the identical point-source argument one moment order up --
 # see models.bijections.POINT_SOURCE_MC.
 from models.bijections import POINT_SOURCE, POINT_SOURCE_MC  # noqa: E402,F401
+from models.bijections import _W0, _bounded_log_scale  # noqa: E402
 from models.shear import _Q_LOC, _Q_SCALE  # noqa: E402
 
 # The target selection the real analysis applies, recorded here (not in
@@ -149,7 +151,11 @@ def to_coords(m, flux_sas=None):
     if flux_sas is not None:
         mu, sig, a, b = flux_sas
         f = np.sinh((np.arcsinh((f - mu) / sig) - a) / b)
-    return np.stack([f, m[:, 1] / m[:, 0], m[:, 4] / m[:, 1],
+    r = m[:, 1] / m[:, 0]
+    # Mc/Mr - Phi(r)/r: see RawMomentStandardize's docstring for why the
+    # exact weight-kernel prediction Phi(r) is subtracted off.  MUST call the
+    # same `concentration_phi` as `_forward_transform`, not reimplement it.
+    return np.stack([f, r, m[:, 4] / m[:, 1] - np.asarray(concentration_phi(r)) / r,
                      m[:, 2] / m[:, 1], m[:, 3] / m[:, 1]], axis=-1)
 
 
@@ -445,11 +451,24 @@ def sync_chart_constants(flow, m_train=None):
                 values += [non_trainable(jnp.asarray(u_stats[0], jnp.float32)),
                            non_trainable(jnp.asarray(u_stats[1], jnp.float32))]
             flow = eqx.tree_at(lambda f: [g(f) for g in getters], flow, values)
-    # SigmaXBlockLayer (build_flow's current centroid layer) has no frozen
-    # chart mean/std of its own -- it operates on already-standardised z, so
-    # there is nothing to resync for it and this loop is a no-op on a flow
-    # built after this port.  It still matters for a warm-start graft of an
-    # OLDER flow that still carries a CentroidMarginalize layer.
+    # SigmaXBlockLayer operates on already-standardised z, so it has no
+    # frozen chart mean/std ARRAY to resync -- but its `_size_loc`
+    # (`chart.mean[1] / chart.std[1]`, see `bulk.build_flow`'s docstring) is
+    # exactly the same kind of frozen chart statistic as `ShearResponse`'s
+    # `chart_loc`/`chart_scale` above, and was missed when this function was
+    # first written: measured on gauss2_v3d, the fresh vs. trained chart's
+    # mean[1]/std[1] differ by ~9% (8.057 vs 8.787), so `_size_loc` was stale
+    # for the entire duration of every `--init` warm start (`centroid.py
+    # train-sigmax`'s only caller of this function) -- and, since it used to
+    # be a `static` python float rather than a pytree leaf, never reached the
+    # serialized checkpoint at all, so even fixing it in memory during
+    # training couldn't survive a save/load round trip.  Now a genuine
+    # (non-trainable) array leaf, same as `chart_loc`/`chart_scale` above.
+    for i, b in enumerate(flow.bijection.bijection.bijections):
+        if isinstance(b, SigmaXBlockLayer):
+            flow = eqx.tree_at(
+                lambda f, i=i: f.bijection.bijection.bijections[i]._size_loc,
+                flow, non_trainable(chart.mean[1] / chart.std[1]))
     for i, b in enumerate(flow.bijection.bijection.bijections):
         if isinstance(b, CentroidMarginalize):
             flow = eqx.tree_at(
@@ -459,30 +478,134 @@ def sync_chart_constants(flow, m_train=None):
     return flow
 
 
-def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3):
+def _bulk_layers(flow):
+    """All 8 `EquivariantAutoregressiveLayer`s, in data->base (forward) order."""
+    return [b for b in flow.bijection.bijection.bijections
+            if hasattr(b, "spin0") and hasattr(b, "spin2")]
+
+
+def _layer_jacobian_penalty(layer, xi):
+    """Sum of squared Jacobian entries of every conditioner net inside one
+    `EquivariantAutoregressiveLayer` (`spin0.net_ls1`, `spin0.net_ls2`,
+    `spin2.net`), each at its own INPUT for this layer -- plus that layer's
+    forward-transformed output, for the next layer's call.
+
+    `xi` (this layer's input) is `stop_gradient`-ed first, so nothing here
+    can reach back into the chart or an earlier layer's weights -- see
+    `bulk_jacobian_penalty`'s docstring for why that boundary has to be
+    structural, not just "don't differentiate the net's own input variable".
+    """
+    xi = jax.lax.stop_gradient(xi)
+    s0 = layer.spin0
+    ls0 = _bounded_log_scale(s0.log_scale0)
+    z0 = (xi[0] - s0.loc0) * jnp.exp(-ls0)
+
+    u1 = jnp.array([z0])
+    p1 = jnp.sum(jax.jacfwd(s0.net_ls1)(u1) ** 2)
+    loc1, ls1 = s0._loc_scale(s0.net_ls1, [z0])
+    z1 = (xi[1] - loc1) * jnp.exp(-ls1)
+
+    u2 = jnp.array([z0, z1])
+    p2 = jnp.sum(jax.jacfwd(s0.net_ls2)(u2) ** 2)
+    loc2, ls2 = s0._loc_scale(s0.net_ls2, [z0, z1])
+    z2 = (xi[2] - loc2) * jnp.exp(-ls2)
+
+    x_s0 = jnp.array([z0, z1, z2, xi[3], xi[4]])
+    s2 = layer.spin2
+    q = x_s0[3] ** 2 + x_s0[4] ** 2
+    u3 = (jnp.concatenate([x_s0[:3], (jnp.log1p(q) - _W0)[None]])
+          if s2.bend else x_s0[:3])
+    p3 = jnp.sum(jax.jacfwd(s2.net)(u3) ** 2)
+
+    x_out, _ = layer.transform_and_log_det(xi)
+    return p1 + p2 + p3, x_out
+
+
+def bulk_jacobian_penalty(flow, m_batch):
+    """Mean, over `m_batch` and all 8 bulk layers, of the squared Jacobian
+    entries of every conditioner net (`spin0.net_ls1`, `spin0.net_ls2`,
+    `spin2.net`) w.r.t. its own input.
+
+    Generalises `dev/bend_layer_check.py`'s finding beyond the ONE net that
+    diagnosis targeted (the first layer's `bend=True` `spin2.net`, penalised
+    alone in an earlier version of this function): re-running the fixed
+    single-net penalty end-to-end (bulk -> shear -> centroid -> `bias.py` at
+    2^24 selection draws) found the R_s estimator's worst leader had MOVED to
+    a different point whose dominant steepness (37.8x the in-band control
+    median, `jacobian_decomposition`-style) came from the SECOND bulk layer's
+    `spin2.net` -- which has `bend=False` and so was never touched by the
+    single-net penalty at all. That is direct evidence the instability is not
+    one net's problem, so this penalises every conditioner net in every
+    layer, not just the one diagnosis first found.
+
+    Each layer's input is `stop_gradient`-ed before its nets see it (see
+    `_layer_jacobian_penalty`), and the chart stays frozen via `train`'s
+    `_trainable(freeze_chart=bool(jac_weight))` -- both boundaries `bend_
+    jacobian_penalty`'s history showed are load-bearing, not optional.
+    """
+    chart = chart_of(flow)
+    layers = _bulk_layers(flow)
+
+    def one(m):
+        x = chart.transform_and_log_det(m, None)[0]
+        total = 0.0
+        for layer in layers:
+            p, x = _layer_jacobian_penalty(layer, x)
+            total = total + p
+        return total
+
+    return jnp.mean(jax.vmap(one)(m_batch))
+
+
+def _trainable(flow, freeze_chart):
+    """Filter spec for `eqx.partition`: every inexact leaf, minus the chart's
+    `mean`/`std` when `freeze_chart` -- see `bulk_jacobian_penalty`'s
+    docstring for why `jac_weight` needs this closed structurally."""
+    if not freeze_chart:
+        return eqx.is_inexact_array
+    spec = jax.tree.map(eqx.is_inexact_array, flow)
+    chart = chart_of(flow)
+    return eqx.tree_at(lambda f: chart_of(f), spec,
+                        replace=jax.tree.map(lambda _: False, chart))
+
+
+def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
+          ema=0.0):
     # The power-law flux gives log10(Mf) a long tail, so an outlier batch can blow
     # the NLL up mid-training and never recover -- clip, then decay the step size.
     opt = optax.chain(optax.clip_by_global_norm(1.0),
                       optax.adam(optax.cosine_decay_schedule(lr, steps)))
-    params, static = eqx.partition(flow, eqx.is_inexact_array)
+    params, static = eqx.partition(flow, _trainable(flow, freeze_chart=bool(jac_weight)))
     state = opt.init(params)
     data = jnp.asarray(m_train)
+    # `ema` > 0: return the exponential average of the params instead of the
+    # last iterate (per-step nll swings +-0.5 at batch 1024, so the final
+    # iterate is one noisy draw -- see [[health-gate-every-stage-and-track-jobs]]).
+    ema_params = params
 
     @eqx.filter_jit
     def step(params, state, idx):
-        def nll(p):
-            return -jnp.mean(eqx.combine(p, static).log_prob(data[idx]))
-        loss, grads = jax.value_and_grad(nll)(params)
+        def loss_fn(p):
+            model = eqx.combine(p, static)
+            nll = -jnp.mean(model.log_prob(data[idx]))
+            if not jac_weight:
+                return nll, nll
+            pen = bulk_jacobian_penalty(model, data[idx])
+            return nll + jac_weight * pen, nll
+        (loss, nll), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, state = opt.update(grads, state, params)
-        return eqx.apply_updates(params, updates), state, loss
+        return eqx.apply_updates(params, updates), state, nll
 
     for i in range(steps):
         key, sk = jr.split(key)
         idx = jr.randint(sk, (batch,), 0, data.shape[0])
         params, state, loss = step(params, state, idx)
+        if ema:
+            ema_params = jax.tree_util.tree_map(
+                lambda e, q: ema * e + (1.0 - ema) * q, ema_params, params)
         if i % 500 == 0 or i == steps - 1:
             print(f"step {i:5d}  nll {loss:.4f}")
-    return eqx.combine(params, static)
+    return eqx.combine(ema_params if ema else params, static)
 
 
 def _split(m, frac=0.9):
@@ -504,9 +627,37 @@ def main():
     p.add_argument("--data", default="../bfd_cnf_imsims/data/moments.fits")
     p.add_argument("--flow", default="flows/bulk.eqx")
     p.add_argument("--steps", type=int, default=4000)
+    p.add_argument("--jac-weight", type=float, default=0.0,
+                   help="weight on an explicit Jacobian penalty (mean "
+                        "squared gradient of every conditioner net in every "
+                        "bulk layer, w.r.t. its own input); 0 = off, pure "
+                        "NLL. Generalises the single-net penalty "
+                        "dev/bend_layer_check.py's diagnosis first targeted, "
+                        "after that version fixed one leader but a re-run "
+                        "found the R_s estimator's next-worst leader's "
+                        "steepness in a DIFFERENT layer's net entirely (see "
+                        "bulk_jacobian_penalty).")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--batch", type=int, default=1024)
+    p.add_argument("--ema", type=float, default=0.0,
+                   help="EMA decay of the trained params (0 = return the last "
+                        "iterate); e.g. 0.9995 averages over the last ~2k steps")
     p.add_argument("--flux-sas", type=_flux_sas, default=None,
                    help="fitted sinh-arcsinh warp of the flux axis as \"mu,sig,a,b\"; omit for the plain log10 this chart has always used. Gaussianises log10 Mf (skew 1.78 -> 0 on bulgedisc_v2). MUST match across bulk/shear/centroid/bias or the charts disagree.")
+    p.add_argument("--chart-from", default=None,
+                   help="load the RawMomentStandardize mean/std from this "
+                        "already-trained flow instead of the fresh "
+                        "data-derived init, before training. Meant to pair "
+                        "with --jac-weight, which freezes the chart entirely: "
+                        "freezing it at its untrained init (rather than a "
+                        "value close to what full NLL training would "
+                        "converge to) starves the rest of the architecture "
+                        "of the scaling it needs and can push the spin-2 "
+                        "bend layer's log-det past its log1p(2 q dh) domain "
+                        "for points a normally-trained chart never reaches "
+                        "-- found when a first --jac-weight run without this "
+                        "produced exactly that at one held-out point.")
     p.add_argument("--out", default="plots/bulk_corner.png")
     a = p.parse_args()
 
@@ -515,9 +666,13 @@ def main():
     key = jr.key(a.seed)
     k_build, k_train, k_sample = jr.split(key, 3)
     flow = build_flow(k_build, m_train, flux_sas=a.flux_sas)
+    if a.chart_from:
+        src = eqx.tree_deserialise_leaves(a.chart_from, flow)
+        flow = eqx.tree_at(lambda f: chart_of(f), flow, replace=chart_of(src))
 
     if a.mode == "train":
-        flow = train(flow, m_train, k_train, steps=a.steps)
+        flow = train(flow, m_train, k_train, steps=a.steps, batch=a.batch,
+                     lr=a.lr, jac_weight=a.jac_weight, ema=a.ema)
         print(f"val nll {-jnp.mean(flow.log_prob(jnp.asarray(m_val))):.4f}")
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")
