@@ -571,7 +571,7 @@ def _trainable(flow, freeze_chart):
 
 
 def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
-          ema=0.0):
+          ema=0.0, self_jac_weight=0.0, self_jac_samples=512):
     # The power-law flux gives log10(Mf) a long tail, so an outlier batch can blow
     # the NLL up mid-training and never recover -- clip, then decay the step size.
     opt = optax.chain(optax.clip_by_global_norm(1.0),
@@ -584,14 +584,32 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
     # iterate is one noisy draw -- see [[health-gate-every-stage-and-track-jobs]]).
     ema_params = params
 
-    def step(params, state, idx):
+    def step(params, state, idx, key):
         def loss_fn(p):
             model = eqx.combine(p, static)
             nll = -jnp.mean(model.log_prob(data[idx]))
-            if not jac_weight:
-                return nll, nll
-            pen = bulk_jacobian_penalty(model, data[idx])
-            return nll + jac_weight * pen, nll
+            loss = nll
+            if jac_weight:
+                loss = loss + jac_weight * bulk_jacobian_penalty(model, data[idx])
+            if self_jac_weight:
+                # Real templates can only teach smoothness where the training
+                # catalog HAS points; the estimator's selection integral visits
+                # the flow's own tails too, and a batch-mean penalty over real
+                # data gets essentially zero gradient at a point the training
+                # batch almost never lands on (diagnosed this session: a
+                # pathological point >1.7 chart-units from its nearest real
+                # template, yet 12th percentile of the flow's OWN draws). Sample
+                # from the model itself each step so the penalty tracks
+                # wherever the flow currently puts mass, self-correcting as
+                # training moves it. `stop_gradient` is load-bearing (see
+                # `_layer_jacobian_penalty`'s own docstring on this point): the
+                # only gradient path must be "make the net smoother HERE", not
+                # "move probability mass away from here", which is what an
+                # un-stopped sampling-path gradient would let the optimiser do
+                # instead.
+                self_m = jax.lax.stop_gradient(model.sample(key, (self_jac_samples,)))
+                loss = loss + self_jac_weight * bulk_jacobian_penalty(model, self_m)
+            return loss, nll
         (loss, nll), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, state = opt.update(grads, state, params)
         return eqx.apply_updates(params, updates), state, nll
@@ -614,24 +632,38 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
     # the same DISTRIBUTION (uniform batch indices) but not the same SEQUENCE
     # as the old per-step draws, so training is no longer bit/value identical
     # to the pre-change code for a given `key` -- expected, not a bug.
+    # `self_jac_weight`'s `model.sample` depends on the CURRENT params, which
+    # change every step -- unlike `idx`'s batch indices (drawn once per chunk
+    # below, since they don't depend on params), the sample key cannot be
+    # pre-drawn outside the scan. It has to be threaded through the scan's own
+    # carry and split ON DEVICE, once per step, or the fused loop this
+    # scan/chunk structure exists for would need a host round-trip per step
+    # again to hand it a fresh key -- exactly what folding `REPORT` steps into
+    # one `lax.scan` was for.
     def scan_body(carry, idx):
-        params, state, ema_params = carry
-        params, state, nll = step(params, state, idx)
+        params, state, ema_params, key = carry
+        key, sk = jr.split(key)
+        params, state, nll = step(params, state, idx, sk)
         if ema:
             ema_params = jax.tree_util.tree_map(
                 lambda e, q: ema * e + (1.0 - ema) * q, ema_params, params)
-        return (params, state, ema_params), nll
+        return (params, state, ema_params, key), nll
 
     @eqx.filter_jit
-    def run_chunk(params, state, ema_params, idx_chunk):
-        return jax.lax.scan(scan_body, (params, state, ema_params), idx_chunk)
+    def run_chunk(params, state, ema_params, key, idx_chunk):
+        return jax.lax.scan(scan_body, (params, state, ema_params, key), idx_chunk)
 
     i = 0
     while i < steps:
         n = min(REPORT, steps - i)
         key, sk = jr.split(key)
         idx_chunk = jr.randint(sk, (n, batch), 0, data.shape[0])
-        (params, state, ema_params), nlls = run_chunk(params, state, ema_params, idx_chunk)
+        # Independent split for the scan's internal per-step key stream --
+        # `sk` above only seeds `idx_chunk`'s batch draw and must not double
+        # as the self-sample stream too.
+        key, ck = jr.split(key)
+        (params, state, ema_params, ck), nlls = run_chunk(
+            params, state, ema_params, ck, idx_chunk)
         i += n
         print(f"step {i - 1:5d}  nll {float(nlls[-1]):.4f}")
     return eqx.combine(ema_params if ema else params, static)
@@ -666,6 +698,16 @@ def main():
                         "found the R_s estimator's next-worst leader's "
                         "steepness in a DIFFERENT layer's net entirely (see "
                         "bulk_jacobian_penalty).")
+    p.add_argument("--self-jac-weight", type=float, default=0.0,
+                   help="Weight of the self-sample smoothness penalty: same "
+                        "bulk_jacobian_penalty term as --jac-weight, but evaluated "
+                        "on points drawn from the model's OWN current distribution "
+                        "each step rather than real training-catalog points. "
+                        "Targets regions the training catalog doesn't cover but "
+                        "the flow itself visits -- see "
+                        "[[health-gate-every-stage-and-track-jobs]].")
+    p.add_argument("--self-jac-samples", type=int, default=512,
+                   help="Batch size for the self-sample penalty (--self-jac-weight).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch", type=int, default=1024)
@@ -701,7 +743,9 @@ def main():
 
     if a.mode == "train":
         flow = train(flow, m_train, k_train, steps=a.steps, batch=a.batch,
-                     lr=a.lr, jac_weight=a.jac_weight, ema=a.ema)
+                     lr=a.lr, jac_weight=a.jac_weight, ema=a.ema,
+                     self_jac_weight=a.self_jac_weight,
+                     self_jac_samples=a.self_jac_samples)
         print(f"val nll {-jnp.mean(flow.log_prob(jnp.asarray(m_val))):.4f}")
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")
