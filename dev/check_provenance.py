@@ -59,14 +59,33 @@ def main(tag="v3", prior_tag=None, size="200k", pop_kind="bulgedisc"):
     print("headers")
     hdrs = {p: fitsio.read_header(p, ext=1)
             for p in [prior, copies, *arms.values()]}
+    # A NOISY prior/templates catalog (2026-09-22: real templates always carry
+    # SOME deep-coadd noise, so the prior is deliberately rendered with image
+    # noise at a fraction of the targets' -- see HANDOFF/dev/render_g2v4n.sh).
+    # `copies` stays noiseless/exact regardless (it is an analytic shift-grid
+    # construction, not a rendered image) and must still match the TARGETS'
+    # noise_sigma, since Sigma_X marginalises the TARGETS' centroid error.
+    prior_noisy = bool(hdrs[prior].get("IMGNOISE", False))
     sig = {p: h["NOISESIG"] for p, h in hdrs.items()}
-    check("one noise_sigma across every artifact",
-          len(set(sig.values())) == 1, f"{sorted(set(sig.values()))}")
+    if prior_noisy:
+        target_sig = {sig[arms[k]] for k in arms}
+        check("copies share the targets' noise_sigma (prior is noisy, "
+              "independently)",
+              sig[copies] in target_sig, f"copies {sig[copies]}, targets "
+              f"{target_sig}, prior {sig[prior]} (expected < targets')")
+        check("prior noise_sigma is strictly below the targets'",
+              sig[prior] < min(target_sig),
+              f"prior {sig[prior]} vs targets {sorted(target_sig)}")
+    else:
+        check("one noise_sigma across every artifact",
+              len(set(sig.values())) == 1, f"{sorted(set(sig.values()))}")
     check("target arms carry g1 = 0, +0.02, -0.02",
           sorted(hdrs[arms[k]]["G1"] for k in arms) == [-0.02, 0.0, 0.02])
-    check("targets have image noise, prior does not",
+    check("targets have image noise, prior does not" if not prior_noisy else
+          "targets and prior both have image noise (prior deliberately, at "
+          "a lower level)",
           all(hdrs[arms[k]]["IMGNOISE"] for k in arms)
-          and not hdrs[prior]["IMGNOISE"])
+          and (hdrs[prior]["IMGNOISE"] == prior_noisy))
     # The three ARMS must share a PSF, or +g and -g are different experiments
     # and the antithetic difference measures the PSF instead of the shear.
     # The PRIOR is allowed to differ and is only reported: BFD's moments are
@@ -97,9 +116,19 @@ def main(tag="v3", prior_tag=None, size="200k", pop_kind="bulgedisc"):
 
     print("\nprior -- the copy sum and the flow must share one prior, galaxy "
           "for galaxy")
-    check("copies GALAXIES moments == prior moments",
-          np.array_equal(col(copies, "moments", ext="GALAXIES"),
-                         col(prior, "moments")))
+    if prior_noisy:
+        # The identity that matters is the GALAXY (POPULATION table, checked
+        # below), not its measured moments: `copies` measures each galaxy
+        # noiselessly (an analytic shift-grid, never a rendered image) while
+        # the noisy prior measures the same galaxy through one noisy image
+        # realization, so the two moments columns are legitimately different.
+        print("  SKIP  copies GALAXIES moments == prior moments   "
+              "(prior is noisy by design; POPULATION identity below is "
+              "the check that matters)")
+    else:
+        check("copies GALAXIES moments == prior moments",
+              np.array_equal(col(copies, "moments", ext="GALAXIES"),
+                             col(prior, "moments")))
     check("copies POPULATION == prior POPULATION",
           same_pop(pop(prior), pop(copies)))
     for c in ("dm_dg", "d2m_dg2"):
@@ -115,12 +144,27 @@ def main(tag="v3", prior_tag=None, size="200k", pop_kind="bulgedisc"):
     sys.path.insert(0, ".")
     from models.bijections import POINT_SOURCE, POINT_SOURCE_MC  # noqa: E402
     m = col(prior, "moments")
-    check("no prior row at or above the Mr/Mf ceiling",
-          bool((m[:, 1] < POINT_SOURCE * m[:, 0]).all()),
-          f"max {np.max(m[:, 1] / m[:, 0]):.4f} vs {POINT_SOURCE:.4f}")
-    check("no prior row at or above the Mc/Mr ceiling",
-          bool((m[:, 4] < POINT_SOURCE_MC * m[:, 1]).all()),
-          f"max {np.max(m[:, 4] / m[:, 1]):.4f} vs {POINT_SOURCE_MC:.4f}")
+    if prior_noisy:
+        # Image noise on the prior can legitimately push a MEASURED point
+        # past the noiseless point-source ceiling (same statistical effect
+        # as on the targets); the chart itself has no hard boundary on slot 1
+        # (bare Mr/Mf ratio) and `concentration_phi` is smooth outside
+        # (0, POINT_SOURCE) by construction (`_CONC_TAU_FLOOR`), so training
+        # on these rows is safe. Report the rate instead of demanding zero.
+        frac1 = float((m[:, 1] >= POINT_SOURCE * m[:, 0]).mean())
+        frac2 = float((m[:, 4] >= POINT_SOURCE_MC * m[:, 1]).mean())
+        check("Mr/Mf ceiling overshoot rate is small (noisy prior)",
+              frac1 < 0.05, f"{frac1:.4%} of rows at/above {POINT_SOURCE:.4f}")
+        check("Mc/Mr ceiling overshoot rate is small (noisy prior)",
+              frac2 < 0.05,
+              f"{frac2:.4%} of rows at/above {POINT_SOURCE_MC:.4f}")
+    else:
+        check("no prior row at or above the Mr/Mf ceiling",
+              bool((m[:, 1] < POINT_SOURCE * m[:, 0]).all()),
+              f"max {np.max(m[:, 1] / m[:, 0]):.4f} vs {POINT_SOURCE:.4f}")
+        check("no prior row at or above the Mc/Mr ceiling",
+              bool((m[:, 4] < POINT_SOURCE_MC * m[:, 1]).all()),
+              f"max {np.max(m[:, 4] / m[:, 1]):.4f} vs {POINT_SOURCE_MC:.4f}")
 
     print(f"\n{len(FAIL)} failed")
     return 1 if FAIL else 0

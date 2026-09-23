@@ -93,7 +93,12 @@ def main():
     # plain transform above), so batch it -- an unchunked call over 2^16+
     # draws at once is what OOM'd a 16 GB card. 4096 matches
     # `dev/leader_corner_plot.py`'s default `--batch`.
-    QR_CHUNK = 4096
+    # 4096 OOM'd at the centroid stage with a multi-scale SigmaXBlockLayer
+    # (2026-09-22, g2v4n: 37 GiB requested on a 16 GB card) -- that layer's
+    # per-point Hessian is heavier than the shear-only flows this default was
+    # tuned against, so shrink it here rather than raise a CLI flag nobody
+    # will remember to pass at the stage that needs it.
+    QR_CHUNK = 512
     qf_l, rf_l, qt_l, rt_l = [], [], [], []
     for i in range(0, n, QR_CHUNK):
         mm = jnp.asarray(m0[i:i + QR_CHUNK])

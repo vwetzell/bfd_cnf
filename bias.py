@@ -355,6 +355,17 @@ CATALOGS = {
     "gauss2_v4": {"plus": "targets_g2v4_g1p02_22k",
                   "minus": "targets_g2v4_g1m02_22k",
                   "zero": "targets_g2v4_g0_22k"},
+    # Same targets as gauss2_v4 (unchanged), but the flow is trained on a
+    # NOISY, 500k prior instead of gauss2_v4's noiseless 100k one -- see
+    # dev/render_g2v4n.sh.  Real templates always carry some deep-coadd
+    # noise; this renders that noise explicitly (1/10 the targets') rather
+    # than approximating it as an artificial jitter at the moment level, and
+    # the 5x larger catalog gives the flow far denser joint-coverage of its
+    # own training population (see [[rs-tail-is-unphysical-draws]] and this
+    # session's leader/sparsity findings). TRAIN_DATA points at the new prior.
+    "gauss2_v4n": {"plus": "targets_g2v4_g1p02_22k",
+                   "minus": "targets_g2v4_g1m02_22k",
+                   "zero": "targets_g2v4_g0_22k"},
     "gauss2_v3e": {"plus": "targets_g2v3e_g1p02_4600k",
                    "minus": "targets_g2v3e_g1m02_4600k",
                    "zero": "targets_g2v3e_g0_4600k"},
@@ -403,6 +414,7 @@ TRAIN_DATA = {
     "gauss2_v3": "moments_gauss2_fwd_g2v3.fits",
     "gauss2_v3d": "moments_gauss2_fwd_g2v3d.fits",
     "gauss2_v4": "moments_gauss2_fwd_g2v4.fits",
+    "gauss2_v4n": "moments_gauss2_fwd_g2v4n.fits",
     "gauss2_v3e": "moments_gauss2_fwd_g2v3d.fits",   # deliberate: see CATALOGS
     "gauss2_deep": "gauss2_g0_1M.fits",
     # Same reasoning as bulgedisc_v3_psfe*: PSF ellipticity doesn't touch the
@@ -3374,39 +3386,53 @@ def main():
         # scaled to the full S, since ESS grows linearly with draws.  Stratified
         # by flux quintile (not just the first n_e rows) so a starved tail
         # concentrated in one quintile doesn't average out against the rest.
-        n_e = min(2000, len(m["zero"]))
-        flux_e = truth[:, 0]
-        edges_e = np.percentile(flux_e, [0, 20, 40, 60, 80, 100])
-        per_q = max(1, n_e // 5)
-        idx = np.concatenate([
-            np.flatnonzero((flux_e >= edges_e[i]) & (flux_e <= edges_e[i + 1]))[:per_q]
-            for i in range(5)])
-        d_e, w_e = mixture_draws(draw_flow, m_raw["zero"][idx], cov, chunk,
-                                 a.alpha, draw_seed, sigma_x=None
-                                 if draw_sigma_x is None else draw_sigma_x[idx])
-        # NOT through the peel.  `ess` tests `in_domain` and stands bad rows in
-        # at `safe_point`, both of which read RAW moments; on peeled draws they
-        # are nonsense and the reported median came out NaN.  The peel is exact,
-        # so the full flow on raw draws is the same number, computed where the
-        # domain test means something.
-        e = ess(flow, m_raw["zero"][idx], d_e, w_e, 4 * batch,
-                None if sigma_x is None else sigma_x[idx])
-        scale = a.samples / chunk
-        print(f"integrating under C_M with {a.samples} draws/target "
-              f"(alpha = {a.alpha}): ESS = {np.median(e) * scale:.0f} (median), "
-              f"{np.percentile(e, 5) * scale:.0f} (5th pct), "
-              f"frac<10 = {float((e * scale < 10).mean()):.3f}")
-        print(f"  {'quintile':>10s}{'median ESS':>12s}{'5th pct':>10s}{'frac<10':>10s}")
-        lo = 0
-        for i in range(5):
-            n_i = min(per_q, ((flux_e >= edges_e[i]) & (flux_e <= edges_e[i + 1])).sum())
-            e_i = e[lo:lo + n_i]
-            lo += n_i
-            if len(e_i) == 0:
-                continue
-            print(f"  {f'q{i + 1}':>10s}{np.median(e_i) * scale:>12.0f}"
-                  f"{np.percentile(e_i, 5) * scale:>10.0f}"
-                  f"{float((e_i * scale < 10).mean()):>10.3f}")
+        #
+        # PRINT-ONLY: wrapped in try/except (2026-09-22, g2v4n). At the
+        # centroid stage with a multi-scale SigmaXBlockLayer this diagnostic's
+        # OWN internal batch-sizing (both `mixture_draws`' hardcoded
+        # batch*samples=131072 default, ignoring --chunk/--batch-budget, and
+        # `ess`'s own `4*batch`) repeatedly OOM'd on a 16 GB card even after
+        # `--chunk`/`--batch-budget`/n_e were all cut -- none of those knobs
+        # reach either hardcoded size. A print-out is not worth chasing that
+        # flow's actual per-draw memory footprint at 3am; skip it rather than
+        # lose the real estimate below to a diagnostic's OOM.
+        try:
+            n_e = min(200, len(m["zero"]))
+            flux_e = truth[:, 0]
+            edges_e = np.percentile(flux_e, [0, 20, 40, 60, 80, 100])
+            per_q = max(1, n_e // 5)
+            idx = np.concatenate([
+                np.flatnonzero((flux_e >= edges_e[i]) & (flux_e <= edges_e[i + 1]))[:per_q]
+                for i in range(5)])
+            d_e, w_e = mixture_draws(draw_flow, m_raw["zero"][idx], cov, chunk,
+                                     a.alpha, draw_seed, batch=batch, sigma_x=None
+                                     if draw_sigma_x is None else draw_sigma_x[idx])
+            # NOT through the peel.  `ess` tests `in_domain` and stands bad rows
+            # in at `safe_point`, both of which read RAW moments; on peeled
+            # draws they are nonsense and the reported median came out NaN.
+            # The peel is exact, so the full flow on raw draws is the same
+            # number, computed where the domain test means something.
+            e = ess(flow, m_raw["zero"][idx], d_e, w_e, batch,
+                    None if sigma_x is None else sigma_x[idx])
+            scale = a.samples / chunk
+            print(f"integrating under C_M with {a.samples} draws/target "
+                  f"(alpha = {a.alpha}): ESS = {np.median(e) * scale:.0f} (median), "
+                  f"{np.percentile(e, 5) * scale:.0f} (5th pct), "
+                  f"frac<10 = {float((e * scale < 10).mean()):.3f}")
+            print(f"  {'quintile':>10s}{'median ESS':>12s}{'5th pct':>10s}{'frac<10':>10s}")
+            lo = 0
+            for i in range(5):
+                n_i = min(per_q, ((flux_e >= edges_e[i]) & (flux_e <= edges_e[i + 1])).sum())
+                e_i = e[lo:lo + n_i]
+                lo += n_i
+                if len(e_i) == 0:
+                    continue
+                print(f"  {f'q{i + 1}':>10s}{np.median(e_i) * scale:>12.0f}"
+                      f"{np.percentile(e_i, 5) * scale:>10.0f}"
+                      f"{float((e_i * scale < 10).mean()):>10.3f}")
+        except Exception as exc:
+            print(f"  ESS diagnostic skipped ({type(exc).__name__}: {exc}) -- "
+                  f"print-only, does not affect the estimate below")
 
     # The unsheared arm costs a THIRD of the target integration and feeds
     # exactly one output, `ghat` at g = 0 -- `bias` and `bootstrap` read only
@@ -3590,7 +3616,8 @@ def main():
             m_draw = jnp.concatenate(
                 [tr(zs[i:i + 16384]) for i in range(0, len(zs), 16384)])
             ps, qs, rs, qs_err = selection_terms_score(
-                flow, m_draw, cov, size, flux, sigma_x=sx1, density=density)
+                flow, m_draw, cov, size, flux, sigma_x=sx1, density=density,
+                batch=1024)  # default 4096 OOMs (37 GiB) on a multi-scale SigmaXBlockLayer flow
         else:
             ps, qs, rs, qs_err = selection_terms(
                 draw, z, cov, size, flux, fd=a.window_fd,
