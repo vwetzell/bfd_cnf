@@ -522,7 +522,7 @@ def _layer_jacobian_penalty(layer, xi):
     return p1 + p2 + p3, x_out
 
 
-def bulk_jacobian_penalty(flow, m_batch):
+def bulk_jacobian_penalty(flow, m_batch, *, reduce=True):
     """Mean, over `m_batch` and all 8 bulk layers, of the squared Jacobian
     entries of every conditioner net (`spin0.net_ls1`, `spin0.net_ls2`,
     `spin2.net`) w.r.t. its own input.
@@ -543,6 +543,14 @@ def bulk_jacobian_penalty(flow, m_batch):
     `_layer_jacobian_penalty`), and the chart stays frozen via `train`'s
     `_trainable(freeze_chart=bool(jac_weight))` -- both boundaries `bend_
     jacobian_penalty`'s history showed are load-bearing, not optional.
+
+    `reduce=False` skips the final batch mean and returns the raw per-point
+    array (n,) instead, still summed over layers/nets as above -- for a
+    caller (`train`'s self-sample term) that needs to MASK points before
+    reducing, since one non-finite entry would otherwise poison a plain
+    `jnp.mean` however it is computed downstream. `reduce=True` (the
+    default) is unchanged and every existing caller keeps seeing exactly
+    today's scalar.
     """
     chart = chart_of(flow)
     layers = _bulk_layers(flow)
@@ -555,7 +563,8 @@ def bulk_jacobian_penalty(flow, m_batch):
             total = total + p
         return total
 
-    return jnp.mean(jax.vmap(one)(m_batch))
+    per_point = jax.vmap(one)(m_batch)
+    return jnp.mean(per_point) if reduce else per_point
 
 
 def _trainable(flow, freeze_chart):
@@ -608,7 +617,57 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
                 # un-stopped sampling-path gradient would let the optimiser do
                 # instead.
                 self_m = jax.lax.stop_gradient(model.sample(key, (self_jac_samples,)))
-                loss = loss + self_jac_weight * bulk_jacobian_penalty(model, self_m)
+                # A self-sampled batch WILL periodically include a wild tail
+                # point -- the model's own flux/size tail is heavy, the same
+                # concern as the outlier-batch note on the plain NLL term
+                # above -- whose per-point penalty is non-finite OUTRIGHT,
+                # not just large. `clip_by_global_norm` only rescales an
+                # ALREADY-FINITE gradient, so one non-finite entry reaching
+                # `jnp.mean` poisons the whole step's loss and then Adam's
+                # moment state PERMANENTLY (confirmed empirically resuming
+                # from a fully converged checkpoint: nll 37.96 at step 500,
+                # inf by step 1000). Masking the MEAN alone is not enough
+                # either: `jnp.where(finite, per_point, 0.0)` still
+                # differentiates the discarded branch in reverse mode, so a
+                # NaN/inf forward value there gives a NaN/inf GRADIENT that
+                # `0 *` does not clean up (0 * nan = nan). The only safe fix
+                # is to keep the offending points OUT of the differentiated
+                # computation in the first place: probe for them with a
+                # `stop_gradient`-d forward pass (whose backward is an exact
+                # zero, not "compute-then-discard", so a NaN inside it can
+                # never reach `grads`), then swap those SELF-SAMPLED rows --
+                # already `stop_gradient`-ed as a batch, so this changes no
+                # gradient path -- for a real, already-known-finite catalog
+                # row before the differentiated evaluation runs at all.
+                probe = jax.lax.stop_gradient(
+                    bulk_jacobian_penalty(model, self_m, reduce=False))
+                finite = jnp.isfinite(probe)
+                self_m_safe = jnp.where(finite[:, None], self_m, data[idx[0]])
+                per_point = bulk_jacobian_penalty(model, self_m_safe, reduce=False)
+                # Second, separate guard: a point can be FAR steeper than the
+                # rest of the batch while still being technically finite, and
+                # dominate a plain mean exactly the way a NaN would. Cap every
+                # point at a multiple of the batch's OWN median rather than a
+                # hardcoded constant, so it self-adapts across populations and
+                # training stages instead of needing its own re-tuned knob --
+                # 100x mirrors `--window-guard`'s own "far past the pilot
+                # median" tripwire elsewhere in this codebase (bias.py/
+                # dev/window_scan.py, "100 to match the g2v3d/g2v3e runs").
+                # The already-excluded (non-finite-probe) rows are pushed to
+                # `inf` here, not included as 0, so a batch that is mostly
+                # wild cannot drag the median down to ~0 and make the cap
+                # vanish.
+                med = jnp.median(jnp.where(finite, per_point, jnp.inf))
+                cap = 100.0 * med
+                capped = jnp.where(finite, jnp.minimum(per_point, cap), 0.0)
+                count = jnp.sum(finite)
+                # Mean over SURVIVING points only; an all-wild batch (should
+                # not happen in practice, but costs nothing to guard) falls
+                # back to a harmless 0.0 contribution rather than 0/0 -> nan.
+                self_pen = jnp.where(count > 0,
+                                     jnp.sum(capped) / jnp.maximum(count, 1),
+                                     0.0)
+                loss = loss + self_jac_weight * self_pen
             return loss, nll
         (loss, nll), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, state = opt.update(grads, state, params)
