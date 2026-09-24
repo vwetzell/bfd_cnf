@@ -66,113 +66,33 @@ POINT_SOURCE = 3.692575
 POINT_SOURCE_MC = 6.662089
 
 # ---------------------------------------------------------------------------
-# Exact weight-kernel concentration slot: Phi(r) = Mc/Mf at the isotropic
-# Gaussian galaxy whose Mr/Mf equals r, for the REAL (Blackman-Harris) weight,
-# replacing the old Gaussian-weight shortcut Mc/Mf = 2 r^2.
+# Concentration slot: Phi(r) = Mc/Mf of the isotropic Gaussian galaxy with
+# Mr/Mf = r under the real (Blackman-Harris) weight.  For galaxy size tau,
+# r = -2 L'(tau) and Phi = r^2 + 4 L''(tau), L = log A(tau).
 #
-# For an isotropic Gaussian galaxy of size tau (=sigma_gal^2), Itilde(k) =
-# F exp(-k^2 tau/2), so Mf, Mr, Mc are the 0th/1st/2nd tau-derivatives (up to
-# sign) of A(tau) = 2*pi INT_0^kmax kr w(kr) exp(-kr^2 tau/2) dkr.  Writing
-# L = log A: Mr/Mf = -2 L', Mc/Mf = 4 L'' + (Mr/Mf)^2.  Given r = Mr/Mf, invert
-# r = -2 L'(tau) for tau by Newton, then Phi(r) := 4 L''(tau(r)) + r^2 is the
-# slot's exact zero-noise prediction for Mc/Mf, replacing the Gaussian-weight
-# `2 r^2`.
-#
-# Coefficients and kmax are `bfd/weightfunction.py`'s `KBlackmanHarris` at
-# `imsims.sim.WEIGHT_SIGMA` -- frozen HERE as literals, same as POINT_SOURCE
-# above, so this module never imports the sibling imsims/bfd repos.
-_CONC_C = np.array([0.349792, 0.487396, 0.150208, 0.012604])
-_CONC_SIGMA_W = 0.65
-_CONC_KMAX = 1.07635 * np.pi / _CONC_SIGMA_W
-
-# Fixed 64-point Gauss-Legendre quadrature on [0, kmax], computed once at
-# import time -- mirrors `bias.py`'s `_GL_NODES, _GL_WEIGHTS =
-# np.polynomial.legendre.leggauss(64)`, duplicated locally rather than
-# imported from `bias.py` to avoid any import-cycle risk.
-_conc_x, _conc_w = np.polynomial.legendre.leggauss(64)
-_CONC_KR = 0.5 * _CONC_KMAX * (_conc_x + 1.0)
-_CONC_DKR = 0.5 * _CONC_KMAX * _conc_w
-_conc_u = _CONC_KR * np.pi / _CONC_KMAX
-_CONC_WK = (_CONC_C[0] + _CONC_C[1] * np.cos(_conc_u)
-            + _CONC_C[2] * np.cos(2 * _conc_u) + _CONC_C[3] * np.cos(3 * _conc_u))
-# Per-node coefficient of exp(-kr^2 tau/2) in A(tau): 2*pi * dkr * kr * w(kr).
-# The 2*pi is carried for fidelity to the definition but is an additive
-# constant in L = log A and drops out of L', L'' -- kept anyway since it costs
-# nothing.  Built from plain numpy (double precision by default) and handed to
-# `jnp.asarray` WITHOUT an explicit dtype: with x64 on this stays float64, with
-# it off jax's own promotion silently downcasts it, same as the `jnp.asarray`
-# in `bias.py`'s `kernel_draws`/`log_conv_is` -- an explicit `dtype=jnp.float64`
-# instead triggers a UserWarning on every import when x64 is off.
-_CONC_COEF = jnp.asarray(2.0 * np.pi * _CONC_DKR * _CONC_KR * _CONC_WK)
-_CONC_KR2 = jnp.asarray(_CONC_KR ** 2)
-
-# Floor on the Newton solve's internal tau iterate: keeps it from running away
-# to a negative or huge value when `r` is fed a value outside the physical
-# range (0, POINT_SOURCE) -- which happens, since this is evaluated on latent
-# flow draws, not just physical moments.  `r` itself is never clipped, so the
-# returned Phi(r) stays smooth in `r` on either side of the floor.
-_CONC_TAU_FLOOR = 1e-8
-_CONC_NEWTON_ITERS = 40
-
-
-def _conc_log_A(tau):
-    """log A(tau), tau a scalar (float64).  Plain sum, not logsumexp: the
-    per-node coefficients `_CONC_COEF` need not be positive (the weight
-    kernel can dip slightly negative near kmax), only their sum is."""
-    return jnp.log(jnp.sum(_CONC_COEF * jnp.exp(-0.5 * _CONC_KR2 * tau)))
-
-
-_conc_Lp = jax.grad(_conc_log_A)
-_conc_Lpp = jax.grad(_conc_Lp)
-
-
-def _conc_tau_of_r(r):
-    """Newton solve of `r = -2 L'(tau)` for tau, scalar in, scalar out,
-    float64 internally (see module docstring above `_CONC_TAU_FLOOR`)."""
-    tau0 = 2.0 / jnp.clip(r, 1e-6, None)
-
-    def body(_, tau):
-        tau = jnp.maximum(tau, _CONC_TAU_FLOOR)
-        f = -2.0 * _conc_Lp(tau) - r
-        fp = -2.0 * _conc_Lpp(tau)
-        return jnp.maximum(tau - f / fp, _CONC_TAU_FLOOR)
-
-    return jax.lax.fori_loop(0, _CONC_NEWTON_ITERS, body, tau0)
+# RULE: the chart is ANALYTIC -- no Newton solves.  The r -> tau inversion is
+# done OFFLINE by `dev/fit_concentration_phi.py`, which fits 4 L''(tau(r)) by a
+# degree-16 Chebyshev series on [_PHI_LO, POINT_SOURCE] (max error 3e-9, below
+# float32).  Rerun it whenever the weight changes, like POINT_SOURCE.
+# Past the ceiling tau is 0, so Phi = r^2 + 4 L''(0): continuous, and what the
+# old Newton solve (tau floored) returned there too.
+_PHI_LO = 0.2
+_PHI_CHEB = np.array([4.5535647081633162, 5.6005110376959966, 0.956236998073689, -0.14122608159490377, -0.007261380903319817, 0.0034690538586551476, 7.7046442306933833e-06, -0.00018173476469048394, 2.2440947079721744e-05, 1.0732984557210446e-05, -3.8327364567307496e-06, -3.0069210082646145e-07, 4.7020234064157572e-07, -7.6094934123922515e-08, -3.735577602317745e-08, 1.9762318992030473e-08, -7.4780762313491637e-10])
+_PHI_AT_PS = float(np.polynomial.chebyshev.Chebyshev(_PHI_CHEB, domain=[_PHI_LO, POINT_SOURCE])(POINT_SOURCE))
 
 
 def concentration_phi(r):
-    """Exact weight-kernel prediction Phi(r) = Mc/Mf for an isotropic Gaussian
-    galaxy with Mr/Mf = r, replacing the Gaussian-weight shortcut `2 r^2`.
-
-    Works under `jax.grad`/`jax.vmap`/`jax.jit`, any input shape, float32 or
-    float64 input (internal Newton solve is requested in float64; with x64
-    off this silently degrades to float32 like every other float64 request in
-    this codebase -- see `bias.py`'s note next to `m64 = np.asarray(...,
-    dtype=np.float64)`).
-    """
+    """Phi(r) = Mc/Mf for an isotropic Gaussian galaxy with Mr/Mf = r (see above)."""
     r = jnp.asarray(r)
-    orig_dtype = r.dtype
-    # Promote to whatever precision `_CONC_KR2` carries (float64 with x64 on,
-    # float32 otherwise -- see its own comment) via `result_type` rather than
-    # an explicit `dtype=jnp.float64`, which warns when x64 is off; this also
-    # keeps every `tau` iterate inside the Newton loop below at ONE dtype, as
-    # `lax.fori_loop` requires of its carry.
-    work_dtype = jnp.result_type(r, _CONC_KR2)
-    flat = r.reshape(-1).astype(work_dtype)
-    tau = jax.vmap(_conc_tau_of_r)(flat)
-    lpp = jax.vmap(_conc_Lpp)(tau)
-    phi = (flat ** 2 + 4.0 * lpp).reshape(r.shape)
-    return phi.astype(orig_dtype)
+    t = (2.0 * jnp.minimum(r, POINT_SOURCE) - (POINT_SOURCE + _PHI_LO)) / (POINT_SOURCE - _PHI_LO)
+    # Clenshaw recurrence: analytic, differentiable, any shape/dtype.
+    b1 = b2 = jnp.zeros_like(t)
+    for c in _PHI_CHEB[:0:-1]:
+        b1, b2 = 2.0 * t * b1 - b2 + c, b1
+    lpp4 = t * b1 - b2 + _PHI_CHEB[0]
+    return r * r + jnp.where(r < POINT_SOURCE, lpp4, _PHI_AT_PS)
 
 
-# Below this radius, `atanh(rho)/rho` and `tanh(s)/s` switch from their
-# closed forms to the Taylor series below -- both ratios have a removable
-# singularity at 0 (limit 1), and forming `atanh(rho)/rho` near rho=0 the
-# naive way is `0/0` both in value AND in the gradient jax would otherwise
-# take through the masked-out branch of a `jnp.where`.  1e-4 keeps the
-# series error (O(rho^6)) below float32 eps at the switch point while still
-# being comfortably inside the region where the closed form is safe to
-# differentiate.
 _SPIN2_SERIES_EPS = 1e-4
 
 
@@ -2515,9 +2435,51 @@ class SigmaXBlockLayer(AbstractBijection):
 
     def transform_and_log_det(self, x, condition=None):
         y = self._raw_transform(x, condition)
+        return y, self._fwd_log_det(x, condition)
+
+    def _fwd_log_det(self, x, condition):
+        """log|det d(_raw_transform)/dx| by autodiff (the reference).  Both
+        directions go through here so `_log_det_analytic` can be swapped in
+        for testing without touching either solve."""
         jac = jax.jacfwd(self._raw_transform, argnums=0)(x, condition)
         _, log_det = jnp.linalg.slogdet(jac)
-        return y, log_det
+        return log_det
+
+    def _log_det_analytic(self, x, condition):
+        """Closed-form log|det d(y)/d(x)| of `_raw_transform`; same value as
+        the `jacfwd` + `slogdet` above, without its 5-tangent Jacobian (whose
+        second g-derivative dominates `bias.py`'s per-draw memory and time).
+
+        With w = (x0, y1, y2, y3, y4) the map is block-triangular:
+          * (y1, y2) depend only on (x0, x1) and (x0, x2): diagonal (kappa, 1);
+          * (y3, y4) = (x + E*phi)/kappa + const, phi = D + c*p, p = E.(x3,x4),
+            D and kappa independent of (x3, x4): d(y3,y4)/d(x3,x4) =
+            (I + E grad(phi)^T)/kappa, det = (1 + E.grad phi)/kappa^2, and
+            E.grad phi = c|E|^2 + p*(E.grad c) (matrix determinant lemma);
+          * y0 = x0 + s0(x0, y3, y4) touches only row 0: det = 1 + ds0/dx0
+            at FIXED (y3, y4).
+        so det J = (1 + ds0/dx0) * kappa^-1 * (1 + E.grad phi).  The two
+        derivatives are single forward-mode jvps through small nets.
+        """
+        log_scale_n, e1, e2, _, e_mag_sq_n, T_n, g1, g2 = self._unpack(condition)
+        x0, x1, x2, x3, x4 = x
+        y3, y4, kappa, _, c = self._ellipticity(
+            x0, x1, x2, x3, x4, e1, e2, log_scale_n, e_mag_sq_n, T_n)
+        dg3, dg4 = self._g_shift(g1, g2, e1, e2, log_scale_n, e_mag_sq_n, T_n)
+        y3, y4 = y3 + dg3, y4 + dg4
+        ds0 = jax.jvp(lambda a: self._s0(a, y3, y4, log_scale_n, e_mag_sq_n, T_n),
+                      (x0,), (jnp.ones_like(x0),))[1]
+
+        def c_of(a3, a4):
+            egm, edp = _ell_gal_invariants(a3, a4, e1, e2)
+            q_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), log_scale_n,
+                              e_mag_sq_n, egm, edp, _bound_coeff_input(x2)])
+            return jnn.tanh(T_n**2 * self.net_quad(q_in)[0])
+
+        dc = jax.jvp(c_of, (x3, x4), (e1, e2))[1]
+        dphi = c * (e1**2 + e2**2) + (e1 * x3 + e2 * x4) * dc
+        return (jnp.log(jnp.abs(1.0 + ds0)) - jnp.log(kappa)
+                + jnp.log(jnp.abs(1.0 + dphi)))
 
     def inverse_and_log_det(self, y, condition=None):
         # y3,y4 (ellipticity) are GIVEN, so s0 (and hence x0) is immediately
@@ -2560,9 +2522,7 @@ class SigmaXBlockLayer(AbstractBijection):
         x3, x4 = self._solve_ell(x0, x1, x2, y3_ell, y4_ell, e1, e2, log_scale_n, e_mag_sq_n, T_n)
 
         x = jnp.stack([x0, x1, x2, x3, x4])
-        jac = jax.jacfwd(self._raw_transform, argnums=0)(x, condition)
-        _, log_det_fwd = jnp.linalg.slogdet(jac)
-        return x, -log_det_fwd
+        return x, -self._fwd_log_det(x, condition)
 
 
 @partial(jax.custom_jvp, nondiff_argnums=(0,))

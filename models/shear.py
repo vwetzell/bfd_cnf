@@ -435,33 +435,32 @@ def project_to_physics(coeffs, z, g, e_scale, chart_loc, chart_scale):
     J_spin2 = jax.jacfwd(
         lambda ee: jnp.stack(spin2_bound(ee[0], ee[1])))(jnp.array([e1, e2]))
 
-    # The shift function that defines the physics
-    def shift_func(g_vec):
-        s0, A, B, mu, nu, rho = (coeffs[:9].reshape(3, 3), coeffs[9], coeffs[10],
-                                 coeffs[11], coeffs[12], coeffs[13])
-        gc = jax.lax.complex(g_vec[0], g_vec[1])
-        ec, gcc = jnp.conj(e), jnp.conj(gc)
-        p1 = (ec * gc).real
-        p2 = (gc * gcc).real
-        p3 = (ec * ec * gc * gc).real
-        spin0 = (_chart_spin0_jac(z, chart_loc, chart_scale)
-                         @ (s0 @ jnp.stack([p1, p2, p3])))
-        # Response in PHYSICAL ellipticity space, then pushed through the
-        # local `spin2_bound` Jacobian to un-standardised chart units (the
-        # bounded map is nonlinear, so this is no longer a plain division by
-        # `e_scale` the way it was under the old bare-ratio chart), and only
-        # THEN down to standardised units -- same order as the spin-0 path,
-        # which applies `_chart_spin0_jac` and divides by scale inside that
-        # function.
-        de_phys = (A * gc + B * e * e * gcc + mu * ec * gc * gc
-                   + nu * e * p2 + rho * e * e * e * gcc * gcc)
-        dz34 = (J_spin2 @ jnp.array([de_phys.real, de_phys.imag])) / e_scale
-        return jnp.concatenate([spin0, dz34])
-
-    # Q (5, 2)
-    Q = jax.jacfwd(shift_func)(jnp.zeros(2))
-    # R (5, 2, 2)
-    R = jax.hessian(shift_func)(jnp.zeros(2))
+    # Q and R in CLOSED FORM.  The shift is a fixed polynomial in g, so its
+    # g-derivatives at 0 are read off term by term.  This used to be
+    # jacfwd/hessian of the polynomial, which sat under the log-det's
+    # jacfwd(unshear) under bias.py's g-Hessian -- four nested autodiff levels
+    # and ~95% of the estimator's per-draw cost (logs/profile_layers.log).
+    s0, A, B, mu, nu, rho = (coeffs[:9].reshape(3, 3), coeffs[9], coeffs[10],
+                             coeffs[11], coeffs[12], coeffs[13])
+    J0 = _chart_spin0_jac(z, chart_loc, chart_scale)
+    # spin 0: p1 = Re(e* g), p2 = |g|^2, p3 = Re(e*^2 g^2)
+    u, v = e1 * e1 - e2 * e2, 2.0 * e1 * e2
+    c1, c2, c3 = J0 @ s0[:, 0], J0 @ s0[:, 1], J0 @ s0[:, 2]
+    I2 = jnp.eye(2)
+    H3 = 2.0 * jnp.array([[u, v], [v, -u]])
+    Q0 = c1[:, None] * jnp.stack([e1, e2])[None, :]
+    R0 = 2.0 * c2[:, None, None] * I2 + c3[:, None, None] * H3
+    # spin 2, complex: d/dg1, d/dg2 of c g -> (c, ic); of c g* -> (c, -ic);
+    # d2 of c g^2 -> 2c[[1, i], [i, -1]]; c|g|^2 -> 2c I; c g*^2 -> 2c[[1, -i], [-i, -1]]
+    lin_g, lin_gc = A, B * e * e
+    Q2 = jnp.stack([lin_g + lin_gc, 1j * (lin_g - lin_gc)])            # (2,)
+    q_g2, q_ab, q_gc2 = mu * jnp.conj(e), nu * e, rho * e * e * e
+    R2 = 2.0 * jnp.array([[q_g2 + q_ab + q_gc2, 1j * (q_g2 - q_gc2)],
+                          [1j * (q_g2 - q_gc2), -q_g2 + q_ab - q_gc2]])  # (2, 2)
+    # physical ellipticity -> standardised chart units via spin2_bound's Jacobian
+    to_z = lambda c: jnp.tensordot(J_spin2, jnp.stack([c.real, c.imag]), 1) / e_scale
+    Q = jnp.concatenate([Q0, to_z(Q2)], axis=0)                          # (5, 2)
+    R = jnp.concatenate([R0, to_z(R2)], axis=0)                          # (5, 2, 2)
     # `s` does not depend on g, so scaling the g-independent Q, R by it is
     # exactly the same as scaling `shift_func` itself before differentiating.
     s = _edge_factor(z, chart_loc, chart_scale)
@@ -583,6 +582,26 @@ class ShearResponse(AbstractBijection):
     def inverse_and_log_det(self, y, condition=None):
         x = self.shear(y, condition)
         return x, -jnp.linalg.slogdet(jax.jacfwd(self.unshear)(x, condition))[1]
+
+    def _log_det_g2(self, x, condition):
+        """Second-order Taylor of log|det d(unshear)/dx| in g about g = 0.
+
+        `unshear` is exactly x + Q(x).g + 0.5 g.R(x).g (`response_tensors`), so
+        J = I + A_a g_a + 0.5 B_ab g_a g_b with A_a = dQ_a/dx, B_ab = dR_ab/dx and
+        log det J = tr(A_a) g_a + 0.5 g_a g_b [tr(B_ab) - tr(A_a A_b)] + O(g^3).
+        EXACT in value and in the first two g-derivatives AT g = 0 -- which is
+        all `bias.py` reads -- but NOT a substitute for `transform_and_log_det`
+        at g != 0 (training, `--window-terms` draws at g != 0).  `x` must not
+        depend on g (true when this layer's input is the chart/centroid output).
+        Cost: two x-Jacobians, no autodiff through slogdet(jacfwd(...)) and so
+        no nested g-derivatives.
+        """
+        g = condition[:2]
+        b = jax.jacfwd(lambda z: self.response_tensors(z)[0])(x)       # (5, 2, 5) dQ_ia/dx_j
+        dR = jax.jacfwd(lambda z: self.response_tensors(z)[1])(x)      # (5, 2, 2, 5) dR_iab/dx_j
+        t1 = jnp.einsum("iai->a", b)
+        t2 = jnp.einsum("iabi->ab", dR) - jnp.einsum("iaj,jbi->ab", b, b)
+        return g @ t1 + 0.5 * g @ t2 @ g
 
 
 def dm_dg(layer, m, chart):
