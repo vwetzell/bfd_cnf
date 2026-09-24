@@ -366,6 +366,11 @@ CATALOGS = {
     "gauss2_v4n": {"plus": "targets_g2v4_g1p02_22k",
                    "minus": "targets_g2v4_g1m02_22k",
                    "zero": "targets_g2v4_g0_22k"},
+    # Closed loop (dev/closed_loop.py catalogs): targets drawn from the g2v4n
+    # flow itself + C_M noise, so the model is exact -- any bias is numerics.
+    "gauss2_v4n_closed": {"plus": "closed_g2v4n_g1p02",
+                          "minus": "closed_g2v4n_g1m02",
+                          "zero": "closed_g2v4n_g0"},
     "gauss2_v3e": {"plus": "targets_g2v3e_g1p02_4600k",
                    "minus": "targets_g2v3e_g1m02_4600k",
                    "zero": "targets_g2v3e_g0_4600k"},
@@ -415,6 +420,7 @@ TRAIN_DATA = {
     "gauss2_v3d": "moments_gauss2_fwd_g2v3d.fits",
     "gauss2_v4": "moments_gauss2_fwd_g2v4.fits",
     "gauss2_v4n": "moments_gauss2_fwd_g2v4n.fits",
+    "gauss2_v4n_closed": "moments_gauss2_fwd_g2v4n.fits",
     "gauss2_v3e": "moments_gauss2_fwd_g2v3d.fits",   # deliberate: see CATALOGS
     "gauss2_deep": "gauss2_g0_1M.fits",
     # Same reasoning as bulgedisc_v3_psfe*: PSF ellipticity doesn't touch the
