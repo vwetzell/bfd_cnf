@@ -44,9 +44,7 @@ python -u shear.py train --data $D/moments_gauss2_fwd_g2v4n.fits \
     --deriv-weight 1e4 --steps 60000 \
     2>&1 | tee logs/shear_g2v4n.log
 
-echo "=== interim health gate + leader corner on the SHEAR flow ==="
-python -u dev/window_scan.py --pop gauss2_v4n --flow flows/shear_g2v4n.eqx \
-    --stage shear --no-scan 2>&1 | tee logs/window_scan_g2v4n_shear.log || true
+echo "=== leader corner on the SHEAR flow ==="
 python -u dev/leader_corner_plot.py --flow flows/shear_g2v4n.eqx \
     --pop gauss2_v4n --out dev/leader_corner_g2v4n_shear.png \
     2>&1 | tee logs/leader_corner_g2v4n_shear.log || true
@@ -62,9 +60,9 @@ python -u centroid.py train-sigmax --multi-scale \
     --flow flows/centroid_g2v4n.eqx --steps 6000 --batch 8192 \
     2>&1 | tee logs/centroid_g2v4n.log
 
-echo "=== final health gate: R_s leader/traceless (window_scan --no-scan) ==="
-python -u dev/window_scan.py --pop gauss2_v4n --flow flows/centroid_g2v4n.eqx \
-    --no-scan 2>&1 | tee logs/window_scan_g2v4n.log
+echo "=== final health gate: CRN finite-difference R_s (isotropy R11=R22, R12=0) ==="
+python -u dev/closed_loop.py selection --flow flows/centroid_g2v4n.eqx \
+    2>&1 | tee logs/closed_loop_selection_g2v4n.log
 
 echo "=== flow-vs-truth diagnostic (caveat: prior is now noisy, so a"
 echo "residual flow/truth mismatch now legitimately includes noise"

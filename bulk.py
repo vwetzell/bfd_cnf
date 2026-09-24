@@ -651,8 +651,8 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
                 # hardcoded constant, so it self-adapts across populations and
                 # training stages instead of needing its own re-tuned knob --
                 # 100x mirrors `--window-guard`'s own "far past the pilot
-                # median" tripwire elsewhere in this codebase (bias.py/
-                # dev/window_scan.py, "100 to match the g2v3d/g2v3e runs").
+                # median" tripwire elsewhere in this codebase (bias.py,
+                # "100 to match the g2v3d/g2v3e runs").
                 # The already-excluded (non-finite-probe) rows are pushed to
                 # `inf` here, not included as 0, so a batch that is mostly
                 # wild cannot drag the median down to ~0 and make the cap

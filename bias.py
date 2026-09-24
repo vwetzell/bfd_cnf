@@ -2268,6 +2268,63 @@ def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
                              # "template": with `--window-terms flow` these are
                              # flow samples, and the warning below said
                              # "template" unconditionally for both branches.
+    if fd:
+        # FIXED-SHAPE fast path.  The generic loop below slices bad draws out
+        # of each chunk, so every chunk has a new shape and `chunked`
+        # recompiles (seconds each: 9 flow passes); it also re-draws every
+        # stencil point once more for `keep_at_zero` and g = 0 once more for
+        # the density guard.  Here one jitted call returns each draw's 9
+        # stencil F values, its finiteness and its g = 0 moments; masking and
+        # the float64 sums happen on the host.  Same draws, same mask, same
+        # estimand -- `F` is bounded, so no autodiff-through-a-mask problem.
+        @eqx.filter_jit
+        def raw(z_chunk):
+            ms = [draw(g, z_chunk) for g in stencil]
+            fin = jnp.all(jnp.stack([jnp.isfinite(m).all(-1) for m in ms]), 0)
+            Fs = jnp.stack([jnp.where(fin, window_prob(jnp.where(fin[:, None], m, 1.0),
+                                                        cov, size, flux), 0.0)
+                            for m in ms])
+            return Fs, fin, ms[0]
+
+        h = fd
+        s = np.zeros(9)                      # sums of the 9 stencil F's
+        r00_top, m_top, w_acc, qs_chunks = 0.0, None, 0, []
+        for i in range(0, n, batch):
+            Fs, fin, m0 = (np.asarray(v, np.float64) for v in raw(jnp.asarray(z[i:i + batch])))
+            ok = fin.astype(bool)
+            if density is not None:
+                sane = np.zeros_like(ok)
+                sane[ok] = in_support_density(m0[ok], density)
+                n_guarded += int(ok.sum() - sane.sum())
+                ok = sane
+            n_dropped += int((~ok).sum())
+            Fs = Fs[:, ok]
+            s += Fs.sum(1)
+            w_acc += Fs.shape[1]
+            qs_chunks.append(np.array([Fs[1] - Fs[2], Fs[3] - Fs[4]]).mean(1) / (2 * h))
+            r00 = (Fs[1] - 2 * Fs[0] + Fs[2]) / h ** 2
+            if r00.size and np.abs(r00).max() > r00_top:
+                j = int(np.argmax(np.abs(r00)))
+                r00_top, m_top = float(np.abs(r00[j])), m0[ok][j]
+        P = s / w_acc
+        ps = P[0]
+        qs = np.array([P[1] - P[2], P[3] - P[4]]) / (2 * h)
+        r01 = (P[5] - P[6] - P[7] + P[8]) / (4 * h ** 2)
+        rs = np.array([[P[1] - 2 * P[0] + P[2], 0.0], [0.0, P[3] - 2 * P[0] + P[4]]]) / h ** 2
+        rs[0, 1] = rs[1, 0] = r01
+        qs_stack = np.stack(qs_chunks)
+        qs_err = (qs_stack.std(axis=0, ddof=1) / np.sqrt(len(qs_stack))
+                  if len(qs_stack) > 1 else np.zeros(2))
+        if n_dropped:
+            print(f"  selection_terms: dropped {n_dropped}/{n} non-finite/"
+                  f"low-density prior draws ({n_dropped / n:.1e})")
+        share = r00_top / (w_acc * abs(rs[0, 0])) if rs[0, 0] else np.inf
+        print(f"  selection_terms (fd h={h}): top draw share of R_s11 {share:.2e}")
+        if share > 0.05:
+            print(f"  WARNING: one {kind} carries {share:.0%} of R_s11 "
+                  f"(Mf = {m_top[0]:.4g}, Mr/Mf = {m_top[1] / m_top[0]:.4g})")
+        return np.float64(ps), qs, rs, qs_err
+
     for i in range(0, n, batch):
         z_chunk = jnp.asarray(z[i:i + batch])
         # Drop NON-FINITE prior draws BEFORE differentiating.  A single such
@@ -2466,7 +2523,7 @@ def in_support_density(m, density):
     """
     tree, scale, cutoff, k = density
     x = _shape_invariants(m) / scale
-    dist, _ = tree.query(x, k=k)
+    dist, _ = tree.query(x, k=k, workers=-1)
     return dist[:, -1] <= cutoff
 
 
@@ -3051,7 +3108,7 @@ def main():
     p.add_argument("--window-flux", type=float, nargs=2, default=None,
                    metavar=("LO", "HI"),
                    help="target selection window in Mf; see --window-size.")
-    p.add_argument("--window-fd", type=float, default=None,
+    p.add_argument("--window-fd", type=float, default=0.02,
                    metavar="H",
                    help="estimate P_s's shear derivatives by central "
                         "differences at step H instead of by autodiff. "
@@ -3064,7 +3121,7 @@ def main():
                         "the |g| the estimator actually solves at; do NOT "
                         "shrink it, that walks back toward the divergence.")
     p.add_argument("--window-draws", type=int, default=1 << 24,
-                   help="prior draws for --window-terms score. 262144 is NOT "
+                   help="prior draws for --window-terms flow/score. 262144 is NOT "
                         "converged: R_s11 moves -0.182 -> -0.168 from 2^18 to "
                         "2^20 and the exact R_s11 = R_s22 identity goes from "
                         "17%% violated to 2%%. Only this estimator has finite "
@@ -3072,11 +3129,8 @@ def main():
                         "is not converged either -- corrected m1 moves 9.0e-03 "
                         "between draw seeds at 2^24, per dev/g2v3d_500k.sh's "
                         "own note -- so 2^24 (matching that run) is now the "
-                        "default; a cheaper in-run scan can still override "
-                        "this and be re-quoted later via dev/window_scan.py's "
-                        "offline resolve off --save-pqr, since ghat is affine "
-                        "in the selection terms.")
-    # DEFAULT IS `score`, AND THE SELECTION CORRECTION IS FLOW-BASED ONLY.
+                        "default.")
+    # DEFAULT IS `flow` + `--window-fd 0.02`, AND THE CORRECTION IS FLOW-BASED ONLY.
     # `templates` lenses the training catalog by its own exact dm/dg, which is
     # what eq. (40) literally is -- but it is not a method that exists on real
     # data (there is no catalog of true dm/dg there), and its error is set by
@@ -3108,17 +3162,21 @@ def main():
                         "existing scripts that pass this do not fail to "
                         "parse.")
     p.add_argument("--window-terms", choices=["templates", "flow", "score"],
-                   default="score",
+                   default="flow",
                    help="where eq. (40)'s P_s, Q_s, R_s come from. 'score' "
                         "is the score-function estimator E[F (R + QQ^T)], "
                         "which differentiates the DENSITY rather than the "
                         "sample and so has no 1/sigma^2 in its integrand -- "
-                        "prefer it, and it needs no --window-fd. 'templates' "
+                        "It is NOT the default: against a CRN finite-difference "
+                        "truth on the g2v4n K(M) flow it runs R_s 7-16%% low and "
+                        "anisotropic at 2^24, one draw carrying 9%% "
+                        "(dev/closed_loop.py selection). 'templates' "
                         "lenses --train-data by its own exact dm/dg, which is "
                         "what eq. (40) literally is (a sum over G) and is exact "
                         "to the catalog's sampling; 'flow' integrates the "
                         "fitted prior instead, which is what you would have to "
-                        "do on real data but currently runs P_s 4%% high.")
+                        "do on real data; with the default --window-fd 0.02 it "
+                        "is the production estimator.")
     p.add_argument("--proposal-flow", default=None,
                    help="DANGEROUS unless it EQUALS --flow: at alpha < 1 the "
                         "weights carry P_eval/q_proposal, and wherever the "
@@ -3273,7 +3331,7 @@ def main():
             raise SystemExit("--prefilter-sample must be in [0, 1]")
         # Integrate the window widened by `pad`, unioned over the arms, plus a
         # random `--prefilter-sample` share of everything else.  The padding
-        # keeps `dev/window_scan.py`'s boundary perturbations inside the
+        # keeps boundary perturbations of the window inside the
         # integrated set; the sample keeps the OUT-OF-WINDOW population visible,
         # which is not cosmetic -- gauss2_v3d's 22% zero-weight targets, the
         # open IS-proposal failure, are 4338/4338 out of window (0.00% in), so
@@ -3590,16 +3648,22 @@ def main():
             # bootstrapping follows.  The flow is deserialised float32, so its
             # leaves are promoted explicitly -- x64 alone would leave them
             # float32 and the chain would silently demote right back.
-            jax.config.update("jax_enable_x64", True)
-            flow = jax.tree_util.tree_map(
-                lambda x: (x.astype(jnp.float64) if eqx.is_inexact_array(x)
-                           else x), flow)
+            # --window-fd needs none of this: central differences of a bounded
+            # F in float32 match the float64 autodiff truth (dev/closed_loop.py
+            # selection: R_s11 0.2329 / 0.2337 at h = 0.02 / 0.05, isotropic to
+            # 1e-3), and float64 through the flow is ~64x slower on this GPU.
+            dt = jnp.float32 if a.window_fd else jnp.float64
+            if not a.window_fd:
+                jax.config.update("jax_enable_x64", True)
+                flow = jax.tree_util.tree_map(
+                    lambda x: (x.astype(jnp.float64) if eqx.is_inexact_array(x)
+                               else x), flow)
             sx1 = (None if sigma_x is None
-                   else jnp.asarray(sigma_x[0], dtype=jnp.float64))
+                   else jnp.asarray(sigma_x[0], dtype=dt))
             draw = lambda g, zz: jax.vmap(
                 lambda z1: flow.bijection.transform(z1, condition(g, sx1)))(zz)
             z = flow.base_dist.sample(jr.key(a.seed + 31),
-                                      (262144,)).astype(jnp.float64)
+                                      (a.window_draws,)).astype(dt)
         if a.window_terms == "score":
             # MORE DRAWS than the 262144 the pathwise branch uses.  Measured on
             # v10 (`dev/window_terms_compare.py`): R_s11 runs -0.213, -0.182,
