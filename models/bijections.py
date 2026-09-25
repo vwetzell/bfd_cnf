@@ -1971,6 +1971,12 @@ class SigmaXBlockLayer(AbstractBijection):
                            # invariants here is correct, unlike for D.
     net_flux_e: CoeffNet   # (log1p(|e_final|^2),)         -> (1,)  s0 "own final ellipticity" correction (NEW)
     net_mc: CoeffNet       # (x0, log_scale_n, ehat2)      -> (1,)  Mc additive shift (NEW, 5-D extension)
+    net_eown: CoeffNet     # (x0, x1, x2, log1p|x34|^2, log_scale_n, ehat2) -> (1,)  h: ISOTROPIC
+                           # rescaling (1 + h) of the galaxy's OWN spin-2 slots, independent of
+                           # kappa.  D e and c.proj.e both carry Sigma_X's own ellipticity, so for
+                           # a round Sigma_X they vanish and, without this, the only ellipticity
+                           # change left was 1/kappa(flux) -- tied to the size change and blind to
+                           # size/|e| (dev/centroid_e_response.py: layer/copies 0.81 -> 0.62).
     net_K: CoeffNet        # (x0, x1, x2, |e_gal|^2) -> (9,)  real coefficients of the centroid's
                            # shear response A(g, x) -- see `_A`.  The ONLY place g enters this layer.
     _cond_dim: int = eqx.field(static=True)
@@ -1994,6 +2000,7 @@ class SigmaXBlockLayer(AbstractBijection):
     _g_s_max: float = eqx.field(static=True)
     _s0_e_max: float = eqx.field(static=True)
     _D_max: float = eqx.field(static=True)
+    _h_max: float = eqx.field(static=True)
 
     def __init__(
         self,
@@ -2008,6 +2015,7 @@ class SigmaXBlockLayer(AbstractBijection):
         g_s_max=1.0,
         s0_e_max=1.0,
         D_max=5.0,
+        h_max=0.5,
     ):
         self._cond_dim = full_cond_dim
         self._log_scale_mean = float(log_scale_mean)
@@ -2030,7 +2038,8 @@ class SigmaXBlockLayer(AbstractBijection):
         # `check_sigmax`'s "layer shift" printout) -- this should not change
         # trained behavior, only cap the untrained/adversarial-weight case.
         self._D_max = float(D_max)
-        k0, k1, k2, k3, k4, k5, k6 = jr.split(key, 7)
+        self._h_max = float(h_max)
+        k0, k1, k2, k3, k4, k5, k6, k7 = jr.split(key, 8)
         nets = [
             CoeffNet(k0, 3, 1, nn_width, nn_depth, activation),  # net_flux (x0, log_scale_n, ehat2)
             CoeffNet(k1, 3, 1, nn_width, nn_depth, activation),  # net_size
@@ -2046,12 +2055,13 @@ class SigmaXBlockLayer(AbstractBijection):
             CoeffNet(k3, 1, 1, nn_width, nn_depth, activation),  # net_flux_e
             CoeffNet(k4, 3, 1, nn_width, nn_depth, activation),  # net_mc (5-D extension)
             CoeffNet(k6, 4, 9, nn_width, nn_depth, activation),  # net_K
+            CoeffNet(k7, 6, 1, nn_width, nn_depth, activation),  # net_eown
         ]
         # Zero each net's final layer -> all coefficients start at 0, so the
         # layer is the identity at init (same convention as SigmaXCouplingLayer).
         nets = [_zero_last_layer(n) for n in nets]
         (self.net_flux, self.net_size, self.net_dip, self.net_quad, self.net_flux_e,
-         self.net_mc, self.net_K) = nets
+         self.net_mc, self.net_K, self.net_eown) = nets
         # K starts at the global least-squares affine shear of X (c0 ~ 0.6,
         # dev/fit_centroid_K.py), not at 0: a fresh layer is already sane.
         self.net_K = eqx.tree_at(lambda n: n.layers[-1].bias, self.net_K,
@@ -2117,6 +2127,13 @@ class SigmaXBlockLayer(AbstractBijection):
             return CX
         Ainv = jnp.linalg.inv(self._A(x, condition[:2]))
         return Ainv @ CX @ Ainv.T
+
+    def _h(self, x0, x1, x2, x3, x4, log_scale_n, e_mag_sq_n, T_n):
+        """Isotropic own-ellipticity rescaling h (see `net_eown`): bounded like
+        D, and O(T) like every other C_X response, so h -> 0 as Sigma_X -> 0."""
+        h_in = jnp.array([_bound_coeff_input(x0), _bound_coeff_input(x1), _bound_coeff_input(x2),
+                          jnp.log1p(x3 * x3 + x4 * x4), log_scale_n, e_mag_sq_n])
+        return self._h_max * jnn.tanh(T_n * self.net_eown(h_in)[0] / self._h_max)
 
     def _ellipticity(self, x0, x1, x2, x3, x4, e1, e2, log_scale_n, e_mag_sq_n, T_n):
         """The (x0,x1)->D,c map is UNCHANGED from SigmaXCouplingLayer in that
@@ -2198,7 +2215,8 @@ class SigmaXBlockLayer(AbstractBijection):
         proj = e1 * x3 + e2 * x4          # Re[E * conj(X)], real, rotation-invariant
         m3 = x3 + D * e1 + c * proj * e1
         m4 = x4 + D * e2 + c * proj * e2
-        return m3 / kappa, m4 / kappa, kappa, D, c
+        s = (1.0 + self._h(x0, x1, x2, x3, x4, log_scale_n, e_mag_sq_n, T_n)) / kappa
+        return m3 * s, m4 * s, kappa, D, c
 
     def _s0(self, x0, y3, y4, log_scale_n, e_mag_sq_n, T_n):
         """Flux shift: base (C_X + the galaxy's OWN flux `x0`, unlike
@@ -2341,8 +2359,11 @@ class SigmaXBlockLayer(AbstractBijection):
         D = self._D_max * jnn.tanh(T_n * D_raw / self._D_max)
         c = jnn.tanh(T_n**2 * c_raw)
         e_mag_sq = e1**2 + e2**2
-        r3 = kappa * y3 - D * e1
-        r4 = kappa * y4 - D * e2
+        # (1 + h) read at the CURRENT guess (x3, x4): one more Picard-iterated
+        # dependence, same as D, c reading the galaxy's own ellipticity.
+        kh = kappa / (1.0 + self._h(x0, x1, x2, x3, x4, log_scale_n, e_mag_sq_n, T_n))
+        r3 = kh * y3 - D * e1
+        r4 = kh * y4 - D * e2
         # invert (r3,r4) = (I + c*outer(E,E)) @ (x3,x4) via Sherman-Morrison:
         # (I + c*E E^T)^-1 = I - c*E E^T / (1 + c|E|^2), matching the new
         # covariant `_ellipticity` (proj*E, not the old antisymmetric form).

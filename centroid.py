@@ -670,8 +670,10 @@ def _sigmax_inverse_decoupled(layer, y, condition):
     c_raw = layer.net_quad(q_in)[0]
     D = T_n * D_raw
     c = jax.nn.tanh(T_n**2 * c_raw)
-    r3 = kappa_sg * y3_ell - D * e1
-    r4 = kappa_sg * y4_ell - D * e2
+    # own-e rescaling at the single-shot guess (x3, x4) ~ kappa y
+    h = layer._h(x0, x1, x2, kappa_sg * y3_ell, kappa_sg * y4_ell, log_scale_n, e_mag_sq_n, T_n)
+    r3 = kappa_sg * y3_ell / (1.0 + h) - D * e1
+    r4 = kappa_sg * y4_ell / (1.0 + h) - D * e2
     det_e = 1.0 - c**2 * e_mag_sq
     x3 = ((1.0 - c * e1) * r3 - c * e2 * r4) / det_e
     x4 = (-c * e2 * r3 + (1.0 + c * e1) * r4) / det_e

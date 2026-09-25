@@ -46,6 +46,7 @@ from imsims.copies import log_weights
 COPIES = f"{D}/copies_gauss2_fwd_g2v4n.fits"
 PRIOR = f"{D}/{B.TRAIN_DATA['gauss2_v4n']}"
 BINS = [0, 3000, 5000, 8000, 20000, np.inf]
+EBINS = [0, 0.05, 0.08, 0.11, 0.15, np.inf]   # --bin-by e: galaxy |e| = |M1+iM2|/Mr
 COLS = ["gal", "moments", "xy", "da", "dm_dg", "d2m_dg2", "dxy_dg", "d2xy_dg2"]
 H = 0.02
 
@@ -96,16 +97,20 @@ def report_pit(z, flux):
               f"  z4 {z[k, 4].mean():+.3f}/{z[k, 4].std():.3f}")
 
 
+def binvar(m):
+    return np.hypot(m[:, 2], m[:, 3]) / m[:, 1] if BIN_BY == "e" else m[:, 0]
+
+
 def report_response(d_flow, flux_flow, ref_fn, flux_ref):
     """d_flow: per-draw CRN difference of e1; ref_fn(mask) -> (value, error)."""
-    print("\n  3. d<e1>/dg1:        flow                 ref            flow/ref")
-    for lo, hi in bins():
+    print(f"\n  3. d<e1>/dg1 by {'|e|' if BIN_BY == 'e' else 'flux'}:   flow                 ref            flow/ref")
+    for lo, hi in (zip(EBINS[:-1], EBINS[1:]) if BIN_BY == "e" else bins()):
         kf = (flux_flow >= lo) & (flux_flow < hi) & np.isfinite(d_flow)
         kr = (flux_ref >= lo) & (flux_ref < hi)
         f, fe = d_flow[kf].mean(), d_flow[kf].std() / np.sqrt(kf.sum())
         r, re = ref_fn(kr)
         rat = f / r
-        print(f"     flux {lo:6.0f}-{hi:<7.0f} {f:+.4f}+/-{fe:.4f}   {r:+.4f}+/-{re:.4f}   "
+        print(f"     {lo:8.4g}-{hi:<8.4g} {f:+.4f}+/-{fe:.4f}   {r:+.4f}+/-{re:.4f}   "
               f"{rat:.4f}+/-{abs(rat) * np.hypot(fe / f, re / r):.4f}")
 
 
@@ -141,11 +146,12 @@ def stage_a(a, rng):
     m0, d_flow = flow_response(flow, cond_of, z, a.batch)
     ok = np.isfinite(m0).all(1)
     tr = m[rng.choice(n_tr, n, replace=False)]      # baseline: train-split real vs held-out real
-    report_c2st("(A)", c2st(mh, m0[ok], rng), c2st(mh, tr, rng))
-    report_pit(to_base(flow, cond_of(jnp.zeros(2)), mh, a.batch), mh[:, 0])
+    if not a.response_only:
+        report_c2st("(A)", c2st(mh, m0[ok], rng), c2st(mh, tr, rng))
+        report_pit(to_base(flow, cond_of(jnp.zeros(2)), mh, a.batch), mh[:, 0])
     d_ref = (e1(lens(mh, dmh, d2mh, [H, 0])) - e1(lens(mh, dmh, d2mh, [-H, 0]))) / (2 * H)
-    report_response(d_flow, m0[:, 0], lambda k: (d_ref[k].mean(), d_ref[k].std() / np.sqrt(k.sum())),
-                    mh[:, 0])
+    report_response(d_flow, binvar(m0), lambda k: (d_ref[k].mean(), d_ref[k].std() / np.sqrt(k.sum())),
+                    binvar(mh))
 
 
 def stage_b(a, rng):
@@ -172,9 +178,10 @@ def stage_b(a, rng):
     z = flow.base_dist.sample(jr.key(a.seed), (a.n,))
     m0, d_flow = flow_response(flow, cond_of, z, a.batch)
     ok = np.isfinite(m0).all(1)
-    report_c2st("(B)", c2st(c["moments"][idx], m0[ok], rng),
+    if not a.response_only:
+      report_c2st("(B)", c2st(c["moments"][idx], m0[ok], rng),
                 c2st(c["moments"][ia], c["moments"][ib], rng))
-    report_pit(to_base(flow, cond_of(jnp.zeros(2)), c["moments"][idx], a.batch), c["moments"][idx, 0])
+      report_pit(to_base(flow, cond_of(jnp.zeros(2)), c["moments"][idx], a.batch), c["moments"][idx, 0])
 
     mp = lens(c["moments"], c["dm_dg"], c["d2m_dg2"], [H, 0])
     mm = lens(c["moments"], c["dm_dg"], c["d2m_dg2"], [-H, 0])
@@ -189,7 +196,7 @@ def stage_b(a, rng):
         jk = np.array([est(k & (blk != b)) for b in range(20)])
         return full, np.sqrt(19 / 20 * ((jk - jk.mean()) ** 2).sum())
 
-    report_response(d_flow, m0[:, 0], ref, flux)
+    report_response(d_flow, binvar(m0), ref, binvar(c["moments"]))
 
 
 def main():
@@ -202,7 +209,11 @@ def main():
     p.add_argument("--slab-rows", type=int, default=4_000_000)
     p.add_argument("--seed", type=int, default=3)
     p.add_argument("--batch", type=int, default=65536)
+    p.add_argument("--bin-by", choices=["flux", "e"], default="flux")
+    p.add_argument("--response-only", action="store_true")
     a = p.parse_args()
+    global BIN_BY
+    BIN_BY = a.bin_by
     rng = np.random.default_rng(a.seed)
     if a.stage in ("A", "both"):
         stage_a(a, rng)

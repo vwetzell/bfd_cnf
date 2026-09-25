@@ -52,13 +52,53 @@ def m1(d, idx, ns_scale, rs):
 
 
 def fisher(d, idx):
-    """sum q1^2 / sum(-r11) over both arms' in-window rows."""
+    """sum |q|^2 / sum(-tr r) over both arms' in-window rows (both components)."""
     num = den = 0.0
     for arm, s in (("plus", "sp"), ("minus", "sm")):
         k = idx[d[s][idx]]
-        num += (d[f"{arm}_q"][k, 0] ** 2).sum()
-        den += (-d[f"{arm}_r"][k, 0, 0]).sum()
+        num += (d[f"{arm}_q"][k] ** 2).sum()
+        den += (-d[f"{arm}_r"][k, 0, 0] - d[f"{arm}_r"][k, 1, 1]).sum()
     return num / den
+
+
+def fisher_split(R, C, j, var, name, rng, nq=5):
+    """Paired Fisher excess (real - closed) by quantile of `var` over in-window real rows."""
+    w = B.window_mask(R["moments"], SIZE, FLUX)
+    q = np.quantile(var[w], np.linspace(0, 1, nq + 1)); q[-1] += 1e-9
+    print(f"\n   by {name}:")
+    for lo, hi in zip(q[:-1], q[1:]):
+        k = np.flatnonzero((var >= lo) & (var < hi))
+        d0 = fisher(R, k) - fisher(C, j[k])
+        bs = [fisher(R, b) - fisher(C, j[b]) for b in (rng.choice(k, len(k)) for _ in range(300))]
+        print(f"     {lo:9.4g}-{hi:<9.4g} excess {d0:+.4f}+/-{np.std(bs):.4f}")
+
+
+def c2st_obs(rng):
+    """Classifier: real vs closed-loop NOISY g=0 observations in the window, with a
+    closed-vs-closed (disjoint halves of the iid flow population) baseline."""
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.metrics import roc_auc_score
+    rd = fitsio.read(f"{D}/{B.CATALOGS['gauss2_v4n']['zero']}.fits")["moments"]
+    cd = fitsio.read(f"{D}/{B.CATALOGS['gauss2_v4n_closed']['zero']}.fits")["moments"]
+    rd, cd = rd[B.window_mask(rd, SIZE, FLUX)], cd[B.window_mask(cd, SIZE, FLUX)]
+    cd = cd[rng.permutation(len(cd))]
+    half = len(cd) // 2
+    n = min(len(rd), half)
+
+    def auc(a, b):
+        X = np.concatenate([feats(a), feats(b)]); y = np.r_[np.zeros(len(a)), np.ones(len(b))]
+        aucs = []
+        for tr, te in ((slice(0, None, 2), slice(1, None, 2)), (slice(1, None, 2), slice(0, None, 2))):
+            p = rng.permutation(len(y)); Xp, yp = X[p], y[p]
+            pr = HistGradientBoostingClassifier(max_iter=200, max_leaf_nodes=15).fit(Xp[tr], yp[tr]).predict_proba(Xp[te])[:, 1]
+            aucs.append(roc_auc_score(yp[te], pr))
+        return np.mean(aucs)
+
+    base = [auc(cd[:half][rng.choice(half, n, False)], cd[half:][rng.choice(len(cd) - half, n, False)]) for _ in range(5)]
+    real = [auc(rd[rng.choice(len(rd), n, False)], cd[rng.choice(len(cd), n, False)]) for _ in range(5)]
+    print(f"\n3. C2ST on noisy in-window g=0 observations ({n} vs {n}): "
+          f"real-vs-flow AUC {np.mean(real):.4f}+/-{np.std(real):.4f}   "
+          f"flow-vs-flow baseline {np.mean(base):.4f}+/-{np.std(base):.4f}")
 
 
 def main():
@@ -107,7 +147,7 @@ def main():
         print(f"   {name:12s} {base_r[i]:+.4f}+/-{err[i]:.4f}   {base_c[i]:+.4f}+/-{err[2 + i]:.4f}   "
               f"{d:+.4f}+/-{err[4 + i]:.4f}   {np.hypot(err[i], err[2 + i]):.4f}")
 
-    print("\n2. Fisher identity sum q1^2 / sum(-r11), in-window rows, by real g=0 flux quintile")
+    print("\n2. Fisher identity sum |q|^2 / sum(-tr r), in-window rows, by real g=0 flux quintile")
     flux = R["moments"][:, 0]
     w = B.window_mask(R["moments"], SIZE, FLUX)
     q = np.quantile(flux[w], np.linspace(0, 1, 6)); q[-1] += 1
@@ -122,6 +162,13 @@ def main():
         bs = np.array(bs); e = bs.std(0); ed = (bs[:, 0] - bs[:, 1]).std()
         print(f"   {lo:6.0f}-{hi:<7.0f} {vals[0]:.4f}+/-{e[0]:.4f} {vals[1]:.4f}+/-{e[1]:.4f} "
               f"{vals[0] - vals[1]:+.4f}+/-{ed:.4f}")
+
+    m = R["moments"]
+    print("\n2b. paired Fisher excess (real - closed) localised")
+    fisher_split(R, C, j, m[:, 1] / m[:, 0], "size Mr/Mf", rng)
+    fisher_split(R, C, j, np.hypot(m[:, 2], m[:, 3]) / m[:, 1], "|e|", rng)
+    fisher_split(R, C, j, m[:, 4] / m[:, 1], "concentration Mc/Mr", rng)
+    c2st_obs(rng)
 
 
 if __name__ == "__main__":
