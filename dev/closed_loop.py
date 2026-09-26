@@ -33,7 +33,6 @@ import shear
 
 D = "../bfd_cnf_imsims/data"
 REAL = B.CATALOGS["gauss2_v4n"]
-CLOSED = B.CATALOGS["gauss2_v4n_closed"]
 
 
 def load_flow(path):
@@ -73,7 +72,7 @@ def catalogs(a):
         h = {k: hdr[k] for k in ("PIXSCALE", "WTSIGMA", "PSFSIGMA", "NOISESIG",
                                  "PSFE1", "PSFE2", "POPKIND", "IMGNOISE", "SIG_XY")}
         h.update(G1=g1, G2=0.0, SEED=a.seed, CLOSEDLP=os.path.basename(a.flow))
-        path = f"{D}/{CLOSED[arm]}.fits"
+        path = f"{D}/{B.CATALOGS[a.pop][arm]}.fits"
         fitsio.write(path, out, header=h, clobber=True)
         print(f"{arm:5s} g1={g1:+.2f}  wrote {path}  ({bad.sum()} non-finite draws)")
 
@@ -129,6 +128,7 @@ def main():
     p.add_argument("--flow", default="flows/centroid_g2v4n_K.eqx")
     p.add_argument("--n", type=int, default=65372, help="population size (real NPOP)")
     p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--pop", default="gauss2_v4n_closed", help="bias.py CATALOGS entry to write")
     p.add_argument("--batch", type=int, default=65536)
     p.add_argument("--log2-draws", type=int, default=24)
     p.add_argument("--h", type=float, nargs="+", default=[0.02, 0.05])

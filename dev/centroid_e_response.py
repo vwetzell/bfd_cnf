@@ -25,7 +25,8 @@ import shear
 from closed_loop import D, REAL
 
 COPIES = f"{D}/copies_gauss2_fwd_g2v4n.fits"
-FLOW = "flows/centroid_g2v4n_K.eqx"
+import os
+FLOW = os.environ.get("FLOW", "flows/centroid_g2v4n_Ke.eqx")
 EBINS = [0, 0.05, 0.08, 0.11, 0.15, 0.2, np.inf]
 ROWS = 30_000_000
 

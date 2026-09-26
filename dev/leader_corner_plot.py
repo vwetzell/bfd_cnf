@@ -8,6 +8,7 @@ import argparse
 import sys
 
 import equinox as eqx
+import fitsio
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -37,10 +38,11 @@ def main():
     p.add_argument("--window-size", type=float, nargs=2, default=(2.2, 3.2))
     p.add_argument("--window-flux", type=float, nargs=2, default=(3000.0, 20000.0))
     p.add_argument("--out", default="dev/leader_corner.png")
+    p.add_argument("--stage", choices=["shear", "centroid"], default="shear")
     a = p.parse_args()
 
     m_train = shear.load(f"{a.data_dir}/{B.TRAIN_DATA[a.pop]}")[0]
-    flow = bulk.build_flow(jr.key(0), m_train, shear=True, centroid=False)
+    flow = bulk.build_flow(jr.key(0), m_train, shear=True, centroid=a.stage == "centroid")
     flow = eqx.tree_deserialise_leaves(a.flow, flow)
     jax.config.update("jax_enable_x64", True)
     flow = jax.tree_util.tree_map(
@@ -50,10 +52,15 @@ def main():
     cat = B.CATALOGS[a.pop]
     cov = B.load_cov(f"{a.data_dir}/{cat['zero']}.fits")
 
+    sx = None
+    if a.stage == "centroid":
+        sx = jnp.asarray(np.asarray(fitsio.read(
+            f"{a.data_dir}/{cat['zero']}.fits")["cov_odd"], dtype=np.float64)[0])
+
     zero, e0, e1 = jnp.zeros(2), jnp.array([1.0, 0.0]), jnp.array([0.0, 1.0])
 
     def one(m_i):
-        f = lambda g: flow.log_prob(m_i, condition=B.condition(g, None))
+        f = lambda g: flow.log_prob(m_i, condition=B.condition(g, sx))
         vg = jax.value_and_grad(f)
         (_, q), lin = jax.linearize(vg, zero)
         _, h0 = lin(e0)
@@ -68,7 +75,7 @@ def main():
     print(f"{n} draws (2^{a.log2_draws})")
     zs = flow.base_dist.sample(jr.key(a.seed + 31), (n,)).astype(jnp.float64)
     tr = eqx.filter_jit(jax.vmap(lambda z1: flow.bijection.transform(
-        z1, B.condition(jnp.zeros(2), None))))
+        z1, B.condition(jnp.zeros(2), sx))))
     m0 = np.concatenate([np.asarray(tr(zs[i:i + 16384]))
                          for i in range(0, n, 16384)])
     del zs

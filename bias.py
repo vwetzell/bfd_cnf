@@ -371,6 +371,34 @@ CATALOGS = {
     "gauss2_v4n_closed": {"plus": "closed_g2v4n_g1p02",
                           "minus": "closed_g2v4n_g1m02",
                           "zero": "closed_g2v4n_g0"},
+    # 8x more g2v4n targets, independent of the 22k (seed 2 vs 1), same render
+    # config: dev/more_targets_and_chunks.sh is the provenance record.
+    "gauss2_v4n_176k": {"plus": "targets_g2v4_g1p02_176k",
+                        "minus": "targets_g2v4_g1m02_176k",
+                        "zero": "targets_g2v4_g0_176k"},
+    # the 22k targets re-rendered under an elliptical PSF (psf_e1 = 0.05), same
+    # seed/galaxies/noise -- dev/psfe_g2v4.sh.
+    "gauss2_v4n_psfe1p05": {"plus": "targets_g2v4_g1p02_22k_psfe1p05",
+                            "minus": "targets_g2v4_g1m02_22k_psfe1p05",
+                            "zero": "targets_g2v4_g0_22k_psfe1p05"},
+    "gauss2_v4n_176k_psfe1p05": {"plus": "targets_g2v4_g1p02_176k_psfe1p05",
+                                 "minus": "targets_g2v4_g1m02_176k_psfe1p05",
+                                 "zero": "targets_g2v4_g0_176k_psfe1p05"},
+    # dev/psfe_g2v4.sh TAG=varobs: per-galaxy Gaussian PSF e/size and noise.
+    "gauss2_v4n_176k_varobs": {"plus": "targets_g2v4_g1p02_176k_varobs",
+                               "minus": "targets_g2v4_g1m02_176k_varobs",
+                               "zero": "targets_g2v4_g0_176k_varobs"},
+    "gauss2_v4n_tiny_varobs": {"plus": "targets_g2v4_g1p02_tiny_varobs",
+                               "minus": "targets_g2v4_g1m02_tiny_varobs",
+                               "zero": "targets_g2v4_g0_tiny_varobs"},
+    "gauss2_v4n_176k_psfs1p10": {"plus": "targets_g2v4_g1p02_176k_psfs1p10",
+                                 "minus": "targets_g2v4_g1m02_176k_psfs1p10",
+                                 "zero": "targets_g2v4_g0_176k_psfs1p10"},
+    # 8 more closed-loop populations (seed 12), for the real-catalog-sized
+    # chunk scatter -- same script.
+    "gauss2_v4n_closed8": {"plus": "closed8_g2v4n_g1p02",
+                           "minus": "closed8_g2v4n_g1m02",
+                           "zero": "closed8_g2v4n_g0"},
     "gauss2_v3e": {"plus": "targets_g2v3e_g1p02_4600k",
                    "minus": "targets_g2v3e_g1m02_4600k",
                    "zero": "targets_g2v3e_g0_4600k"},
@@ -421,6 +449,13 @@ TRAIN_DATA = {
     "gauss2_v4": "moments_gauss2_fwd_g2v4.fits",
     "gauss2_v4n": "moments_gauss2_fwd_g2v4n.fits",
     "gauss2_v4n_closed": "moments_gauss2_fwd_g2v4n.fits",
+    "gauss2_v4n_176k": "moments_gauss2_fwd_g2v4n.fits",
+    "gauss2_v4n_psfe1p05": "moments_gauss2_fwd_g2v4n.fits",
+    "gauss2_v4n_176k_psfe1p05": "moments_gauss2_fwd_g2v4n.fits",
+    "gauss2_v4n_176k_psfs1p10": "moments_gauss2_fwd_g2v4n.fits",
+    "gauss2_v4n_176k_varobs": "moments_gauss2_fwd_g2v4n.fits",
+    "gauss2_v4n_tiny_varobs": "moments_gauss2_fwd_g2v4n.fits",
+    "gauss2_v4n_closed8": "moments_gauss2_fwd_g2v4n.fits",
     "gauss2_v3e": "moments_gauss2_fwd_g2v3d.fits",   # deliberate: see CATALOGS
     "gauss2_deep": "gauss2_g0_1M.fits",
     # Same reasoning as bulgedisc_v3_psfe*: PSF ellipticity doesn't touch the
@@ -456,13 +491,17 @@ def load_cov(path):
     """C_M, the even-moment noise covariance of a target (paper eq. 9).
 
     It is a pure noise covariance -- set by the PSF, the weight function and the
-    depth, not by the galaxy -- so in these sims every target shares one C_M and
-    one Cholesky factor serves for all of them.  Heteroscedastic catalogs would
-    only mean carrying a factor per target.
+    depth, not by the galaxy -- so in these sims it is USUALLY one C_M shared by
+    every target.  Returns a float64 `(5, 5)` when every row's unpacked C_M
+    matches row 0 (`np.allclose`), the homoscedastic case every caller before
+    this was written for; otherwise a float64 `(n_rows, 5, 5)`, one factor per
+    target, for a catalog whose PSF/depth varies row to row.
     """
-    c = bfd.MomentCovariance.bulkUnpack(fitsio.read(path)["cov"])
-    assert np.allclose(c, c[0]), "C_M varies between targets; see load_cov"
-    return np.asarray(c[0], dtype=np.float64)
+    c = np.asarray(bfd.MomentCovariance.bulkUnpack(fitsio.read(path)["cov"]),
+                   dtype=np.float64)
+    if np.allclose(c, c[0]):
+        return c[0]
+    return c
 
 
 def add_noise(m, cov, seed):
@@ -481,6 +520,13 @@ def add_noise(m, cov, seed):
 
 def kernel_draws(cov, n, samples, seed):
     """`samples` offsets per target, drawn from the noise kernel N(0, C_M).
+
+    `cov` is `(5, 5)` (one kernel for every target) or `(n, 5, 5)`
+    (heteroscedastic: one C_M per target, `load_cov`'s other return shape).
+    Either way the underlying standard normals are the SAME draw --
+    `jr.normal(jr.key(seed), (n, samples // 2, 5))` -- only the Cholesky
+    factor applied to them differs; a heteroscedastic run with every row
+    equal must reproduce the homoscedastic call bit for bit.
 
     Antithetic in pairs: eps and -eps both appear, which cancels the leading
     term of the estimator's error where the prior varies linearly across the
@@ -504,9 +550,14 @@ def kernel_draws(cov, n, samples, seed):
     until the bootstrap at the end of `main`) the caller's `jnp.asarray`
     downcast these to float32 the moment they reached the device anyway.
     """
-    L = np.linalg.cholesky(cov)          # 5x5 constant; the RNG was the cost
-    half = jr.normal(jr.key(seed), (n, samples // 2, 5),
-                     dtype=jnp.float32) @ jnp.asarray(L.T, jnp.float32)
+    L = np.linalg.cholesky(cov)          # 5x5 (or n,5,5); the RNG was the cost
+    half = jr.normal(jr.key(seed), (n, samples // 2, 5), dtype=jnp.float32)
+    if np.ndim(cov) == 2:
+        half = half @ jnp.asarray(L.T, jnp.float32)
+    else:
+        # Per-target L: batched `half @ L[i].T` without ever forming a
+        # (n, samples, 5, 5) intermediate.
+        half = jnp.einsum("nsj,nkj->nsk", half, jnp.asarray(L, jnp.float32))
     return jnp.concatenate([half, -half], axis=1)
 
 
@@ -968,8 +1019,10 @@ def mixture_draws(flow, m, cov, samples, alpha, seed, batch=None, sigma_x=None,
     m64 = np.asarray(m, dtype=np.float64)
     kernel = kernel_draws(cov, n, n_k, seed)     # (n, n_k, 5) offsets, empty if n_k=0
 
+    cov3 = np.ndim(cov) == 3
     L = jnp.asarray(np.linalg.cholesky(cov))
-    log_diag = jnp.sum(jnp.log(jnp.diag(L)))
+    log_diag = (jnp.sum(jnp.log(jnp.diagonal(L, axis1=-2, axis2=-1)), axis=-1)
+                if cov3 else jnp.sum(jnp.log(jnp.diag(L))))
 
     # Guard log(alpha) and log(1 - alpha) at the 0/1 endpoints so neither
     # produces a NaN; -inf * (finite log-density) is fine, it just drops that
@@ -1003,7 +1056,9 @@ def mixture_draws(flow, m, cov, samples, alpha, seed, batch=None, sigma_x=None,
         sub = None
         if n_f:
             key, sub = jr.split(key)
-        x, log_wt = _mixture_chunk(flow, m_i, kern_i, sx_i, sub, L, log_diag,
+        L_i = L[i:i + batch] if cov3 else L
+        ld_i = log_diag[i:i + batch] if cov3 else log_diag
+        x, log_wt = _mixture_chunk(flow, m_i, kern_i, sx_i, sub, L_i, ld_i,
                                    log_alpha, log_1ma, n_f)
         # float32 on the host: these are (n, samples, 5) and at 32k draws/target
         # float64 would be 26 GB per catalog.  Nothing is lost -- `_over_targets`
@@ -1131,10 +1186,20 @@ def _mixture_chunk(flow, m_i, kern, sx_i, key, L, log_diag, log_alpha, log_1ma, 
     def log_normal(offset):
         # log N(offset; 0, cov), via a triangular solve rather than inverting
         # cov -- the numerically stable way to get the quadratic form.
+        # `L`/`log_diag` are per-target when this batch's cov is heteroscedastic
+        # ((batch, 5, 5)/(batch,)), so the solve is vmapped over the batch axis
+        # instead of the single (5, 5)-against-everything solve below.
         shp = offset.shape[:-1]
-        y = jax.scipy.linalg.solve_triangular(L, offset.reshape(-1, 5).T, lower=True)
-        quad = jnp.sum(y * y, axis=0).reshape(shp)
-        return -0.5 * quad - log_diag - 2.5 * jnp.log(2 * jnp.pi)
+        if L.ndim == 2:
+            y = jax.scipy.linalg.solve_triangular(L, offset.reshape(-1, 5).T, lower=True)
+            quad = jnp.sum(y * y, axis=0).reshape(shp)
+            ld = log_diag
+        else:
+            y = jax.vmap(lambda Lb, ob: jax.scipy.linalg.solve_triangular(
+                Lb, ob.T, lower=True))(L, offset)
+            quad = jnp.sum(y * y, axis=1)
+            ld = log_diag[:, None]
+        return -0.5 * quad - ld - 2.5 * jnp.log(2 * jnp.pi)
 
     log_k = log_normal(x - m_i[:, None, :])
     ok = in_domain(x)
@@ -1591,6 +1656,13 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
     if gauge not in ("prior", "kernel", "auto"):
         raise ValueError(
             f"gauge must be 'prior', 'kernel' or 'auto'; got {gauge!r}")
+    cov3 = np.ndim(cov) == 3
+    if cov3 and gauge != "prior":
+        # "kernel"/"auto" substitute m = Psi_g(u) with g moved into the noise
+        # kernel via `cinv`/`_L`, both built once below on the assumption of
+        # ONE C_M for the whole catalog -- not implemented per-target.
+        raise NotImplementedError(
+            "per-target C_M is only implemented for gauge 'prior'")
     zero = jnp.zeros(2)
     # `flow` still carries the centroid layer, because `mixture_draws` needs the
     # FULL prior to build its proposal.  Everything downstream of the transform
@@ -1621,7 +1693,9 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
     psi = (make_psi_ld(flow, peeled=layer is not None) if gauge == "auto" else
            make_psi(flow, peeled=layer is not None) if gauge == "kernel" else
            None)
-    cinv = jnp.asarray(np.linalg.inv(cov), jnp.float32)
+    # Unused (and skipped) when cov is per-target: those callers are gauge
+    # "prior" only (guarded above), which never reads cinv.
+    cinv = None if cov3 else jnp.asarray(np.linalg.inv(cov), jnp.float32)
 
     def _auto_glue(m_raw_i, x_i, d_raw_i):
         """Per-draw masking and `r0`, INSIDE the kernel.
@@ -1803,6 +1877,7 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
         if _TIME is not None:
             _t_batch = time.perf_counter()
         m_b = m[i:i + batch]
+        cov_b = cov[i:i + batch] if cov3 else cov
         sx_b = None if sigma_x is None else sigma_x[i:i + batch]
         psx_b = None if proposal_sigma_x is None else proposal_sigma_x[i:i + batch]
 
@@ -1854,7 +1929,7 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
             # numpy round trip is pure loss and its `np.asarray` drained the
             # pipeline once per chunk.  Bit-identical values.
             d, lw = mixture_draws(
-                flow if proposal is None else proposal, m_b, cov, chunk, alpha,
+                flow if proposal is None else proposal, m_b, cov_b, chunk, alpha,
                 seed + 7919 * c + 104729 * (i // batch),
                 batch=len(m_b), sigma_x=sx_b if proposal is None else psx_b,
                 to_host=False)
@@ -2065,7 +2140,9 @@ def window_prob(m, cov, size, flux, nodes=64):
     why that is right here and how it was checked.
 
     Only the (Mf, Mr) 2x2 block of `cov` enters: the window is a cut on those
-    two moments alone.  The size cut `size[0] < Mr'/Mf' < size[1]` is
+    two moments alone.  `cov` is `(5, 5)` (shared) or `(..., 5, 5)` aligned
+    with `m`'s leading axes (per-target C_M); indexed as `cov[..., 0, 0]` etc.
+    so either shape works.  The size cut `size[0] < Mr'/Mf' < size[1]` is
     equivalent to the two LINEAR constraints `size[0] Mf' < Mr' < size[1] Mf'`
     when `Mf' > 0`, and conditioning on `Mf' = Mf + sf t` reduces it to a
     single Gaussian CDF difference in the residual of Mr' after regressing out
@@ -2102,17 +2179,22 @@ def window_prob(m, cov, size, flux, nodes=64):
 
     Mf = m[..., 0]
     Mr = m[..., 1]
-    sf = jnp.sqrt(cov[0, 0])
-    sr = jnp.sqrt(cov[1, 1])
-    rho = cov[0, 1] / (sf * sr)
+    sf = jnp.sqrt(cov[..., 0, 0])
+    sr = jnp.sqrt(cov[..., 1, 1])
+    rho = cov[..., 0, 1] / (sf * sr)
     sc = sr * jnp.sqrt(1.0 - rho ** 2)
+    # `sf`/`sr`/`rho`/`sc` are scalar when `cov` is shared, or match `m`'s
+    # leading shape when it is per-target -- add the quadrature axis back on
+    # whichever it is so the broadcast against `u` (..., nodes) is correct
+    # either way.
+    col = lambda a: a if jnp.ndim(a) == 0 else a[..., None]
 
     t0 = jnp.clip((flux[0] - Mf) / sf, -8.0, 8.0)
     t1 = jnp.clip((flux[1] - Mf) / sf, -8.0, 8.0)
 
     u = 0.5 * (t1 + t0)[..., None] + 0.5 * (t1 - t0)[..., None] * x
-    Mfp = Mf[..., None] + sf * u
-    mur = Mr[..., None] + rho * sr * u
+    Mfp = Mf[..., None] + col(sf) * u
+    mur = Mr[..., None] + col(rho) * col(sr) * u
 
     def lin(coef):
         # `coef * Mfp` is a genuine 0 * inf trap in the GRADIENT when `coef`
@@ -2126,7 +2208,7 @@ def window_prob(m, cov, size, flux, nodes=64):
             return jnp.full_like(mur, -jnp.inf)
         if np.isposinf(coef):
             return jnp.full_like(mur, jnp.inf)
-        return (coef * Mfp - mur) / sc
+        return (coef * Mfp - mur) / col(sc)
 
     a, b = lin(size[0]), lin(size[1])
     integrand = jax.scipy.stats.norm.pdf(u) * (
@@ -2182,23 +2264,30 @@ def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
     """
     zero = jnp.zeros(2)
     cov = jnp.asarray(cov)
+    # 3-D `cov` is per-DRAW (aligned with `z`'s leading axis, not per-target
+    # like everywhere else this module carries it): `z` here is the base
+    # sample eq. (40) integrates over, one row per prior draw, and a
+    # heteroscedastic catalog means each draw's assumed observing conditions
+    # come along with it -- see `bias.py main()`'s window-selection branch,
+    # which packs them into `z` itself so this function never has to know.
+    cov3 = cov.ndim == 3
 
-    def one_chunk(z_chunk):
-        f = lambda g: jnp.mean(window_prob(draw(g, z_chunk), cov, size, flux))
+    def one_chunk(z_chunk, cov_chunk):
+        f = lambda g: jnp.mean(window_prob(draw(g, z_chunk), cov_chunk, size, flux))
         vg = jax.value_and_grad(f)
         (val, dq), lin = jax.linearize(vg, zero)   # see `one_b`: shared primal
         _, h0 = lin(jnp.array([1.0, 0.0]))
         _, h1 = lin(jnp.array([0.0, 1.0]))
         return val, dq, jnp.stack([h0, h1], axis=-1)
 
-    def one_chunk_d2(z_chunk):
+    def one_chunk_d2(z_chunk, cov_chunk):
         """PER-TEMPLATE d2F/dg1^2, for the concentration check below."""
         e0 = jnp.array([1.0, 0.0])
-        fv = lambda g: window_prob(draw(g, z_chunk), cov, size, flux)
+        fv = lambda g: window_prob(draw(g, z_chunk), cov_chunk, size, flux)
         d1 = lambda g: jax.jvp(fv, (g,), (e0,))[1]
         return jax.jvp(d1, (zero,), (e0,))[1]
 
-    def one_chunk_fd(z_chunk):
+    def one_chunk_fd(z_chunk, cov_chunk):
         """Central differences at step `fd`, with common random numbers.
 
         For a SIZE window the exact `d2F/dg2` has no usable mean -- `F` is a
@@ -2229,7 +2318,7 @@ def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
         """
         h = fd
         P = lambda a, b: window_prob(
-            draw(jnp.array([a, b]), z_chunk), cov, size, flux)
+            draw(jnp.array([a, b]), z_chunk), cov_chunk, size, flux)
         p00 = P(0.0, 0.0)
         pp0, pm0, p0p, p0m = P(h, 0.0), P(-h, 0.0), P(0.0, h), P(0.0, -h)
         ppp, ppm, pmp, pmm = P(h, h), P(h, -h), P(-h, h), P(-h, -h)
@@ -2278,11 +2367,11 @@ def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
         # the float64 sums happen on the host.  Same draws, same mask, same
         # estimand -- `F` is bounded, so no autodiff-through-a-mask problem.
         @eqx.filter_jit
-        def raw(z_chunk):
+        def raw(z_chunk, cov_chunk):
             ms = [draw(g, z_chunk) for g in stencil]
             fin = jnp.all(jnp.stack([jnp.isfinite(m).all(-1) for m in ms]), 0)
             Fs = jnp.stack([jnp.where(fin, window_prob(jnp.where(fin[:, None], m, 1.0),
-                                                        cov, size, flux), 0.0)
+                                                        cov_chunk, size, flux), 0.0)
                             for m in ms])
             return Fs, fin, ms[0]
 
@@ -2290,7 +2379,9 @@ def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
         s = np.zeros(9)                      # sums of the 9 stencil F's
         r00_top, m_top, w_acc, qs_chunks = 0.0, None, 0, []
         for i in range(0, n, batch):
-            Fs, fin, m0 = (np.asarray(v, np.float64) for v in raw(jnp.asarray(z[i:i + batch])))
+            cov_chunk = cov[i:i + batch] if cov3 else cov
+            Fs, fin, m0 = (np.asarray(v, np.float64)
+                           for v in raw(jnp.asarray(z[i:i + batch]), cov_chunk))
             ok = fin.astype(bool)
             if density is not None:
                 sane = np.zeros_like(ok)
@@ -2327,6 +2418,7 @@ def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
 
     for i in range(0, n, batch):
         z_chunk = jnp.asarray(z[i:i + batch])
+        cov_chunk = cov[i:i + batch] if cov3 else cov
         # Drop NON-FINITE prior draws BEFORE differentiating.  A single such
         # row NaNs the whole `jnp.mean` and with it P_s, Q_s and R_s -- which
         # is how `--window-terms flow` came back NaN for every window on
@@ -2358,14 +2450,16 @@ def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
         if not ok.all():
             n_dropped += int((~ok).sum())
             z_chunk = z_chunk[jnp.asarray(ok)]
+            if cov3:
+                cov_chunk = cov_chunk[jnp.asarray(ok)]
         nb = z_chunk.shape[0]
         if nb == 0:
             continue
         if fd:
-            val, dq, d2q, d2_raw = chunked(z_chunk)
+            val, dq, d2q, d2_raw = chunked(z_chunk, cov_chunk)
         else:
-            val, dq, d2q = chunked(z_chunk)
-            d2_raw = chunked_d2(z_chunk)
+            val, dq, d2q = chunked(z_chunk, cov_chunk)
+            d2_raw = chunked_d2(z_chunk, cov_chunk)
         val = float(np.asarray(val, dtype=np.float64))
         dq = np.asarray(dq, dtype=np.float64)
         d2q = np.asarray(d2q, dtype=np.float64)
@@ -2579,6 +2673,9 @@ def selection_terms_score(flow, m, cov, size, flux, sigma_x=None, batch=4096,
     are held FIXED as `g` varies, which is what makes this a likelihood-ratio
     estimator rather than a second pathwise one.
     """
+    if np.ndim(cov) == 3:
+        raise NotImplementedError(
+            "per-target C_M is not implemented for --window-terms score")
     zero = jnp.zeros(2)
     e0, e1 = jnp.array([1.0, 0.0]), jnp.array([0.0, 1.0])
     sx = None if sigma_x is None else jnp.asarray(sigma_x)
@@ -2894,21 +2991,22 @@ def bootstrap(qp, rp, qm, rm, g=0.02, n=200, seed=0, sel=None, ns=None,
     """Paired bootstrap over galaxies: the same resampled index into BOTH
     catalogs, so the shape noise that the +/- pairing cancels stays cancelled.
 
-    `sel`/`ns` follow `bias`'s per-arm convention (`_split_per_arm`).  Without
-    `ns` there is no N_ns to move, so the pool is exactly the selected subset,
-    resampled to its own size -- today's behaviour, kept bit-for-bit.  WITH
-    `ns`, N_ns is a COUNT over the resample, not a fixed number, so the index
-    is drawn over ALL targets and each arm's own mask (and so its N_ns) is
-    recomputed on every draw -- that is what puts the correction's own
-    sampling noise into the returned error, rather than treating it as exact.
+    `sel`/`ns` follow `bias`'s per-arm convention (`_split_per_arm`).  With
+    any `sel`, the index is drawn over ALL targets and each arm's own mask is
+    applied to the resample.  Resampling only within one selected subset (the
+    old no-`ns` path) fixed window membership, so it dropped the galaxies that
+    sit in exactly one arm's window -- shape noise the +/- pairing never
+    cancels -- and understated the uncorrected bar 3-8x
+    ([[uncorrected-bar-understates]]).  WITH `ns`, N_ns is likewise a COUNT
+    over the resample, recomputed on every draw -- that is what puts the
+    correction's own sampling noise into the returned error.
     """
     rng = np.random.default_rng(seed)
     sel_p, sel_m = _split_per_arm(sel)
     ns_p, ns_m = _split_per_arm(ns)
 
-    if ns_p is None and ns_m is None:
-        pool_sel = sel_p if sel_p is not None else sel_m
-        idx0 = np.arange(len(qp)) if pool_sel is None else np.flatnonzero(pool_sel)
+    if sel_p is None and sel_m is None and ns_p is None and ns_m is None:
+        idx0 = np.arange(len(qp))
         out = [bias(qp[i], rp[i], qm[i], rm[i], g)
                for i in (rng.choice(idx0, len(idx0)) for _ in range(n))]
         return np.std(np.array(out), axis=0)
@@ -3393,7 +3491,28 @@ def main():
         # moment-space catalog stand in for a deeper render.  It is exact only
         # for the noise; a deeper IMAGE would also re-find the centroid, which
         # is why the bulgedisc deep study renders instead of scaling.
-        cov = load_cov(path(cat["zero"])) * a.noise_scale ** 2
+        cov = load_cov(path(cat["zero"]))
+        if cov.ndim == 3:
+            # Per-target C_M: row-align it with `rows`/`m`/`sigma_x_all`,
+            # which have already been through the same n-targets slice, the
+            # badcenter drop and the pre-filter -- in that order -- above.
+            # `keep` is all-True when it was never touched (not `img_noise`),
+            # so applying it unconditionally is a no-op there.
+            cov = cov[n][keep]
+            if prefilter is not None:
+                cov = cov[prefilter]
+            p5, p50, p95 = np.percentile(cov[:, 0, 0], [5, 50, 95])
+            print(f"  per-target C_M: {len(cov)} rows, Var(Mf) "
+                  f"p5/p50/p95 = {p5:.3g}/{p50:.3g}/{p95:.3g}")
+        cov = cov * a.noise_scale ** 2
+        if cov.ndim == 3 and not img_noise:
+            # `add_noise` draws ONE realization from ONE Cholesky factor; a
+            # per-target one is unimplemented here (no catalog needs it yet --
+            # every heteroscedastic catalog on hand already carries image
+            # noise).
+            raise NotImplementedError(
+                "per-target C_M with moment-space noise (add_noise) is not "
+                "implemented; only IMGNOISE catalogs are supported")
         if not img_noise:
             # The SAME noise realization for a galaxy in all three catalogs, so
             # what the +/- difference cancels stays cancelled.
@@ -3468,7 +3587,8 @@ def main():
             idx = np.concatenate([
                 np.flatnonzero((flux_e >= edges_e[i]) & (flux_e <= edges_e[i + 1]))[:per_q]
                 for i in range(5)])
-            d_e, w_e = mixture_draws(draw_flow, m_raw["zero"][idx], cov, chunk,
+            cov_e = cov[idx] if cov.ndim == 3 else cov
+            d_e, w_e = mixture_draws(draw_flow, m_raw["zero"][idx], cov_e, chunk,
                                      a.alpha, draw_seed, batch=batch, sigma_x=None
                                      if draw_sigma_x is None else draw_sigma_x[idx])
             # NOT through the peel.  `ess` tests `in_domain` and stands bad rows
@@ -3609,6 +3729,11 @@ def main():
         # g = 0), not of which arm's catalog is being corrected, so one
         # `selection_terms` call serves both arms -- only N_ns (a property of
         # each arm's own data) differs between them.
+        if cov.ndim == 3 and a.window_terms != "flow":
+            raise NotImplementedError(
+                f"per-target C_M with --window-terms {a.window_terms} is not "
+                f"implemented; only 'flow' draws its own observing conditions "
+                f"per prior draw")
         if a.window_terms == "templates":
             # eq. (40) is a sum over TEMPLATES G, not an integral over a fitted
             # prior, and the catalog carries bfd's exact dm/dg -- so take the
@@ -3658,12 +3783,49 @@ def main():
                 flow = jax.tree_util.tree_map(
                     lambda x: (x.astype(jnp.float64) if eqx.is_inexact_array(x)
                                else x), flow)
-            sx1 = (None if sigma_x is None
-                   else jnp.asarray(sigma_x[0], dtype=dt))
-            draw = lambda g, zz: jax.vmap(
-                lambda z1: flow.bijection.transform(z1, condition(g, sx1)))(zz)
-            z = flow.base_dist.sample(jr.key(a.seed + 31),
-                                      (a.window_draws,)).astype(dt)
+            if cov.ndim == 2:
+                sx1 = (None if sigma_x is None
+                       else jnp.asarray(sigma_x[0], dtype=dt))
+                draw = lambda g, zz: jax.vmap(
+                    lambda z1: flow.bijection.transform(z1, condition(g, sx1)))(zz)
+                z = flow.base_dist.sample(jr.key(a.seed + 31),
+                                          (a.window_draws,)).astype(dt)
+            else:
+                # Heteroscedastic: P_s/Q_s/R_s integrate over the FULL prior,
+                # including its observing conditions, so each of the
+                # `window_draws` prior samples needs its own Sigma_X/C_M drawn
+                # from the population of conditions -- not from `sigma_x`/`cov`
+                # above, which are the INTEGRATED targets' own rows and would
+                # bias the condition distribution toward wherever the window
+                # or the pre-filter happens to sit.  Read fresh, full, straight
+                # off disk: conditions are independent of the galaxy, so the
+                # catalog's own row order is as good a sample of them as any,
+                # and this sidesteps every in-memory subsetting (n-targets,
+                # badcenter, pre-filter) done to `rows`/`m` above.
+                full = fitsio.read(path(cat["zero"]))
+                cov_full = np.asarray(
+                    bfd.MomentCovariance.bulkUnpack(full["cov"]),
+                    dtype=np.float64) * a.noise_scale ** 2
+                sx_full = np.asarray(full["cov_odd"], dtype=np.float64)
+                cidx = np.random.default_rng(a.seed + 37).integers(
+                    0, len(full), a.window_draws)
+                cov_win = cov_full[cidx]
+                sx_win = jnp.asarray(sx_full[cidx], dtype=dt)
+
+                def draw(g, zz):
+                    z1, sxz = zz[..., :5], zz[..., 5:]
+                    return jax.vmap(
+                        lambda zi, sxi: flow.bijection.transform(
+                            zi, condition(g, sxi)))(z1, sxz)
+
+                z0 = flow.base_dist.sample(jr.key(a.seed + 31),
+                                          (a.window_draws,)).astype(dt)
+                # Pack Sigma_X onto `z` itself: `selection_terms` slices and
+                # masks `z` per chunk/draw, and this way that carries each
+                # draw's own condition along for free instead of needing a
+                # second array threaded through every slice/mask site.
+                z = jnp.concatenate([z0, sx_win], axis=-1)
+                sx1 = None  # only used by the --window-terms score branch below
         if a.window_terms == "score":
             # MORE DRAWS than the 262144 the pathwise branch uses.  Measured on
             # v10 (`dev/window_terms_compare.py`): R_s11 runs -0.213, -0.182,
@@ -3689,8 +3851,13 @@ def main():
                 flow, m_draw, cov, size, flux, sigma_x=sx1, density=density,
                 batch=1024)  # default 4096 OOMs (37 GiB) on a multi-scale SigmaXBlockLayer flow
         else:
+            # `cov` itself (the integrated targets' own C_M) only ever means
+            # something per-TARGET; the draws here are prior samples, each
+            # with its own randomly-assigned condition, so this uses `cov_win`
+            # in the heteroscedastic branch above -- see its own comment.
+            sel_cov = cov if cov.ndim == 2 else cov_win
             ps, qs, rs, qs_err = selection_terms(
-                draw, z, cov, size, flux, fd=a.window_fd,
+                draw, z, sel_cov, size, flux, fd=a.window_fd,
                 kind=("template" if a.window_terms == "templates" else "draw"),
                 density=None if a.window_terms == "templates" else density)
         print(f"  selection terms from the {a.window_terms}"
