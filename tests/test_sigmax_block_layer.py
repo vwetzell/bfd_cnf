@@ -247,6 +247,105 @@ def test_block_survives_large_weights_and_outliers():
             assert jnp.allclose(lad_f, -lad_i, atol=1e-3), f"stress logdet {lad_f} vs {-lad_i}"
 
 
+def _block_layer3(key, zero_init=True, scale=0.3):
+    """Like `_block_layer`, but `full_cond_dim=3` (no shear, no `net_K`) --
+    de-zeros ALL nets the 3-dim layer actually reads, including `net_eown`
+    (`_h`, folded into `_ellipticity`'s `s`), which `_block_layer` above does
+    NOT touch since the 5-dim tests never needed it de-zeroed."""
+    lay = SigmaXBlockLayer(key, nn_width=16, nn_depth=2, log_scale_mean=MEAN,
+                            e_max=EMAX, full_cond_dim=3)
+    if zero_init:
+        return lay
+    names = ("net_flux", "net_size", "net_dip", "net_quad", "net_flux_e",
+             "net_mc", "net_eown")
+    nets = []
+    for i, n in enumerate(names):
+        sub = getattr(lay, n)
+        last = sub.layers[-1]
+        k = jr.fold_in(key, i)
+        w = scale * jr.normal(k, last.weight.shape)
+        sub = eqx.tree_at(lambda m: m.layers[-1].weight, sub, w)
+        nets.append(sub)
+    lay = eqx.tree_at(
+        lambda m: tuple(getattr(m, n) for n in names), lay, tuple(nets)
+    )
+    return lay
+
+
+def _cx_cond3(C00, C01, C11):
+    """[C00, C01, C11] -- condition for a standalone (`full_cond_dim=3`)
+    block layer, no shear."""
+    return jnp.array([C00, C01, C11])
+
+
+def test_cond3_closed_form_logdet_matches_jacfwd():
+    """`_fwd_log_det`'s closed form at `_cond_dim == 3` against the exact
+    `jacfwd`+`slogdet` it replaces, at moderate (not stress-scale) weights so
+    the forward stays finite, including the off-manifold stress inputs from
+    `test_block_survives_large_weights_and_outliers` and both an isotropic
+    and an anisotropic C_X."""
+    lay = _block_layer3(jr.PRNGKey(5), zero_init=False)
+    xs = [
+        jnp.array([0.4, -0.7, 0.2, -0.1, 0.55]),
+        jnp.array([15.0, -12.0, 8.0, -9.0, 20.0]),
+        jnp.array([-20.0, 20.0, -5.0, 5.0, -30.0]),
+    ]
+    conds = [
+        _cx_cond3(jnp.exp(2 * 12.6), 0.0, jnp.exp(2 * 12.6)),  # isotropic
+        _cx_cond3(jnp.exp(2 * 11.9), 0.05 * jnp.exp(2 * 11.9), 0.95 * jnp.exp(2 * 11.9)),  # anisotropic
+    ]
+    for x in xs:
+        for cond in conds:
+            lad_closed = lay._fwd_log_det(x, cond)
+            jac = jax.jacfwd(lay._raw_transform, argnums=0)(x, cond)
+            _, lad_jac = jnp.linalg.slogdet(jac)
+            assert jnp.isfinite(lad_closed) and jnp.isfinite(lad_jac), \
+                f"non-finite logdet at x={x}, cond={cond}"
+            assert abs(lad_closed - lad_jac) < 1e-8, \
+                f"closed form {lad_closed} vs jacfwd {lad_jac} at x={x}, cond={cond}"
+
+
+def test_cond3_inverse_single_pass_equals_refined():
+    """`inverse_and_log_det` at `_cond_dim == 3` must take only the single
+    `_inverse_at(y, raw CX)` pass and skip the 4 redundant refinement passes
+    -- compared here against a literal manual 5-pass reference (which is a
+    no-op at `_cond_dim == 3` since `_sigma_eff` ignores x, so both must
+    produce the EXACT same floats, not merely close ones)."""
+    lay = _block_layer3(jr.PRNGKey(6), zero_init=False)
+    cond = _cx_cond3(jnp.exp(2 * 12.6), 0.03 * jnp.exp(2 * 12.6), jnp.exp(2 * 12.6))
+    x0 = jnp.array([0.4, -0.7, 0.2, -0.1, 0.55])
+    y, _ = lay.transform_and_log_det(x0, cond)
+
+    x, lad = lay.inverse_and_log_det(y, cond)
+
+    x_ref = lay._inverse_at(y, lay._raw_cx(cond))
+    for _ in range(4):
+        x_ref = lay._inverse_at(y, lay._sigma_eff(x_ref, cond))
+    lad_ref = -lay._fwd_log_det(x_ref, cond)
+
+    assert jnp.array_equal(x, x_ref), f"single-pass inverse {x} != 5-pass reference {x_ref}"
+    assert jnp.array_equal(lad, lad_ref), f"single-pass logdet {lad} != 5-pass reference {lad_ref}"
+    assert jnp.allclose(x, x0, atol=1e-9), f"cond3 roundtrip off: {x} vs {x0}"
+
+
+def test_cond3_logdet_grad_finite():
+    """Gradient of `transform_and_log_det`'s closed-form log-det w.r.t. the
+    layer's own params (what training actually differentiates) stays finite."""
+    lay = _block_layer3(jr.PRNGKey(7), zero_init=False)
+    cond = _cx_cond3(jnp.exp(2 * 12.6), 0.0, jnp.exp(2 * 12.6))
+    x = jnp.array([0.4, -0.7, 0.2, -0.1, 0.55])
+
+    def loss(lay):
+        _, lad = lay.transform_and_log_det(x, cond)
+        return lad
+
+    grad = eqx.filter_grad(loss)(lay)
+    g_leaves = jax.tree_util.tree_leaves(eqx.filter(grad, eqx.is_inexact_array))
+    assert g_leaves, "expected at least one gradient leaf"
+    assert all(jnp.all(jnp.isfinite(g)) for g in g_leaves), \
+        "non-finite gradient through cond3 closed-form logdet"
+
+
 if __name__ == "__main__":
     test_coupling_identity_at_zero_init()
     test_coupling_roundtrip_and_logdet()
@@ -257,5 +356,9 @@ if __name__ == "__main__":
     test_block_logdet_matches_finite_difference()
     test_block_gradient_through_inverse()
     test_block_survives_large_weights_and_outliers()
+    test_cond3_closed_form_logdet_matches_jacfwd()
+    test_cond3_inverse_single_pass_equals_refined()
+    test_cond3_logdet_grad_finite()
     print("OK: coupling identity/roundtrip, block identity/Mc-shift/roundtrip/"
-          "logdet/FD-logdet/gradient/large-weight-outlier stress test all pass")
+          "logdet/FD-logdet/gradient/large-weight-outlier stress test all pass, "
+          "cond3 closed-form logdet/single-pass-inverse/grad all pass")

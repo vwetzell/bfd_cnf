@@ -16,6 +16,8 @@ propagate_cov_to_std_jax.
 
 from __future__ import annotations
 
+import os
+
 from collections.abc import Callable
 from functools import partial
 from typing import Any, ClassVar
@@ -131,6 +133,17 @@ def _tanh_over_s(s):
     return jnp.where(small, series, exact)
 
 
+#: Hard ceiling on the NOISELESS ellipticity |e| = hypot(M1, M2)/Mr (2026-09-30).
+#: The chart maps |e| in [0, E_MAX) onto [0, inf), so no finite latent can reach
+#: |e| = 1, where J = (Mr^2 - M1^2 - M2^2)/4 -> 0 and the paper model's 1/J weight
+#: diverges.  Seed 2 of flows/cv2 put 2e-5 of its mass at |e| = 1.00000 (training
+#: max 0.753) and that sliver alone halved R_s.  0.95 clears every training set
+#: (max 0.8724, gauss2_fwd_g2v3) and caps 1/J at 1/(1 - E_MAX^2) ~ 10 x round.
+#: BFD_LEGACY_CHART=1 restores the old |e| < 1 chart, for checkpoints written
+#: before this (they carry no `e_max_tag` leaf, so they fail loudly otherwise).
+E_MAX = 1.0 if os.environ.get("BFD_LEGACY_CHART") == "1" else 0.95
+
+
 def spin2_bound(e1, e2):
     """Physical ellipticity ``(e1, e2) = (M1/Mr, M2/Mr)`` -> unbounded chart
     coordinate ``(w1, w2)``.
@@ -161,8 +174,9 @@ def spin2_bound(e1, e2):
     e1 = jnp.asarray(e1)
     e2 = jnp.asarray(e2)
     rho = jnp.hypot(e1, e2)
-    rho = jnp.clip(rho, 0.0, 1.0 - 1e-7)
-    ratio = _atanh_over_rho(rho)
+    rho = jnp.clip(rho, 0.0, E_MAX * (1.0 - 1e-7))
+    # atanh(rho/E_MAX) * e/rho = atanh(r)/r * e/E_MAX with r = rho/E_MAX
+    ratio = _atanh_over_rho(rho / E_MAX) / E_MAX
     return ratio * e1, ratio * e2
 
 
@@ -194,10 +208,14 @@ def spin2_unbound(w1, w2):
     w1 = jnp.asarray(w1)
     w2 = jnp.asarray(w2)
     s = jnp.hypot(w1, w2)
-    ratio = _tanh_over_s(s)
+    ratio = E_MAX * _tanh_over_s(s)
     e1, e2 = ratio * w1, ratio * w2
     rho_out = jnp.hypot(e1, e2)
-    safety = jnp.minimum(1.0, (1.0 - 1e-6) / jnp.maximum(rho_out, 1e-30))
+    # Clamp the denominator AT the bound, not at 1e-30: same value, but at
+    # rho = 0 the old tangent was c/(1e-30)^2 = inf (underflow), and
+    # `jnp.minimum`'s JVP multiplies it by 0 -> NaN Jacobian at e = 0.
+    rho_max = E_MAX * (1.0 - 1e-6)
+    safety = jnp.minimum(1.0, rho_max / jnp.maximum(rho_out, rho_max))
     return e1 * safety, e2 * safety
 
 
@@ -214,7 +232,10 @@ def in_domain(m):
     density nonzero", which is a different and stricter question, see
     :func:`in_support`.
     """
-    return (m[..., 0] > 0) & (m[..., 1] > 0)
+    # |e| < E_MAX without division: past it `spin2_bound` only clips, which
+    # would hand a draw outside the prior's support a finite density.
+    return ((m[..., 0] > 0) & (m[..., 1] > 0)
+            & (m[..., 2] ** 2 + m[..., 3] ** 2 < (E_MAX * m[..., 1]) ** 2))
 
 
 def in_support(m):
@@ -276,7 +297,11 @@ def safe_point(m):
     # has to see the value Mr actually ends up with.
     mr = jnp.clip(m[..., 1], 1e-6, 0.5 * POINT_SOURCE * mf)
     mc = jnp.minimum(m[..., 4], 0.5 * POINT_SOURCE_MC * mr)
-    return m.at[..., 0].set(mf).at[..., 1].set(mr).at[..., 4].set(mc)
+    # |e| to at most E_MAX/2 (in_domain's ceiling), against the clamped Mr.
+    e = jnp.hypot(m[..., 2], m[..., 3])
+    k = jnp.minimum(1.0, 0.5 * E_MAX * mr / jnp.maximum(e, 1e-30))
+    return (m.at[..., 0].set(mf).at[..., 1].set(mr).at[..., 4].set(mc)
+            .at[..., 2].multiply(k).at[..., 3].multiply(k))
 
 
 # ---------------------------------------------------------------------------
@@ -690,10 +715,14 @@ class RawMomentStandardize(AbstractBijection):
     # Static: a fixed reparameterisation of the flux axis, not a fitted leaf.
     # `None` (the default) is the plain log10 this chart has always used.
     flux_sas: tuple | None = eqx.field(static=True, default=None)
+    # Checkpoint tag for the E_MAX chart: an int leaf (never trained), absent
+    # (None) in legacy mode, so an old checkpoint cannot load into the new chart.
+    e_max_tag: jax.Array | None = None
 
     def __init__(self, mean=None, std=None, flux_sas=None):
         self.flux_sas = None if flux_sas is None else tuple(
             float(v) for v in flux_sas)
+        self.e_max_tag = None if E_MAX == 1.0 else jnp.array(round(E_MAX * 1e4), jnp.int32)
         """Initialise with optional mean and std for the standardisation step.
 
         Parameters
@@ -850,10 +879,13 @@ class RawMomentStandardize(AbstractBijection):
         # this runs per training row.  Checked against `jax.jacfwd` +
         # `slogdet` over the whole method by
         # `tests/test_bounded_chart.py::test_round_trip_and_log_det`.
+        # With the E_MAX ceiling f = atanh(rho/E_MAX): f' = 1/(E_MAX (1 - r^2)),
+        # f/rho = ratio/E_MAX, r = rho/E_MAX, so an extra -2 log E_MAX.
         rho = jnp.hypot(M1 / Mr, M2 / Mr)
-        rho = jnp.clip(rho, 0.0, 1.0 - 1e-7)
-        ratio = _atanh_over_rho(rho)
-        lad_radial = jnp.log(ratio) - jnp.log1p(-rho ** 2)
+        rho = jnp.clip(rho, 0.0, E_MAX * (1.0 - 1e-7))
+        r = rho / E_MAX
+        ratio = _atanh_over_rho(r)
+        lad_radial = jnp.log(ratio) - jnp.log1p(-r ** 2) - 2.0 * jnp.log(E_MAX)
         lad_geom = lad_geom + lad_radial
         if self.flux_sas is not None:
             # Slot 0's own factor is now d sas(log10 Mf)/dMf, i.e. the plain
@@ -2001,6 +2033,15 @@ class SigmaXBlockLayer(AbstractBijection):
     _s0_e_max: float = eqx.field(static=True)
     _D_max: float = eqx.field(static=True)
     _h_max: float = eqx.field(static=True)
+    # Static (so old checkpoints' leaf structure is unchanged): True makes
+    # this layer ignore g entirely (same "kernel is fixed" path `_cond_dim ==
+    # 3` already takes -- see `_kernel_fixed`), even though the condition is
+    # still the chain's 5-vector (flowjax's `Chain` needs every layer to share
+    # one `cond_shape`, see `flowjax.utils.merge_cond_shapes`).  Lets
+    # `bulk.build_flow(..., adapter=True)` evaluate this layer once per draw
+    # outside the g-autodiff (`bias.split_centroid`) while the shear response
+    # moves to `CentroidShearAdapter` instead.
+    g_blind: bool = eqx.field(static=True, default=False)
 
     def __init__(
         self,
@@ -2016,8 +2057,10 @@ class SigmaXBlockLayer(AbstractBijection):
         s0_e_max=1.0,
         D_max=5.0,
         h_max=0.5,
+        g_blind=False,
     ):
         self._cond_dim = full_cond_dim
+        self.g_blind = bool(g_blind)
         self._log_scale_mean = float(log_scale_mean)
         self._e_mag_sq_scale = float(e_max**2)
         self._size_loc = non_trainable(jnp.asarray(size_loc, dtype=jnp.float32))
@@ -2075,6 +2118,17 @@ class SigmaXBlockLayer(AbstractBijection):
     def cond_shape(self):
         return (self._cond_dim,)
 
+    @property
+    def _kernel_fixed(self):
+        """True wherever `_sigma_eff` must return the raw `CX` unchanged: a
+        standalone (3,)-conditioned layer (`g` not even in the condition) or
+        a 5-wide `g_blind` one (`g` present but ignored).  The three places
+        that used to special-case `self._cond_dim == 3` alone -- `_sigma_eff`,
+        `_fwd_log_det`'s closed-form branch, and the refinement-loop skip in
+        `inverse_and_log_det` -- all apply equally to `g_blind`, so they share
+        this one property instead of drifting out of sync."""
+        return self._cond_dim == 3 or self.g_blind
+
     def _raw_cx(self, condition):
         # `condition` is [g1, g2, C00, C01, C11] when chained with shear, or
         # bare [C00, C01, C11] when standalone (self._cond_dim is 5 or 3
@@ -2123,7 +2177,7 @@ class SigmaXBlockLayer(AbstractBijection):
         can't carry; the template-sum --kfit check says the rest is ~85% of
         the reweight term."""
         CX = self._raw_cx(condition)
-        if self._cond_dim == 3:
+        if self._kernel_fixed:
             return CX
         Ainv = jnp.linalg.inv(self._A(x, condition[:2]))
         return Ainv @ CX @ Ainv.T
@@ -2441,7 +2495,57 @@ class SigmaXBlockLayer(AbstractBijection):
 
     def _fwd_log_det(self, x, condition):
         """log|det d(_raw_transform)/dx| by autodiff, including the x-dependence
-        of `_sigma_eff`.  Both directions go through here."""
+        of `_sigma_eff`.  Both directions go through here.
+
+        For `_cond_dim == 3` the kernel is x-independent (`_sigma_eff` just
+        returns the raw `CX`, see that method), so `_raw_transform` factors
+        exactly as F2 o F1:
+
+          F1: x -> (x0, y1, y2, y3, y4), block lower-triangular in the
+              blocks x0 | x1 | x2 | (x3, x4) -- `y1 = kappa(x0)*x1 + ...`
+              and `y2 = x2 + mc_shift(x0, ...)` each only add an x0-column
+              entry to an otherwise-diagonal row, and `(y3, y4) =
+              _ellipticity(x0..x4, ...)` is the only row reading everything
+              -- so `det(J_F1) = 1 * kappa * 1 * det(B)`,
+              `B = d(y3, y4)/d(x3, x4)` at fixed `x0, x1, x2`.
+          F2: (x0, w1..w4) -> (x0 + s0(x0, w3, w4, ...), w1..w4), triangular
+              with diagonal `1 + ds0/dx0` at FIXED `(w3, w4) = (y3, y4)` (the
+              `ds0/dw3`, `ds0/dw4` entries sit in row 0 but columns 3, 4 are
+              picked out verbatim by rows 3, 4, so they never enter the
+              determinant) -- `det(J_F2) = 1 + ds0/dx0`.
+
+        Hence `log|det J| = log|1 + ds0/dx0| + log(kappa) + log|det B|`
+        exactly (`log(kappa) = g_s` since `kappa = exp(g_s)`).  Checked
+        against this method's own `jacfwd`+`slogdet` by
+        `tests/test_sigmax_block_layer.py::test_cond3_closed_form_logdet_matches_jacfwd`.
+        The `_cond_dim == 5` path (g != 0, `_sigma_eff` depends on x through
+        `_A`) is unchanged below -- no comparable closed form was attempted
+        there.  `g_blind` takes the SAME closed-form branch as `_cond_dim ==
+        3` (see `_kernel_fixed`): `_sigma_eff` returns the raw `CX` either
+        way, so the factorisation argument above is unaffected by which of
+        the two made it true.
+        """
+        if self._kernel_fixed:
+            log_scale_n, e1, e2, _, e_mag_sq_n, T_n = self._unpack(self._raw_cx(condition))
+            x0, x1, x2, x3, x4 = x
+            y3, y4, kappa, _, _ = self._ellipticity(
+                x0, x1, x2, x3, x4, e1, e2, log_scale_n, e_mag_sq_n, T_n)
+            # d s0/d x0 at FIXED (y3, y4) -- y3, y4 are the values _ellipticity
+            # just produced at x, treated as constants here (that is what
+            # "fixed (y3, y4)" means in F2 above).
+            ds0_dx0 = jax.grad(
+                lambda a: self._s0(a, y3, y4, log_scale_n, e_mag_sq_n, T_n)
+            )(x0)
+
+            def _ell34(v):
+                # x0, x1, x2 closed over as constants: only net_quad's and
+                # net_eown's dependence on (x3, x4) gets a tangent here.
+                return jnp.stack(self._ellipticity(
+                    x0, x1, x2, v[0], v[1], e1, e2, log_scale_n, e_mag_sq_n, T_n)[:2])
+
+            B = jax.jacfwd(_ell34)(jnp.stack([x3, x4]))
+            return (jnp.log(jnp.abs(1.0 + ds0_dx0)) + jnp.log(kappa)
+                    + jnp.linalg.slogdet(B)[1])
         jac = jax.jacfwd(self._raw_transform, argnums=0)(x, condition)
         _, log_det = jnp.linalg.slogdet(jac)
         return log_det
@@ -2450,11 +2554,17 @@ class SigmaXBlockLayer(AbstractBijection):
         # `_sigma_eff` depends on the unknown x, so invert at the raw kernel
         # first, then refine x a fixed number of times.  At g = 0 the kernel
         # is x-independent and the first pass is already exact.
-        # ponytail: 4 unrolled passes; |g| <~ 0.05 makes the map a tight
-        # contraction -- make it a while_loop on |dx| if a check ever misses.
+        # ponytail: 4 unrolled passes.  MEASURED 2026-10-02 (cv5 s2, 20k sn8r):
+        # round trip 3e-5 at |g| = 0.02 but 2.9e-4 at |g| = 0.05 (pass 3 still
+        # off by 1.4e-2) -- NOT a tight contraction past 0.02.  Fine for the
+        # +-0.02 response term; anything evaluating it further out needs more.
         x = self._inverse_at(y, self._raw_cx(condition))
-        for _ in range(4):
-            x = self._inverse_at(y, self._sigma_eff(x, condition))
+        if not self._kernel_fixed:
+            # `_kernel_fixed`: `_sigma_eff` returns the raw CX regardless of
+            # x (see that method), so every refinement pass above would just
+            # recompute the identical `_inverse_at(y, CX)` -- skip them.
+            for _ in range(4):
+                x = self._inverse_at(y, self._sigma_eff(x, condition))
         return x, -self._fwd_log_det(x, condition)
 
     def _inverse_at(self, y, CX):
@@ -2582,6 +2692,139 @@ def _solve_ell_ift_jvp(static, primals, tangents):
     # = dPhi/dtheta . theta_dot -- a 2x2 linear solve, not a division.
     dx_dot = jnp.linalg.solve(jnp.eye(2) - dPhi_dx, Phi_dot_rest)
     return (x3, x4), (dx_dot[0], dx_dot[1])
+
+
+# ---------------------------------------------------------------------------
+# CentroidShearAdapter
+# ---------------------------------------------------------------------------
+
+
+class CentroidShearAdapter(AbstractBijection):
+    """Cheap near-identity layer carrying the centroid stage's shear
+    dependence, so `SigmaXBlockLayer` can be made `g_blind` and evaluated
+    once per draw outside the g-autodiff (`bias.split_centroid` peels it).
+
+    Acts on the chart's standardised z = (z0 flux, z1 size, z2 concentration,
+    z3, z4 ellipticity pair) -- the SAME coordinates `SigmaXBlockLayer` and
+    `ShearResponse` see.  The map is ``a_g(z) = z + Q_c(z; Sigma_X) . g``,
+    first order in g, identity at g = 0 (one coefficient net, zero-init last
+    layer -- same convention as every other coefficient net in this file).
+
+    Condition is `[g1, g2, C00, C01, C11]`, like `SigmaXBlockLayer`'s own.
+
+    Eighteen real coefficients, 12 spin-0 (4 each for z0, z1, z2) and 6
+    spin-2 (the physical ellipticity's own velocity), built ONLY from
+    rotation- and parity-invariant/-covariant combinations of the three
+    spin-2 fields in play -- the galaxy's own ellipticity `e`, the shear `g`
+    and Sigma_X's ellipticity `E` -- so the whole map is rotation-equivariant
+    and parity-even by construction (`tests/test_centroid_adapter.py` checks
+    both directly). See `_w` for the exact algebra.
+
+    `inverse_and_log_det` solves `x + w(x) = y` by a FIXED 8-iteration Picard
+    loop (`x <- y - w(x)`, unrolled) -- unlike `SigmaXBlockLayer`'s own
+    fixed-point inverses, `w` here has no branching/bisection anywhere
+    inside it, so plain autodiff through the unrolled loop already gives the
+    correct gradient; no `custom_jvp`/IFT needed.  At g = 0 every term in `w`
+    below carries an explicit factor of `g` or `conj(g)`, so `w` is
+    identically zero there REGARDLESS of the net's weights -- the layer is
+    exactly the identity at g = 0 even away from init.
+    """
+
+    net: CoeffNet
+    _log_scale_mean: float = eqx.field(static=True)
+    _e_mag_sq_scale: float = eqx.field(static=True)
+    # Frozen, resynced by `bulk.sync_chart_constants` -- same pattern and
+    # same reason as `ShearResponse.e_scale` (models/shear.py): the chart's
+    # spin-2 std this layer un-standardises z3, z4 by.
+    e_scale: jax.Array = eqx.field(default=None)
+
+    def __init__(self, key, nn_width=32, nn_depth=2, activation=jnn.silu,
+                log_scale_mean=12.0, e_max=0.1, e_scale=1.0):
+        # 8 inputs (see `_w`), 18 outputs (12 spin-0 + 6 spin-2 coefficients).
+        self.net = _zero_last_layer(CoeffNet(key, 8, 18, nn_width, nn_depth, activation))
+        self._log_scale_mean = float(log_scale_mean)
+        self._e_mag_sq_scale = float(e_max**2)
+        self.e_scale = non_trainable(jnp.asarray(e_scale))
+
+    @property
+    def shape(self):
+        return (5,)
+
+    @property
+    def cond_shape(self):
+        return (5,)
+
+    def _w(self, z, condition):
+        """velocity `w(z, g) = Q_c(z; Sigma_X) . g`, in z-slot units (the
+        spin-2 pair converted from the physical-ellipticity algebra back to
+        chart units via `spin2_bound`'s own local Jacobian, exactly as
+        `models.shear.project_to_physics` does for `ShearResponse`)."""
+        CX = jnp.array([[condition[2], condition[3]],
+                       [condition[3], condition[4]]])
+        log_scale, eX1, eX2 = cx_to_sx_cond(CX)
+        log_scale_n = log_scale - self._log_scale_mean
+        e_mag_sq_n = (eX1**2 + eX2**2) / (self._e_mag_sq_scale + 1e-8)
+        T_n = jnp.exp(log_scale_n)
+        es = unwrap(self.e_scale)
+        e1, e2 = spin2_unbound(z[3] * es, z[4] * es)
+        e = jax.lax.complex(e1, e2)
+        E = jax.lax.complex(eX1, eX2)
+        g = jax.lax.complex(condition[0], condition[1])
+        gc = jnp.conj(g)
+
+        # Net inputs: all rotation- and parity-INVARIANT.  `cross = e.conj(E)`
+        # is spin 0 (e and E are both spin 2); its real part is already
+        # parity-even (`_ell_gal_invariants`'s `dot` is the same combination
+        # in raw-centroid form), its imaginary part is parity-ODD so only its
+        # SQUARE is used here -- same trick `_ellipticity`'s `proj` uses via a
+        # real projection rather than a bare imaginary part.
+        cross = e * jnp.conj(E)
+        e_scale_x = jnp.sqrt(self._e_mag_sq_scale + 1e-8)
+        re_n = cross.real / e_scale_x
+        im_sq_n = (cross.imag / e_scale_x) ** 2
+        u = jnp.array([_bound_coeff_input(z[0]), _bound_coeff_input(z[1]),
+                       _bound_coeff_input(z[2]), jnp.log1p(e1 * e1 + e2 * e2),
+                       log_scale_n, e_mag_sq_n, re_n, im_sq_n])
+        c = T_n * self.net(u)
+
+        # Spin-0 (z0, z1, z2): four real, rotation-invariant structures each.
+        re_ge, im_ge = (gc * e).real, (gc * e).imag
+        re_gE, im_gE = (gc * E).real, (gc * E).imag
+        im_eE = cross.imag
+        w_spin0 = [
+            c[4 * s] * re_ge + c[4 * s + 1] * re_gE
+            + c[4 * s + 2] * im_eE * im_ge + c[4 * s + 3] * im_eE * im_gE
+            for s in range(3)
+        ]
+
+        # Spin-2 (physical ellipticity velocity), complex, 6 real coefficients.
+        w_e = (c[12] * g + c[13] * (e * jnp.conj(E)) * g + c[14] * (jnp.conj(e) * E) * g
+              + c[15] * gc * e**2 + c[16] * gc * e * E + c[17] * gc * E**2)
+        # physical ellipticity velocity -> chart units, same as
+        # `project_to_physics`'s `to_z`.
+        J_spin2 = jax.jacfwd(
+            lambda ee: jnp.stack(spin2_bound(ee[0], ee[1])))(jnp.array([e1, e2]))
+        dz34 = J_spin2 @ jnp.array([w_e.real, w_e.imag]) / es
+        return jnp.array([w_spin0[0], w_spin0[1], w_spin0[2], dz34[0], dz34[1]])
+
+    def _fwd(self, z, condition):
+        return z + self._w(z, condition)
+
+    def transform_and_log_det(self, x, condition=None):
+        y = self._fwd(x, condition)
+        jac = jax.jacfwd(self._fwd)(x, condition)
+        return y, jnp.linalg.slogdet(jac)[1]
+
+    #: Fixed Picard-iteration count -- see the class docstring for why a
+    #: plain unrolled loop (no custom_jvp) is correct here.
+    _FIXEDPOINT_STEPS = 8
+
+    def inverse_and_log_det(self, y, condition=None):
+        x = y
+        for _ in range(self._FIXEDPOINT_STEPS):
+            x = y - self._w(x, condition)
+        jac = jax.jacfwd(self._fwd)(x, condition)
+        return x, -jnp.linalg.slogdet(jac)[1]
 
 
 # ---------------------------------------------------------------------------

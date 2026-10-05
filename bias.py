@@ -112,7 +112,8 @@ import shear
 # `safe_point` lives beside `in_domain` in models/bijections.py: the centroid
 # TRAINING loss needs the identical guard, and the last bug here was one copy
 # of it not learning about a new ceiling.
-from models.bijections import in_domain, safe_point, SigmaXBlockLayer
+from models.bijections import (CentroidShearAdapter, in_domain, in_support, safe_point,
+                               SigmaXBlockLayer)
 from models.centroid import CentroidMarginalize
 
 # Both are located BY TYPE at bijections[1] when a centroid/Sigma_X layer is
@@ -394,8 +395,41 @@ CATALOGS = {
     "gauss2_v4n_176k_psfs1p10": {"plus": "targets_g2v4_g1p02_176k_psfs1p10",
                                  "minus": "targets_g2v4_g1m02_176k_psfs1p10",
                                  "zero": "targets_g2v4_g0_176k_psfs1p10"},
+    # bulgedisc_g2 (bulgedisc retuned onto gauss2_fwd's measured moments) with its
+    # own g2v4n-recipe flow chain; 176k-region varobs targets, full population
+    # rendered (no region sampler for bulgedisc) -- dev/bdg2n.sh.
+    "bulgedisc_g2n_176k_varobs": {"plus": "targets_bdg2_g1p02_176k_varobs",
+                                  "minus": "targets_bdg2_g1m02_176k_varobs",
+                                  "zero": "targets_bdg2_g0_176k_varobs"},
+    # the same at noise 3.674: flux S/N 8 at Mf = 3000 (dev/bdg2n.sh DEPTH=sn8)
+    "bulgedisc_g2n_176k_varobs_sn8": {"plus": "targets_bdg2_g1p02_176k_varobs_sn8",
+                                      "minus": "targets_bdg2_g1m02_176k_varobs_sn8",
+                                      "zero": "targets_bdg2_g0_176k_varobs_sn8"},
+    # sn8 with a ROUND PSF and fixed noise (dev/sn8_diag.sh): separates the PSF anisotropy
+    "bulgedisc_g2n_176k_sn8r": {"plus": "targets_bdg2_g1p02_176k_sn8r",
+                                "minus": "targets_bdg2_g1m02_176k_sn8r",
+                                "zero": "targets_bdg2_g0_176k_sn8r"},
+    # more sn8r galaxies: render seeds 3-5, otherwise identical (dev/sn8r_batches.sh)
+    **{f"bulgedisc_g2n_176k_sn8r_s{s}": {a: f"targets_bdg2_{b}_176k_sn8r_s{s}" for a, b in
+                                         (("plus", "g1p02"), ("minus", "g1m02"), ("zero", "g0"))}
+       for s in (3, 4, 5)},
+    # seed-2 sn8 galaxies under other observing conditions, paired vs sn8r (dev/cond_batches.sh):
+    # A aniso PSF, B PSF sigma +10%, C noise x1.2, D Moffat aniso PSF, W per-galaxy wide spreads
+    **{f"bulgedisc_g2n_176k_sn8_cond{c}": {a: f"targets_bdg2_{b}_176k_sn8_cond{c}" for a, b in
+                                           (("plus", "g1p02"), ("minus", "g1m02"), ("zero", "g0"))}
+       for c in "ABCDEW"},
     # 8 more closed-loop populations (seed 12), for the real-catalog-sized
     # chunk scatter -- same script.
+    # sn8r closed loops from the cv2 s0 flow (dev/closed_loop.py, REAL_POP=bulgedisc_g2n_176k_sn8r);
+    # _J: noise drawn from the paper's J(M)/J(m)-tilted likelihood (--jacobian).
+    "bdg2n_sn8r_closed": {"plus": "closed_sn8r_g1p02", "minus": "closed_sn8r_g1m02", "zero": "closed_sn8r_g0"},
+    "bdg2n_sn8r_closedJ": {"plus": "closedJ_sn8r_g1p02", "minus": "closedJ_sn8r_g1m02", "zero": "closedJ_sn8r_g0"},
+    "bdg2n_sn8r_closedJ_cv6": {"plus": "closedJ_cv6_sn8r_g1p02", "minus": "closedJ_cv6_sn8r_g1m02",
+                               "zero": "closedJ_cv6_sn8r_g0"},
+    # the sn8r targets' own galaxies (seed-2 copies) with the paper's noise model (dev/truegal_loop.py)
+    "bdg2n_sn8r_truegal": {"plus": "truegal_sn8r_g1p02", "minus": "truegal_sn8r_g1m02", "zero": "truegal_sn8r_g0"},
+    # second realisation (copy pick + noise, --seed 12) of the same galaxies
+    "bdg2n_sn8r_truegal2": {"plus": "truegal2_sn8r_g1p02", "minus": "truegal2_sn8r_g1m02", "zero": "truegal2_sn8r_g0"},
     "gauss2_v4n_closed8": {"plus": "closed8_g2v4n_g1p02",
                            "minus": "closed8_g2v4n_g1m02",
                            "zero": "closed8_g2v4n_g0"},
@@ -426,6 +460,12 @@ CATALOGS = {
 # population as "bulgedisc", just measured with image noise, so they share its
 # noiseless moments.fits.
 TRAIN_DATA = {
+    "bulgedisc_g2n": "moments_bulgedisc_g2_bdg2n.fits",
+    "bulgedisc_g2n_176k_varobs": "moments_bulgedisc_g2_bdg2n.fits",
+    "bulgedisc_g2n_176k_varobs_sn8": "moments_bulgedisc_g2_bdg2n.fits",
+    "bulgedisc_g2n_176k_sn8r": "moments_bulgedisc_g2_bdg2n.fits",
+    **{f"bulgedisc_g2n_176k_sn8r_s{s}": "moments_bulgedisc_g2_bdg2n.fits" for s in (3, 4, 5)},
+    **{f"bulgedisc_g2n_176k_sn8_cond{c}": "moments_bulgedisc_g2_bdg2n.fits" for c in "ABCDEW"},
     "bulgedisc": "moments.fits", "bulgedisc_noisy": "moments.fits",
     "bulgedisc_deep": "moments.fits",
     "bulgedisc_deep_v2": "moments_bulgedisc_v2.fits",
@@ -456,6 +496,11 @@ TRAIN_DATA = {
     "gauss2_v4n_176k_varobs": "moments_gauss2_fwd_g2v4n.fits",
     "gauss2_v4n_tiny_varobs": "moments_gauss2_fwd_g2v4n.fits",
     "gauss2_v4n_closed8": "moments_gauss2_fwd_g2v4n.fits",
+    "bdg2n_sn8r_closed": "moments_bulgedisc_g2_bdg2n.fits",
+    "bdg2n_sn8r_closedJ": "moments_bulgedisc_g2_bdg2n.fits",
+    "bdg2n_sn8r_closedJ_cv6": "moments_bulgedisc_g2_bdg2n.fits",
+    "bdg2n_sn8r_truegal": "moments_bulgedisc_g2_bdg2n.fits",
+    "bdg2n_sn8r_truegal2": "moments_bulgedisc_g2_bdg2n.fits",
     "gauss2_v3e": "moments_gauss2_fwd_g2v3d.fits",   # deliberate: see CATALOGS
     "gauss2_deep": "gauss2_g0_1M.fits",
     # Same reasoning as bulgedisc_v3_psfe*: PSF ellipticity doesn't touch the
@@ -472,6 +517,20 @@ TRAIN_DATA = {
     "gauss2_v3d_psfe1m10": "moments_gauss2_fwd_g2v3d.fits",
     "gauss2_v3d_psfe00_s2": "moments_gauss2_fwd_g2v3d.fits",
 }
+# Paired round-176k tests (dev/psfe_g2v4.sh): pixel noise +10%, and shear +/-0.01
+# (nonlinearity alpha; no zero arm of its own, selection reads the round g0).
+CATALOGS["gauss2_v4n_176k_noise1p10"] = {k: f"targets_g2v4_{a}_176k_noise1p10" for k, a in
+                                         (("plus", "g1p02"), ("minus", "g1m02"), ("zero", "g0"))}
+CATALOGS["gauss2_v4n_176k_g01"] = {"plus": "targets_g2v4_g1p01_176k_g01",
+                                   "minus": "targets_g2v4_g1m01_176k_g01",
+                                   "zero": "targets_g2v4_g0_176k"}
+for _p in ("gauss2_v4n_176k_noise1p10", "gauss2_v4n_176k_g01"):
+    TRAIN_DATA[_p] = "moments_gauss2_fwd_g2v4n.fits"
+# 176k batches seeds 3-7 (dev/more_176k_batches.sh), rendered with the varobs conditions.
+for _s in range(3, 8):
+    CATALOGS[f"gauss2_v4n_176k_s{_s}_varobs"] = {k: f"targets_g2v4_{a}_176k_s{_s}_varobs" for k, a in
+                                         (("plus", "g1p02"), ("minus", "g1m02"), ("zero", "g0"))}
+    TRAIN_DATA[f"gauss2_v4n_176k_s{_s}_varobs"] = "moments_gauss2_fwd_g2v4n.fits"
 
 
 def condition(g, sigma_x):
@@ -636,6 +695,9 @@ def make_psi(flow, peeled):
     Either way the result is a raw moment, which is where the noise kernel lives.
     """
     bij = flow.bijection.bijection.bijections
+    if any(isinstance(b, CentroidShearAdapter) for b in bij):
+        raise NotImplementedError(
+            "gauge kernel/auto not implemented with CentroidShearAdapter")
     chart = bij[0]
     cen = bij[1] if isinstance(bij[1], _CENTROID_LAYER_TYPES) else None
     sh = bij[2] if cen is not None else bij[1]
@@ -720,6 +782,9 @@ def make_psi_ld(flow, peeled):
     both claims rather than taking this paragraph's word for it.
     """
     bij = flow.bijection.bijection.bijections
+    if any(isinstance(b, CentroidShearAdapter) for b in bij):
+        raise NotImplementedError(
+            "gauge kernel/auto not implemented with CentroidShearAdapter")
     chart = bij[0]
     cen = bij[1] if isinstance(bij[1], _CENTROID_LAYER_TYPES) else None
     sh = bij[2] if cen is not None else bij[1]
@@ -1096,27 +1161,41 @@ def split_centroid(flow):
     The peel is exact, not an approximation; see `centroid_transform`.
 
     RESTRICTED to a standalone (3,)-conditioned layer, not a chained (5,)
-    one, even though `models/centroid.py`'s `CentroidMarginalize` no longer
-    reads g at all (module docstring, "No shear-conditioning") and so is
-    mathematically safe to peel either way.  Verified empirically NOT safe in
-    practice: peeling a chained layer and reconstructing `rest =
-    Invert(Chain(bij[2:]).merge_chains())` reproduces `flow.log_prob` exactly
-    (matches to float32 roundoff), but `bias.py`'s actual Q/R -- gradient and
-    HESSIAN of log_prob w.r.t. g, computed through `rest` -- come out wrong
-    even with `_transport` forced to a literal identity (m1 ~ -0.66 on
-    `gauss2_deep` where `--no-centroid` gives ~-0.03).  So the bug is in
-    autodiff through the RECONSTRUCTED sub-chain specifically, not in this
-    layer's transport or in log_prob-level peeling -- root cause not yet
-    found (HANDOFF.md, 2026-08-27).  Refusing here costs what it always did:
-    5 extra JVPs of this (now free, coefficient-net-less) layer per draw
-    inside the forward-over-reverse Hessian, no longer using a large network.
+    one -- UNLESS the chained layer is itself `g_blind` (`SigmaXBlockLayer`,
+    see that field's docstring), in which case it is g-independent despite
+    the wide condition and the restriction below does not apply.  Even
+    though `models/centroid.py`'s `CentroidMarginalize` no longer reads g at
+    all (module docstring, "No shear-conditioning") and so is mathematically
+    safe to peel either way, it stays restricted to the bare (3,) case: the
+    bug documented below is about autodiff through the RECONSTRUCTED
+    sub-chain, not about whether the peeled layer itself reads g, and has
+    not been re-tested for it.  Verified empirically NOT safe in practice
+    for a (5,)-conditioned but g-DEPENDENT layer: peeling it and
+    reconstructing `rest = Invert(Chain(bij[2:]).merge_chains())` reproduces
+    `flow.log_prob` exactly (matches to float32 roundoff), but `bias.py`'s
+    actual Q/R -- gradient and HESSIAN of log_prob w.r.t. g, computed through
+    `rest` -- come out wrong even with `_transport` forced to a literal
+    identity (m1 ~ -0.66 on `gauss2_deep` where `--no-centroid` gives
+    ~-0.03).  So the bug is in autodiff through the RECONSTRUCTED sub-chain
+    specifically, not in this layer's transport or in log_prob-level peeling
+    -- root cause not yet found (HANDOFF.md, 2026-08-27).  Refusing here
+    costs what it always did: 5 extra JVPs of this (now free, coefficient-
+    net-less) layer per draw inside the forward-over-reverse Hessian, no
+    longer using a large network.  A `g_blind` layer sidesteps the bug by
+    construction: `rest`'s own g-dependence (now carried by
+    `CentroidShearAdapter`, see `bulk.build_flow(..., adapter=True)`) never
+    passes back THROUGH the peeled-off layer at all, so there is no
+    reconstructed-sub-chain autodiff path for the bug to live in --
+    `tests/test_centroid_adapter.py`'s peel-equivalence check is what backs
+    that claim rather than taking this paragraph's word for it.
     """
     bij = flow.bijection.bijection.bijections
     # data -> base order is [raw2standard, centroid, shear, *bulk]; the chart is
     # always first now, so the centroid layer is at index 1 when it is present.
     if len(bij) < 2 or not isinstance(bij[1], _CENTROID_LAYER_TYPES):
         return flow, None
-    if bij[1].cond_shape[-1] >= 5:
+    g_blind = isinstance(bij[1], SigmaXBlockLayer) and bij[1].g_blind
+    if bij[1].cond_shape[-1] >= 5 and not g_blind:
         return flow, None
     rest = Invert(Chain(list(bij[2:])).merge_chains())
     # Both halves are g-independent here -- the chart is a fixed
@@ -1262,6 +1341,128 @@ def centroid_transform(peel, x, sigma_x, batch=200_000, to_host=True):
     if to_host:
         return np.asarray(z, dtype=np.float32), np.asarray(ld, dtype=np.float32)
     return z, ld
+
+
+#: Pool draws built per `_pool_build` call: one compiled shape, ~the
+#: 8 x 4096 draws a `one` chunk already holds, so it fits the same memory.
+_POOL_SUB = 32768
+
+
+@eqx.filter_jit
+def _pool_build(flow, flow_g, peel, sx0, key, n):
+    """`n` prior draws at g = 0 and everything about them that does not depend
+    on the target -- the flow component of the defensive mixture, shared.
+
+    When every target has the same Sigma_X and C_M, a flow draw u, its proposal
+    density p(u|0), log J(u), the peel's (z, log-det) and the g-derivatives of
+    log p_rest(z|g) at 0 are the same numbers whichever target uses it; only
+    the kernel weight L(M_i - u) differs.  `pqr_streamed(pool_reuse=k)` computes
+    them once here and lets ~k targets draw from each, instead of drawing and
+    differentiating fresh ones per target (half of every chunk's Hessian work).
+    """
+    cond0 = condition(jnp.zeros(2), sx0)
+    u = flow.sample(key, (n,), condition=cond0)
+    ok = in_domain(u)
+    if peel is not None and getattr(flow, "support", False):
+        ok = ok & in_support(u)      # see `pqr_streamed`'s `_ok`
+    us = jnp.where(ok[:, None], u, safe_point(u))
+    log_f = jnp.where(ok, flow.log_prob(us, condition=cond0), -jnp.inf)
+    log_jac = _log_jac(u) if TARGET_JAC else jnp.zeros(n)
+    if peel is None:
+        z, ld = us, jnp.zeros(n)
+    else:
+        sp = jnp.zeros(peel[1].cond_shape) if sx0 is None else sx0
+        if peel[1].cond_shape[0] > sp.shape[-1]:
+            sp = jnp.concatenate([jnp.zeros(peel[1].cond_shape[0] - sp.shape[-1]), sp])
+        z, ld = _centroid_apply(peel, us, jnp.broadcast_to(sp, (n, sp.shape[-1])))
+    lp, dlp, d2lp = jax.vmap(lambda zs: _val_grad_hess(
+        lambda g: flow_g.log_prob(zs, condition=condition(g, sx0))))(z)
+    return dict(u=u, ok=ok, log_f=log_f, log_jac=log_jac, ld=ld,
+                lp=lp, dlp=dlp, d2lp=d2lp)
+
+
+@eqx.filter_jit
+def _pool_stats(m_b, idx, pool, L, log_diag, log_alpha, log_1ma):
+    """One chunk's pool half per target: (log sum_s w p, B/A, C/A) over the
+    pool draws `idx` picks, plus each draw's linearised contribution to the
+    target's Q (for the reuse variance-inflation diagnostic).
+
+    Same summand as `log_conv_is` with `_mixture_chunk`'s weights: log_wt =
+    log L - log q, q the full defensive mixture, minus log J (TARGET_JAC),
+    plus the peel's log-det."""
+    g = lambda k: pool[k][idx]
+    off = g("u") - m_b[:, None, :]
+    y = jax.scipy.linalg.solve_triangular(L, off.reshape(-1, 5).T, lower=True)
+    log_k = (-0.5 * jnp.sum(y * y, axis=0).reshape(off.shape[:-1])
+             - log_diag - 2.5 * jnp.log(2 * jnp.pi))
+    log_q = jnp.logaddexp(log_alpha + log_k, log_1ma + g("log_f"))
+    lw = log_k - log_q
+    lw = jnp.where(jnp.isfinite(lw), lw, -jnp.inf) - g("log_jac") + g("ld")
+    t = jnp.where(g("ok"), lw + g("lp"), -jnp.inf)
+    la = jax.nn.logsumexp(t, axis=1)
+    pi = jnp.exp(t - jnp.where(jnp.isfinite(la), la, 0.0)[:, None])
+    dlp, d2lp = g("dlp"), g("d2lp")
+    df = jnp.einsum("ns,nsa->na", pi, dlp)
+    ca = jnp.einsum("ns,nsab->nab", pi, d2lp + dlp[..., :, None] * dlp[..., None, :])
+    return la, df, ca, t, dlp[..., 0]
+
+
+@eqx.filter_jit
+def _pool_chunk(fk, dfk, d2fk, log_nk, m_j, key, n_f, pool, L, log_diag,
+                log_alpha, log_1ma, vif_S, vif_t):
+    """Everything in a pool chunk after the kernel half's `batched`: pick the
+    pool draws, `_pool_stats`, combine the two halves by A-weighting, and
+    accumulate the reuse diagnostic -- ONE dispatch, no host sync.
+
+    These ~30 ops ran eagerly, with a `float()` on the diagnostic forcing a
+    sync every chunk: nvidia-smi showed the card at ~60% between pool builds."""
+    idx = jr.randint(key, (m_j.shape[0], n_f), 0, pool["u"].shape[0])
+    lap, dfp, cap, t, dlp0 = _pool_stats(m_j, idx, pool, L, log_diag, log_alpha, log_1ma)
+    lak = fk + log_nk
+    cak = d2fk + jnp.einsum("ia,ib->iab", dfk, dfk)
+    la = jnp.logaddexp(lak, lap)
+    fin = jnp.isfinite(la)
+    wk = jnp.where(jnp.isfinite(lak) & fin, jnp.exp(lak - la), 0.0)
+    wp = jnp.where(jnp.isfinite(lap) & fin, jnp.exp(lap - la), 0.0)
+    z0 = lambda w, a: jnp.where(w.reshape(w.shape + (1,) * (a.ndim - 1)) > 0, a, 0.0)
+    df = wk[:, None] * z0(wk, dfk) + wp[:, None] * z0(wp, dfp)
+    ca = wk[:, None, None] * z0(wk, cak) + wp[:, None, None] * z0(wp, cap)
+    # Reuse diagnostic: draw j's linearised contribution to this chunk's Q_1
+    # for target i, summed per pool draw.
+    cij = jnp.where(jnp.isfinite(t), jnp.exp(t - jnp.where(fin, la, 0.0)[:, None]), 0.0) \
+        * (dlp0 - df[:, :1])
+    cij = jnp.where(jnp.isfinite(cij), cij, 0.0)
+    return (la, df, ca, vif_S.at[idx.ravel()].add(cij.ravel()),
+            vif_t + jnp.sum(cij ** 2))
+
+
+@eqx.filter_jit
+def _pool_full_chunk(flow, flow_g, peel, support, m_j, m_z, kern, sx_j, key, n_f,
+                     pool, L, log_diag, log_alpha, log_1ma, vif_S, vif_t, log_nk):
+    """A whole pool chunk in ONE dispatch: the kernel half (`_mixture_chunk`
+    with n_f = 0, TARGET_JAC, the domain/support mask, the peel, the per-target
+    g-Hessian of `log_conv_is`) and then `_pool_chunk`.  Same ops as
+    `pqr_streamed`'s non-pool chunk, just not dispatched one by one: with the
+    pool halving each chunk's GPU work, the ~40 eager launches between kernels
+    left the card at ~60%."""
+    d, lw = _mixture_chunk(flow, m_j, kern, sx_j, None, L, log_diag, log_alpha, log_1ma, 0)
+    d = d.astype(jnp.float32)
+    lw = lw.astype(jnp.float32)
+    if TARGET_JAC:
+        lw = lw - _log_jac(d)
+    ok = None
+    if peel is not None:
+        ok = in_domain(d) & in_support(d) if support else in_domain(d)
+        d, ld = centroid_transform(peel, d, sx_j, to_host=False)
+        lw = lw + ld
+
+    def one(m_i, d_i, lw_i, s_i, ok_i):
+        return _val_grad_hess(lambda g: log_conv_is(flow_g, m_i, d_i, lw_i,
+                                                    condition(g, s_i), ok_i))
+
+    fk, dfk, d2fk = jax.vmap(one)(m_z, d, lw, sx_j, ok)
+    return _pool_chunk(fk, dfk, d2fk, log_nk, m_j, key, n_f, pool, L, log_diag,
+                       log_alpha, log_1ma, vif_S, vif_t)
 
 
 def _fixed_batch(fn, batch):
@@ -1589,7 +1790,7 @@ def _merge_opg(st):
 def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
                  batch=64, chunk=2048, report=None,
                  proposal=None, proposal_sigma_x=None, jackknife=True,
-                 opg=False, gauge="prior", lam_stride=1):
+                 opg=False, gauge="prior", lam_stride=1, pool_reuse=0):
     """Per-target (d logP/dg, d2 logP/dg2) WITHOUT materialising the draws.
 
     `Phat = (1/S) sum_s w_s p(x_s|g)` is a plain sum over samples, and so are its
@@ -1669,6 +1870,18 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
     # must use the peeled flow instead -- evaluating `flow` on already
     # transformed draws would apply the layer a second time.
     flow_g, layer = split_centroid(flow)
+    # The peel keeps only the bare chain, so `SupportedFlow`'s support
+    # indicator -- which `flow_g` no longer calls -- has to be applied to the
+    # RAW draw here.  Without it the faint targets' kernel draws past the
+    # point-source ceilings reached the raw flow (log p ~ -1e10 / -inf, NaN
+    # g-derivatives) and killed whole chunks: cv6 sn8r lost 8.4% of targets,
+    # 33% of those at Mf 2000-3000.  The defensive floor cannot be peeled.
+    _ok = in_domain
+    if layer is not None and getattr(flow, "support", False):
+        _ok = lambda d: in_domain(d) & in_support(d)
+    if layer is not None and getattr(flow, "eps", 0.0) > 0.0:
+        print("    WARNING: --floor-eps is IGNORED on the peeled path "
+              "(the floor lives in raw-moment space)", flush=True)
 
     def one(m_i, draws_i, log_wt_i, sigma_x_i, ok_i):
         f = lambda g: log_conv_is(flow_g, m_i, draws_i, log_wt_i,
@@ -1813,6 +2026,8 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
                                    n_f_c)
             lw = lw.astype(jnp.float32)
             d_raw = d.astype(jnp.float32)
+            if TARGET_JAC:
+                lw = lw - _log_jac(d_raw)
             if layer is not None:
                 d, ld = centroid_transform(layer, d, sx_j, to_host=False)
                 lw = lw + ld
@@ -1861,6 +2076,80 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
     n_empty = 0
     n_fallback = 0
 
+    # Shared prior-draw pool (`_pool_build`): exact per target, but only when
+    # nothing about a flow draw depends on WHICH target uses it.
+    pool_on = pool_reuse > 0
+    if pool_on:
+        why = ("gauge is not 'prior'" if gauge != "prior" else
+               "device path" if use_device else
+               "--proposal-flow given" if proposal is not None else
+               "per-target C_M" if cov3 else
+               "alpha not in (0, 1)" if not (0.0 < alpha < 1.0 and n_f_c > 0) else
+               "Sigma_X varies by target"
+               if sigma_x is not None and not np.allclose(sigma_x, sigma_x[0])
+               else None)
+        if why:
+            print(f"    pool off: {why}", flush=True)
+            pool_on = False
+    if pool_on:
+        _pL = jnp.asarray(np.linalg.cholesky(cov), jnp.float32)
+        _pld = jnp.sum(jnp.log(jnp.diag(_pL)))
+        _pla, _pl1 = float(np.log(alpha)), float(np.log1p(-alpha))
+        _psx = None if sigma_x is None else jnp.asarray(sigma_x[0], jnp.float32)
+        _sup = layer is not None and bool(getattr(flow, "support", False))
+        _plnk = jnp.float32(np.log(n_k_c))
+        _seg = batch * 512
+        pool, pool_key, n_pool_total = None, None, 0
+        vif_s2, vif_t = 0.0, jnp.float32(0.0)
+
+    def _finish_batch(st, i, n_b, t_batch):
+        """Per-batch tail: jackknife merge, counters, progress report."""
+        nonlocal n_fallback, n_empty
+        if _PROF is None and os.environ.get("BFD_DUMP_MERGE") and i // batch < 200:
+            # The merge is float64 on the host on purpose; dump its INPUTS so
+            # the cost of doing it in float32 instead can be measured offline
+            # against the same numbers, rather than argued about.
+            np.savez(f"{os.environ['BFD_DUMP_MERGE']}/merge_{i // batch:03d}.npz",
+                     la=np.stack(st["la"]), b=np.stack(st["b"]),
+                     c=np.stack(st["c"]))
+        if _TIME is not None:
+            _t = time.perf_counter()
+        q_b, r_b, n_fb = _merge_finish(st, jackknife)
+        q_out.append(q_b)
+        r_out.append(r_b)
+        if opg:
+            opg_out.append(_merge_opg(st))
+        n_fallback += n_fb
+        n_empty += int((~_shares(np.stack(st["la"]))[1]).sum())
+        if _TIME is not None:
+            # `finish` is per-BATCH host work -- the delete-one jackknife and
+            # `_shares`, both numpy -- and sits outside the chunk loop, so it
+            # was invisible to the per-chunk buckets.
+            _TIME["finish"] += time.perf_counter() - _t
+            if t_batch is not None:
+                _TIME["wall"] += time.perf_counter() - t_batch
+        if report and (i // batch) % report == 0:
+            print(f"    {i + n_b}/{len(m)} targets", flush=True)
+            if _TIME is not None:
+                w = _TIME["wall"] or 1.0
+                acc = sum(v for k, v in _TIME.items() if k != "wall")
+                print("      " + "  ".join(
+                    f"{k} {v:.1f}s {v / w:.0%}" for k, v in _TIME.items()
+                    if k != "wall")
+                    + f"  | unaccounted {w - acc:.1f}s {(w - acc) / w:.0%}"
+                    + f"  wall {w:.1f}s", flush=True)
+
+    def _pool_collect(st, outs, k):
+        for la_j, df_j, ca_j in outs:
+            la = np.asarray(la_j[:k], dtype=np.float32)
+            df = np.asarray(df_j[:k], dtype=np.float32)
+            c_over_a = np.asarray(ca_j[:k], dtype=np.float32)
+            good = (np.isfinite(la) & np.isfinite(df).all(1)
+                    & np.isfinite(c_over_a).reshape(len(la), -1).all(1))
+            st = _merge_chunk(st, la, df, c_over_a, good)
+        return st
+
+    pending = []
     for i in range(0, len(m), batch):
         # BFD_PROFILE=start:stop -- trace batches [start, stop) with
         # jax.profiler and NO added barriers, so the GPU timeline shows
@@ -1878,6 +2167,20 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
             _t_batch = time.perf_counter()
         m_b = m[i:i + batch]
         cov_b = cov[i:i + batch] if cov3 else cov
+        if pool_on and i % _seg == 0:
+            if pool is not None:
+                vif_s2 += float(jnp.sum(vif_S ** 2))
+            n_seg = min(_seg, len(m) - i)
+            n_pool = -(-n_seg * n_f_c * n_chunks // pool_reuse)
+            n_pool = -(-n_pool // _POOL_SUB) * _POOL_SUB
+            pool_key = jr.fold_in(jr.key(seed), 1_000_003 + i // _seg)
+            parts = [_pool_build(flow, flow_g, layer, _psx,
+                                 jr.fold_in(pool_key, j), _POOL_SUB)
+                     for j in range(n_pool // _POOL_SUB)]
+            pool = {k: jnp.concatenate([p_[k] for p_ in parts]) for k in parts[0]}
+            del parts
+            n_pool_total += n_pool
+            vif_S = jnp.zeros(n_pool, jnp.float32)
         sx_b = None if sigma_x is None else sigma_x[i:i + batch]
         psx_b = None if proposal_sigma_x is None else proposal_sigma_x[i:i + batch]
 
@@ -1915,7 +2218,39 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
         m_z = (jnp.asarray(m_b, dtype=jnp.float32) if layer is None else
                centroid_transform(layer, m_b, sx_b, to_host=False)[0])
 
-        for c in range(n_chunks):
+        if pool_on:
+            # Kernel half exactly as `mixture_draws` would make it (same seed,
+            # same antithetic offsets, full mixture q); flow half from the
+            # pool.  The two are disjoint draw sets of ONE chunk, so their
+            # (A, B/A, C/A) combine exactly by A-weighting (`_pool_chunk`).
+            # Dispatched async and COLLECTED ONE BATCH LATER: reading results
+            # back right away blocked the host on every chunk, so the GPU sat
+            # idle while Python queued the next one.
+            k = len(m_b)
+            # ponytail: the padded rows (last batch only) also land in the
+            # reuse diagnostic; it is a diagnostic.
+            padr = lambda a: (a if k == nb else
+                              jnp.concatenate([a, jnp.repeat(a[:1], nb - k, 0)]))
+            m_j = padr(jnp.asarray(m_b, dtype=jnp.float32))
+            m_zp = padr(m_z)
+            sx_j = None if sx_b is None else padr(jnp.asarray(sx_b, jnp.float32))
+            outs = []
+            for c in range(n_chunks):
+                s_c = seed + 7919 * c + 104729 * (i // batch)
+                la_j, df_j, ca_j, vif_S, vif_t = _pool_full_chunk(
+                    flow, flow_g, layer, _sup, m_j, m_zp,
+                    padr(kernel_draws(cov, k, n_k_c, s_c)), sx_j,
+                    jr.fold_in(jr.fold_in(pool_key, i // batch), c), n_f_c,
+                    pool, _pL, _pld, _pla, _pl1, vif_S, vif_t, _plnk)
+                outs.append((la_j, df_j, ca_j))
+            pending.append((i, k, st, outs))
+            if len(pending) < 2:
+                continue
+            i, k, st, outs = pending.pop(0)
+            st = _pool_collect(st, outs, k)
+            m_b = m[i:i + k]           # for the tail's progress report
+
+        for c in range(0 if pool_on else n_chunks):
             # The seed carries BOTH the chunk and the target batch.  Without the
             # batch term every target batch would replay the same offsets, so
             # targets in different batches would share a noise realization --
@@ -1950,9 +2285,11 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
             # so nothing downstream would recompute it) and needs the RAW draw
             # kept, because the noise kernel is Gaussian in raw moments.
             d_raw = jnp.asarray(d, dtype=jnp.float32)
+            if TARGET_JAC:
+                lw = lw - _log_jac(d_raw)
             # Gauge auto computes this inside its kernel (`_auto_glue`), so
             # doing it here too would be a 20 ms eager stall for nothing.
-            ok_raw = (in_domain(d_raw)
+            ok_raw = (_ok(d_raw)
                       if gauge != "auto" and (layer is not None
                                               or gauge != "prior") else None)
             if layer is not None:
@@ -2032,39 +2369,15 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
             if _TIME is not None:
                 _TIME["merge"] += time.perf_counter() - _t
 
-        if _PROF is None and os.environ.get("BFD_DUMP_MERGE") and i // batch < 200:
-            # The merge is float64 on the host on purpose; dump its INPUTS so
-            # the cost of doing it in float32 instead can be measured offline
-            # against the same numbers, rather than argued about.
-            np.savez(f"{os.environ['BFD_DUMP_MERGE']}/merge_{i // batch:03d}.npz",
-                     la=np.stack(st["la"]), b=np.stack(st["b"]),
-                     c=np.stack(st["c"]))
-        if _TIME is not None:
-            _t = time.perf_counter()
-        q_b, r_b, n_fb = _merge_finish(st, jackknife)
-        q_out.append(q_b)
-        r_out.append(r_b)
-        if opg:
-            opg_out.append(_merge_opg(st))
-        n_fallback += n_fb
-        n_empty += int((~_shares(np.stack(st["la"]))[1]).sum())
-        if _TIME is not None:
-            # `finish` is per-BATCH host work -- the delete-one jackknife and
-            # `_shares`, both numpy -- and sits outside the chunk loop, so it
-            # was invisible to the per-chunk buckets.
-            _TIME["finish"] += time.perf_counter() - _t
-            _TIME["wall"] += time.perf_counter() - _t_batch
-        if report and (i // batch) % report == 0:
-            print(f"    {i + len(m_b)}/{len(m)} targets", flush=True)
-            if _TIME is not None:
-                w = _TIME["wall"] or 1.0
-                acc = sum(v for k, v in _TIME.items() if k != "wall")
-                print("      " + "  ".join(
-                    f"{k} {v:.1f}s {v / w:.0%}" for k, v in _TIME.items()
-                    if k != "wall")
-                    + f"  | unaccounted {w - acc:.1f}s {(w - acc) / w:.0%}"
-                    + f"  wall {w:.1f}s", flush=True)
+        _finish_batch(st, i, len(m_b), _t_batch if _TIME is not None else None)
 
+    for i, k, st, outs in pending:
+        _finish_batch(_pool_collect(st, outs, k), i, k, None)
+    if pool_on:
+        vif_s2 += float(jnp.sum(vif_S ** 2))
+        print(f"    pool: {n_pool_total} draws, reuse k = "
+              f"{len(m) * n_f_c * n_chunks / n_pool_total:.1f}; pool-part variance "
+              f"inflation from sharing = {vif_s2 / max(float(vif_t), 1e-300):.3f}", flush=True)
     if n_empty:
         # Q = R = 0 for these, so they drop out of the eq. (45)-(46) sums rather
         # than poisoning them -- but a rising count means the proposal is
@@ -2129,15 +2442,70 @@ def window_mask(m, size, flux):
     """
     m = np.asarray(m)
     r = m[:, 1] / m[:, 0]
-    return (r > size[0]) & (r < size[1]) & (m[:, 0] > flux[0]) & (m[:, 0] < flux[1])
+    if WINDOW_TAPER is None:
+        return (r > size[0]) & (r < size[1]) & (m[:, 0] > flux[0]) & (m[:, 0] < flux[1])
+    # Tapered: each edge a Gaussian-CDF ramp, w = Pr[lo < r - ts e < hi] *
+    # Pr[f0 < Mf - tf e' < f1], e, e' ~ N(0, 1) -- a hard window on a smoothed
+    # copy of (r, Mf), which is what `window_prob` integrates.  Float weights.
+    from scipy.stats import norm
+    ts, tf = WINDOW_TAPER
+    return ((norm.cdf((r - size[0]) / ts) - norm.cdf((r - size[1]) / ts))
+            * (norm.cdf((m[:, 0] - flux[0]) / tf) - norm.cdf((m[:, 0] - flux[1]) / tf)))
 
 
-def window_prob(m, cov, size, flux, nodes=64):
+# ponytail: module switch set by --window-taper, read at trace time like WINDOW_JAC.
+# (tau_size, tau_flux) or None (hard window).  A galaxy whose measured moments
+# straddle an edge differently in the +g/-g arms enters a hard window's sum
+# unpaired with its whole q -- ~96% of the varobs - sn8r gap variance, and the
+# taper cuts the m1 error 2.3x at (0.05, 150) (dev/taper_check.py).  The
+# estimator stays exact: it is linear in the selection indicator, so w replaces
+# it in sum w q, sum w r, P_s = E[F_w] and N_ns = N - sum w.
+WINDOW_TAPER = None
+
+
+# ponytail: module switch set by --window-jacobian, read at trace time; thread
+# it through selection_terms if a second caller ever needs a different value.
+# "full" is the paper's eq. (psG1); "none" reproduces pre-2026-09-28 numbers.
+WINDOW_JAC = "full"
+# The TARGET side of the same Jacobian, on whenever WINDOW_JAC is "full" (the
+# two are one model and must not be mixed).  The flow's latent is the copies'
+# J(M^G(u))-weighted centroid distribution; the paper's (pMsG2)
+#     P(M_i|g) = J(M_i) SUM_u L(X^G) L(M_i - M^G(u))
+# has J OUTSIDE the u-sum, i.e. J(M_i) INT p_flow(m|g)/J(m) N(M_i; m, C_M) dm.
+# J(M_i) is g-independent and drops out of Q and R; the 1/J(m) is a weight on
+# each noiseless IS draw.  Its selection-side twin, INT_S dM of the same
+# density, is `window_prob(jac="full")` -- exactly, given Tr(B C_M) = 0.
+# Measured on the sn8 varobs s0 layer: +0.0100 +/- 0.0002 in m1, paired.
+TARGET_JAC = True
+
+
+def _log_jac(d):
+    """log J(m) = log((Mr^2 - M1^2 - M2^2)/4) of raw moments (..., 5), +inf
+    where J <= 0.
+
+    Subtracted from a draw's log weight, +inf zeroes it -- which is the
+    physics, not a guard: `J > 0` is `|M_e| < Mr`, provable for any positive
+    surface brightness, so no noiseless galaxy lives there and the prior is
+    exactly zero (the paper's positive-J assumption).  `in_support` does not
+    test it, and kernel draws around faint noisy targets do land there; a
+    floored `1/J` gave those draws weights of e^69 (24/44.6k targets spiked).
+    """
+    j = 0.25 * (d[..., 1] ** 2 - d[..., 2] ** 2 - d[..., 3] ** 2)
+    return jnp.where(j > 0, jnp.log(jnp.where(j > 0, j, 1.0)), jnp.inf)
+
+
+def window_prob(m, cov, size, flux, nodes=64, jac=None):
     """F(m) = Pr[m + n lands in the window], n ~ N(0, cov[:2, :2]).
 
-    This is eq. (30)'s `INT_{M in S} dM L(M - M^G)`, with the paper's `|J(M)|`
-    weight and `L(X^G)` detection factor dropped -- see `selection_terms` for
-    why that is right here and how it was checked.
+    This is eq. (psG1)'s `INT_{M in S} dM L(M - M^G) |J(M)|`, normalised by
+    `E[J(M)] = J(M^G)` (`Tr(B C_M) = 0`), so `F -> 1` inside the window and
+    only the edges feel `J`.  The `L(X^G)` detection factor and the NOISELESS
+    `|J(M^G(u))|` are what the centroid layer carries (the copies' eq.-36
+    weights); the ratio `J(M)/J(M^G)` -- the part of the Jacobian that moves
+    with the same noise as `M` -- is not, and is what `jac="full"` restores.
+    See `selection_terms` for how that was checked.  `jac` defaults to the
+    module's `WINDOW_JAC`; `"none"` is the plain Gaussian window probability,
+    `"quad"` keeps only the part of `J(M) - J(M^G)` quadratic in the noise.
 
     Only the (Mf, Mr) 2x2 block of `cov` enters: the window is a cut on those
     two moments alone.  `cov` is `(5, 5)` (shared) or `(..., 5, 5)` aligned
@@ -2189,12 +2557,28 @@ def window_prob(m, cov, size, flux, nodes=64):
     # either way.
     col = lambda a: a if jnp.ndim(a) == 0 else a[..., None]
 
-    t0 = jnp.clip((flux[0] - Mf) / sf, -8.0, 8.0)
-    t1 = jnp.clip((flux[1] - Mf) / sf, -8.0, 8.0)
+    taper = WINDOW_TAPER
+    if taper is None:
+        f_lo, f_hi = flux
+    else:   # integrate past the soft flux edges (6 tau), never below Mf' = 0
+        f_lo, f_hi = max(flux[0] - 6 * taper[1], 0.0), flux[1] + 6 * taper[1]
+    t0 = jnp.clip((f_lo - Mf) / sf, -8.0, 8.0)
+    t1 = jnp.clip((f_hi - Mf) / sf, -8.0, 8.0)
 
     u = 0.5 * (t1 + t0)[..., None] + 0.5 * (t1 - t0)[..., None] * x
     Mfp = Mf[..., None] + col(sf) * u
     mur = Mr[..., None] + col(rho) * col(sr) * u
+    if taper is None:
+        wf, st = 1.0, col(sc)
+    else:
+        # Soft flux edge: its weight on Mf' rides in the integrand.  Soft size
+        # edge: hard cut on Mr~ = Mr' - ts e Mf' (r - ts e, e ~ N(0,1)), which
+        # given u is Gaussian with sd st = sqrt(sc^2 + (ts Mf')^2); the noise
+        # z of Mr' itself is kappa zeta + sqrt(1 - kappa^2) xi on the cut
+        # variable zeta, kappa = sc / st (used by the J moments below).
+        ncdf = jax.scipy.stats.norm.cdf
+        wf = (ncdf((Mfp - flux[0]) / taper[1]) - ncdf((Mfp - flux[1]) / taper[1]))
+        st = jnp.sqrt(col(sc) ** 2 + (taper[0] * Mfp) ** 2)
 
     def lin(coef):
         # `coef * Mfp` is a genuine 0 * inf trap in the GRADIENT when `coef`
@@ -2208,13 +2592,54 @@ def window_prob(m, cov, size, flux, nodes=64):
             return jnp.full_like(mur, -jnp.inf)
         if np.isposinf(coef):
             return jnp.full_like(mur, jnp.inf)
-        return (coef * Mfp - mur) / col(sc)
+        return (coef * Mfp - mur) / st
 
     a, b = lin(size[0]), lin(size[1])
-    integrand = jax.scipy.stats.norm.pdf(u) * (
-        jax.scipy.stats.norm.cdf(b) - jax.scipy.stats.norm.cdf(a))
-    F = 0.5 * (t1 - t0) * jnp.sum(w * integrand, axis=-1)
-    return jnp.where(t1 <= t0, 0.0, F)
+    D = jax.scipy.stats.norm.cdf(b) - jax.scipy.stats.norm.cdf(a)
+    jac = WINDOW_JAC if jac is None else jac
+    if jac == "none":
+        integrand = jax.scipy.stats.norm.pdf(u) * D * wf
+        F = 0.5 * (t1 - t0) * jnp.sum(w * integrand, axis=-1)
+        return jnp.where(t1 <= t0, 0.0, F)
+    # The paper's |J(M)| weight (eq. psG1): F_J = E[1_S(M) J(M)] / E[J(M)],
+    # J = (Mr^2 - M1^2 - M2^2)/4 on the NOISY M.  Equal to F away from the
+    # window's edges; at an edge it adds eq. (psG2)'s dY/df and d2Y/df2 terms,
+    # which for a SIZE cut act on Mr directly (B_rr = 1/4, B_ff = 0).  Given
+    # u, Mr' = mur + sc z with z ~ N(0,1) truncated to (a, b); M1', M2' are
+    # regressed on (nf, nr).  jac = "quad" keeps only the part quadratic in
+    # the noise (drops the linear term the centroid layer's mean shift can
+    # absorb).
+    pdf = jax.scipy.stats.norm.pdf
+    xpdf = lambda v: jnp.where(jnp.isfinite(v), v * pdf(v), 0.0)
+    kap = col(sc) / st                           # 1 untapered
+    E1 = kap * (pdf(a) - pdf(b))                 # E[z 1]
+    E2 = kap ** 2 * (D + xpdf(a) - xpdf(b)) + (1 - kap ** 2) * D   # E[z^2 1]
+    C = cov
+    cfr = jnp.stack([jnp.stack([C[..., 0, 0], C[..., 0, 1]], -1),
+                     jnp.stack([C[..., 1, 0], C[..., 1, 1]], -1)], -2)
+    inv = jnp.linalg.inv(cfr)
+    nr_u, nr_z = col(rho * sr) * u, col(sc)      # nr = nr_u + nr_z z
+    num = 0.25 * ((mur ** 2) * D + 2 * mur * nr_z * E1 + nr_z ** 2 * E2)
+    lin_ = 0.5 * Mr[..., None] * (nr_u * D + nr_z * E1)
+    # E[J(M)] = J(M^G) + Tr(B C_M), each part formed on its own: summed term by term
+    # in float32, Mr^2 + C_rr - M1^2 - C_11 - M2^2 - C_22 rounds a near-point draw's
+    # J(M^G) away against C ~ 1e6 (sn8r has C_rr = C_11 + C_22 exactly) -> ej = 0, F = inf.
+    e12 = jnp.hypot(m[..., 2], m[..., 3])
+    ej = 0.25 * ((Mr - e12) * (Mr + e12) + (C[..., 1, 1] - C[..., 2, 2] - C[..., 3, 3]))
+    for k in (2, 3):
+        cx = jnp.stack([C[..., k, 0], C[..., k, 1]], -1)
+        al = jnp.einsum("...i,...ij->...j", cx, inv)          # regression on (nf, nr)
+        v = C[..., k, k] - jnp.einsum("...i,...i->...", al, cx)
+        ck = m[..., k][..., None] + col(al[..., 0] * sf) * u + col(al[..., 1]) * nr_u
+        dk = col(al[..., 1]) * nr_z
+        num = num - 0.25 * ((ck ** 2 + col(v)) * D + 2 * ck * dk * E1 + dk ** 2 * E2)
+        lin_ = lin_ - 0.5 * m[..., k][..., None] * ((ck - m[..., k][..., None]) * D + dk * E1)
+    if jac == "quad":
+        num = num - lin_
+    elif jac != "full":
+        raise ValueError(f"jac must be 'none', 'full' or 'quad', got {jac!r}")
+    FJ = 0.5 * (t1 - t0) * jnp.sum(w * pdf(u) * num * wf, axis=-1) / ej
+    return jnp.where(t1 <= t0, 0.0, FJ)
 
 
 def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
@@ -2229,24 +2654,28 @@ def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
     resolve `P_s` and its derivatives to the precision the ensemble sums need;
     `Q_s_err` says whether it was.
 
-    Two factors of the paper's eq. (30)/(38)/(40) are absent, deliberately.
-    `|J(M)|`, the Jacobian of the positional moments, is a function of `M`
-    alone (eq. 23, and eq. 25's note that it is independent of `X`), so it
-    cancels exactly out of every `Q_i`, `R_i` -- those are g-derivatives at
-    FIXED `M_i`.  `L(X^G)`, the detection factor, and its `Delta^2 u` sum are
-    what the centroid layer already carries (eq. 36).  What is left is: every
-    stamp holds one already-detected galaxy, the flow is the density of that
-    detected population, and the only selection is this window -- so `P(s|g)`
-    is just "does a random detected galaxy's noisy M land in S".
+    `F` is `window_prob`, which carries the paper's `|J(M)|` (eq. psG1) as
+    the ratio `J(M)/J(M^G)`.  Until 2026-09-28 it was dropped, on the argument
+    that `|J(M)|` depends on `M` alone and so cancels out of every `Q_i`,
+    `R_i`.  True for those -- they are g-derivatives at FIXED `M_i` -- but
+    not here: inside `INT_S dM` the weight varies with the noisy `M` across
+    the window's edge.  The centroid layer does not carry it either: it is
+    trained on copies weighted by the NOISELESS `|J(M^G(u))|` (imsims
+    `log_weights`), so the part of `J` that moves with the same noise as `M`
+    is in neither.  `B = diag(0, 1/4, -1/4, -1/4)`, so it bites hardest on a
+    SIZE cut (it acts on `Mr` directly) and hardly at all on a flux cut.
 
-    That is an assumption, and it was checked rather than asserted: pushing the
-    TRUE template population (`moments.fits`, with bfd's exact `dm_dg`) through
-    `window_prob` gives `P_s = 0.3033` against the noisy catalog's own measured
-    selection fraction of `0.3016` -- 0.6%.  If the dropped factors mattered
-    they would show up there.  Two things the same check does NOT cover: this
-    is the postage-stamp branch (eq. 45-46, `N_ns` counted), not the Poisson
-    sky branch (eq. 53-55, `n Omega P_s`), and it assumes one `C_M` and one
-    `Sigma_X` for the whole catalog, as these catalogs have.
+    Checked with no flow in the loop (`dev/copies_ps.py`): P_s summed over the
+    82.5M sn8 copies on the matching sn8r targets, 7 windows.  With `J` every
+    window matches the sims' own window fraction within 1.1 sigma; without it
+    they miss by -3.4, +3.4, -4.2 and -11 sigma (base, Mr/Mf < 2.8, > 2.4,
+    < 3.5).  On the sn8 varobs run it moves corrected m1 +0.0084 -> +0.0006
+    and removes most of the window dependence (`dev/window_shift.py`).  The
+    old number is `--window-jacobian none`.  (The earlier "0.3033 vs 0.3016"
+    template check was a flux window, where `J` barely acts.)
+
+    Still the postage-stamp branch (eq. 45-46, `N_ns` counted), not the
+    Poisson sky branch (eq. 53-55, `n Omega P_s`).
 
     By isotropy `Q_s` is exactly zero for a spin-0 window -- `P_s` can only
     depend on `|g|^2` -- so the correction is carried entirely by `R_s`, and a
@@ -2867,7 +3296,10 @@ def ghat(q, r, sel=None, ns=None, opg=None):
     Kept because it is opt-in, inert by default, and the only way to reproduce
     those numbers.
     """
-    if sel is not None:
+    if sel is not None and np.asarray(sel).dtype != bool:   # tapered window weights
+        q, r = q * sel[:, None], r * sel[:, None, None]
+        opg = None if opg is None else opg * sel[:, None, None]
+    elif sel is not None:
         q, r = q[sel], r[sel]
         opg = None if opg is None else opg[sel]
     obs = -r.sum(0) if opg is None else opg.sum(0)
@@ -3027,7 +3459,7 @@ def bootstrap(qp, rp, qm, rm, g=0.02, n=200, seed=0, sel=None, ns=None,
         # 1 inside the pad and 1/sample outside, so the weighted sum is an
         # unbiased N_ns per replicate AND inflates the bar by the subsampling's
         # own variance, which is the honest thing to do.
-        n_ns = ((~sel_i).sum() if w is None else w[idx][~sel_i].sum())
+        n_ns = ((1 - sel_i).sum() if w is None else (w[idx] * (1 - sel_i)).sum())
         return sel_i, (float(n_ns),) + tuple(ns_a[1:])
 
     n_all = len(qp)
@@ -3142,6 +3574,11 @@ def main():
                         "deeper catalog. Only meaningful where the noise is "
                         "ADDED in moment space; an IMGNOISE catalog carries its "
                         "own realization and this would rescale only the kernel.")
+    p.add_argument("--per-target-cov", action="store_true",
+                   help="diagnostic: carry a homoscedastic catalog's C_M as "
+                        "one row per target, so it runs the heteroscedastic "
+                        "(varobs) code path -- per-target kernels, no pool, "
+                        "selection conditions drawn per prior draw.")
     p.add_argument("--noise-seed", type=int, default=1,
                    help="the targets' noise realization; shared by the +g, -g "
                         "and unsheared catalogs so the pairing still cancels "
@@ -3181,6 +3618,11 @@ def main():
                         "the run.  Every lambda is unbiased (see "
                         "`_blend_lambda`), so this trades a little variance in "
                         "Q and R for wall clock and moves no expectation")
+    p.add_argument("--pool-reuse", type=int, default=0,
+                   help="share the defensive mixture's flow draws (and their "
+                        "g-derivatives) across targets, each draw reused by ~k "
+                        "targets on average; exact per target, needs one "
+                        "Sigma_X and C_M for the catalog (`_pool_build`); 0 = off")
     p.add_argument("--save-pqr", default=None,
                    help="write per-target Q and R to this .npz, for --compare")
     p.add_argument("--compare", nargs=2, metavar=("A.npz", "B.npz"), default=None,
@@ -3206,6 +3648,19 @@ def main():
     p.add_argument("--window-flux", type=float, nargs=2, default=None,
                    metavar=("LO", "HI"),
                    help="target selection window in Mf; see --window-size.")
+    p.add_argument("--window-taper", type=float, nargs=2, default=None,
+                   metavar=("TAU_SIZE", "TAU_FLUX"),
+                   help="soft window: Gaussian-CDF edges of width TAU_SIZE in Mr/Mf and "
+                        "TAU_FLUX in Mf, on targets AND selection terms (default: hard)")
+    p.add_argument("--window-jacobian", choices=["full", "quad", "none"],
+                   default="full",
+                   help="the paper's noisy |J(M)| (eqs. pMsG2, psG1; default): "
+                        "in the selection probability AND, as a 1/J(m) weight "
+                        "on each noiseless IS draw, in every target's P/Q/R -- "
+                        "one model, so one switch. 'none' drops both, "
+                        "reproducing every number before 2026-09-28; 'quad' "
+                        "(diagnostic) keeps only the selection side's part "
+                        "quadratic in the noise and no target side.")
     p.add_argument("--window-fd", type=float, default=0.02,
                    metavar="H",
                    help="estimate P_s's shear derivatives by central "
@@ -3291,6 +3746,10 @@ def main():
                         "with different --flow still share draws and --compare "
                         "keeps its pairing. Only matters when --alpha < 1.")
     a = p.parse_args()
+    global WINDOW_JAC, TARGET_JAC, WINDOW_TAPER
+    WINDOW_JAC = a.window_jacobian
+    WINDOW_TAPER = None if a.window_taper is None else tuple(a.window_taper)
+    TARGET_JAC = a.window_jacobian == "full"
     draw_seed = a.noise_seed + 1000 if a.draw_seed is None else a.draw_seed
 
     if a.compare:
@@ -3336,10 +3795,8 @@ def main():
         import truth
         flow = truth.BiasFlow()
     else:
-        flow = bulk.build_flow(jr.key(a.seed), m_train, shear=True,
-                               centroid=use_centroid,
-                               flux_sas=a.flux_sas)
-        flow = eqx.tree_deserialise_leaves(a.flow, flow)
+        flow = bulk.load_flow(a.flow, m_train, key=jr.key(a.seed), shear=True,
+                              centroid=use_centroid, flux_sas=a.flux_sas)
     # The physical support indicator and the defensive floor are EVALUATION-time
     # properties of the prior, not of the trained weights: the checkpoint is
     # unchanged, and --floor-eps 0 --no-support reproduces the raw flow exactly.
@@ -3361,10 +3818,9 @@ def main():
         # flow's is keyed on `use_centroid` above -- get this wrong and the
         # proposal's RawMomentStandardize is silently off.
         m_train_prop = m_train_full if img_noise else slice90(m_train_full)
-        proposal = bulk.build_flow(jr.key(a.seed), m_train_prop, shear=True,
-                                   centroid=img_noise,
-                                   flux_sas=a.flux_sas)
-        proposal = eqx.tree_deserialise_leaves(a.proposal_flow, proposal)
+        proposal = bulk.load_flow(a.proposal_flow, m_train_prop, key=jr.key(a.seed),
+                                  shear=True, centroid=img_noise,
+                                  flux_sas=a.flux_sas)
         print(f"  proposal flow: {a.proposal_flow} "
               f"(draws shared across eval flows)")
 
@@ -3411,13 +3867,13 @@ def main():
         _flux = tuple(a.window_flux) if a.window_flux is not None else (-np.inf, np.inf)
         n_out_full = {}
         for k in ("plus", "minus"):
-            n_in = int(window_mask(m[k], _size, _flux).sum())
+            n_in = round(float(window_mask(m[k], _size, _flux).sum()))
             npop = fitsio.read_header(path(cat[k]), ext=1).get("NPOP")
             if npop is not None:
                 n_out_full[k] = n_out_from_npop(npop, n_in)
                 print(f"  region fraction ({k}) = {len(m[k])/int(npop):.4f}")
             else:
-                n_out_full[k] = int((~window_mask(m[k], _size, _flux)).sum())
+                n_out_full[k] = round(float((1 - window_mask(m[k], _size, _flux)).sum()))
 
     prefilter = None
     prefilter_w = None
@@ -3437,9 +3893,17 @@ def main():
         pad = a.prefilter_pad
         p_size = (_size[0] * (1 - pad), _size[1] * (1 + pad))
         p_flux = (_flux[0] * (1 - pad), _flux[1] * (1 + pad))
+        if WINDOW_TAPER is not None and (
+                _size[1] + 4 * WINDOW_TAPER[0] > p_size[1] or _size[0] - 4 * WINDOW_TAPER[0] < p_size[0]
+                or _flux[0] - 4 * WINDOW_TAPER[1] < p_flux[0]
+                or (np.isfinite(_flux[1]) and _flux[1] + 4 * WINDOW_TAPER[1] > p_flux[1])):
+            raise SystemExit(f"--window-taper {WINDOW_TAPER} reaches past the pre-filter "
+                             f"pad (size {p_size}, flux {p_flux}): need 4 tau inside it")
         prefilter = np.zeros(len(truth), dtype=bool)
+        _wt, WINDOW_TAPER = WINDOW_TAPER, None          # the pad itself is a hard cut
         for k in ("plus", "minus"):
             prefilter |= window_mask(m[k], p_size, p_flux)
+        WINDOW_TAPER = _wt
         in_pad = prefilter.copy()
         n_pad = int(in_pad.sum())
         if a.prefilter_sample > 0:
@@ -3492,6 +3956,9 @@ def main():
         # for the noise; a deeper IMAGE would also re-find the centroid, which
         # is why the bulgedisc deep study renders instead of scaling.
         cov = load_cov(path(cat["zero"]))
+        if a.per_target_cov and cov.ndim == 2:
+            cov = np.repeat(cov[None], fitsio.read_header(
+                path(cat["zero"]), ext=1)["NAXIS2"], 0)
         if cov.ndim == 3:
             # Per-target C_M: row-align it with `rows`/`m`/`sigma_x_all`,
             # which have already been through the same n-targets slice, the
@@ -3540,6 +4007,8 @@ def main():
                 draws[k], log_wt[k] = mixture_draws(
                     draw_flow, v, cov, a.samples, a.alpha, draw_seed,
                     sigma_x=draw_sigma_x)
+                if TARGET_JAC:
+                    log_wt[k] = log_wt[k] - np.asarray(_log_jac(jnp.asarray(draws[k])))
 
     # Peel the centroid layer off and apply it once.  Its log-det is a property
     # of the draw and of Sigma_X, never of g, so it belongs in the importance
@@ -3642,7 +4111,8 @@ def main():
                                  batch=batch, chunk=chunk,
                                  report=max(1, len(v) // (batch * 10)),
                                  proposal=proposal, proposal_sigma_x=proposal_sigma_x,
-                                 gauge=a.gauge, lam_stride=a.lambda_stride)
+                                 gauge=a.gauge, lam_stride=a.lambda_stride,
+                                 pool_reuse=a.pool_reuse)
     else:
         qr = {k: pqr(flow_g, m[k], None if draws is None else draws[k],
                      None if log_wt is None else log_wt[k], batch, sigma_x)
@@ -3709,8 +4179,8 @@ def main():
             if deadmask.any():
                 print(f"  {lbl}: zero-weight {int(deadmask.sum())} "
                       f"({deadmask.mean():.1%}) -- in-window "
-                      f"{deadmask[s_a].mean():.2%}, out-of-window "
-                      f"{deadmask[~s_a].mean():.2%}")
+                      f"{deadmask[s_a > 0.5].mean():.2%}, out-of-window "
+                      f"{deadmask[~(s_a > 0.5)].mean():.2%}")
 
         if a.window_guard:
             print("  --window-guard is deprecated and ignored -- the support "
@@ -3802,6 +4272,13 @@ def main():
                 # catalog's own row order is as good a sample of them as any,
                 # and this sidesteps every in-memory subsetting (n-targets,
                 # badcenter, pre-filter) done to `rows`/`m` above.
+                # Averaging over ALL rows is the right weighting: in expectation
+                # the non-selection sum is N * E_c[Q_s(c)], N * E_c[R_s(c) + ...]
+                # (the 1/(1 - P_s) factors cancel).  Exact but for the O(Q_s^2)
+                # piece.  ponytail: one population mean; the planned upgrade is
+                # selection terms per bin of observing conditions, assigned to
+                # the galaxies in each bin (needed once conditions correlate with
+                # galaxies, e.g. real-survey maps).
                 full = fitsio.read(path(cat["zero"]))
                 cov_full = np.asarray(
                     bfd.MomentCovariance.bulkUnpack(full["cov"]),

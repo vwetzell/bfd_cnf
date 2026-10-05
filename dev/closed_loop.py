@@ -32,13 +32,17 @@ import bulk
 import shear
 
 D = "../bfd_cnf_imsims/data"
-REAL = B.CATALOGS["gauss2_v4n"]
+# C_M only: moment noise does not depend on the galaxy.  REAL_POP must be fixed-noise, round-PSF.
+REAL = B.CATALOGS[__import__("os").environ.get("REAL_POP", "gauss2_v4n")]
+# the flow's own prior (chart constants are rebuilt from it); TRAIN_POP=bulgedisc_g2n for that chain
+TRAIN = __import__("os").environ.get("TRAIN_POP", "gauss2_v4n")
+# target noise / 0.93: C_M and Sigma_X both scale as noise^2 (DEPTH=sn8 in dev/bdg2n.sh)
+S2 = float(__import__("os").environ.get("NOISE_SCALE", "1")) ** 2
 
 
 def load_flow(path):
-    m = np.asarray(shear.load(f"{D}/{B.TRAIN_DATA['gauss2_v4n']}")[0])[:20000]
-    return eqx.tree_deserialise_leaves(
-        path, bulk.build_flow(jr.key(0), m, shear=True, centroid=True))
+    m = np.asarray(shear.load(f"{D}/{B.TRAIN_DATA[TRAIN]}")[0])[:20000]
+    return bulk.load_flow(path, m, shear=True, centroid=True)   # adapter flows too
 
 
 def sampler(flow, sx):
@@ -57,11 +61,30 @@ def catalogs(a):
     draw = sampler(flow, sx)
     kz, kn = jr.split(jr.key(a.seed))
     z = flow.base_dist.sample(kz, (a.n,))
-    noise = np.random.default_rng(a.seed).multivariate_normal(np.zeros(5), cm, a.n)
+    rng = np.random.default_rng(a.seed)
+    if a.jacobian:
+        # The paper's P(M|g) = J(M) INT p_flow(m|g)/J(m) N(M; m, C) dm: per galaxy the
+        # noise is N(n) J(m+n)/J(m) (normalised: E[J(m+n)] = J(m) as Tr(BC) = 0).
+        # Rejection from N with bound KMAX, candidates and uniforms common to the
+        # arms so they stay paired.  ponytail: KMAX clips ratios > 3 (faint only; counted).
+        cand = rng.multivariate_normal(np.zeros(5), cm, (a.n, 48)).astype(np.float32)
+        u = rng.random((a.n, 48), dtype=np.float32)
+    else:
+        noise = rng.multivariate_normal(np.zeros(5), cm, a.n)
     for arm, g1 in (("plus", 0.02), ("minus", -0.02), ("zero", 0.0)):
         g = jnp.array([g1, 0.0])
         m = np.concatenate([np.asarray(draw(z[i:i + a.batch], g), np.float64)
-                            for i in range(0, a.n, a.batch)]) + noise
+                            for i in range(0, a.n, a.batch)])
+        if a.jacobian:
+            jac = lambda d: 0.25 * (d[..., 1] ** 2 - d[..., 2] ** 2 - d[..., 3] ** 2)
+            r = np.maximum(jac(m[:, None] + cand) / jac(m)[:, None], 0.0)
+            r = np.where(np.isfinite(r), r, 1.0)
+            ok = u < r / 3.0
+            k = ok.argmax(1)
+            print(f"  {arm}: ratio > 3 in {(r > 3).mean():.2e} of candidates; "
+                  f"{(~ok.any(1)).sum()} rows with no acceptance (kept candidate 0)")
+            noise = cand[np.arange(a.n), k]
+        m = m + noise
         bad = ~np.isfinite(m).all(1)
         m[bad] = 0.0
         out = np.zeros(a.n, dtype=real[arm].dtype)
@@ -71,7 +94,8 @@ def catalogs(a):
         out["badcenter"] = bad   # non-finite flow draws: dropped by bias.py in all arms
         h = {k: hdr[k] for k in ("PIXSCALE", "WTSIGMA", "PSFSIGMA", "NOISESIG",
                                  "PSFE1", "PSFE2", "POPKIND", "IMGNOISE", "SIG_XY")}
-        h.update(G1=g1, G2=0.0, SEED=a.seed, CLOSEDLP=os.path.basename(a.flow))
+        h.update(G1=g1, G2=0.0, SEED=a.seed, CLOSEDLP=os.path.basename(a.flow), NPOP=a.n,
+                 CLOSEDJ=a.jacobian)
         path = f"{D}/{B.CATALOGS[a.pop][arm]}.fits"
         fitsio.write(path, out, header=h, clobber=True)
         print(f"{arm:5s} g1={g1:+.2f}  wrote {path}  ({bad.sum()} non-finite draws)")
@@ -79,8 +103,8 @@ def catalogs(a):
 
 def selection(a):
     flow = load_flow(a.flow)
-    sx = jnp.asarray(fitsio.read(f"{D}/{REAL['plus']}.fits", rows=[0])["cov_odd"][0], jnp.float32)
-    cm = jnp.asarray(B.load_cov(f"{D}/{REAL['plus']}.fits"), jnp.float32)
+    sx = jnp.asarray(S2 * fitsio.read(f"{D}/{REAL['plus']}.fits", rows=[0])["cov_odd"][0], jnp.float32)
+    cm = jnp.asarray(S2 * B.load_cov(f"{D}/{REAL['plus']}.fits"), jnp.float32)
     draw = sampler(flow, sx)
     size, flux = tuple(a.size), tuple(a.flux)
 
@@ -129,6 +153,7 @@ def main():
     p.add_argument("--n", type=int, default=65372, help="population size (real NPOP)")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--pop", default="gauss2_v4n_closed", help="bias.py CATALOGS entry to write")
+    p.add_argument("--jacobian", action="store_true", help="noise tilted by J(M)/J(m) (paper eq. pMsG2)")
     p.add_argument("--batch", type=int, default=65536)
     p.add_argument("--log2-draws", type=int, default=24)
     p.add_argument("--h", type=float, nargs="+", default=[0.02, 0.05])

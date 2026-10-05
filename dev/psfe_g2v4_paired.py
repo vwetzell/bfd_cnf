@@ -21,7 +21,8 @@ import bias as B
 
 TAG = sys.argv[1] if len(sys.argv) > 1 else "psfe1p05"
 SET = sys.argv[2] if len(sys.argv) > 2 else "22k"
-SIZE, FLUX, G = (2.2, 3.2), (3000.0, 20000.0), 0.02
+SIZE, FLUX = (2.2, 3.2), (3000.0, 20000.0)
+G = {"round": 0.02, TAG: 0.01 if TAG == "g01" else 0.02}   # g01: m(0.01) - m(0.02) = -3e-4 alpha
 RUNS = {"22k": {"round": ("gauss2_v4n", "pqr/g2v4n_Ke_20k.npz", "logs/bias_g2v4n_Ke_20k.log"),
                 TAG: (f"gauss2_v4n_{TAG}", f"pqr/g2v4n_Ke_22k_{TAG}.npz", f"logs/bias_g2v4n_Ke_22k_{TAG}.log")},
         "176k": {"round": ("gauss2_v4n_176k", "pqr/g2v4n_Ke_176k.npz", "logs/bias_g2v4n_Ke_176k.log"),
@@ -60,12 +61,12 @@ def load(pop, f, log):
     return full, sp, sm, npop, sel_terms(log)
 
 
-def est(r, i):
+def est(r, i, g):
     full, sp, sm, npop, st = r
     q = tuple(full[k][i] for k in ("plus_q", "plus_r", "minus_q", "minus_r"))
     p, m = sp[i], sm[i]
     ns = ((npop - p.sum(),) + st, (npop - m.sum(),) + st)
-    return np.array([B.bias(*q, G, sel=(p, m), ns=ns), B.bias(*q, G, sel=(p, m))]).ravel()
+    return np.array([B.bias(*q, g, sel=(p, m), ns=ns), B.bias(*q, g, sel=(p, m))]).ravel()
 
 
 R = {k: load(*v) for k, v in RUNS.items()}
@@ -77,12 +78,12 @@ for k, r in R.items():
 print(f"window membership differs on {(R['round'][1] != R[TAG][1]).sum()} (+) / "
       f"{(R['round'][2] != R[TAG][2]).sum()} (-) of {n} rows")
 idx = np.arange(n)
-pt = {k: est(r, idx) for k, r in R.items()}
+pt = {k: est(r, idx, G[k]) for k, r in R.items()}
 rng = np.random.default_rng(0)
 boot = []
 for _ in range(400):
     i = rng.choice(idx, n)
-    boot.append([est(r, i) for r in R.values()])
+    boot.append([est(r, i, G[k]) for k, r in R.items()])
 boot = np.array(boot)                                  # (nboot, 2 runs, 6)
 lab = ["m1 corr", "c1 corr", "c2 corr", "m1 uncorr", "c1 uncorr", "c2 uncorr"]
 print(f"\n{'':10s}" + "".join(f"{x:>22s}" for x in lab))
@@ -92,3 +93,6 @@ d = pt[TAG] - pt["round"]
 sd = (boot[:, 1] - boot[:, 0]).std(0)
 print(f"{'diff':10s}" + "".join(f"{d[c]:>+13.5f}+/-{sd[c]:.5f}" for c in range(6)))
 print(f"{'sigma':10s}" + "".join(f"{d[c] / sd[c]:>22.1f}" for c in range(6)))
+if TAG == "g01":
+    print(f"alpha (m = m0 + alpha g^2): corr {-d[0] / 3e-4:+.2f} +/- {sd[0] / 3e-4:.2f}   "
+          f"uncorr {-d[3] / 3e-4:+.2f} +/- {sd[3] / 3e-4:.2f}")

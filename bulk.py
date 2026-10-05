@@ -40,6 +40,8 @@ import jax.random as jr
 import numpy as np
 import optax
 
+import train_loop
+
 # XLA picks matmul precision PER PROCESS, and on this flow that is worth ~1
 # nat in the log-densities ([[tf32-breaks-paired-runs]]; `bias.py` has forced
 # this since f1f3c92).  Training left unpinned is worse than imprecise, it is
@@ -52,9 +54,9 @@ from flowjax.bijections import Chain, Invert, Permute
 from flowjax.distributions import MultivariateNormal, Transformed
 from paramax import non_trainable
 
-from models.bijections import (EquivariantAutoregressiveLayer,
+from models.bijections import (CentroidShearAdapter, EquivariantAutoregressiveLayer,
                                RawMomentStandardize, SigmaXBlockLayer,
-                               concentration_phi, in_support)
+                               concentration_phi, in_support, spin2_bound, E_MAX)
 from models.centroid import CentroidMarginalize  # noqa: F401 -- kept importable, see build_flow
 from models.shear import ShearResponse
 
@@ -156,8 +158,11 @@ def to_coords(m, flux_sas=None):
     # Mc/Mr - Phi(r)/r: see RawMomentStandardize's docstring for why the
     # exact weight-kernel prediction Phi(r) is subtracted off.  MUST call the
     # same `concentration_phi` as `_forward_transform`, not reimplement it.
+    # Slots 3, 4 through the chart's own `spin2_bound`, not the bare ratio: with
+    # the E_MAX ceiling they differ by ~1/E_MAX even at small |e|.
+    w = np.asarray(spin2_bound(m[:, 2] / m[:, 1], m[:, 3] / m[:, 1]))
     return np.stack([f, r, m[:, 4] / m[:, 1] - np.asarray(concentration_phi(r)) / r,
-                     m[:, 2] / m[:, 1], m[:, 3] / m[:, 1]], axis=-1)
+                     w[0], w[1]], axis=-1)
 
 
 def coeff_stats(t, mean=None, std=None):
@@ -188,7 +193,7 @@ def coeff_stats(t, mean=None, std=None):
 
 def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH,
                shear=False, centroid=False,
-               flux_sas=None):
+               flux_sas=None, adapter=False):
     """Bulk flow standardised against `m_train`; conditioned on g and/or Sigma_X.
 
     The generative stack is ``base -> bulk -> shear(g) -> centroid(Sigma_X) ->
@@ -202,7 +207,19 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
     composes the chart back in (`shear.dm_dg(layer, m, chart)`), not the
     layers' own coordinates.  Centroid comes last because it happens last -- a galaxy is lensed
     on the sky and only then measured about a centroid somebody had to guess.
+
+    `adapter=True` requires `shear=True, centroid=True`: the data -> base
+    chain becomes ``[raw2standard, SigmaXBlockLayer(g_blind=True),
+    CentroidShearAdapter, shear, *bulk]`` -- the centroid layer's shear
+    dependence (`_A`/`net_K`/`_sigma_eff`) moves out into the cheap adapter,
+    so the (now g-blind) centroid layer can be peeled off and evaluated once
+    per draw outside the g-autodiff (`bias.split_centroid`).  The adapter's
+    key is `jr.fold_in(k_centroid, 1)`, which does not perturb any existing
+    key split -- `adapter=False` builds are bit-identical to before this was
+    added.
     """
+    if adapter and not (shear and centroid):
+        raise ValueError("adapter=True requires shear=True, centroid=True")
     # Loud, not silent: slot 1's chart is undefined at or above the ceiling, so
     # a training set containing such a row would produce NaNs several layers
     # away from the cause.  Noisy moments DO reach up there -- they must be fed
@@ -285,11 +302,21 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
     # through zero, and since `x1` is chart-standardised to zero population
     # mean, no constant kappa can produce a net population-level size shift
     # -- exactly why net_size never moved off its zero-shift plateau.
-    head = ([SigmaXBlockLayer(k_centroid, full_cond_dim=cond or 3,
-                              log_scale_mean=10.8, e_max=0.1,
-                              size_loc=float(t.mean(0)[1] / t.std(0)[1]))]
-            if centroid else []) + \
-           ([shear_layer] if shear else [])
+    # `adapter=True` makes the centroid layer `g_blind` (ignores g entirely,
+    # see `SigmaXBlockLayer.g_blind`) and inserts `CentroidShearAdapter`
+    # right after it to carry that dependence instead -- `jr.fold_in(
+    # k_centroid, 1)` so this never perturbs the key `SigmaXBlockLayer`
+    # itself gets, keeping `adapter=False` builds bit-identical to before.
+    centroid_layer = ([SigmaXBlockLayer(k_centroid, full_cond_dim=cond or 3,
+                                        log_scale_mean=10.8, e_max=0.1,
+                                        size_loc=float(t.mean(0)[1] / t.std(0)[1]),
+                                        g_blind=adapter)]
+                      if centroid else [])
+    adapter_layer = ([CentroidShearAdapter(
+        jr.fold_in(k_centroid, 1), log_scale_mean=10.8, e_max=0.1,
+        e_scale=float(np.sqrt(0.5 * (t.std(0)[3] ** 2 + t.std(0)[4] ** 2))))]
+                     if adapter else [])
+    head = centroid_layer + adapter_layer + ([shear_layer] if shear else [])
     bijection = Invert(Chain([raw2standard, *head, *bulk]).merge_chains())
     base = non_trainable(MultivariateNormal(jnp.zeros(5), jnp.eye(5)))
     return Transformed(base, bijection)
@@ -452,6 +479,14 @@ def sync_chart_constants(flow, m_train=None):
                 values += [non_trainable(jnp.asarray(u_stats[0], jnp.float32)),
                            non_trainable(jnp.asarray(u_stats[1], jnp.float32))]
             flow = eqx.tree_at(lambda f: [g(f) for g in getters], flow, values)
+    # `CentroidShearAdapter` resyncs the SAME way as `ShearResponse.e_scale`
+    # above, and for the identical reason -- it un-standardises z3, z4 by it
+    # too (see `CentroidShearAdapter._w`).
+    for i, b in enumerate(bij):
+        if isinstance(b, CentroidShearAdapter):
+            flow = eqx.tree_at(
+                lambda f, i=i: f.bijection.bijection.bijections[i].e_scale,
+                flow, non_trainable(e_scale))
     # SigmaXBlockLayer operates on already-standardised z, so it has no
     # frozen chart mean/std ARRAY to resync -- but its `_size_loc`
     # (`chart.mean[1] / chart.std[1]`, see `bulk.build_flow`'s docstring) is
@@ -477,6 +512,42 @@ def sync_chart_constants(flow, m_train=None):
                                 f.bijection.bijection.bijections[i].std],
                 flow, [non_trainable(chart.mean), non_trainable(chart.std)])
     return flow
+
+
+def load_flow(path, m_train, key=None, **kw):
+    """Build a flow matching `path`'s checkpoint and deserialise it.
+
+    A checkpoint written with `adapter=True` has a different pytree leaf
+    structure (one extra `CentroidShearAdapter` layer, plus `SigmaXBlockLayer`
+    carrying its own `g_blind` flag -- static, so it does not itself change
+    the leaf count) than one written with `adapter=False`, and `**kw` callers
+    (`bias.py`, `dev/tail_gate.py`, `dev/flow_vs_truegal.py`) have no other way
+    to know which a given `.eqx` file is.  Try `adapter=False` first (the
+    overwhelmingly common case, and every checkpoint written before this was
+    added) and fall back to `adapter=True` only if deserialising into it
+    raises -- `eqx.tree_deserialise_leaves` raises on a leaf-count/shape
+    mismatch, which is exactly the signal needed here. Re-raises the
+    `adapter=False` error if BOTH fail, so a genuinely broken/missing file
+    reports the ordinary (not the fallback's confusing) exception.
+
+    Only meaningful when `kw` has `shear=True, centroid=True` -- `build_flow`
+    itself rejects `adapter=True` otherwise, so with any other `kw` this is
+    just `eqx.tree_deserialise_leaves(path, build_flow(key, m_train, **kw))`.
+    """
+    key = jr.key(0) if key is None else key
+    flow = build_flow(key, m_train, **kw)
+    if kw.get("adapter") or not (kw.get("shear") and kw.get("centroid")):
+        # Caller already said which, or the adapter question doesn't even
+        # arise for this `kw` -- one build, no fallback.
+        return eqx.tree_deserialise_leaves(path, flow)
+    try:
+        return eqx.tree_deserialise_leaves(path, flow)
+    except Exception as exc:
+        try:
+            return eqx.tree_deserialise_leaves(
+                path, build_flow(key, m_train, **{**kw, "adapter": True}))
+        except Exception:
+            raise exc from None
 
 
 def _bulk_layers(flow):
@@ -579,21 +650,61 @@ def _trainable(flow, freeze_chart):
                         replace=jax.tree.map(lambda _: False, chart))
 
 
+def tail_monotone_penalty(model, key, n, e_lo, box, fallback):
+    """mean relu(d/d|e| log p(|e| | spin-0)) on |e| in [e_lo, E_MAX)  (2026-09-30).
+
+    The marginal density in |e| must fall monotonically to 0 at the chart
+    ceiling past the training data (`e_lo` = its max |e|).  cv3 seed 2 broke
+    that: at a ~3 sigma spin-0 base corner one bulk layer's spin-2 stretch
+    sat on its 0.01 bound, so 7.6e-6 of the mass piled AGAINST E_MAX, and
+    those draws dominated faint targets' R ([[s2-bulk-e1-tail]]).  No data
+    lives there, so the NLL never sees it.  Probe points: spin-0 from the
+    model's own draws with the base widened 1.5x (to reach that corner),
+    |e| uniform on [e_lo, E_MAX), random angle.  The radial marginal is
+    2 pi |e| p(M1, M2 | .), hence the +1/|e|.  Points are stop-gradient-ed:
+    the only path is "make the density fall here", never "move the probes".
+    Probes whose spin-0 (Mf, Mr, Mc) leaves `box` (half the training min to
+    twice its max) or whose slope is non-finite are swapped for `fallback`, a
+    training row: early in training the widened draws land at Mf ~ 1e-26 or
+    Mr < 0, finite in value but NaN in gradient, and a NaN in a discarded
+    branch still poisons grads (same guard as `self_jac_weight`'s)."""
+    k1, k2, k3 = jr.split(key, 3)
+    m = jax.lax.stop_gradient(jax.vmap(model.bijection.transform)(
+        1.5 * model.base_dist.sample(k1, (n,))))
+    r = jr.uniform(k2, (n,), minval=e_lo, maxval=E_MAX * (1.0 - 1e-4))
+    phi = jr.uniform(k3, (n,), maxval=2.0 * jnp.pi)
+    lp = lambda rr, mi, ph: model.log_prob(
+        mi.at[2].set(mi[1] * rr * jnp.cos(ph)).at[3].set(mi[1] * rr * jnp.sin(ph)))
+    slope = jax.vmap(jax.grad(lp))
+    s0 = m[:, jnp.array([0, 1, 4])]
+    ok = jax.lax.stop_gradient(jnp.isfinite(slope(r, m, phi))
+                               & jnp.all((s0 > box[0]) & (s0 < box[1]), 1))
+    m = jnp.where(ok[:, None], m, fallback)
+    return jnp.mean(jax.nn.relu(slope(r, m, phi) + 1.0 / r))
+
+
 def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
-          ema=0.0, self_jac_weight=0.0, self_jac_samples=512):
+          ema=0.0, self_jac_weight=0.0, self_jac_samples=512, m_val=None,
+          check_every=5000, tail_weight=0.0, tail_samples=1024):
     # The power-law flux gives log10(Mf) a long tail, so an outlier batch can blow
     # the NLL up mid-training and never recover -- clip, then decay the step size.
+    # `m_val` given: train to convergence on it (`train_loop.fit`: constant LR,
+    # reduce-on-plateau, stop on a paired held-out test); `steps` is then unused.
+    converge = m_val is not None
     opt = optax.chain(optax.clip_by_global_norm(1.0),
-                      optax.adam(optax.cosine_decay_schedule(lr, steps)))
+                      optax.adam(lr if converge else optax.cosine_decay_schedule(lr, steps)))
     params, static = eqx.partition(flow, _trainable(flow, freeze_chart=bool(jac_weight)))
     state = opt.init(params)
     data = jnp.asarray(m_train)
+    e_lo = float(np.max(np.hypot(m_train[:, 2], m_train[:, 3]) / m_train[:, 1]))
+    s0 = np.asarray(m_train)[:, [0, 1, 4]]
+    box = (jnp.asarray(0.5 * s0.min(0)), jnp.asarray(2.0 * s0.max(0)))
     # `ema` > 0: return the exponential average of the params instead of the
     # last iterate (per-step nll swings +-0.5 at batch 1024, so the final
     # iterate is one noisy draw -- see [[health-gate-every-stage-and-track-jobs]]).
     ema_params = params
 
-    def step(params, state, idx, key):
+    def step(params, state, idx, key, mult):
         def loss_fn(p):
             model = eqx.combine(p, static)
             nll = -jnp.mean(model.log_prob(data[idx]))
@@ -668,9 +779,13 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
                                      jnp.sum(capped) / jnp.maximum(count, 1),
                                      0.0)
                 loss = loss + self_jac_weight * self_pen
+            if tail_weight:
+                loss = loss + tail_weight * tail_monotone_penalty(
+                    model, jr.fold_in(key, 1), tail_samples, e_lo, box, data[idx[0]])
             return loss, nll
         (loss, nll), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, state = opt.update(grads, state, params)
+        updates = jax.tree.map(lambda u: mult * u, updates)
         return eqx.apply_updates(params, updates), state, nll
 
     # The plain-Python `for i in range(steps)` loop this replaced dispatched ONE
@@ -699,18 +814,44 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
     # scan/chunk structure exists for would need a host round-trip per step
     # again to hand it a fresh key -- exactly what folding `REPORT` steps into
     # one `lax.scan` was for.
-    def scan_body(carry, idx):
+    def scan_body(carry, idx, mult):
         params, state, ema_params, key = carry
         key, sk = jr.split(key)
-        params, state, nll = step(params, state, idx, sk)
+        params, state, nll = step(params, state, idx, sk, mult)
         if ema:
             ema_params = jax.tree_util.tree_map(
                 lambda e, q: ema * e + (1.0 - ema) * q, ema_params, params)
         return (params, state, ema_params, key), nll
 
     @eqx.filter_jit
-    def run_chunk(params, state, ema_params, key, idx_chunk):
-        return jax.lax.scan(scan_body, (params, state, ema_params, key), idx_chunk)
+    def run_chunk(params, state, ema_params, key, idx_chunk, mult=1.0):
+        return jax.lax.scan(lambda c, x: scan_body(c, x, mult),
+                            (params, state, ema_params, key), idx_chunk)
+
+    if converge:
+        mv = jnp.asarray(m_val[:20000])
+
+        @eqx.filter_jit
+        def val_fn(p):
+            model = eqx.combine(p, static)
+            v = -model.log_prob(mv)
+            if jac_weight:
+                v = v + jac_weight * bulk_jacobian_penalty(model, mv, reduce=False)
+            return v
+
+        def chunk_fn(carry, mult, n):
+            params, state, ema_params, key = carry
+            key, sk, ck = jr.split(key, 3)
+            idx_chunk = jr.randint(sk, (n, batch), 0, data.shape[0])
+            (params, state, ema_params, _), nlls = run_chunk(
+                params, state, ema_params, ck, idx_chunk, mult)
+            return (params, state, ema_params, key), nlls
+
+        best, _ = train_loop.fit(
+            chunk_fn, (params, state, ema_params, key),
+            lambda c: c[2] if ema else c[0], val_fn, chunk=REPORT, check_every=check_every,
+            report=lambda i, nlls: print(f"step {i:5d}  nll {float(nlls[-1]):.4f}", flush=True))
+        return eqx.combine(best, static)
 
     i = 0
     while i < steps:
@@ -747,6 +888,11 @@ def main():
     p.add_argument("--data", default="../bfd_cnf_imsims/data/moments.fits")
     p.add_argument("--flow", default="flows/bulk.eqx")
     p.add_argument("--steps", type=int, default=4000)
+    p.add_argument("--converge", action="store_true",
+                   help="train until the held-out objective (NLL + jac penalty) stops "
+                        "improving (train_loop.fit); --steps is ignored")
+    p.add_argument("--check-every", type=int, default=5000,
+                   help="--converge: steps between held-out checks")
     p.add_argument("--jac-weight", type=float, default=0.0,
                    help="weight on an explicit Jacobian penalty (mean "
                         "squared gradient of every conditioner net in every "
@@ -767,6 +913,10 @@ def main():
                         "[[health-gate-every-stage-and-track-jobs]].")
     p.add_argument("--self-jac-samples", type=int, default=512,
                    help="Batch size for the self-sample penalty (--self-jac-weight).")
+    p.add_argument("--tail-weight", type=float, default=0.0,
+                   help="weight of tail_monotone_penalty: the |e| marginal must "
+                        "fall monotonically to 0 between the data's max |e| and E_MAX")
+    p.add_argument("--tail-samples", type=int, default=1024)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch", type=int, default=1024)
@@ -804,7 +954,9 @@ def main():
         flow = train(flow, m_train, k_train, steps=a.steps, batch=a.batch,
                      lr=a.lr, jac_weight=a.jac_weight, ema=a.ema,
                      self_jac_weight=a.self_jac_weight,
-                     self_jac_samples=a.self_jac_samples)
+                     self_jac_samples=a.self_jac_samples,
+                     tail_weight=a.tail_weight, tail_samples=a.tail_samples,
+                     m_val=m_val if a.converge else None, check_every=a.check_every)
         print(f"val nll {-jnp.mean(flow.log_prob(jnp.asarray(m_val))):.4f}")
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")

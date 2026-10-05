@@ -38,6 +38,8 @@ import jax.random as jr
 import numpy as np
 import optax
 
+import train_loop
+
 import bulk
 
 # XLA picks matmul precision PER PROCESS, and on this flow that is worth ~1
@@ -175,7 +177,7 @@ def bulk_score(flow, m, batch=2000):
 
 def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
           g_max=G_MAX, deriv_weight=0.0, score=None, score_weight=0.0,
-          ema=0.0):
+          ema=0.0, val_set=None, check_every=5000):
     """Likelihood only by default: the g dependence is learned from P(m|g) alone.
 
     The cost is convergence.  The g dependence is worth ~0.3 nats/galaxy against
@@ -215,8 +217,10 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
     # other on magnitude.
     ns = jnp.mean((score[:, None, :] * q) ** 2, axis=(0, 1)) if score_weight \
         else None
+    # `val_set` given: train to convergence on it (`train_loop.fit`); `steps` unused.
+    converge = val_set is not None
     opt = optax.chain(optax.clip_by_global_norm(1.0),
-                      optax.adam(optax.cosine_decay_schedule(lr, steps)))
+                      optax.adam(lr if converge else optax.cosine_decay_schedule(lr, steps)))
     params, static = eqx.partition(flow, _trainable(flow, bulk_frozen))
     state = opt.init(params)
     # See bulk.py's `train` docstring at [[health-gate-every-stage-and-track-jobs]]:
@@ -224,7 +228,7 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
     # averages over the last ~1/(1-ema) steps instead.
     ema_params = params
 
-    def one(carry, _):
+    def one(carry, _, mult=1.0):
         params, state, key, ema_params = carry
         key, sk, gk = jr.split(key, 3)
         idx = jr.randint(sk, (batch // 2,), 0, m.shape[0])
@@ -261,7 +265,7 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
 
         (loss, nll), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, state = opt.update(grads, state, params)
-        params = eqx.apply_updates(params, updates)
+        params = eqx.apply_updates(params, jax.tree.map(lambda u: mult * u, updates))
         if ema:
             ema_params = jax.tree_util.tree_map(
                 lambda e, q: ema * e + (1.0 - ema) * q, ema_params, params)
@@ -275,8 +279,46 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
     # per step.  The RNG stream is unchanged: same `jr.split(key, 3)` in the same
     # order, so this is a speed change and not a numerical one.
     @eqx.filter_jit
-    def run(params, state, key, ema_params, n):
-        return jax.lax.scan(one, (params, state, key, ema_params), None, length=n)
+    def run(params, state, key, ema_params, n, mult=1.0):
+        return jax.lax.scan(lambda c, x: one(c, x, mult),
+                            (params, state, key, ema_params), None, length=n)
+
+    def report(step, out):
+        losses, nlls = out
+        if deriv_weight:
+            print(f"step {step:6d}  loss {float(losses[-1]):.4f}  "
+                  f"nll {float(nlls[-1]):.4f}", flush=True)
+        else:
+            print(f"step {step:6d}  nll {float(losses[-1]):.4f}", flush=True)
+
+    if converge:
+        # The FULL objective, per point: the NLL alone does not see the
+        # response (see the docstring: batch 65536 worsened dm/dg while
+        # held-out NLL did not move), so the stop must watch the deriv term too.
+        vm, vq, vr = (jnp.asarray(x[:20000]) for x in val_set)
+        vg = sample_g(jr.key(99), vm.shape[0])
+        vx = lens(vm, vq, vr, vg)
+
+        @eqx.filter_jit
+        def val_fn(p):
+            model = eqx.combine(p, static)
+            v = -model.log_prob(vx, condition=vg)
+            if deriv_weight:
+                layer, chart = _shear_layer(model), _chart(model)
+                qq, rr = jax.vmap(dm_dg, in_axes=(None, 0, None))(layer, vm, chart)
+                sc = _scale(vm)[:, None, :]
+                v = v + deriv_weight * (jnp.mean(((qq - vq) / sc / nq) ** 2, axis=(1, 2))
+                                        + jnp.mean(((rr - vr) / sc / nr) ** 2, axis=(1, 2)))
+            return v
+
+        def chunk_fn(carry, mult, n):
+            params, state, key, ema_params = carry
+            return run(params, state, key, ema_params, n, mult)
+
+        best, _ = train_loop.fit(chunk_fn, (params, state, key, ema_params),
+                                 lambda c: c[3] if ema else c[0], val_fn,
+                                 chunk=REPORT, check_every=check_every, report=report)
+        return eqx.combine(best, static)
 
     done = 0
     while done < steps:
@@ -284,11 +326,7 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
         (params, state, key, ema_params), (losses, nlls) = run(
             params, state, key, ema_params, n)
         done += n
-        if deriv_weight:
-            print(f"step {done - 1:6d}  loss {float(losses[-1]):.4f}  "
-                  f"nll {float(nlls[-1]):.4f}", flush=True)
-        else:
-            print(f"step {done - 1:6d}  nll {float(losses[-1]):.4f}", flush=True)
+        report(done - 1, (losses, nlls))
     return eqx.combine(ema_params if ema else params, static)
 
 
@@ -528,6 +566,11 @@ def main():
     p.add_argument("--init", default="flows/bulk.eqx",
                    help="bulk checkpoint to warm-start from (train only)")
     p.add_argument("--steps", type=int, default=6000)
+    p.add_argument("--converge", action="store_true",
+                   help="train until the held-out objective (NLL + deriv term) stops "
+                        "improving (train_loop.fit); --steps is ignored")
+    p.add_argument("--check-every", type=int, default=5000,
+                   help="--converge: steps between held-out checks")
     p.add_argument("--g-max", type=float, default=G_MAX,
                    help="training shear disc radius. The spin-0 response is "
                         "odd in e, so it averages out of the population density "
@@ -632,7 +675,8 @@ def main():
         flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps,
                      batch=a.batch, lr=a.lr, g_max=a.g_max,
                      deriv_weight=a.deriv_weight, score=score,
-                     score_weight=a.score_weight, ema=a.ema)
+                     score_weight=a.score_weight, ema=a.ema,
+                     val_set=val_set if a.converge else None, check_every=a.check_every)
         print(f"val nll {val_nll(flow, val_set, jr.key(99)):.4f}")
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")

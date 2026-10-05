@@ -22,20 +22,20 @@ import bias as B
 import bulk
 import centroid as C
 import shear
-from closed_loop import D, REAL
+from closed_loop import D, REAL, S2, TRAIN
 
-COPIES = f"{D}/copies_gauss2_fwd_g2v4n.fits"
 import os
+COPIES = os.environ.get("COPIES", f"{D}/copies_gauss2_fwd_g2v4n.fits")   # with TRAIN_POP/NOISE_SCALE (closed_loop)
 FLOW = os.environ.get("FLOW", "flows/centroid_g2v4n_Ke.eqx")
 EBINS = [0, 0.05, 0.08, 0.11, 0.15, 0.2, np.inf]
 ROWS = 30_000_000
 
 
 def main():
-    m_tr = np.asarray(shear.load(f"{D}/{B.TRAIN_DATA['gauss2_v4n']}")[0])[:20000]
+    m_tr = np.asarray(shear.load(f"{D}/{B.TRAIN_DATA[TRAIN]}")[0])[:20000]
     flow = eqx.tree_deserialise_leaves(FLOW, bulk.build_flow(jr.key(0), m_tr, shear=True, centroid=True))
     layer, chart = C._sigmax_layer(flow), C._chart(flow)
-    sx = fitsio.read(f"{D}/{REAL['plus']}.fits", rows=[0])["cov_odd"][0]
+    sx = S2 * fitsio.read(f"{D}/{REAL['plus']}.fits", rows=[0])["cov_odd"][0]
     with fitsio.FITS(COPIES) as f:
         copies = f["COPIES"][0:ROWS]
         galaxies = f["GALAXIES"].read()
@@ -77,10 +77,10 @@ def structure():
     layer's ellipticity change is 1/kappa(flux) alone.  Show it: the copies'
     fractional e change at FIXED flux varies with size and |e|; the layer's
     cannot."""
-    m_tr = np.asarray(shear.load(f"{D}/{B.TRAIN_DATA['gauss2_v4n']}")[0])[:20000]
+    m_tr = np.asarray(shear.load(f"{D}/{B.TRAIN_DATA[TRAIN]}")[0])[:20000]
     flow = eqx.tree_deserialise_leaves(FLOW, bulk.build_flow(jr.key(0), m_tr, shear=True, centroid=True))
     layer, chart = C._sigmax_layer(flow), C._chart(flow)
-    sx = fitsio.read(f"{D}/{REAL['plus']}.fits", rows=[0])["cov_odd"][0]
+    sx = S2 * fitsio.read(f"{D}/{REAL['plus']}.fits", rows=[0])["cov_odd"][0]
     with fitsio.FITS(COPIES) as f:
         copies = f["COPIES"][0:ROWS]
         galaxies = f["GALAXIES"].read()

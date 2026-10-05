@@ -48,7 +48,9 @@ def test_window_prob_matches_brute_force():
     n_mc = 200_000
     rng = np.random.default_rng(0)
     L = np.linalg.cholesky(COV)
-    p_true = np.asarray(window_prob(jnp.asarray(ROWS), jnp.asarray(COV), SIZE, FLUX))
+    # jac="none": the plain probability the brute force below measures (the default
+    # "full" is the paper model's J-tilted F_J, a different quantity).
+    p_true = np.asarray(window_prob(jnp.asarray(ROWS), jnp.asarray(COV), SIZE, FLUX, jac="none"))
 
     for i, row in enumerate(ROWS):
         samp = row + rng.standard_normal((n_mc, 5)) @ L.T
@@ -56,6 +58,33 @@ def test_window_prob_matches_brute_force():
         se = np.sqrt(p_hat * (1 - p_hat) / n_mc)
         tol = 4 * se + 2e-3   # MC error plus a small floor for p near 0 or 1
         assert abs(p_true[i] - p_hat) < tol, (i, row, p_true[i], p_hat, tol)
+
+
+
+def test_tapered_window_prob_matches_brute_force():
+    """`--window-taper`: `window_prob` with soft edges against Monte Carlo of the
+    target-side weight `window_mask` returns, plain and J-tilted (`jac="full"`,
+    E[w J] / E[J]), with the ellipticity noise correlated with (Mf, Mr)."""
+    import bias as B
+    cov = COV.copy()
+    cov[2, 0] = cov[0, 2] = 0.3 * SF * 10.0
+    cov[3, 1] = cov[1, 3] = -0.4 * SR * 10.0
+    rows = ROWS.copy()
+    rows[:, 2], rows[:, 3] = 0.2 * rows[:, 1], -0.1 * rows[:, 1]
+    n_mc, rng, L = 400_000, np.random.default_rng(1), np.linalg.cholesky(cov)
+    B.WINDOW_TAPER = (0.05, 40.0)
+    try:
+        for jac in ("none", "full"):
+            p = np.asarray(window_prob(jnp.asarray(rows), jnp.asarray(cov), SIZE, FLUX, jac=jac))
+            for i, row in enumerate(rows):
+                samp = row + rng.standard_normal((n_mc, 5)) @ L.T
+                w = window_mask(samp, SIZE, FLUX)
+                j = np.ones(n_mc) if jac == "none" else 0.25 * (samp[:, 1] ** 2 - samp[:, 2] ** 2 - samp[:, 3] ** 2)
+                v = w * j / j.mean()
+                tol = 4 * v.std() / np.sqrt(n_mc) + 1e-3
+                assert abs(p[i] - v.mean()) < tol, (jac, i, row, p[i], v.mean(), tol)
+    finally:
+        B.WINDOW_TAPER = None
 
 
 def test_window_prob_gradient():
