@@ -612,6 +612,48 @@ def test_flux_sas_log_det_matches_autodiff():
         assert abs(float(jnp.linalg.slogdet(j)[1] - ld)) < 1e-6, scale
 
 
+def test_gpu_copy_mean_matches_cpu():
+    """`weighted_copy_mean_many` (one GPU pass, galaxy-aligned blocks, float32 with a
+    per-galaxy max shift) reproduces the float64 CPU `weighted_copy_mean` at several
+    anisotropic Sigma_X, with and without a lensed (g, lens=True) evaluation.  The
+    block size is shrunk so galaxies straddle many block edges, and a few copies get
+    |J| <= 0 (non-finite log weight) as in the real catalogs."""
+    import centroid
+    from imsims.copies import COPY_DTYPE
+
+    rng = np.random.default_rng(3)
+    n_gal = 300
+    per = rng.integers(8, 60, n_gal)
+    gal = np.repeat(np.arange(n_gal), per)
+    m0 = np.stack([rng.uniform(3e3, 5e4, n_gal), np.zeros(n_gal), rng.normal(0, 2e3, n_gal),
+                   rng.normal(0, 2e3, n_gal), rng.uniform(1e4, 1e5, n_gal)], 1)
+    m0[:, 1] = m0[:, 0] * rng.uniform(2.3, 3.4, n_gal)
+    galaxies = np.zeros(n_gal, dtype=[("moments", ">f8", (5,))])
+    galaxies["moments"] = m0
+    c = np.zeros(gal.size, dtype=[(k[0], ">" + k[1]) + k[2:] for k in COPY_DTYPE])
+    c["gal"] = gal
+    c["moments"] = m0[gal] + rng.normal(0, 60, (gal.size, 5))
+    c["moments"][rng.choice(gal.size, 5, replace=False), 1] = 1.0      # |J| <= 0 -> no weight
+    c["xy"] = rng.normal(0, 400, (gal.size, 2))
+    c["da"] = rng.uniform(0.5, 1.5, gal.size)
+    for k, s in (("dm_dg", 300), ("d2m_dg2", 300), ("dxy_dg", 200), ("d2xy_dg2", 200)):
+        c[k] = rng.normal(0, s, c[k].shape)
+    base = np.array([7.4e4, 0.0, 7.4e4])
+    sxs = [base, centroid._aniso_sigma_x(base * 0.6, 0.08, 0.4),
+           centroid._aniso_sigma_x(base * 1.7, 0.10, 2.0)]
+    saved = centroid._COPY_MEAN_MAX_BLOCK
+    centroid._COPY_MEAN_MAX_BLOCK = 512
+    try:
+        for g, lens in ((None, False), ((0.02, 0.0), True), ((0.0, -0.02), False)):
+            gpu = centroid.weighted_copy_mean_many(c, galaxies, sxs, g_list=[g] * len(sxs), lens=lens)
+            for sx, (mean, keep) in zip(sxs, gpu):
+                want, keep_c = centroid.weighted_copy_mean(c, galaxies, sx, g=g, lens=lens)
+                assert np.array_equal(keep, keep_c)
+                # compare the shift (copy mean - galaxy), the quantity the layer trains on
+                np.testing.assert_allclose(mean - m0[keep], want - m0[keep_c], rtol=2e-4, atol=1e-3)
+    finally:
+        centroid._COPY_MEAN_MAX_BLOCK = saved
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_"):

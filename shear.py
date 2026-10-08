@@ -64,10 +64,15 @@ REPORT = 500
 
 
 def load(path):
-    """Moments and their exact shear derivatives, as float64 arrays."""
+    """Moments and their exact shear derivatives, as float64 arrays, physical
+    rows only (`bulk.physical`: J > 0).  Four J <= 0 rows in the DES-depth bdg2d
+    templates wrecked the shear stage; no earlier training catalog has any, so
+    their splits are unchanged."""
     t = fitsio.read(path)
     f64 = lambda a: np.asarray(a, dtype=np.float64)
-    return f64(t["moments"]), f64(t["dm_dg"]), f64(t["d2m_dg2"])
+    m = f64(t["moments"])
+    ok = bulk.physical(m)
+    return m[ok], f64(t["dm_dg"])[ok], f64(t["d2m_dg2"])[ok]
 
 
 def load_labels(path):

@@ -138,9 +138,18 @@ SIZE_WINDOW = (2.2, 3.5)          # Mr/Mf
 FLUX_WINDOW = (2500.0, 50000.0)   # Mf
 
 
+def physical(m):
+    """Rows with J = (Mr^2 - M1^2 - M2^2)/4 > 0.  J <= 0 (|e| >= 1) is clearly
+    unphysical -- only template noise on faint galaxies makes it -- and the chart
+    clips it at E_MAX, blowing up any loss evaluated there (user OK to cut, 2026-10-05)."""
+    return (m[:, 1] > 0) & (m[:, 1] ** 2 > m[:, 2] ** 2 + m[:, 3] ** 2)
+
+
 def load_moments(path):
-    """Read the five even moments [Mf, Mr, M1, M2, Mc] from an imsims catalog."""
-    return np.asarray(fitsio.read(path)["moments"], dtype=np.float64)
+    """Read the five even moments [Mf, Mr, M1, M2, Mc] from an imsims catalog,
+    physical rows only (`physical`)."""
+    m = np.asarray(fitsio.read(path)["moments"], dtype=np.float64)
+    return m[physical(m)]
 
 
 def to_coords(m, flux_sas=None):

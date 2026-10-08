@@ -418,6 +418,14 @@ CATALOGS = {
     **{f"bulgedisc_g2n_176k_sn8_cond{c}": {a: f"targets_bdg2_{b}_176k_sn8_cond{c}" for a, b in
                                            (("plus", "g1p02"), ("minus", "g1m02"), ("zero", "g0"))}
        for c in "ABCDEW"},
+    # DES-Y6-matched depth (dev/desmatch.sh): targets sigma_f 228 +/- 12% (noise 2.289, obs-sd 0.28),
+    # own chain trained on templates at sigma_f 60.9 (noise 0.611); window 2200-90000 / 2.2-3.5
+    "bulgedisc_g2n_176k_des": {a: f"targets_bdg2_{b}_176k_des" for a, b in
+                               (("plus", "g1p02"), ("minus", "g1m02"), ("zero", "g0"))},
+    # 2026-10-06: DES depth + DES-like PSF variation (size +/-5%, e sd 0.008, mean e
+    # (+0.0008, -0.0039)) + noise +/-12%, seed 3, 1M per arm -- dev/desv.sh.
+    "bulgedisc_g2n_1m_desv": {a: f"targets_bdg2_{b}_1m_desv" for a, b in
+                              (("plus", "g1p02"), ("minus", "g1m02"), ("zero", "g0"))},
     # 8 more closed-loop populations (seed 12), for the real-catalog-sized
     # chunk scatter -- same script.
     # sn8r closed loops from the cv2 s0 flow (dev/closed_loop.py, REAL_POP=bulgedisc_g2n_176k_sn8r);
@@ -466,6 +474,8 @@ TRAIN_DATA = {
     "bulgedisc_g2n_176k_sn8r": "moments_bulgedisc_g2_bdg2n.fits",
     **{f"bulgedisc_g2n_176k_sn8r_s{s}": "moments_bulgedisc_g2_bdg2n.fits" for s in (3, 4, 5)},
     **{f"bulgedisc_g2n_176k_sn8_cond{c}": "moments_bulgedisc_g2_bdg2n.fits" for c in "ABCDEW"},
+    "bulgedisc_g2n_176k_des": "moments_bulgedisc_g2_bdg2d.fits",
+    "bulgedisc_g2n_1m_desv": "moments_bulgedisc_g2_bdg2d.fits",
     "bulgedisc": "moments.fits", "bulgedisc_noisy": "moments.fits",
     "bulgedisc_deep": "moments.fits",
     "bulgedisc_deep_v2": "moments_bulgedisc_v2.fits",
@@ -544,6 +554,17 @@ def condition(g, sigma_x):
     properties are data, not something lensing moves.
     """
     return g if sigma_x is None else jnp.concatenate([g, sigma_x])
+
+
+def template_cov(path):
+    """Mean C_M of a NOISY template catalog -- what a flow trained on it has
+    already convolved into its prior.  `--deconvolve-templates` subtracts it
+    from every kernel so template noise is not counted twice.  One mean, not
+    per template: the flow learned the prior convolved with the MIXTURE of
+    template noises, whose covariance is exactly this mean; the spread
+    (+/-18% of a 7%-of-C_M term at DES depth) is second order."""
+    return np.asarray(bfd.MomentCovariance.bulkUnpack(
+        fitsio.read(path, columns=["cov"])["cov"]), dtype=np.float64).mean(0)
 
 
 def load_cov(path):
@@ -3305,9 +3326,12 @@ def ghat(q, r, sel=None, ns=None, opg=None):
     obs = -r.sum(0) if opg is None else opg.sum(0)
     if ns is None:
         return np.linalg.solve(obs, q.sum(0))
-    n_ns, ps, qs, rs = ns
-    Q = q.sum(0) - n_ns * qs / (1 - ps)
-    R = obs + n_ns * (np.outer(qs, qs) / (1 - ps) ** 2 + rs / (1 - ps))
+    # A LIST of `ns` tuples is one per tier of observing conditions (--sel-tiers):
+    # each tier's excluded count carries that tier's own terms.
+    Q, R = q.sum(0), obs
+    for n_ns, ps, qs, rs in (ns if isinstance(ns, list) else [ns]):
+        Q = Q - n_ns * qs / (1 - ps)
+        R = R + n_ns * (np.outer(qs, qs) / (1 - ps) ** 2 + rs / (1 - ps))
     return np.linalg.solve(R, Q)
 
 
@@ -3336,7 +3360,7 @@ def bias(qp, rp, qm, rm, g=0.02, sel=None, ns=None, opg=None):
     return (gp[0] - gm[0]) / (2 * g) - 1, *(0.5 * (gp + gm))
 
 
-def save_pqr(path, qr, truth, obs, w=None):
+def save_pqr(path, qr, truth, obs, w=None, rows=None):
     """Write per-target Q and R so two runs can be differenced later.
 
     The point is the PAIRING.  Two runs over the same galaxies, the same noise
@@ -3368,6 +3392,8 @@ def save_pqr(path, qr, truth, obs, w=None):
             for n, v in (("q", q), ("r", r))}
     if w is not None:
         cols["prefilter_w"] = np.asarray(w)
+    if rows is not None:        # (--target-offset, --n-targets or -1): a re-solve must use the same slice
+        cols["target_rows"] = np.asarray(rows)
     np.savez_compressed(path, flux=truth[:, 0], moments=truth,
                         obs_plus=np.asarray(obs["plus"]),
                         obs_minus=np.asarray(obs["minus"]), **cols)
@@ -3579,6 +3605,11 @@ def main():
                         "one row per target, so it runs the heteroscedastic "
                         "(varobs) code path -- per-target kernels, no pool, "
                         "selection conditions drawn per prior draw.")
+    p.add_argument("--deconvolve-templates", action="store_true",
+                   help="subtract the training catalog's mean template C_M "
+                        "(template_cov) from every target kernel AND from the "
+                        "selection-term draws' C_M: a flow trained on noisy "
+                        "templates already carries that noise in its prior")
     p.add_argument("--noise-seed", type=int, default=1,
                    help="the targets' noise realization; shared by the +g, -g "
                         "and unsheared catalogs so the pairing still cancels "
@@ -3625,6 +3656,10 @@ def main():
                         "Sigma_X and C_M for the catalog (`_pool_build`); 0 = off")
     p.add_argument("--save-pqr", default=None,
                    help="write per-target Q and R to this .npz, for --compare")
+    p.add_argument("--load-pqr", default=None,
+                   help="skip the target integration and read per-target Q, R from "
+                        "this --save-pqr file; recomputes only the selection terms, "
+                        "so a saved run can be re-solved at a window inside its own")
     p.add_argument("--compare", nargs=2, metavar=("A.npz", "B.npz"), default=None,
                    help="paired difference between two --save-pqr runs, and "
                         "nothing else; the only way to resolve a shift smaller "
@@ -3714,6 +3749,14 @@ def main():
                         "no factor, and is on by default. Kept only so "
                         "existing scripts that pass this do not fail to "
                         "parse.")
+    p.add_argument("--sel-tiers", type=int, default=0,
+                   help="ALSO report the selection-corrected m with P_s, Q_s, R_s "
+                        "per tier of observing conditions -- K equal-count bins "
+                        "of det(Sigma_X) over the unsheared catalog, each tier's "
+                        "terms from the prior draws whose condition falls in it, "
+                        "applied with that tier's own N_ns (bfd's noise tiers, in "
+                        "one variable) -- plus each tier's P_s closure. Needs "
+                        "per-target C_M and --window-terms flow.")
     p.add_argument("--window-terms", choices=["templates", "flow", "score"],
                    default="flow",
                    help="where eq. (40)'s P_s, Q_s, R_s come from. 'score' "
@@ -3866,10 +3909,40 @@ def main():
         _size = tuple(a.window_size) if a.window_size is not None else (-np.inf, np.inf)
         _flux = tuple(a.window_flux) if a.window_flux is not None else (-np.inf, np.inf)
         n_out_full = {}
+        if a.sel_tiers:
+            # Tier edges: equal-count quantiles of det(Sigma_X) over the WHOLE
+            # unsheared catalog (conditions are per row, shared by the arms).
+            det_sx = lambda s: s[:, 0] * s[:, 2] - s[:, 1] ** 2
+            tier_edges = np.quantile(det_sx(np.asarray(fitsio.read(
+                path(cat["zero"]), columns=["cov_odd"])["cov_odd"], np.float64)),
+                np.linspace(0, 1, a.sel_tiers + 1))[1:-1]
+            tier_out, tier_pobs = {}, {}
         for k in ("plus", "minus"):
+            if a.sel_tiers:
+                t_k = np.digitize(det_sx(np.asarray(rows[k]["cov_odd"], np.float64)), tier_edges)
+                in_t = np.bincount(t_k, weights=window_mask(m[k], _size, _flux).astype(np.float64),
+                                   minlength=a.sel_tiers)
+                # Tier sizes from the slice BEFORE the badcenter drop: recentring fails
+                # 5x more often in the worst tier (0.19% -> 0.99% on desv), so the
+                # post-drop share would shrink the bad tiers' N_t and inflate their
+                # observed in-window fraction.  Drops count as excluded, as in N_ns.
+                t_all = np.digitize(det_sx(np.asarray(fitsio.read(
+                    path(cat[k]), columns=["cov_odd"])["cov_odd"][n], np.float64)), tier_edges)
+                n_t = np.bincount(t_all, minlength=a.sel_tiers).astype(np.float64)
+                hdr_k = fitsio.read_header(path(cat[k]), ext=1)
+                if hdr_k.get("NPOP") is not None:   # tier share of the (slice-scaled) population
+                    n_t = n_t / n_t.sum() * hdr_k["NPOP"] * len(range(hdr_k["NAXIS2"])[n]) / hdr_k["NAXIS2"]
+                tier_out[k], tier_pobs[k] = n_t - in_t, in_t / n_t
             n_in = round(float(window_mask(m[k], _size, _flux).sum()))
-            npop = fitsio.read_header(path(cat[k]), ext=1).get("NPOP")
+            hdr = fitsio.read_header(path(cat[k]), ext=1)
+            npop = hdr.get("NPOP")
             if npop is not None:
+                # NPOP counts the WHOLE catalog's population; a --n-targets /
+                # --target-offset slice holds only its share of it (rows are iid).
+                # Unscaled, a 300k slice of a 1M catalog got N_ns = 890k, not ~190k,
+                # and a 4.4x selection correction (desv s3/s4, 2026-10-08).
+                nrows = hdr["NAXIS2"]
+                npop = round(npop * len(range(nrows)[n]) / nrows)
                 n_out_full[k] = n_out_from_npop(npop, n_in)
                 print(f"  region fraction ({k}) = {len(m[k])/int(npop):.4f}")
             else:
@@ -3972,6 +4045,12 @@ def main():
             print(f"  per-target C_M: {len(cov)} rows, Var(Mf) "
                   f"p5/p50/p95 = {p5:.3g}/{p50:.3g}/{p95:.3g}")
         cov = cov * a.noise_scale ** 2
+        if a.deconvolve_templates:
+            c_tmpl = template_cov(train_data)
+            cov = cov - c_tmpl
+            np.linalg.cholesky(cov)     # raises if any kernel is no longer positive definite
+            print(f"  --deconvolve-templates: kernel C_M - <C_tmpl> from {train_data}; "
+                  f"C_tmpl/C_M (Mf) median {np.median(c_tmpl[0, 0] / (cov + c_tmpl)[..., 0, 0]):.4f}")
         if cov.ndim == 3 and not img_noise:
             # `add_noise` draws ONE realization from ONE Cholesky factor; a
             # per-target one is unimplemented here (no catalog needs it yet --
@@ -4101,7 +4180,23 @@ def main():
     # matched run they agree to ~1e-04: pair c = (-2.20e-03, -7.64e-05) against
     # unsheared ghat = (-2.30e-03, -1.65e-04).
     arms = [k for k in m_raw if not (a.no_zero_arm and k == "zero")]
-    if a.samples and a.samples > chunk:
+    if a.load_pqr:
+        # Re-solve a saved run at a new window: only the selection terms are
+        # recomputed.  The saved rows must cover the new window (padded), i.e. the
+        # run was pre-filtered on a window containing this one.  N_ns still comes
+        # from the full catalog above.
+        z = np.load(a.load_pqr)
+        qr = {k: (z[f"{k}_q"], z[f"{k}_r"]) for k in ("plus", "minus")}
+        truth = z["moments"]
+        m_raw = {"plus": z["obs_plus"], "minus": z["obs_minus"]}
+        prefilter_w = z["prefilter_w"] if "prefilter_w" in z.files else None
+        rows_now = [off, -1 if a.n_targets is None else a.n_targets]
+        if "target_rows" in z.files and list(z["target_rows"]) != rows_now:
+            raise SystemExit(f"{a.load_pqr} was saved on target rows {list(z['target_rows'])} "
+                             f"(offset, n); this run slices {rows_now} -- N_ns would not match")
+        print(f"  loaded per-target Q, R for {len(truth)} targets from {a.load_pqr} "
+              f"(target integration skipped)")
+    elif a.samples and a.samples > chunk:
         qr = {}
         for k in arms:
             v = m_raw[k]
@@ -4152,7 +4247,8 @@ def main():
     obs = {"plus": m_raw["plus"][sane], "minus": m_raw["minus"][sane]}
 
     if a.save_pqr:
-        save_pqr(a.save_pqr, qr, truth, obs, w=prefilter_w)
+        save_pqr(a.save_pqr, qr, truth, obs, w=prefilter_w,
+                 rows=(off, -1 if a.n_targets is None else a.n_targets))
 
     if a.window_size is not None or a.window_flux is not None:
         size = tuple(a.window_size) if a.window_size is not None else (-np.inf, np.inf)
@@ -4204,6 +4300,8 @@ def main():
                 f"per-target C_M with --window-terms {a.window_terms} is not "
                 f"implemented; only 'flow' draws its own observing conditions "
                 f"per prior draw")
+        if a.sel_tiers and (cov.ndim != 3 or a.window_terms != "flow"):
+            raise SystemExit("--sel-tiers needs per-target C_M and --window-terms flow")
         if a.window_terms == "templates":
             # eq. (40) is a sum over TEMPLATES G, not an integral over a fitted
             # prior, and the catalog carries bfd's exact dm/dg -- so take the
@@ -4283,6 +4381,9 @@ def main():
                 cov_full = np.asarray(
                     bfd.MomentCovariance.bulkUnpack(full["cov"]),
                     dtype=np.float64) * a.noise_scale ** 2
+                if a.deconvolve_templates:
+                    cov_full = cov_full - c_tmpl   # same P as the targets
+                    np.linalg.cholesky(cov_full)
                 sx_full = np.asarray(full["cov_odd"], dtype=np.float64)
                 cidx = np.random.default_rng(a.seed + 37).integers(
                     0, len(full), a.window_draws)
@@ -4374,6 +4475,53 @@ def main():
                                      weights=prefilter_w)
         print(f"  windowed, corrected:   m1 = {m1c:+.5f} +/- {dm1c:.5f}   "
               f"c1 = {c1c:+.2e} +/- {dc1c:.1e}   c2 = {c2c:+.2e} +/- {dc2c:.1e}")
+
+        if a.sel_tiers:
+            # Same prior draws, partitioned by the tier of the condition each was
+            # assigned, so the pooled terms above are (up to the density filter)
+            # the equal-weight mean of these.  Under conditions independent of
+            # the galaxies the tiered and pooled corrections agree in
+            # expectation; they differ when the flow's P_s error varies with
+            # the condition, which the per-tier closure shows directly.
+            t_draw = np.digitize(det_sx(sx_full[cidx]), tier_edges)
+            print(f"\n  selection tiers: {a.sel_tiers} equal-count bins of det(Sigma_X), "
+                  f"edges {' '.join(f'{e:.4e}' for e in tier_edges)}")
+            print(f"  {'tier':>4s} {'draws':>9s} {'P_s':>8s} {'obs +':>8s} {'obs -':>8s} "
+                  f"{'R_s11':>9s} {'R_s22':>9s} {'N_ns +':>9s}")
+            tiers = []
+            for t in range(a.sel_tiers):
+                sel_t = t_draw == t
+                ps_t, qs_t, rs_t, _ = selection_terms(
+                    draw, z[sel_t], cov_win[sel_t], size, flux, fd=a.window_fd,
+                    kind="draw", density=density)
+                tiers.append((ps_t, qs_t, rs_t))
+                print(f"  {t:>4d} {int(sel_t.sum()):>9d} {ps_t:>8.4f} {tier_pobs['plus'][t]:>8.4f} "
+                      f"{tier_pobs['minus'][t]:>8.4f} {rs_t[0, 0]:>+9.5f} {rs_t[1, 1]:>+9.5f} "
+                      f"{tier_out['plus'][t]:>9.0f}")
+            ns_tp = [(tier_out["plus"][t],) + tiers[t] for t in range(a.sel_tiers)]
+            ns_tm = [(tier_out["minus"][t],) + tiers[t] for t in range(a.sel_tiers)]
+            m1t, c1t, c2t = bias(qp, rp, qm, rm, a.g, sel=(sp, sm), ns=(ns_tp, ns_tm))
+            # ponytail: no tier-aware bootstrap; the galaxy bar is the pooled one,
+            # and tiered - pooled is shared-galaxy, so its scatter is selection MC
+            # (read it off --seed repeats).
+            print(f"  windowed, corrected (tiered): m1 = {m1t:+.5f}   c1 = {c1t:+.2e}   "
+                  f"c2 = {c2t:+.2e}   tiered - pooled m1 = {m1t - m1c:+.5f}")
+            # Per-tier m1: each tier's galaxies with its own N_ns and terms.  Conditions
+            # are independent of the galaxies, so a tier is a sub-survey in its own right
+            # (unlike a band on galaxy properties).  Needs the integrated rows' own
+            # conditions, i.e. this run's pre-filter == the saved run's.
+            if len(rows["plus"]) == len(sane) and np.allclose(np.asarray(rows["plus"]["moments"], np.float64)[sane], obs["plus"], rtol=1e-5):
+                t_row = np.digitize(det_sx(np.asarray(rows["plus"]["cov_odd"][sane], np.float64)), tier_edges)
+                for t in range(a.sel_tiers):
+                    k = t_row == t
+                    mt = bias(qp[k], rp[k], qm[k], rm[k], a.g, sel=(sp[k], sm[k]), ns=(ns_tp[t], ns_tm[t]))
+                    dt_ = bootstrap(qp[k], rp[k], qm[k], rm[k], a.g, a.boot, a.seed, sel=(sp[k], sm[k]),
+                                    ns=(ns_tp[t], ns_tm[t]),
+                                    weights=None if prefilter_w is None else prefilter_w[k])
+                    print(f"  tier {t}: corrected m1 = {mt[0]:+.5f} +/- {dt_[0]:.5f}   "
+                          f"c1 = {mt[1]:+.2e}   c2 = {mt[2]:+.2e}   ({int(k.sum())} integrated)")
+            else:
+                print("  per-tier m1 skipped: this window's pre-filter differs from the saved run's")
 
     m1, c1, c2 = bias(qp, rp, qm, rm, a.g)
     dm1, dc1, dc2 = bootstrap(qp, rp, qm, rm, a.g, a.boot, a.seed)
