@@ -16,6 +16,9 @@ tol = 0.08
 if "--tol" in argv:
     k = argv.index("--tol"); tol = float(argv[k + 1]); del argv[k:k + 2]
 N = 40000
+cut = None
+if "--template-cut" in argv:   # check only the templates the layer was fit on
+    k = argv.index("--template-cut"); cut = (float(argv[k + 1]), float(argv[k + 2])); del argv[k:k + 3]
 cp, td, flows = argv[0], argv[1], argv[2:]
 copies, galaxies = C.load_copies(cp)
 sx0 = np.asarray(galaxies["cov_odd"][0], np.float64)
@@ -33,7 +36,11 @@ for path in flows:
     print(f"\n{path}")
     worst = 0.0
     for s, (tgt, keep) in zip(S, res):
-        m0, t = m0all[keep][:N], tgt[:N]
+        m0, t = m0all[keep], tgt
+        if cut:
+            sel = np.asarray(bulk.selected(m0, cut))
+            m0, t = m0[sel], t[sel]
+        m0, t = m0[:N], t[:N]
         cond = jnp.tile(jnp.concatenate([jnp.zeros(2), jnp.asarray(sx0 * s ** 2, jnp.float32)]), (N, 1))
         pred = np.asarray(jax.vmap(C.sigmax_dm_dsigma, in_axes=(None, 0, 0, None))(
             layer, jnp.asarray(m0, jnp.float32), cond, chart), np.float64)

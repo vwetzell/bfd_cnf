@@ -145,6 +145,102 @@ def physical(m):
     return (m[:, 1] > 0) & (m[:, 1] ** 2 > m[:, 2] ** 2 + m[:, 3] ** 2)
 
 
+def selected(m, cut):
+    """Hard template selection on MEASURED moments, `cut` = (Mf_min, Mr/Mf_min): Mf >= Mf_min and
+    Mr >= (Mr/Mf_min) Mf, both linear in the moments (Fourier moments: low Mr/Mf = LARGE).  The
+    faint, large, low-Mr templates below it made the chart's ratio coordinates explode and kept
+    every stage wandering (2026-10-13).  Used where the selection is on a conditioning variable
+    (centroid stage, shear deriv regression); the likelihoods use the soft `sel_prob`."""
+    return (m[..., 0] >= cut[0]) & (m[..., 1] >= cut[1] * m[..., 0])
+
+
+def sel_prob(m, cov, cut):
+    """Soft template selection S(m; C) = Phi((Mf - Mf_min)/s_f) Phi((Mr - k Mf)/s_u), k = Mr/Mf_min,
+    s_f^2 = C_ff, s_u^2 = Var(Mr - k Mf) from the template's OWN measured covariance (`cov` packed,
+    bfd order: [0]=ff, [1]=fr, [5]=rr).  A randomised selection that depends only on observed
+    (m, C), so `log_p_unselected`'s censored likelihood is exact for it; its width is the template
+    noise, so it is the same cut as `selected`, smeared by what the template could have measured."""
+    k = cut[1]
+    sf = jnp.sqrt(cov[..., 0])
+    su = jnp.sqrt(cov[..., 5] + k * k * cov[..., 0] - 2.0 * k * cov[..., 1])
+    return (jax.scipy.stats.norm.cdf((m[..., 0] - cut[0]) / sf)
+            * jax.scipy.stats.norm.cdf((m[..., 1] - k * m[..., 0]) / su))
+
+
+T_GRID = np.linspace(0.5, 1.5, 41)
+
+
+def noise_scale(cov):
+    """(t, C_ref): every template covariance is ONE matrix times its noise level squared,
+    C_i = t_i^2 C_ref (exact to 1e-6 on bdg2d; t 0.56-1.41), so P(unselected | C_i) is a function
+    of t_i alone -- `log_p_unselected` tabulates it on T_GRID."""
+    cov = np.asarray(cov, np.float64)
+    ref = np.median(cov[:, 0])
+    t = np.sqrt(cov[:, 0] / ref)
+    c_ref = np.median(cov / (t * t)[:, None], axis=0)
+    assert np.allclose(cov, (t * t)[:, None] * c_ref, rtol=1e-4, atol=1e-6 * np.abs(c_ref).max()), \
+        "template covariances are not one shape times a scale; log_p_unselected's t grid would be wrong"
+    assert t.min() >= T_GRID[0] and t.max() <= T_GRID[-1], f"noise scale {t.min():.3f}-{t.max():.3f} outside T_GRID"
+    return t, c_ref
+
+
+def log_p_unselected(model, key, n, cut, t, c_ref, condition=None, box=None):
+    """Per template, log(1 - E_model[S(x; t_i^2 C_ref)]) = log P(template i not selected | C_i),
+    from `n` model draws: tabulated on T_GRID (a (41, n) matrix; a (B, n) one at B = 16384 sent ptxas
+    past 150 s) and linearly interpolated at each `t` (B,) -> (B,).  `noise_scale` gives (t, c_ref).
+
+    The censored likelihood: template i contributes S_i log p(m_i) + (1 - S_i) log P(unselected | C_i),
+    the expectation over the randomised selection `sel_prob`.  That pins the flow's mass outside the
+    selection (a truncated likelihood would leave it free), so the flow stays the full-population
+    density and nothing downstream renormalises.
+
+    Pathwise gradient through the draws x = T(z): only draws within a few s of a cut edge carry any
+    (S' ~ 0 elsewhere).  The score-function version (d log p at stop-gradient draws) instead pushed
+    log p UP at the flow's own draws anywhere in the unselected region -- which includes the
+    Mr/Mf < 1.5 strip out to unbounded Mf -- and the bright tail fed on itself until it overflowed
+    (Mf draws 4e7 -> 1e33 -> NaN, 5k-24k steps, logs/desv/censor_diag*.log).  Draws that are
+    non-finite or whose spin-0 (Mf, Mr, Mc) leaves `box` (`tail_monotone_penalty`'s guard) are
+    swapped for a good draw BEFORE the differentiated pass and dropped from the mean.
+    dx/dtheta by the implicit-function theorem on the ANALYTIC inverse (the one log_prob uses):
+    r = T^-1_theta(x) - z = 0 at the stop-gradient draw, so dx/dtheta = -J^-1 dr/dtheta with
+    J = dT^-1/dx held fixed.  Differentiating the sampling direction itself unrolled the spin-2
+    bisection into one kernel ptxas spent >10 min and 28 GB on (2026-10-13).
+    `condition`: (n, c) per-draw conditions."""
+    z = model.base_dist.sample(key, (n,))
+    if condition is None:
+        fwd, inv = model.bijection.transform, model.bijection.inverse
+        cond = jnp.zeros((n, 0))
+    else:
+        fwd, inv, cond = model.bijection.transform, model.bijection.inverse, condition
+    call = lambda f, a, c: f(a) if condition is None else f(a, c)
+    x0 = jax.lax.stop_gradient(jax.vmap(lambda a, c: call(fwd, a, c))(z, cond))
+    ok = jnp.all(jnp.isfinite(x0), -1)
+    if box is not None:
+        s0 = x0[:, jnp.array([0, 1, 4])]
+        ok = ok & jnp.all((s0 > box[0]) & (s0 < box[1]), -1)
+    # A draw whose J is singular/non-finite gives a NaN solve, and ONE NaN draw poisons the tabulated
+    # P for every template (all 20000 val points non-finite at 65536 draws): screen the solve too.
+    J = jax.lax.stop_gradient(jax.vmap(jax.jacrev(lambda a, c: call(inv, a, c)))(x0, cond))
+    r0 = jax.lax.stop_gradient(jax.vmap(lambda a, c: call(inv, a, c))(x0, cond) - z)
+    ok = ok & jnp.all(jnp.isfinite(J), (1, 2)) & jnp.all(jnp.isfinite(jnp.linalg.solve(J, r0[..., None])[..., 0]), -1)
+    k = jnp.argmax(ok)
+    x0, z, J = (jnp.where(ok.reshape((-1,) + (1,) * (v.ndim - 1)), v, v[k]) for v in (x0, z, J))
+    r = jax.vmap(lambda a, c: call(inv, a, c))(x0, cond) - z
+    d = jnp.linalg.solve(J, r[..., None])[..., 0]
+    x = x0 - (d - jax.lax.stop_gradient(d))     # value: the draw; gradient: -J^-1 dr/dtheta
+    tg = jnp.asarray(T_GRID)
+    covg = (tg * tg)[:, None] * jnp.asarray(c_ref)[None, :]
+    s = jnp.where(ok[None, :], sel_prob(x[None, :, :], covg[:, None, :], cut), 0.0)   # (41, n)
+    p_sel = jnp.interp(t, tg, jnp.sum(s, 1) / jnp.maximum(jnp.sum(ok), 1))
+    return jnp.log1p(-jnp.minimum(p_sel, 1.0 - 1.0 / n))
+
+
+def load_cov(path):
+    """Packed moment covariances, rows aligned with `load_moments`."""
+    t = fitsio.read(path, columns=["moments", "cov"])
+    return np.asarray(t["cov"], np.float64)[physical(np.asarray(t["moments"], np.float64))]
+
+
 def load_moments(path):
     """Read the five even moments [Mf, Mr, M1, M2, Mc] from an imsims catalog,
     physical rows only (`physical`)."""
@@ -694,7 +790,8 @@ def tail_monotone_penalty(model, key, n, e_lo, box, fallback):
 
 def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
           ema=0.0, self_jac_weight=0.0, self_jac_samples=512, m_val=None,
-          check_every=5000, tail_weight=0.0, tail_samples=1024):
+          check_every=5000, tail_weight=0.0, tail_samples=1024, cut=None, cut_samples=4096,
+          cov_train=None, cov_val=None):
     # The power-law flux gives log10(Mf) a long tail, so an outlier batch can blow
     # the NLL up mid-training and never recover -- clip, then decay the step size.
     # `m_val` given: train to convergence on it (`train_loop.fit`: constant LR,
@@ -708,6 +805,13 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
     e_lo = float(np.max(np.hypot(m_train[:, 2], m_train[:, 3]) / m_train[:, 1]))
     s0 = np.asarray(m_train)[:, [0, 1, 4]]
     box = (jnp.asarray(0.5 * s0.min(0)), jnp.asarray(2.0 * s0.max(0)))
+    # `cut`: soft censored likelihood, S_i log p(m_i) + (1 - S_i) log P(unselected | C_i)
+    # (`sel_prob`, `log_p_unselected`); `cov_train`/`cov_val` are the templates' packed covariances.
+    if cut:
+        t_np, c_ref = noise_scale(np.concatenate([cov_train] + ([cov_val] if cov_val is not None else [])))
+        t_tr = jnp.asarray(t_np[:len(cov_train)])
+        S_tr = sel_prob(data, jnp.asarray(cov_train), cut)
+    k0 = int(np.argmax(np.asarray(S_tr) > 0.5)) if cut else 0   # a kept row, for fallbacks
     # `ema` > 0: return the exponential average of the params instead of the
     # last iterate (per-step nll swings +-0.5 at batch 1024, so the final
     # iterate is one noisy draw -- see [[health-gate-every-stage-and-track-jobs]]).
@@ -716,9 +820,32 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
     def step(params, state, idx, key, mult):
         def loss_fn(p):
             model = eqx.combine(p, static)
-            nll = -jnp.mean(model.log_prob(data[idx]))
+            if cut:
+                sw = S_tr[idx]
+                lpu = log_p_unselected(model, jr.fold_in(key, 2), cut_samples, cut, t_tr[idx], c_ref, box=box)
+                nll = -jnp.mean(jnp.where(sw > 0, sw * model.log_prob(data[idx]), 0.0) + (1.0 - sw) * lpu)  # S=0 rows: 0*-inf
+            else:
+                nll = -jnp.mean(model.log_prob(data[idx]))
             loss = nll
-            if jac_weight:
+            if jac_weight and cut:
+                # The uncut term is mean_i pen(m_i).  Censored templates' share, (1 - S_i), goes to the
+                # flow's OWN draws in the censored region (weight 1 - S(x; C_ref)) instead: without it
+                # nothing shapes the flow below the cut and bulk_x4 sent a base corner to Mf ~ 1e-4
+                # (16 NaN draws in the tail gate, 2026-10-13).  Same weight as the data term, no new
+                # knob; draws stop-gradient-ed, so the only path is "be smooth HERE" (see self_jac).
+                pen = bulk_jacobian_penalty(model, data[idx], reduce=False)
+                xs = jax.lax.stop_gradient(model.sample(jr.fold_in(key, 3), (cut_samples,)))
+                s0 = xs[:, jnp.array([0, 1, 4])]
+                okd = jnp.all(jnp.isfinite(xs), -1) & jnp.all((s0 > box[0]) & (s0 < box[1]), -1)
+                xs = jnp.where(okd[:, None], xs, data[k0])
+                okd = okd & jnp.isfinite(jax.lax.stop_gradient(bulk_jacobian_penalty(model, xs, reduce=False)))
+                xs = jnp.where(okd[:, None], xs, data[k0])
+                pc = bulk_jacobian_penalty(model, xs, reduce=False)
+                pc = jnp.minimum(pc, 100.0 * jax.lax.stop_gradient(jnp.median(jnp.where(okd, pc, jnp.inf))))
+                wc = jnp.where(okd, 1.0 - sel_prob(xs, jnp.asarray(c_ref)[None, :], cut), 0.0)
+                pen_c = jnp.sum(wc * pc) / jnp.maximum(jnp.sum(wc), 1e-6)
+                loss = loss + jac_weight * (jnp.sum(sw * pen) + jnp.sum(1.0 - sw) * pen_c) / sw.shape[0]
+            elif jac_weight:
                 loss = loss + jac_weight * bulk_jacobian_penalty(model, data[idx])
             if self_jac_weight:
                 # Real templates can only teach smoothness where the training
@@ -762,7 +889,7 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
                 probe = jax.lax.stop_gradient(
                     bulk_jacobian_penalty(model, self_m, reduce=False))
                 finite = jnp.isfinite(probe)
-                self_m_safe = jnp.where(finite[:, None], self_m, data[idx[0]])
+                self_m_safe = jnp.where(finite[:, None], self_m, data[k0] if cut else data[idx[0]])
                 per_point = bulk_jacobian_penalty(model, self_m_safe, reduce=False)
                 # Second, separate guard: a point can be FAR steeper than the
                 # rest of the batch while still being technically finite, and
@@ -790,7 +917,7 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
                 loss = loss + self_jac_weight * self_pen
             if tail_weight:
                 loss = loss + tail_weight * tail_monotone_penalty(
-                    model, jr.fold_in(key, 1), tail_samples, e_lo, box, data[idx[0]])
+                    model, jr.fold_in(key, 1), tail_samples, e_lo, box, data[k0] if cut else data[idx[0]])
             return loss, nll
         (loss, nll), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         updates, state = opt.update(grads, state, params)
@@ -839,6 +966,10 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
 
     if converge:
         mv = jnp.asarray(m_val[:20000])
+        if cut:
+            cv = jnp.asarray(cov_val[:20000])
+            S_v = sel_prob(mv, cv, cut)
+            t_v = jnp.asarray(t_np[len(cov_train):][:20000])
 
         @eqx.filter_jit
         def val_fn(p):
@@ -846,6 +977,8 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
             v = -model.log_prob(mv)
             if jac_weight:
                 v = v + jac_weight * bulk_jacobian_penalty(model, mv, reduce=False)
+            if cut:   # the training objective per point; fixed-key draws, so checks pair
+                v = S_v * v - (1.0 - S_v) * log_p_unselected(model, jr.key(98), 65536, cut, t_v, c_ref)
             return v
 
         def chunk_fn(carry, mult, n):
@@ -856,11 +989,11 @@ def train(flow, m_train, key, steps=4000, batch=1024, lr=1e-3, jac_weight=0.0,
                 params, state, ema_params, ck, idx_chunk, mult)
             return (params, state, ema_params, key), nlls
 
-        best, _ = train_loop.fit(
+        last, _ = train_loop.fit(
             chunk_fn, (params, state, ema_params, key),
             lambda c: c[2] if ema else c[0], val_fn, chunk=REPORT, check_every=check_every,
             report=lambda i, nlls: print(f"step {i:5d}  nll {float(nlls[-1]):.4f}", flush=True))
-        return eqx.combine(best, static)
+        return eqx.combine(last, static)
 
     i = 0
     while i < steps:
@@ -926,6 +1059,11 @@ def main():
                    help="weight of tail_monotone_penalty: the |e| marginal must "
                         "fall monotonically to 0 between the data's max |e| and E_MAX")
     p.add_argument("--tail-samples", type=int, default=1024)
+    p.add_argument("--template-cut", type=float, nargs=2, default=None, metavar=("MF", "MRMF"),
+                   help="censor templates with measured Mf < MF or Mr/Mf < MRMF (log_p_unselected); "
+                        "MUST match across bulk/shear/centroid")
+    p.add_argument("--cut-samples", type=int, default=4096,
+                   help="model draws per step for --template-cut's log P(unselected)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch", type=int, default=1024)
@@ -952,6 +1090,7 @@ def main():
 
     m = load_moments(a.data)
     m_train, m_val = _split(m)
+    cov_train, cov_val = _split(load_cov(a.data)) if a.template_cut else (None, None)
     key = jr.key(a.seed)
     k_build, k_train, k_sample = jr.split(key, 3)
     flow = build_flow(k_build, m_train, flux_sas=a.flux_sas)
@@ -964,9 +1103,18 @@ def main():
                      lr=a.lr, jac_weight=a.jac_weight, ema=a.ema,
                      self_jac_weight=a.self_jac_weight,
                      self_jac_samples=a.self_jac_samples,
-                     tail_weight=a.tail_weight, tail_samples=a.tail_samples,
-                     m_val=m_val if a.converge else None, check_every=a.check_every)
-        print(f"val nll {-jnp.mean(flow.log_prob(jnp.asarray(m_val))):.4f}")
+                     tail_weight=a.tail_weight, tail_samples=a.tail_samples, cut_samples=a.cut_samples,
+                     m_val=m_val if a.converge else None, check_every=a.check_every,
+                     cut=a.template_cut, cov_train=cov_train, cov_val=cov_val)
+        mv = m_val[selected(m_val, a.template_cut)] if a.template_cut else m_val
+        msg = ""
+        if a.template_cut:   # selected fraction: flow vs data, at the val rows' own covariances
+            t_, c_ = noise_scale(cov_val)
+            p_flow = 1.0 - np.exp(np.asarray(log_p_unselected(flow, jr.key(98), 65536, a.template_cut,
+                                                             jnp.asarray(t_), c_))).mean()
+            msg = (f" (kept rows); selected fraction flow {p_flow:.4f} vs data "
+                   f"{float(np.mean(sel_prob(jnp.asarray(m_val), jnp.asarray(cov_val), a.template_cut))):.4f}")
+        print(f"val nll {-jnp.mean(flow.log_prob(jnp.asarray(mv))):.4f}" + msg)
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")
         return

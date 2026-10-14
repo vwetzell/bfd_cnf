@@ -6,7 +6,10 @@ No training metric saw it (no data there), but the paper model's 1/J weight,
 J = (Mr^2 - M1^2 - M2^2)/4, diverges there and that sliver halved R_s.  The
 E_MAX chart ceiling now caps 1/J; this gate catches a flow piling mass against
 the ceiling anyway.  Samples the flow at g = 0 and compares with the training set:
-  - fraction of samples with |e| > training max + MARGIN   (FAIL if > FRAC_MAX)
+  - fraction of samples with |e| > training p99.99 + MARGIN   (FAIL if > FRAC_MAX)
+    (2026-10-09: was training max + 0.05, which falls with the training-set size -- 0.827 at 500k,
+    0.706-0.729 on 100k splits, where the real population's own tail is 4e-6 past it.  p99.99 is
+    0.608-0.631 on every split and 0.6125 at 500k; + 0.265 = 0.877 there, the old 500k threshold.)
   - mean Mr^2/(4J) = E[1/(1-|e|^2)], flow / data          (FAIL if off by > WT_TOL)
 
   python dev/tail_gate.py --kind bulk|shear|centroid FLOW.eqx [--data M.fits] [--sx-from T.fits]
@@ -27,7 +30,7 @@ import bias as B
 import bulk
 import shear
 
-MARGIN, FRAC_MAX, WT_TOL = 0.05, 1e-6, 0.02
+Q, MARGIN, FRAC_MAX, WT_TOL = 99.99, 0.265, 1e-6, 0.02
 
 p = argparse.ArgumentParser()
 p.add_argument("flow")
@@ -53,11 +56,12 @@ e = lambda v: np.hypot(v[:, 2], v[:, 3]) / v[:, 1]
 wt = lambda v: np.mean(1.0 / (1.0 - e(v) ** 2))
 ed, ex = e(m), e(x)
 ok = np.isfinite(ex)
-frac = np.mean(ex[ok] > ed.max() + MARGIN)
+thr = np.percentile(ed, Q) + MARGIN
+frac = np.mean(ex[ok] > thr)
 ratio = wt(x[ok]) / wt(m)
 fail = frac > FRAC_MAX or abs(ratio - 1) > WT_TOL or (~ok).any()
 print(f"tail gate {a.flow}: max|e| flow {ex[ok].max():.4f} data {ed.max():.4f}  "
-      f"frac > data max + {MARGIN} {frac:.1e} (max {FRAC_MAX:.0e})  "
+      f"frac > data p{Q} + {MARGIN} = {thr:.4f}: {frac:.1e} (max {FRAC_MAX:.0e})  "
       f"E[1/(1-e^2)] flow/data {ratio:.4f} (tol {WT_TOL})  nonfinite {(~ok).sum()}  "
       f"{'FAIL' if fail else 'PASS'}")
 sys.exit(1 if fail else 0)

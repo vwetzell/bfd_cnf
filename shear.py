@@ -180,9 +180,26 @@ def bulk_score(flow, m, batch=2000):
     return jnp.concatenate([g(m[i:i + batch]) for i in range(0, len(m), batch)])
 
 
+def noise_g_term(score, cff, g_path):
+    """G_i grad log p_t(T_i), (n, 2, 5): what regressing onto a noisy template's dm_dg leaves out.
+
+    bfd's getTemplate shears the template's pixel noise along with the galaxy, and that noise
+    in dm_dg is correlated with the moment noise (G = Cov(dD, dM), a pure noise-model quantity,
+    `dev/noise_G.py`).  So E[D_T | T] = E[D(m) | T] - G grad log p_t(T) (Tweedie, any population),
+    and a layer fit to D_T believes template noise shears -- +0.0006 to +0.0009 in desv corrected
+    m1 (2026-10-09).  Adding this term to the target makes the layer's optimum the transport of the
+    flow's own noisy-template density p_t under "galaxy shears, noise does not".  `score` is the
+    flow's own grad log p_t (its frozen bulk); `cff` each template's own C_ff, since G is stored
+    per unit C_ff.  Validated on bdg2d: pure-noise G = twin-extracted G to <1% for every galaxy
+    type; the flow's score reproduces the measured noise term at 0.91-0.96 across the window."""
+    G = np.load(g_path)["G"]
+    return np.asarray(cff)[:, None, None] * np.einsum("gij,nj->ngi", G, np.asarray(score))
+
+
 def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
           g_max=G_MAX, deriv_weight=0.0, score=None, score_weight=0.0,
-          ema=0.0, val_set=None, check_every=5000):
+          ema=0.0, val_set=None, check_every=5000, converge=None, stop_on="nod2", ckpt=None,
+          cut=None, cut_samples=4096, cov=None, val_cov=None, jac_weight=0.0):
     """Likelihood only by default: the g dependence is learned from P(m|g) alone.
 
     The cost is convergence.  The g dependence is worth ~0.3 nats/galaxy against
@@ -216,6 +233,17 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
     """
     m, q, r = (jnp.asarray(a) for a in data)
     nq, nr = partial_norms(m, q, r) if deriv_weight else (None, None)
+    # `cut`: the NLL is the soft censored likelihood on the LENSED moments, S log p(x | g) +
+    # (1 - S) log P(unselected | g, C) (bulk.sel_prob / bulk.log_p_unselected, each template's own
+    # covariance `cov`); the deriv regression keeps the templates `bulk.selected` at g = 0
+    # (selecting on the regressor does not bias E[dm/dg | m]).
+    covs = jnp.asarray(cov) if cut else None
+    if cut:
+        t_np, c_ref = bulk.noise_scale(np.concatenate([cov, val_cov]))
+        t_tr, t_v = jnp.asarray(t_np[:len(cov)]), jnp.asarray(t_np[len(cov):][:20000])
+    assert not (cut and score_weight), '--template-cut does not mask --score-weight'
+    s0 = np.asarray(data[0])[:, [0, 1, 4]]
+    box = (jnp.asarray(0.5 * s0.min(0)), jnp.asarray(2.0 * s0.max(0)))   # bulk.log_p_unselected's guard
     # Per-moment normalisation of the score-weighted term, <(score_i Q_i)^2>,
     # shape (5,).  Fractional like the `mse` above, so the two weights are on
     # the same scale -- and per moment, so Mr and Mc cannot trade against each
@@ -223,7 +251,8 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
     ns = jnp.mean((score[:, None, :] * q) ** 2, axis=(0, 1)) if score_weight \
         else None
     # `val_set` given: train to convergence on it (`train_loop.fit`); `steps` unused.
-    converge = val_set is not None
+    # `converge=False` with a `val_set`: fixed cosine schedule, held-out terms only logged.
+    converge = val_set is not None if converge is None else converge
     opt = optax.chain(optax.clip_by_global_norm(1.0),
                       optax.adam(lr if converge else optax.cosine_decay_schedule(lr, steps)))
     params, static = eqx.partition(flow, _trainable(flow, bulk_frozen))
@@ -242,15 +271,44 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
 
         def loss_fn(p):
             model = eqx.combine(p, static)
-            nll = -jnp.mean(model.log_prob(x, condition=g))
+            if cut:
+                sw = bulk.sel_prob(x, covs[take], cut)
+                # ponytail: one pooled P(unselected) over fresh |g| <= g_max draws; its g dependence is O(g^2)
+                lpu = bulk.log_p_unselected(model, jr.fold_in(gk, 1), cut_samples, cut, t_tr[take], c_ref,
+                                            condition=sample_g(jr.fold_in(gk, 2), cut_samples, g_max), box=box)
+                nll = -jnp.mean(jnp.where(sw > 0, sw * model.log_prob(x, condition=g), 0.0) + (1.0 - sw) * lpu)  # S=0 rows: 0*-inf
+            else:
+                nll = -jnp.mean(model.log_prob(x, condition=g))
+            loss = nll
+            if cut and jac_weight:
+                # Censored templates' share (1 - S_i) of a smoothness penalty, moved to the flow's OWN
+                # draws below the cut (weight 1 - S(x; C_ref)) -- bulk.py's censored jac term, same
+                # weight.  Selected templates get no penalty (none before the cut either).
+                gs = sample_g(jr.fold_in(gk, 3), cut_samples, g_max)
+                xs = jax.lax.stop_gradient(model.sample(jr.fold_in(gk, 4), (), condition=gs))
+                s0_ = xs[:, jnp.array([0, 1, 4])]
+                okd = jnp.all(jnp.isfinite(xs), -1) & jnp.all((s0_ > box[0]) & (s0_ < box[1]), -1)
+                xs = jnp.where(okd[:, None], xs, m[0])
+                pc = shear_jacobian_penalty(model, xs)
+                okd = okd & jnp.isfinite(jax.lax.stop_gradient(pc))
+                pc = jnp.where(okd, pc, 0.0)
+                pc = jnp.minimum(pc, 100.0 * jax.lax.stop_gradient(jnp.median(jnp.where(okd, pc, jnp.inf))))
+                wc = jnp.where(okd, 1.0 - bulk.sel_prob(xs, jnp.asarray(c_ref)[None, :], cut), 0.0)
+                pen_c = jnp.sum(wc * pc) / jnp.maximum(jnp.sum(wc), 1e-6)
+                loss = loss + jac_weight * jnp.mean(1.0 - sw) * pen_c
             if not deriv_weight:
-                return nll, nll
+                return loss, nll
             layer, chart = _shear_layer(model), _chart(model)
             qq, rr = jax.vmap(dm_dg, in_axes=(None, 0, None))(layer, m[idx], chart)
             s = _scale(m[idx])[:, None, :]
-            mse = (jnp.mean(((qq - q[idx]) / s / nq) ** 2)
-                   + jnp.mean(((rr - r[idx]) / s / nr) ** 2))
-            loss = nll + deriv_weight * mse
+            per = (jnp.mean(((qq - q[idx]) / s / nq) ** 2, axis=(1, 2))
+                   + jnp.mean(((rr - r[idx]) / s / nr) ** 2, axis=(1, 2)))
+            if cut:
+                sm = bulk.selected(m[idx], cut)
+                mse = jnp.sum(jnp.where(sm, per, 0.0)) / jnp.maximum(jnp.sum(sm), 1)
+            else:
+                mse = jnp.mean(per)
+            loss = loss + deriv_weight * mse
             if score_weight:
                 # Score-weighted, but NOT contracted.  Contracting first --
                 # mean((score . dq)^2) -- is the metric the estimator is actually
@@ -296,34 +354,68 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
         else:
             print(f"step {step:6d}  nll {float(losses[-1]):.4f}", flush=True)
 
-    if converge:
+    if val_set is not None:
         # The FULL objective, per point: the NLL alone does not see the
         # response (see the docstring: batch 65536 worsened dm/dg while
         # held-out NLL did not move), so the stop must watch the deriv term too.
+        # `stop_on`: "total" = NLL + both deriv terms; "nod2" (default) drops the
+        # d2m/dg2 term; "dm" = the dm/dg term alone.  Why nod2 (2026-10-12,
+        # logs/desv/shear_s4c.log, noisy templates): the held-out d2m/dg2 misfit
+        # RISES (+9%) as training goes on while dm/dg improves and the NLL is flat,
+        # so "total" stopped every desv shear stage at 5k-10k steps, still at the
+        # full LR, where the spin-2 response swings +/-15e-3 between checks (the
+        # seed scatter).  Annealed, it settles within 1e-3 in the window.  d2m/dg2
+        # errors cannot move the corrected m (they cancel against R_s).
         vm, vq, vr = (jnp.asarray(x[:20000]) for x in val_set)
         vg = sample_g(jr.key(99), vm.shape[0])
         vx = lens(vm, vq, vr, vg)
+        sel_m = bulk.selected(vm, cut) if cut else jnp.ones(vm.shape[0], bool)
+        if cut:
+            vc = jnp.asarray(val_cov[:20000])
+            S_vx = bulk.sel_prob(vx, vc, cut)
 
         @eqx.filter_jit
-        def val_fn(p):
+        def val_terms(p):
             model = eqx.combine(p, static)
-            v = -model.log_prob(vx, condition=vg)
-            if deriv_weight:
-                layer, chart = _shear_layer(model), _chart(model)
-                qq, rr = jax.vmap(dm_dg, in_axes=(None, 0, None))(layer, vm, chart)
-                sc = _scale(vm)[:, None, :]
-                v = v + deriv_weight * (jnp.mean(((qq - vq) / sc / nq) ** 2, axis=(1, 2))
-                                        + jnp.mean(((rr - vr) / sc / nr) ** 2, axis=(1, 2)))
-            return v
+            nll_ = -model.log_prob(vx, condition=vg)
+            if cut:   # the training objective per point; fixed-key draws, so checks pair
+                nll_ = S_vx * nll_ - (1.0 - S_vx) * bulk.log_p_unselected(
+                    model, jr.key(98), 65536, cut, t_v, c_ref, condition=sample_g(jr.key(97), 65536, g_max))
+            if not deriv_weight:
+                return nll_, jnp.zeros_like(nll_), jnp.zeros_like(nll_), jnp.zeros(())
+            layer, chart = _shear_layer(model), _chart(model)
+            qq, rr = jax.vmap(dm_dg, in_axes=(None, 0, None))(layer, vm, chart)
+            sc = _scale(vm)[:, None, :]
+            # held-out spin-2 response amplitude: mean d(M1/Mr)/dg1, layer / templates - 1
+            de1 = lambda d: jnp.where(sel_m, (d[:, 0, 2] - vm[:, 2] / vm[:, 1] * d[:, 0, 1]) / vm[:, 1], 0.0)
+            # cut templates: deriv terms 0 (identical at every check, so the paired test is unaffected)
+            return (nll_, jnp.where(sel_m, deriv_weight * jnp.mean(((qq - vq) / sc / nq) ** 2, axis=(1, 2)), 0.0),
+                    jnp.where(sel_m, deriv_weight * jnp.mean(((rr - vr) / sc / nr) ** 2, axis=(1, 2)), 0.0),
+                    jnp.sum(de1(qq)) / jnp.sum(de1(vq)) - 1)
+
+        n_check = [0]
+
+        def val_fn(p):
+            nll_, tq, tr, re1 = (np.asarray(x, np.float64) for x in val_terms(p))
+            n_check[0] += 1
+            w = lambda x: np.mean(np.clip(x, *np.percentile(x, [0.1, 99.9])))
+            print(f"val terms #{n_check[0]}: nll mean {nll_.mean():.4f} median {np.median(nll_):.4f} "
+                  f"wins {w(nll_):.4f} max {nll_.max():.1f} | dm/dg {tq.mean():.2f} (wins {w(tq):.2f}) | "
+                  f"d2m/dg2 {tr.mean():.2f} (wins {w(tr):.2f}) | spin-2 response {float(re1) * 1e3:+.2f}e-3", flush=True)
+            if ckpt:
+                eqx.tree_serialise_leaves(f"{ckpt}_{n_check[0]:03d}.eqx", eqx.combine(p, static))
+            return {"total": nll_ + tq + tr, "nod2": nll_ + tq, "dm": tq}[stop_on]
+
+    if converge:
 
         def chunk_fn(carry, mult, n):
             params, state, key, ema_params = carry
             return run(params, state, key, ema_params, n, mult)
 
-        best, _ = train_loop.fit(chunk_fn, (params, state, key, ema_params),
+        last, _ = train_loop.fit(chunk_fn, (params, state, key, ema_params),
                                  lambda c: c[3] if ema else c[0], val_fn,
                                  chunk=REPORT, check_every=check_every, report=report)
-        return eqx.combine(best, static)
+        return eqx.combine(last, static)
 
     done = 0
     while done < steps:
@@ -332,6 +424,8 @@ def train(flow, data, key, steps=6000, batch=1024, lr=3e-3, bulk_frozen=True,
             params, state, key, ema_params, n)
         done += n
         report(done - 1, (losses, nlls))
+        if val_set is not None and done % check_every == 0:
+            val_fn(ema_params if ema else params)
     return eqx.combine(ema_params if ema else params, static)
 
 
@@ -357,6 +451,24 @@ def _shear_layer(flow):
 def _chart(flow):
     """The RawMomentStandardize, which `dm_dg` needs to convert dz/dg to dm/dg."""
     return flow.bijection.bijection.bijections[0]
+
+
+def shear_jacobian_penalty(flow, m):
+    """Per-point (n,) sum of squared Jacobian entries of the shear layer's coefficient net w.r.t.
+    its own (whitened) input -- `bulk.bulk_jacobian_penalty`'s analogue for this stage.  The layer's
+    coefficients are bounded, but `ShearResponse.shear` uses dQ/dx, which is not: a steep net is
+    how the censored desv x4 flow's draws at Mf ~ 20-100 collapsed to ~1e-40 at g = +/-0.005
+    (selection terms R_s ~ 1e25; target R11 x260 from censored kernel draws, 2026-10-13).
+    Input stop-gradient-ed, so the only path is "be smooth HERE"."""
+    from models.shear import _invariants, _Q_LOC, _Q_SCALE
+    from paramax import unwrap
+    co, chart = _shear_layer(flow).coeffs, _chart(flow)
+
+    def one(mi):
+        f, a_, b_, q, _ = _invariants(jax.lax.stop_gradient(chart.transform(mi)))
+        u = unwrap(co.u_white) @ (jnp.stack([f, a_, b_, (q - _Q_LOC) / _Q_SCALE]) - unwrap(co.u_mean))
+        return jnp.sum(jax.jacfwd(co.net)(jax.lax.stop_gradient(u)) ** 2)
+    return jax.vmap(one)(m)
 
 
 def check(flow, data, n=4000, labels=None):
@@ -576,6 +688,12 @@ def main():
                         "improving (train_loop.fit); --steps is ignored")
     p.add_argument("--check-every", type=int, default=5000,
                    help="--converge: steps between held-out checks")
+    p.add_argument("--stop-on", choices=["total", "nod2", "dm"], default="nod2",
+                   help="--converge: held-out objective the stop test watches -- NLL + dm/dg + d2m/dg2 "
+                        "terms (total), NLL + dm/dg (nod2), or the dm/dg term alone (dm)")
+    p.add_argument("--ckpt", default=None, metavar="PREFIX",
+                   help="save PREFIX_<check>.eqx at every held-out check; without --converge the "
+                        "held-out terms are still logged every --check-every steps")
     p.add_argument("--g-max", type=float, default=G_MAX,
                    help="training shear disc radius. The spin-0 response is "
                         "odd in e, so it averages out of the population density "
@@ -594,6 +712,12 @@ def main():
                    help="shear-stage learning rate. It has never been tuned "
                         "UPWARD, and it moved the old noiseless metric 5x -- "
                         "more than every architectural axis combined.")
+    p.add_argument("--noise-g", default=None, metavar="G.npz",
+                   help="add G grad log p_t to every template's dm_dg target "
+                        "(noise_g_term; G from dev/noise_G.py) -- for noisy templates")
+    p.add_argument("--jac-weight", type=float, default=0.0,
+                   help="with --template-cut: censored templates' share of a coefficient-net Jacobian "
+                        "penalty, on the flow's own draws below the cut (use bulk's --jac-weight)")
     p.add_argument("--deriv-weight", type=float, default=0.0,
                    help="weight on regressing the layer's own dm/dg, d2m/dg2 "
                         "onto bfd's exact per-template derivative (never "
@@ -622,6 +746,11 @@ def main():
                         "error and the whole flux gradient in m1. Added to "
                         "`--deriv-weight`'s term, not a replacement.")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--template-cut", type=float, nargs=2, default=None, metavar=("MF", "MRMF"),
+                   help="censor templates with measured Mf < MF or Mr/Mf < MRMF (bulk.log_p_unselected); "
+                        "MUST match bulk's")
+    p.add_argument("--cut-samples", type=int, default=4096,
+                   help="model draws per step for --template-cut's log P(unselected | g)")
     p.add_argument("--flux-sas", type=_flux_sas, default=None,
                    help="fitted sinh-arcsinh warp of the flux axis as \"mu,sig,a,b\"; omit for the plain log10 this chart has always used. Gaussianises log10 Mf (skew 1.78 -> 0 on bulgedisc_v2). MUST match across bulk/shear/centroid/bias or the charts disagree.")
     p.add_argument("--log10mf", type=float, default=3.6)
@@ -637,6 +766,7 @@ def main():
     a = p.parse_args()
 
     data = load(a.data)
+    cov_all = bulk.load_cov(a.data) if a.template_cut else None   # rows aligned with `load`
     if a.mode == "scatter":
         # A property of the population, not of any trained flow -- no checkpoint.
         response_scatter(data[0], data[1], load_labels(a.data))
@@ -677,11 +807,26 @@ def main():
         # so once is enough.
         score = bulk_score(flow, jnp.asarray(train_set[0])) if a.score_weight \
             else None
+        if a.noise_g:
+            t = fitsio.read(a.data, columns=["moments", "cov"])
+            cff = t["cov"][bulk.physical(np.asarray(t["moments"], np.float64)), 0]
+            sets = []
+            for s_, c_ in ((train_set, cff[:n_train]), (val_set, cff[n_train:])):
+                d_ = noise_g_term(bulk_score(flow, jnp.asarray(s_[0])), c_, a.noise_g)
+                sets.append((s_[0], s_[1] + d_, s_[2]))
+            print(f"--noise-G {a.noise_g}: rms term / rms dm_dg, g1 (f r 1 2 c) "
+                  f"{np.round(d_[:, 0].std(0) / s_[1][:, 0].std(0), 4)}")
+            train_set, val_set = sets
         flow = train(flow, train_set, jr.key(a.seed + 1), steps=a.steps,
                      batch=a.batch, lr=a.lr, g_max=a.g_max,
                      deriv_weight=a.deriv_weight, score=score,
                      score_weight=a.score_weight, ema=a.ema,
-                     val_set=val_set if a.converge else None, check_every=a.check_every)
+                     val_set=val_set if a.converge or a.ckpt else None, check_every=a.check_every,
+                     converge=a.converge, stop_on=a.stop_on, ckpt=a.ckpt,
+                     cut=a.template_cut, cut_samples=a.cut_samples,
+                     cov=cov_all[:n_train] if a.template_cut else None,
+                     val_cov=cov_all[n_train:] if a.template_cut else None,
+                     jac_weight=a.jac_weight)
         print(f"val nll {val_nll(flow, val_set, jr.key(99)):.4f}")
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")

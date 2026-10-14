@@ -412,7 +412,7 @@ def weighted_copy_mean(copies, galaxies, sigma_x, base=None, g=None,
 # GPU.  (Until 2026-10-05 it was one full numpy pass per point in forked CPU workers:
 # each pass re-read the 20 GB big-endian record array several times -- ~100 TB of
 # DRAM traffic for a 600-point grid, memory-bound, and 16 workers cut every other
-# process's bandwidth 11x.)  Per row block, the host builds the sigma_x-independent
+# process's bandwidth 11x.)  Up front (`_copy_prep`), the host builds the sigma_x-independent
 # pieces once in float64 -- lensed X, `log_weights_base` (+ the lensed |J| ratio),
 # copy moments MINUS the galaxy's own -- and the GPU evaluates all K points' chi^2
 # and weights for the block together.  Blocks end on galaxy boundaries (copies are
@@ -446,7 +446,39 @@ def _copy_mean_block(seg, xy, lw0, dm, coef, n_seg):
     return mx, den, num
 
 
-def weighted_copy_mean_many(copies, galaxies, sigma_x_list, g_list=None, lens=False):
+def _copy_prep(copies, m0, gal, g, lens, rows=1 << 22):
+    """The sigma_x-independent per-copy inputs of `_copy_mean_block`, float32:
+    lensed X (n, 2), `log_weights_base` plus the lensed |J| ratio (n,; -inf = no
+    weight), and copy moments minus the galaxy's own (n, 5).  Built in float64 in
+    `rows`-row chunks, then cast -- the same values the per-block build gave."""
+    n = len(copies)
+    xy32, lw32, dm32 = (np.empty((n, 2), np.float32), np.empty(n, np.float32),
+                        np.empty((n, 5), np.float32))
+    q = np.array([0.5 * g[0] ** 2, g[0] * g[1], 0.5 * g[1] ** 2])
+    for a in range(0, n, rows):
+        b = min(a + rows, n)
+        c = copies[a:b]
+        lw0 = np.asarray(log_weights_base(c), np.float64)
+        xy = np.asarray(c["xy"], np.float64)
+        mc = np.asarray(c["moments"], np.float64)
+        if g != (0.0, 0.0):
+            xy = (xy + g[0] * np.asarray(c["dxy_dg"][:, 0], np.float64)
+                  + g[1] * np.asarray(c["dxy_dg"][:, 1], np.float64)
+                  + np.tensordot(q, np.asarray(c["d2xy_dg2"], np.float64), axes=(0, 1)))
+        if lens:
+            m_g0 = mc
+            mc = (mc + g[0] * np.asarray(c["dm_dg"][:, 0], np.float64)
+                  + g[1] * np.asarray(c["dm_dg"][:, 1], np.float64)
+                  + np.tensordot(q, np.asarray(c["d2m_dg2"], np.float64), axes=(0, 1)))
+            lw0 = lw0 + log_jacobian(mc) - log_jacobian(m_g0)
+        xy32[a:b] = xy
+        lw32[a:b] = np.where(np.isfinite(lw0), lw0, -np.inf)
+        dm32[a:b] = mc - m0[gal[a:b]]
+    return xy32, lw32, dm32
+
+
+def weighted_copy_mean_many(copies, galaxies, sigma_x_list, g_list=None, lens=False,
+                             prep_cache=None):
     """`weighted_copy_mean` at every point in `sigma_x_list` -> list of (mean, keep).
 
     `g_list`, if given, is one shear per point, passed as `weighted_copy_mean`'s
@@ -454,6 +486,12 @@ def weighted_copy_mean_many(copies, galaxies, sigma_x_list, g_list=None, lens=Fa
     lensed per-copy quantities be built once per block -- a list of different
     shears raises.  `lens` as in `weighted_copy_mean`.  Matches it to float32
     rounding of the copy-minus-galaxy shift (tests/test_centroid.py).
+
+    `prep_cache`, a dict the caller owns, keeps the per-copy float32 inputs
+    (`_copy_prep`) for the last (shear, lens) between calls: a caller that
+    splits one long point list into chunks then converts and lenses the copies
+    once instead of once per chunk (~35 s per pass over 140M copies).  It holds
+    ~36 bytes per copy; drop the dict to free it.
     """
     gs = {(0.0, 0.0) if g is None else (float(g[0]), float(g[1])) for g in (g_list or [None])}
     if len(gs) != 1:
@@ -478,7 +516,6 @@ def weighted_copy_mean_many(copies, galaxies, sigma_x_list, g_list=None, lens=Fa
         cuts.append(int(bounds[np.searchsorted(bounds, cuts[-1] + B, side="right") - 1]))
     n_seg = 1 << int(np.ceil(np.log2(max(np.searchsorted(starts, b) - np.searchsorted(starts, a)
                                          for a, b in zip(cuts[:-1], cuts[1:])))))
-    q = np.array([0.5 * g[0] ** 2, g[0] * g[1], 0.5 * g[1] ** 2])
     mean = np.zeros((K, n, 5))
     log_den = np.full((K, n), -np.inf)
 
@@ -489,31 +526,24 @@ def weighted_copy_mean_many(copies, galaxies, sigma_x_list, g_list=None, lens=Fa
                                    + num / np.where(den > 0, den, 1.0)[..., None]).transpose(1, 0, 2)
         log_den[:, g_lo:g_lo + ng] = (mx + np.log(np.where(den > 0, den, 0.0))).T
 
+    prep = None if prep_cache is None else prep_cache.get((g, lens))
+    if prep is None:
+        prep = _copy_prep(copies, m0, gal, g, lens)
+        if prep_cache is not None:
+            prep_cache.clear()                        # one (shear, lens) at a time: ~5 GB at 140M copies
+            prep_cache[(g, lens)] = prep
+    xy32, lw32, dm32 = prep
+
     pending = None
     for a, b in zip(cuts[:-1], cuts[1:]):
-        c = copies[a:b]
         gl = gal[a:b]
-        lw0 = np.asarray(log_weights_base(c), np.float64)
-        xy = np.asarray(c["xy"], np.float64)
-        mc = np.asarray(c["moments"], np.float64)
-        if g != (0.0, 0.0):
-            xy = (xy + g[0] * np.asarray(c["dxy_dg"][:, 0], np.float64)
-                  + g[1] * np.asarray(c["dxy_dg"][:, 1], np.float64)
-                  + np.tensordot(q, np.asarray(c["d2xy_dg2"], np.float64), axes=(0, 1)))
-        if lens:
-            m_g0 = mc
-            mc = (mc + g[0] * np.asarray(c["dm_dg"][:, 0], np.float64)
-                  + g[1] * np.asarray(c["dm_dg"][:, 1], np.float64)
-                  + np.tensordot(q, np.asarray(c["d2m_dg2"], np.float64), axes=(0, 1)))
-            lw0 = lw0 + log_jacobian(mc) - log_jacobian(m_g0)
-        lw0 = np.where(np.isfinite(lw0), lw0, -np.inf)
         pad = B - (b - a)
         blk = (np.r_[gl - gl[0], np.full(pad, n_seg)].astype(np.int32),
-               np.pad(xy, ((0, pad), (0, 0))).astype(np.float32),
-               np.r_[lw0, np.full(pad, -np.inf)].astype(np.float32),
-               np.pad(mc - m0[gl], ((0, pad), (0, 0))).astype(np.float32))
+               np.pad(xy32[a:b], ((0, pad), (0, 0))),
+               np.r_[lw32[a:b], np.full(pad, -np.inf, np.float32)],
+               np.pad(dm32[a:b], ((0, pad), (0, 0))))
         job = (int(gl[0]), int(gl[-1] - gl[0] + 1), _copy_mean_block(*blk, coef, n_seg=n_seg))
-        if pending is not None:                       # host prepares block i+1 while GPU runs i
+        if pending is not None:                       # host collects block i-1 while GPU runs i
             collect(pending)
         pending = job
     collect(pending)
@@ -802,9 +832,31 @@ def _sigmax_inverse_decoupled(layer, y, condition):
     return jnp.stack([x0, x1, x2, x3, x4])
 
 
+def mdd_dist(zb):
+    """pairwise chart-z distances, zero diagonal; data only (no gradient)."""
+    sq = jnp.sum(zb * zb, 1)
+    A = jnp.sqrt(jnp.maximum(sq[:, None] + sq[None] - 2 * zb @ zb.T, 0.0))
+    return jax.lax.stop_gradient(jnp.fill_diagonal(A, 0.0, inplace=False))
+
+
+def mdd_points(r, A):
+    """per point; the mean over points is MDD_U(r | z) + dbar |E r|^2_U (train_sigmax's resp_mdd).
+    `A` = mdd_dist(z) of the same points."""
+    B = r.shape[0]
+    a = A.sum(1)
+    at = a.sum()
+    R = r.sum(0)
+    rmr = R[None] - r                                   # sum over j != i
+    # (U-centred A) @ r, row i, j != i
+    atr = (A @ r - (a[:, None] * rmr + (a[:, None] * r).sum(0) - a[:, None] * r) / (B - 2)
+           + at * rmr / ((B - 1) * (B - 2)))
+    return -jnp.sum(r * atr, 1) / (B - 3) + at / (B * (B - 1)) * jnp.sum(r * rmr, 1) / (B - 1)
+
+
 def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
                  extra_scales=None, decouple_kappa=False, g0=(0.0, 0.0),
-                 converge=False, check_every=5000, g_resp=None, g_resp_weight=1.0):
+                 converge=False, check_every=5000, g_resp=None, g_resp_weight=1.0, resp_mdd=None,
+                 ckpt=None, tail_steps=0):
     """Fit `SigmaXBlockLayer`'s five (now six) coefficient nets by SUPERVISED
     regression against `imsims.copies`' own weighted copy mean, directly in
     the CHART's z-space -- not plain NLL, and not `relative_channels`'
@@ -881,6 +933,19 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
     of leaving every OTHER grid point's g-response to net_K alone. `main`'s
     `--g-resp-grid` builds this; the plain 2-D form above is unchanged and
     numerically identical to before.
+
+    `resp_mdd = (weight, w)` (2026-10-12, needs `g_resp`): adds `weight` x a
+    CONDITIONAL-MEAN penalty on the same normalised response residual r_i
+    the g_resp term squares per galaxy: the U-statistic martingale
+    difference divergence MDD(w r | z) (Shao & Zhang 2014) plus dbar x the
+    U-statistic |E[w r]|^2 (MDD is blind to a constant), both over the batch,
+    distances in chart z.  Zero in expectation iff E[r | z] = 0 -- no bins,
+    no bandwidth.  The per-galaxy MSE's optimum trades a coherent 1e-3
+    response error against the per-template residual (template noise the
+    moments cannot predict, rms ~ 2.2/SNR), so it leaves seed-dependent
+    ~1e-3 coherent errors; this term sees only the coherent part.  `w` (per
+    galaxy, mean 1) is an inverse residual-noise weight: any weight that is a
+    function of the template leaves the target E[r|z] = 0 unchanged.
     """
     grid = [(sigma_x, truth, g0)] + [
         e if len(e) == 3 else (e[0], e[1], g0) for e in (extra_scales or [])
@@ -909,7 +974,7 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
                                               jnp.asarray(sx, dtype=jnp.float32)])
                              for sx, _, gi in grid])
     # `_resp_cond(sx, h)` builds the [+h, -h, 0] x [g=(s,0), sigma_x=sx]
-    # condition triple `resp_loss` needs -- factored out so the grid case
+    # condition triple `resp_resid` needs -- factored out so the grid case
     # below can build one per grid point's OWN sigma_x instead of closing
     # over a single fixed one.
     _resp_cond = lambda sx_vec, h: [
@@ -946,18 +1011,23 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
             print("g_resp targets (z-space d+ - d-): " +
                   "  ".join(f"z{i} rms {float(dr_scale[i]):.3e}" for i in range(5)))
 
-    def resp_loss(layer, sh, inv, zb, dtrue, c_pm_):
-        """per galaxy: sum over z-slots of the normalised response misfit.
+    def resp_resid(layer, sh, inv, zb, dtrue, c_pm_):
+        """per galaxy (n, 5): the normalised response misfit per z-slot.
         `inv` is the GENERATIVE centroid step; with `--adapter` callers pass
         the composed `adapter.inverse -> layer.inverse` (see `_gen_inv`), not
         the bare centroid inverse `step`'s own dz-regression term uses."""
         u = jax.vmap(lambda zz: sh.transform(zz, c_pm_[2]))(zb)
         zp = [jax.vmap(lambda uu: inv(sh.inverse(uu, c), c))(u) for c in c_pm_[:2]]
-        return jnp.sum(((zp[0] - zp[1] - dtrue) / dr_scale) ** 2, axis=1)
+        return (zp[0] - zp[1] - dtrue) / dr_scale
+
+    assert resp_mdd is None or g_resp is not None, "resp_mdd needs g_resp"
+    if resp_mdd is not None:
+        mdd_weight, w_mdd = resp_mdd[0], jnp.asarray(resp_mdd[1], jnp.float32)
+
 
     def _gen_inv(inv, adapter):
         """`inv` (the bare `SigmaXBlockLayer` inverse) composed behind the
-        adapter's own inverse: latent -> data order is shear^-1 (`resp_loss`'s
+        adapter's own inverse: latent -> data order is shear^-1 (`resp_resid`'s
         own `sh.inverse`) -> adapter^-1 -> centroid^-1, since that is the
         order the GENERATIVE chain actually applies them in (`bulk.build_flow
         (..., adapter=True)`'s chain is `[..., SigmaXBlockLayer, Centroid
@@ -968,8 +1038,10 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
             return inv
         return lambda zz, cc: inv(adapter.inverse_and_log_det(zz, cc)[0], cc)
 
+    # Fixed budget: the same 2000-step linear warmup as train_loop.fit, then cosine to zero.
     opt = optax.chain(optax.clip_by_global_norm(1.0),
-                      optax.adam(lr if converge else optax.cosine_decay_schedule(lr, steps)))
+                      optax.adam(lr if converge else optax.warmup_cosine_decay_schedule(
+                          0.0, lr, min(2000, steps // 10), steps, end_value=0.0)))
     params, static = eqx.partition(flow, _sigmax_trainable(flow))
     state = opt.init(params)
     n_grid = len(grid)
@@ -985,8 +1057,9 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
     # snapshot noise. Zero-initialized nets make the early-training EMA
     # bias negligible in practice (no bias correction needed) as long as
     # `steps` isn't tiny.
-    # --converge has no step count: a fixed ~2000-step window instead.
-    ema_decay = 0.9995 if converge else 1.0 - 5.0 / max(steps, 5)
+    # A fixed ~2000-step window in both modes.  It was 1 - 5/steps without --converge, a 20k-step window at
+    # 100k: averaging weights over that much of a nonlinear net's trajectory gave val 4.68 vs 4.53 (2026-10-13).
+    ema_decay = 0.9995
     ema_params = params
 
     # `full_loss`/`per_galaxy_loss` below need `inv` evaluated at every (grid
@@ -1013,6 +1086,7 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
         zj=zj, dz_true_j=dz_true_j, cond_grid_j=cond_grid_j, dr_true=dr_true,
         zb_eval=zj[:n_full_eval], dz_true_eval=dz_true_j[:, :n_full_eval, :],
         dr_true_eval=(dr_true[:, :n_full_eval, :] if grid_resp else None),
+        w_mdd=(w_mdd if resp_mdd is not None else None),
     )
 
     def step(params, state, idx, g, dz_b, dr_b, data, mult):
@@ -1037,11 +1111,13 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
                     # steps every grid point gets covered in proportion to
                     # how often it's drawn, same as the dz-regression term.
                     c_pm_g = _resp_cond(data["cond_grid_j"][g, 2:], H)
-                    loss = loss + g_resp_weight * jnp.mean(
-                        resp_loss(layer, sh, inv_resp, zb, dr_b, c_pm_g))
                 else:
-                    loss = loss + g_resp_weight * jnp.mean(
-                        resp_loss(layer, sh, inv_resp, zb, dr_b, c_pm))
+                    c_pm_g = c_pm
+                rr = resp_resid(layer, sh, inv_resp, zb, dr_b, c_pm_g)
+                loss = loss + g_resp_weight * jnp.mean(jnp.sum(rr ** 2, axis=1))
+                if resp_mdd is not None:
+                    loss = loss + mdd_weight * jnp.mean(
+                        mdd_points(rr * data["w_mdd"][idx][:, None], mdd_dist(zb)))
             return loss, terms
 
         (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -1085,6 +1161,10 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
             sh = _shear_layer(model)
             inv_resp = _gen_inv(inv, _adapter_layer(model))
 
+        if resp_mdd is not None:
+            A_eval = mdd_dist(data["zb_eval"])
+            w_eval = data["w_mdd"][:n_full_eval]
+
         def per_scale(args):
             if grid_resp:
                 cond_i, dz_true_i, dr_true_i = args
@@ -1100,8 +1180,10 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
                 # also averages the response term over every grid point, not
                 # just the base one.
                 c_pm_i = _resp_cond(cond_i[2:], H)
-                sums_i = sums_i + g_resp_weight * resp_loss(
-                    layer, sh, inv_resp, data["zb_eval"], dr_true_i, c_pm_i)
+                rr = resp_resid(layer, sh, inv_resp, data["zb_eval"], dr_true_i, c_pm_i)
+                sums_i = sums_i + g_resp_weight * jnp.sum(rr ** 2, axis=1)
+                if resp_mdd is not None:
+                    sums_i = sums_i + mdd_weight * mdd_points(rr * w_eval[:, None], A_eval)
             return sums_i
 
         # (n_grid, n_eval) -> per galaxy, averaged over the grid; its mean is
@@ -1112,8 +1194,10 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
                             batch_size=min(_FULL_LOSS_CHUNK, n_grid))
         out = jnp.mean(sums, axis=0)
         if g_resp is not None and not grid_resp:
-            out = out + g_resp_weight * resp_loss(
-                layer, sh, inv_resp, data["zb_eval"], data["dr_true"][:n_full_eval], c_pm)
+            rr = resp_resid(layer, sh, inv_resp, data["zb_eval"], data["dr_true"][:n_full_eval], c_pm)
+            out = out + g_resp_weight * jnp.sum(rr ** 2, axis=1)
+            if resp_mdd is not None:
+                out = out + mdd_weight * mdd_points(rr * w_eval[:, None], A_eval)
         return out
 
     _per_galaxy_loss_jit = eqx.filter_jit(_per_galaxy_loss)
@@ -1122,6 +1206,27 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
     # signature exactly what `train_loop.fit`'s `val_fn` expects.
     per_galaxy_loss = lambda p: _per_galaxy_loss_jit(p, data)
     full_loss = lambda p: jnp.mean(per_galaxy_loss(p))
+
+    def mdd_report(p, tag, n=8192, n_perm=16):
+        """base grid point, first `n` training galaxies: per-galaxy response term vs the
+        weighted conditional-mean term, with a permutation z (r shuffled against z)."""
+        if g_resp is None:
+            return
+        model = eqx.combine(p, static)
+        layer = _sigmax_layer(model)
+        inv = lambda zz, cc: layer.inverse_and_log_det(zz, cc)[0]
+        c0 = _resp_cond(data["cond_grid_j"][0, 2:], H) if grid_resp else c_pm
+        dr0 = data["dr_true"][0, :n] if grid_resp else data["dr_true"][:n]
+        rr = eqx.filter_jit(resp_resid)(layer, _shear_layer(model), _gen_inv(inv, _adapter_layer(model)),
+                                        data["zj"][:n], dr0, c0)
+        w = data["w_mdd"][:n, None] if resp_mdd is not None else jnp.ones((n, 1))
+        A = mdd_dist(data["zj"][:n])
+        f = jax.jit(lambda r, A_: jnp.mean(mdd_points(r, A_)))     # A as an argument, not a baked-in constant
+        m = float(f(rr * w, A))
+        perm = np.array([float(f((rr * w)[np.random.default_rng(k).permutation(n)], A)) for k in range(n_perm)])
+        print(f"resp MDD [{tag}]: per-galaxy term {float(jnp.mean(jnp.sum(rr ** 2, 1))):.4e}  "
+              f"weighted MDD+mean {m:+.4e}  perm {perm.mean():+.2e} +/- {perm.std():.2e}  "
+              f"z {(m - perm.mean()) / perm.std():+.1f}", flush=True)
 
     # The plain-Python `for i in range(steps)` loop this replaced dispatched
     # ONE tiny jitted `step` call per iteration, with numpy-RNG draws and a
@@ -1181,14 +1286,36 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
             print(f"step {i:6d}  loss {float(losses[-1]):.5f}  " +
                   "  ".join(f"z{j} {a[j]:.5f}" for j in range(5)), flush=True)
 
+        save = lambda p, name: eqx.tree_serialise_leaves(f"{ckpt}_{name}.eqx", eqx.combine(p, static))
+        mdd_report(params, "init")
         # Evaluated on the fixed `zb_eval` subsample of the TRAINING galaxies,
         # like the full loss always was: tiny nets on ~500k galaxies, so the
         # stop is an optimisation test, not an overfitting one.
-        best, _ = train_loop.fit(chunk_fn, (params, state, ema_params, key),
+        st = {}
+        last, _ = train_loop.fit(chunk_fn, (params, state, ema_params, key),
                                  lambda c: c[2], per_galaxy_loss, chunk=REPORT,
-                                 check_every=check_every, report=report)
-        return eqx.combine(best, static)
+                                 check_every=check_every, report=report, state_out=st,
+                                 on_check=(lambda i, p: save(p, f"ck{i}")) if ckpt else None)
+        mdd_report(last, "stop")
+        if tail_steps:
+            # Keep going past the stop at its final LR, with a uniform (Polyak) average of the raw
+            # params from here on next to the EMA: does the fit still drift, and does the average settle?
+            carry, mult, i0 = st["carry"], np.float32(st["lr"]), st["step"]
+            avg, n_avg = jax.tree.map(jnp.zeros_like, carry[0]), 0
+            for i in range(i0, i0 + tail_steps, REPORT):
+                carry, out = chunk_fn(carry, mult, REPORT)
+                avg, n_avg = jax.tree.map(lambda a_, p_: a_ + (p_ - a_) / (n_avg + 1), avg, carry[0]), n_avg + 1
+                if (i + REPORT - i0) % check_every == 0:
+                    report(i + REPORT - 1, out)
+                    print(f"tail: step {i + REPORT}  val EMA {float(full_loss(carry[2])):.6f}  "
+                          f"avg ({n_avg * REPORT} steps) {float(full_loss(avg)):.6f}", flush=True)
+                    if ckpt:
+                        save(carry[2], f"ck{i + REPORT}")
+                        save(avg, f"avg{i + REPORT}")
+            last = carry[2]          # the last params, tail included
+        return eqx.combine(last, static)
 
+    mdd_report(params, "init")
     SCAN_CHUNK = min(REPORT, steps)
     rng_key = key
     i = 0
@@ -1201,19 +1328,26 @@ def train_sigmax(flow, m0, truth, sigma_x, key, steps=6000, batch=8192, lr=3e-3,
             params, state, ema_params, idx_chunk, g_chunk, data)
         i += n
         a = [float(x) for x in auxs[-1]]
-        fl = float(full_loss(ema_params))
+        # the all-scale eval costs about as much as a few hundred steps: every check_every, not every chunk
+        fl = f"{float(full_loss(ema_params)):.5f}" if i % check_every == 0 or i == steps else "-"
         print(f"step {i - 1:6d}  scale#{int(g_chunk[-1])}  loss {float(losses[-1]):.5f}  " +
               "  ".join(f"z{j} {a[j]:.5f}" for j in range(5)) +
-              f"  |  EMA full-loss (all {n_grid} scales) {fl:.5f}", flush=True)
+              f"  |  EMA full-loss (all {n_grid} scales) {fl}", flush=True)
+    mdd_report(ema_params, "final")
     return eqx.combine(ema_params, static)
 
 
-def check_sigmax(flow, copies, galaxies, sigma_x, n=4000, skip=0):
+def check_sigmax(flow, copies, galaxies, sigma_x, n=4000, skip=0, cut=None):
     """`SigmaXBlockLayer` analogue of `check`: layer shift vs. catalog copy
-    mean, both at g=0 -- the catalog's weighted copy means are unlensed."""
+    mean, both at g=0 -- the catalog's weighted copy means are unlensed.
+    `cut`: check only the templates the layer was fit on (`--template-cut`)."""
     target, keep = weighted_copy_mean(copies, galaxies, sigma_x)
-    m0 = galaxies["moments"][keep][skip:skip + n]
-    target = target[skip:skip + n]
+    m0 = galaxies["moments"][keep][skip:]
+    target = target[skip:]
+    if cut:
+        sel = np.asarray(bulk.selected(m0, cut))
+        m0, target = m0[sel], target[sel]
+    m0, target = m0[:n], target[:n]
     layer, chart = _sigmax_layer(flow), _chart(flow)
     full_cond = jnp.tile(
         jnp.concatenate([jnp.zeros(2), jnp.asarray(sigma_x, dtype=jnp.float32)]),
@@ -1307,12 +1441,22 @@ def main():
     p.add_argument("--init", default="flows/shear.eqx",
                    help="shear checkpoint to warm-start bulk+shear from")
     p.add_argument("--steps", type=int, default=3000)
+    p.add_argument("--resume", default=None, metavar="CENTROID.eqx",
+                   help="train-sigmax: start from a trained centroid chain (same flags) instead of "
+                        "the --init graft; pair with a small --lr to anneal it")
     p.add_argument("--fit-K", action="store_true",
                    help="fit the centroid layer's shear-response net_K (fit_K) to the "
                         "copies' dxy_dg/d2xy_dg2 before training; net_K stays frozen after")
+    p.add_argument("--noise-g", default=None, metavar="G.npz",
+                   help="--g-resp-weight only: add G grad log p_t to the response target "
+                        "(shear.noise_g_term) -- for noisy templates")
     p.add_argument("--g-resp-weight", type=float, default=0.0,
                    help="train-sigmax: weight of the whole-chain shear-response term "
                         "against the J-lensed copy means at g1 = +/-0.02 (0 = off)")
+    p.add_argument("--resp-mdd-weight", type=float, default=0.0,
+                   help="train-sigmax, with --g-resp-weight: weight of the conditional-mean "
+                        "(MDD) penalty on the response residual, see train_sigmax's resp_mdd; "
+                        "per-galaxy weights 1/(2.18/SNR + 0.0048) from --train-data (0 = off)")
     p.add_argument("--g-resp-grid", action="store_true",
                    help="--g-resp-weight only: apply the g_resp term at EVERY "
                         "training Sigma_X grid point (base + --multi-scale/"
@@ -1331,8 +1475,17 @@ def main():
                    help="rescale Sigma_X by this factor squared; the catalog "
                         "grid is valid over roughly [1/1.4, 1.4]")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--save-checks", action="store_true",
+                   help="--converge: save the EMA params at every check as FLOW_ck<step>.eqx (and FLOW_avg<step>.eqx in the tail)")
+    p.add_argument("--tail-steps", type=int, default=0,
+                   help="--converge: keep training this many steps past the stop at the final LR, with a Polyak average")
+    p.add_argument("--aniso-seed", type=int, default=None,
+                   help="RNG seed of the --n-aniso Sigma_X cloud (default --seed + 2); fix it to train seeds on one cloud")
     p.add_argument("--flux-sas", type=_flux_sas, default=None,
                    help="fitted sinh-arcsinh warp of the flux axis as \"mu,sig,a,b\"; omit for the plain log10 this chart has always used. Gaussianises log10 Mf (skew 1.78 -> 0 on bulgedisc_v2). MUST match across bulk/shear/centroid/bias or the charts disagree.")
+    p.add_argument("--template-cut", type=float, nargs=2, default=None, metavar=("MF", "MRMF"),
+                   help="train only on templates with measured Mf >= MF and Mr/Mf >= MRMF "
+                        "(bulk.selected); MUST match bulk/shear's")
     p.add_argument("--holdout", type=float, default=0.0,
                    help="fraction of the galaxies to keep OUT of training and "
                         "report `check` on. The split is WITHIN one population "
@@ -1466,23 +1619,36 @@ def main():
             # (`coeffs.u_mean/.u_white`), stale by the same mechanism.
             flow = bulk.sync_chart_constants(flow, m_train=m_train)
             print(f"warm started bulk + shear from {a.init}")
+        if a.resume:   # continue a trained centroid chain (overrides the --init graft)
+            flow = eqx.tree_deserialise_leaves(a.resume, flow)
+            print(f"resumed the whole chain from {a.resume}")
         target, keep = weighted_copy_mean(copies, galaxies, sigma_x)
         m0 = np.asarray(galaxies["moments"][keep], dtype=np.float64)
         print(f"fitting on galaxies [0, {n_train}) of {len(m0)}")
+        # Rows actually fit.  --template-cut drops the copies of the templates bulk/shear censor
+        # (bulk.selected): this stage is conditional on the template, so selecting on it is unbiased.
+        fit = np.arange(len(m0)) < n_train
+        if a.template_cut:
+            fit &= bulk.selected(m0, a.template_cut)
+            print(f"--template-cut {a.template_cut}: fitting {fit.sum()} of {n_train} templates")
         def _grid_f32(sx_list, g=(0.0, 0.0), lens=False, shift=True, chunk=100):
             """`weighted_copy_mean_many` over `sx_list` -> (K, n_train, 5) float32
             copy means (or, `shift`, minus m0), `chunk` points per copy pass.
             float32 is what train_sigmax's chart casts them to anyway; whole-list
             float64 means blew 62 GB host at 400 points (2026-10-07).
-            ponytail: one copy pass per chunk; raise `chunk` if passes dominate."""
-            out = np.empty((len(sx_list), len(m0[:n_train]), 5), np.float32)
+            ponytail: one copy pass per chunk; raise `chunk` if passes dominate.
+            The chunks share one `prep_cache`, so the copies are converted and
+            lensed once per call rather than once per chunk."""
+            out = np.empty((len(sx_list), len(m0[fit]), 5), np.float32)
+            prep_cache = {}
             for i in range(0, len(sx_list), chunk):
                 part = sx_list[i:i + chunk]
                 for j, (t_, k_) in enumerate(weighted_copy_mean_many(
-                        copies, galaxies, part, g_list=[g] * len(part), lens=lens)):
+                        copies, galaxies, part, g_list=[g] * len(part), lens=lens,
+                        prep_cache=prep_cache)):
                     assert np.array_equal(k_, keep), \
                         f"keep mask differs at grid point {i + j} -- rows would misalign"
-                    out[i + j] = (t_ - m0 if shift else t_)[:n_train]
+                    out[i + j] = (t_ - m0 if shift else t_)[fit]
             return out
 
         if sigmax:
@@ -1500,7 +1666,7 @@ def main():
                 assert np.array_equal(keep_, keep), \
                     f"keep mask differs at {label} -- rows would misalign"
                 m0_ = np.asarray(galaxies["moments"][keep_], dtype=np.float64)
-                extra_scales.append((sx_, (tgt_ - m0_)[:n_train], g_))
+                extra_scales.append((sx_, (tgt_ - m0_)[fit], g_))
 
             if a.multi_scale:
                 for s_ in (1.0 / a.scale_margin, a.scale_margin):
@@ -1518,7 +1684,7 @@ def main():
                 assert np.array_equal(keep2, keep), \
                     f"keep mask differs at {a.extra_copies} -- rows would misalign"
                 m0_2 = np.asarray(galaxies2["moments"][keep2], dtype=np.float64)
-                extra_scales.append((sigma_x2, (tgt2 - m0_2)[:n_train], (0.0, 0.0)))
+                extra_scales.append((sigma_x2, (tgt2 - m0_2)[fit], (0.0, 0.0)))
                 print(f"training an extra native-depth Sigma_X point from {a.extra_copies}")
             if a.anisotropic:
                 n_before = len(extra_scales)
@@ -1529,7 +1695,7 @@ def main():
                     # with ellipticity, so the layer sees anisotropy across
                     # the same noise-level range it must generalise over,
                     # not only at the base Sigma_X's trace.
-                    rng_aniso = np.random.default_rng(a.seed + 2)
+                    rng_aniso = np.random.default_rng(a.seed + 2 if a.aniso_seed is None else a.aniso_seed)
                     scales_ = np.exp(rng_aniso.uniform(
                         np.log(1.0 / a.scale_margin), np.log(a.scale_margin), a.n_aniso))
                     e_mags = rng_aniso.uniform(0.0, a.aniso_max, a.n_aniso)
@@ -1566,19 +1732,46 @@ def main():
                     tp, kp_ = weighted_copy_mean(copies, galaxies, sigma_x, g=(H, 0.0), lens=True)
                     tm, km_ = weighted_copy_mean(copies, galaxies, sigma_x, g=(-H, 0.0), lens=True)
                     assert np.array_equal(kp_, keep) and np.array_equal(km_, keep), "g_resp keep mask differs"
-                    g_resp = (H, tp[:n_train], tm[:n_train])
+                    g_resp = (H, tp[fit], tm[fit])
+                if a.noise_g:
+                    # The response target's copies are the noisy template image re-centred, so its
+                    # noise couples to the template's moment noise like dm_dg's does (G_copy-mean =
+                    # G_template to 1-2%, 2026-10-09): the same shear.noise_g_term, scored by the
+                    # init flow's frozen bulk -- this chain's own p_t.  m_+ - m_- gains 2H x term.
+                    assert a.init and a.train_data, "--noise-g needs --init and --train-data"
+                    t_ = fitsio.read(a.train_data, columns=["moments", "cov"])
+                    assert np.array_equal(t_["moments"], galaxies["moments"]), \
+                        "--train-data is not row-aligned with the copies' GALAXIES"
+                    d_ = H * shear.noise_g_term(shear.bulk_score(prior, jnp.asarray(m0[fit])),
+                                                t_["cov"][keep][fit, 0], a.noise_g)[:, 0]
+                    print(f"--noise-g: H x term rms / rms (m_+ - m_-)/2, (f r 1 2 c) "
+                          f"{np.round(d_.std(0) / (0.5 * (np.asarray(g_resp[1]) - g_resp[2]).reshape(-1, 5).std(0)), 4)}")
+                    g_resp = (H, g_resp[1] + d_.astype(np.float32), g_resp[2] - d_.astype(np.float32))
+            resp_mdd = None
+            if a.resp_mdd_weight:
+                assert a.train_data and g_resp is not None, "--resp-mdd-weight needs --train-data and --g-resp-weight"
+                t_ = fitsio.read(a.train_data, columns=["moments", "cov"])
+                assert np.array_equal(t_["moments"], galaxies["moments"]), \
+                    "--train-data is not row-aligned with the copies' GALAXIES"
+                snr = t_["moments"][keep][fit, 0] / np.sqrt(t_["cov"][keep][fit, 0])
+                # residual rms ~ 2.18/SNR + 0.0048 (template noise; desv s4 chain vs copies, 2026-10-12)
+                w_ = 1.0 / (2.18 / np.maximum(snr, 1.0) + 0.0048)
+                resp_mdd = (a.resp_mdd_weight, w_ / w_.mean())
+                print(f"--resp-mdd-weight {a.resp_mdd_weight}: w p1/50/99 "
+                      f"{np.round(np.percentile(resp_mdd[1], [1, 50, 99]), 3)}")
             del copies          # 20 GB at DES depth; reloaded below for the post-training check
-            flow = train_sigmax(flow, m0[:n_train], (target - m0)[:n_train],
+            flow = train_sigmax(flow, m0[fit], (target - m0)[fit],
                                 sigma_x, jr.key(a.seed + 1), g_resp=g_resp,
-                                g_resp_weight=a.g_resp_weight,
+                                g_resp_weight=a.g_resp_weight, resp_mdd=resp_mdd,
                                 steps=a.steps, batch=a.batch,
                                 lr=a.lr if a.lr is not None else 3e-3,
                                 extra_scales=extra_scales,
                                 decouple_kappa=a.decouple_kappa,
-                                converge=a.converge, check_every=a.check_every)
+                                converge=a.converge, check_every=a.check_every,
+                                ckpt=a.flow[:-4] if a.save_checks else None, tail_steps=a.tail_steps)
             copies = load_copies(a.copies)[0]
         else:
-            flow = train(flow, m0[:n_train], (target - m0)[:n_train], sigma_x,
+            flow = train(flow, m0[fit], (target - m0)[fit], sigma_x,
                         jr.key(a.seed + 1), steps=a.steps, batch=a.batch)
         eqx.tree_serialise_leaves(a.flow, flow)
         print(f"wrote {a.flow}")
@@ -1591,7 +1784,7 @@ def main():
         m_check = np.asarray(galaxies["moments"], dtype=np.float64)
         net_saturation(flow, m_check[n_train if a.holdout else 0:], sigma_x)
         check_sigmax(flow, copies, galaxies, sigma_x,
-                    skip=n_train if a.holdout else 0)
+                    skip=n_train if a.holdout else 0, cut=a.template_cut)
     else:
         check(flow, copies, galaxies, sigma_x, skip=n_train if a.holdout else 0)
 

@@ -567,6 +567,31 @@ def template_cov(path):
         fitsio.read(path, columns=["cov"])["cov"]), dtype=np.float64).mean(0)
 
 
+def template_noise_g(g_path, c_tmpl):
+    """dC/dg_k of the deconvolved kernel, (2, 5, 5): -cbar (G_k + G_k^T).
+
+    A noisy template sheared by g carries noise dM + g dD, so the template-noise
+    covariance the flow convolved into P(m|g) is Sigma_t(g) = C_t + g cbar (G + G^T)
+    + O(g^2), with G = Cov(dD, dM) per unit C_ff (dev/noise_G.py) and cbar the mean
+    template C_ff (exact for the mixture: linear in C_ff).  The kernel that
+    deconvolves it is C_M - Sigma_t(g); a fixed C_M - C_t leaves a spurious
+    response wherever the density is curved -- the Mr/Mf ceiling (fwd_check
+    sigt, 2026-10-11).  Its (Mf, Mr) block is zero by isotropy, so the window
+    probability and the selection terms do not move."""
+    G = np.load(g_path)["G"].astype(np.float64)
+    return -c_tmpl[0, 0] * (G + G.transpose(0, 2, 1))
+
+
+def template_sigma_x(path):
+    """Mean Sigma_X (packed cov_odd: xx, xy, yy) of a NOISY template catalog.
+    Each template was recentred on its own noisy centroid, so its moments already
+    carry the geometric centroid jitter at Sigma_X,t; the copies then shift it by
+    the target's Sigma_X on top.  `--deconvolve-sigmax` subtracts this mean, as
+    `template_cov` does for C_M.  (The Kac-Rice |J(T)| part of the template's
+    recentring needs no such term: the 1/J weight on every prior draw cancels it.)"""
+    return np.asarray(fitsio.read(path, columns=["cov_odd"])["cov_odd"], dtype=np.float64).mean(0)
+
+
 def load_cov(path):
     """C_M, the even-moment noise covariance of a target (paper eq. 9).
 
@@ -1811,8 +1836,18 @@ def _merge_opg(st):
 def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
                  batch=64, chunk=2048, report=None,
                  proposal=None, proposal_sigma_x=None, jackknife=True,
-                 opg=False, gauge="prior", lam_stride=1, pool_reuse=0):
+                 opg=False, gauge="prior", lam_stride=1, pool_reuse=0,
+                 dsig=None, support_cut=None):
     """Per-target (d logP/dg, d2 logP/dg2) WITHOUT materialising the draws.
+
+    `support_cut = (Mf_min, Mr/Mf_min)` (`--template-cut`): draws BELOW the
+    flow's training cut get zero weight -- the prior is taken to be zero
+    there.  A censored flow's shear response is unconstrained below its cut:
+    one draw at Mf 11.6 (per-draw d2 log p/dg2 ~ -8e11, x4r 2026-10-14)
+    carried 99.9% of a target's R11.  A k-NN template-density guard cannot
+    see it (its 10-NN spacing, 3.47, is inside the sparsest selected
+    template's, 3.57).  Measured cost on x4r (40k targets, spikes aside):
+    the censored region carries ~1e-6 of sum Q and ~1e-5 of sum R11.
 
     `Phat = (1/S) sum_s w_s p(x_s|g)` is a plain sum over samples, and so are its
     two g-derivatives, so a target needs only three running accumulators
@@ -1874,10 +1909,18 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
     `Var[d_g log p]` does not exist and no draw count converges it (see
     `log_conv_is_kernel` and `dev/hmc_ref.py`).  Default stays "prior" so old
     runs reproduce.
+
+    `dsig` (2, 5, 5), if given, makes the kernel g-dependent: C(g) = cov +
+    sum_k g_k dsig_k (`template_noise_g`).  Each draw's log weight gains
+    log N(r; C(g)) - log N(r; cov), r = M_i - draw, expanded to O(g^2) -- all
+    the derivatives at g = 0 read -- so it is a per-draw polynomial in g with
+    host-precomputed coefficients.  Gauge "prior" only.
     """
     if gauge not in ("prior", "kernel", "auto"):
         raise ValueError(
             f"gauge must be 'prior', 'kernel' or 'auto'; got {gauge!r}")
+    if dsig is not None and (gauge != "prior" or opg or pool_reuse):
+        raise NotImplementedError("dsig needs gauge 'prior', no --opg, no pool")
     cov3 = np.ndim(cov) == 3
     if cov3 and gauge != "prior":
         # "kernel"/"auto" substitute m = Psi_g(u) with g moved into the noise
@@ -1913,6 +1956,38 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
         # times over, and `hessian` is `jacfwd(grad)` so it already computed the
         # first two internally and discarded them.
         return _val_grad_hess(f)
+
+    def one_t(m_i, draws_i, log_wt_i, sigma_x_i, ok_i, lin_i, quad_i):
+        f = lambda g: log_conv_is(
+            flow_g, m_i, draws_i,
+            log_wt_i + lin_i @ g - jnp.einsum("skl,k,l->s", quad_i, g, g),
+            condition(g, sigma_x_i), ok_i)
+        return _val_grad_hess(f)
+
+    if dsig is not None:
+        _dsig = jnp.asarray(dsig, jnp.float32)
+
+        @jax.jit
+        def _tn_terms(m_raw, d_raw, cinv, trb, trbb):
+            """Per draw: lin (n,S,2), quad (n,S,2,2) with
+            log N(r; C(g)) - log N(r; C) = lin.g - g.quad.g + O(g^3), from
+            C(g)^-1 = C^-1 - C^-1 A C^-1 + C^-1 A C^-1 A C^-1, A = g.dsig and
+            logdet C(g) = logdet C + tr(C^-1 A) - tr(C^-1 A C^-1 A)/2."""
+            r = m_raw[:, None, :] - d_raw
+            r = jnp.where(jnp.isfinite(r), r, 0.0)   # masked draws: weight -inf anyway
+            y = jnp.einsum("nsi,nij->nsj", r, cinv)
+            u = jnp.einsum("kij,nsj->nski", _dsig, y)
+            lin = 0.5 * (jnp.einsum("nski,nsi->nsk", u, y) - trb[:, None, :])
+            quad = 0.5 * (jnp.einsum("nski,nij,nslj->nskl", u, cinv, u)
+                          - 0.5 * trbb[:, None])
+            return lin, quad
+
+        def tn_terms(m_b, d_raw, cov_b):
+            ci = np.broadcast_to(np.linalg.inv(cov_b), (len(m_b), 5, 5))
+            trb = np.einsum("nij,kji->nk", ci, dsig)
+            trbb = np.einsum("nij,kjl,nlm,qmi->nkq", ci, dsig, ci, dsig)
+            f32 = lambda x: jnp.asarray(x, jnp.float32)
+            return _tn_terms(f32(m_b), d_raw, f32(ci), f32(trb), f32(trbb))
 
     # Gauge K differentiates the same estimator with g moved into the kernel;
     # see `log_conv_is_kernel` for why.  `c` arrives precomputed, so the flow is
@@ -1987,6 +2062,7 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
         return val, df, jnp.stack([h0, h1], axis=-1)
 
     batched = _fixed_batch(eqx.filter_jit(jax.vmap(
+        one_t if dsig is not None else
         {"prior": one, "kernel": one_k, "auto": one_b}[gauge])), nb)
     batched_c = _fixed_batch(eqx.filter_jit(jax.vmap(
         lambda x, lw, mr, sx, ok: _gauge_k_c(
@@ -2096,6 +2172,9 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
     q_out, r_out, opg_out = [], [], []
     n_empty = 0
     n_fallback = 0
+    n_unsup = 0
+    if support_cut is not None and use_device:
+        raise NotImplementedError("support_cut is host-path only (unset BFD_DEVICE_PQR)")
 
     # Shared prior-draw pool (`_pool_build`): exact per target, but only when
     # nothing about a flow draw depends on WHICH target uses it.
@@ -2112,6 +2191,8 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
         if why:
             print(f"    pool off: {why}", flush=True)
             pool_on = False
+    if pool_on and support_cut is not None:
+        raise NotImplementedError("support_cut is not implemented with --pool-reuse")
     if pool_on:
         _pL = jnp.asarray(np.linalg.cholesky(cov), jnp.float32)
         _pld = jnp.sum(jnp.log(jnp.diag(_pL)))
@@ -2313,6 +2394,12 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
             ok_raw = (_ok(d_raw)
                       if gauge != "auto" and (layer is not None
                                               or gauge != "prior") else None)
+            if support_cut is not None:
+                bad = ~bulk.selected(d_raw, support_cut)
+                n_unsup += int(bad.sum())
+                lw = jnp.where(bad, -jnp.inf, lw)
+                if ok_raw is not None:
+                    ok_raw = ok_raw & ~bad
             if layer is not None:
                 # Stay on device: the transformed draws go straight back into a
                 # jitted function, so a host round-trip here is pure loss.
@@ -2358,6 +2445,9 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
                 d_raw = jnp.where(ok_raw[..., None], d_raw, m_raw_j[:, None, :])
                 r0 = m_raw_j[:, None, :] - d_raw
                 f, df, d2f = batched(r0, d, d_raw, c_k, sx_j, ok_raw)
+            elif dsig is not None:
+                f, df, d2f = batched(m_z, d, lw, sx_j, ok_raw,
+                                     *tn_terms(m_b, d_raw, cov_b))
             else:
                 f, df, d2f = batched(m_z, d, lw, sx_j, ok_raw)
             if _TIME is not None:
@@ -2405,6 +2495,9 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
         # failing, not that the targets are uninformative.
         print(f"    {n_empty} targets had no draw with any weight; "
               f"they contribute nothing", flush=True)
+    if support_cut is not None:
+        print(f"    --template-cut: zeroed {n_unsup} draws below the cut "
+              f"({n_unsup / max(len(m) * samples, 1):.1e} of all)", flush=True)
     if n_fallback:
         # One chunk holds nearly all of this target's weight, so the delete-one
         # jackknife would divide by a vanishing 1 - a_e and these targets keep
@@ -2823,19 +2916,26 @@ def selection_terms(draw, z, cov, size, flux, batch=16384, fd=None,
             Fs = jnp.stack([jnp.where(fin, window_prob(jnp.where(fin[:, None], m, 1.0),
                                                         cov_chunk, size, flux), 0.0)
                             for m in ms])
-            return Fs, fin, ms[0]
+            return Fs, fin, jnp.stack(ms)
 
         h = fd
         s = np.zeros(9)                      # sums of the 9 stencil F's
         r00_top, m_top, w_acc, qs_chunks = 0.0, None, 0, []
         for i in range(0, n, batch):
             cov_chunk = cov[i:i + batch] if cov3 else cov
-            Fs, fin, m0 = (np.asarray(v, np.float64)
+            Fs, fin, ms = (np.asarray(v, np.float64)
                            for v in raw(jnp.asarray(z[i:i + batch]), cov_chunk))
+            m0 = ms[0]
             ok = fin.astype(bool)
             if density is not None:
                 sane = np.zeros_like(ok)
-                sane[ok] = in_support_density(m0[ok], density)
+                # Support at EVERY stencil point, as finiteness above: a draw in
+                # support at g = 0 can still be thrown off it at g = +/-h.  The
+                # censored desv x4 flow (template cut Mf >= 1200) has draws at
+                # Mf ~ 20-100, below every template, whose shear transport
+                # collapses the moments to ~1e-40 at one stencil point; the
+                # |J| ratio's 1/J(M^G) then gave F ~ 1e30 and R_s ~ 1e25.
+                sane[ok] = np.all([in_support_density(mk[ok], density) for mk in ms], axis=0)
                 n_guarded += int(ok.sum() - sane.sum())
                 ok = sane
             n_dropped += int((~ok).sum())
@@ -3067,8 +3167,12 @@ def in_support_density(m, density):
     """
     tree, scale, cutoff, k = density
     x = _shape_invariants(m) / scale
-    dist, _ = tree.query(x, k=k, workers=-1)
-    return dist[:, -1] <= cutoff
+    fin = np.isfinite(x).all(-1)          # Mf <= 0 -> log10 non-finite: out of support
+    out = np.zeros(len(x), bool)
+    if fin.any():
+        dist, _ = tree.query(x[fin], k=k, workers=-1)
+        out[fin] = dist[:, -1] <= cutoff
+    return out
 
 
 def selection_terms_score(flow, m, cov, size, flux, sigma_x=None, batch=4096,
@@ -3605,11 +3709,20 @@ def main():
                         "one row per target, so it runs the heteroscedastic "
                         "(varobs) code path -- per-target kernels, no pool, "
                         "selection conditions drawn per prior draw.")
+    p.add_argument("--deconvolve-sigmax", action="store_true",
+                   help="subtract the training catalog's mean template Sigma_X "
+                        "(template_sigma_x) from every target's and selection "
+                        "draw's Sigma_X: noisy templates were recentred, so their "
+                        "own centroid jitter is already in the prior")
     p.add_argument("--deconvolve-templates", action="store_true",
                    help="subtract the training catalog's mean template C_M "
                         "(template_cov) from every target kernel AND from the "
                         "selection-term draws' C_M: a flow trained on noisy "
                         "templates already carries that noise in its prior")
+    p.add_argument("--template-noise-g", default=None, metavar="G.npz",
+                   help="with --deconvolve-templates: g-dependent kernel C_M - Sigma_t(g), "
+                        "Sigma_t(g) = C_t + g cbar (G + G^T), G = Cov(dD, dM)/C_ff from "
+                        "dev/noise_G.py (template_noise_g).  Target likelihood only")
     p.add_argument("--noise-seed", type=int, default=1,
                    help="the targets' noise realization; shared by the +g, -g "
                         "and unsheared catalogs so the pairing still cancels "
@@ -3729,6 +3842,9 @@ def main():
     # [[rs-flow-vs-templates-is-draw-count]].  Keep `templates` reachable for
     # dev/rs_agree.py, which cross-checks the two; do not correct a bias with
     # it.
+    p.add_argument("--template-cut", type=float, nargs=2, default=None, metavar=("MF", "MRMF"),
+                   help="the flow's training cut (bulk/shear/centroid --template-cut): target "
+                        "draws below it get zero weight (pqr_streamed support_cut)")
     p.add_argument("--no-window-density-filter", action="store_true",
                    help="skip the support-density filter on selection draws "
                         "(see `build_support_density`): by default a draw is "
@@ -4008,6 +4124,12 @@ def main():
     # IMGNOISE (see the proposal-flow build above), so it needs Sigma_X even
     # when the evaluation flow -- keyed on `use_centroid` -- does not.
     sigma_x_all = np.asarray(rows["zero"]["cov_odd"], dtype=np.float64)
+    if a.deconvolve_sigmax:
+        sx_tmpl = template_sigma_x(train_data)
+        sigma_x_all = sigma_x_all - sx_tmpl
+        assert (sigma_x_all[:, 0] > 0).all() and (sigma_x_all[:, 0] * sigma_x_all[:, 2] > sigma_x_all[:, 1] ** 2).all()
+        print(f"  --deconvolve-sigmax: Sigma_X - <Sigma_X,tmpl> from {train_data}; "
+              f"Sigma_X,tmpl/Sigma_X (xx) median {np.median(sx_tmpl[0] / (sigma_x_all[:, 0] + sx_tmpl[0])):.4f}")
     sigma_x = sigma_x_all if use_centroid else None
     proposal_sigma_x = sigma_x_all if img_noise else None
     # The three mixture_draws call sites below all draw the flow component
@@ -4051,6 +4173,13 @@ def main():
             np.linalg.cholesky(cov)     # raises if any kernel is no longer positive definite
             print(f"  --deconvolve-templates: kernel C_M - <C_tmpl> from {train_data}; "
                   f"C_tmpl/C_M (Mf) median {np.median(c_tmpl[0, 0] / (cov + c_tmpl)[..., 0, 0]):.4f}")
+        dsig = None
+        if a.template_noise_g:
+            if not a.deconvolve_templates:
+                raise SystemExit("--template-noise-g needs --deconvolve-templates")
+            dsig = template_noise_g(a.template_noise_g, c_tmpl)
+            print(f"  --template-noise-g: kernel C_M - Sigma_t(g), cbar {c_tmpl[0, 0]:.1f}, "
+                  f"|dC/dg1| max {np.abs(dsig[0]).max():.4g} from {a.template_noise_g}")
         if cov.ndim == 3 and not img_noise:
             # `add_noise` draws ONE realization from ONE Cholesky factor; a
             # per-target one is unimplemented here (no catalog needs it yet --
@@ -4198,6 +4327,7 @@ def main():
               f"(target integration skipped)")
     elif a.samples and a.samples > chunk:
         qr = {}
+        support_cut = None if a.template_cut is None else tuple(a.template_cut)
         for k in arms:
             v = m_raw[k]
             print(f"  {k}:", flush=True)
@@ -4207,7 +4337,8 @@ def main():
                                  report=max(1, len(v) // (batch * 10)),
                                  proposal=proposal, proposal_sigma_x=proposal_sigma_x,
                                  gauge=a.gauge, lam_stride=a.lambda_stride,
-                                 pool_reuse=a.pool_reuse)
+                                 pool_reuse=a.pool_reuse, dsig=dsig,
+                                 support_cut=support_cut)
     else:
         qr = {k: pqr(flow_g, m[k], None if draws is None else draws[k],
                      None if log_wt is None else log_wt[k], batch, sigma_x)
@@ -4385,6 +4516,8 @@ def main():
                     cov_full = cov_full - c_tmpl   # same P as the targets
                     np.linalg.cholesky(cov_full)
                 sx_full = np.asarray(full["cov_odd"], dtype=np.float64)
+                if a.deconvolve_sigmax:
+                    sx_full = sx_full - sx_tmpl   # same P as the targets
                 cidx = np.random.default_rng(a.seed + 37).integers(
                     0, len(full), a.window_draws)
                 cov_win = cov_full[cidx]

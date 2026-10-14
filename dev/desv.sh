@@ -62,7 +62,7 @@ echo "renders done $(date)"
 ollama_off() { for m in $(ollama ps 2>/dev/null | awk 'NR > 1 {print $1}'); do ollama stop $m >/dev/null 2>&1; done; }
 ( while kill -0 $$ 2>/dev/null; do ollama_off; sleep 30; done ) &
 gate() { python -u dev/tail_gate.py --kind $1 $2 --data $M --sx-from $SX 2>&1 | grep "tail gate" | tee -a $L/tail_gate.log | grep -q PASS; }
-for s in 2 3 4; do
+for s in 2 3 4 5 6; do   # s5/s6 added 2026-10-08 for the flow-variance bar
     r=s$s
     [ -f $F/bulk_base_$r.eqx ] || { python -u bulk.py train --data $M --flow $F/bulk_base_$r.eqx --converge \
         --batch 16384 --lr 3e-3 --tail-weight 1.0 --seed $s > $L/bulk_base_$r.log 2>&1 \
@@ -99,9 +99,8 @@ resolve() {   # tag pqr flow size_lo size_hi flux_lo flux_hi seed [extra]: selec
 W="full90k:2.2 3.5 2200 90000 sel20k:2.2 3.5 2200 20000 cv6win:2.2 3.2 3000 20000 s32_f2200:2.2 3.2 2200 20000 s35_f3000:2.2 3.5 3000 20000"
 P2=pqr/desv_tnc15c_s2.npz
 t0=$SECONDS
-[ -f $P2 ] || python -u bias.py $BF --flow $F/centroid_tnc15c_s2.eqx --window-size 2.2 3.5 --window-flux 2200 90000 \
-    --save-pqr $P2 > $L/bias_s2_main.log 2>&1 || die "main bias"
-echo "WALL $((SECONDS - t0)) s" >> $L/bias_s2_main.log
+[ -f $P2 ] || { python -u bias.py $BF --flow $F/centroid_tnc15c_s2.eqx --window-size 2.2 3.5 --window-flux 2200 90000 \
+    --save-pqr $P2 > $L/bias_s2_main.log 2>&1 && echo "WALL $((SECONDS - t0)) s" >> $L/bias_s2_main.log; } || die "main bias"
 grep -E "windowed|P_s =|Q_s =|R_s =|top draw|WALL|ESS =" $L/bias_s2_main.log
 echo "$W" | tr ' ' '\n' | paste -d' ' - - - - | while read -r spec; do
     name=${spec%%:*}; set -- ${spec#*:}
@@ -109,7 +108,7 @@ echo "$W" | tr ' ' '\n' | paste -d' ' - - - - | while read -r spec; do
 done
 for h in 0.0025 0.01; do resolve s2_sel20k_h$h $P2 $F/centroid_tnc15c_s2.eqx 2.2 3.5 2200 20000 0 --window-fd $h; done
 
-# --- GPU: flow variance, flows s2/s3/s4 on the first 300k catalog rows ---
+# --- GPU: flow variance, flows s2-s6 on the first 300k catalog rows ---
 # 2026-10-08: the first pass had N_ns from the FULL catalog's NPOP against a 300k slice (bias.py fixed:
 #   NPOP now scaled to the slice) and re-solves without --n-targets; those logs are in $L/nns_bug/.
 #   s2 needs no new integration: its pre-filtered rows for the prefix are the first rows of $P2 (checked
@@ -121,12 +120,12 @@ a = np.load("$P2"); b = np.load("pqr/desv_tnc15c_s3_sub.npz"); n = len(b["moment
 assert all(np.array_equal(a[k][:n], b[k]) for k in ("moments", "obs_plus", "obs_minus", "prefilter_w"))
 np.savez_compressed("pqr/desv_tnc15c_s2_sub.npz", **{k: a[k][:n] for k in a.files}, target_rows=np.array([0, $NT]))
 EOF2
-for s in 3 4; do
+for s in 3 4 5 6; do
     P=pqr/desv_tnc15c_s${s}_sub.npz
     [ -f $P ] || python -u bias.py $BF --flow $F/centroid_tnc15c_s$s.eqx --window-size 2.2 3.5 --window-flux 2200 90000 \
         --n-targets $NT --save-pqr $P > $L/bias_s${s}_sub.log 2>&1 || die "bias s$s subset"
 done
-for s in 2 3 4; do
+for s in 2 3 4 5 6; do
     echo "$W" | tr ' ' '\n' | paste -d' ' - - - - | head -3 | while read -r spec; do
         name=${spec%%:*}; set -- ${spec#*:}
         for seed in 0 1 2 3; do resolve s${s}sub_${name}_sd$seed pqr/desv_tnc15c_s${s}_sub.npz $F/centroid_tnc15c_s$s.eqx \
