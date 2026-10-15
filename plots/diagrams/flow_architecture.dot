@@ -1,0 +1,69 @@
+digraph arch {
+  graph [rankdir=TB, fontname="Helvetica", fontsize=22, labelloc=t, nodesep=0.5, ranksep=0.45, newrank=true,
+         label="cNF prior p(M | g, Σ_X): exact layer stack of centroid_tnc15c_x6r.eqx  (bulk.build_flow(shear=True, centroid=True, adapter=True))\n\n"];
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=13, penwidth=1.2];
+  edge [fontname="Helvetica", fontsize=11, penwidth=1.3];
+
+  base [label="Base distribution\nz ~ N(0, I₅)   (5 latent coordinates)", fillcolor="#eeeeee"];
+
+  subgraph cluster_bulk {
+    label="BULK: unconditional template density  (stage 1-2: bulk.py)"; fontsize=14; style="rounded,filled"; fillcolor="#e3eefb"; color="#4a7cc0";
+    bulkrep [label=<<b>8 × EquivariantAutoregressiveLayer</b>, each followed by a Permute<br/><br/>
+      <b>Spin0AutoregressiveLayer</b> on spin-0 slots (z0, z1, z2):<br/>
+      z0 → (z0 − loc0)·e<sup>−s0</sup>;  z1, z2 affine, conditioned autoregressively on the earlier slots<br/>
+      (loc, log-scale from CoeffNet MLPs, width 64, depth 2, SiLU)<br/><br/>
+      <b>Spin2CouplingLayer</b> on the shape pair (z3, z4), conditioned on spin-0:<br/>
+      pure radial stretch  (z3, z4) → (z3, z4)·exp h(z0, z1, z2, log1p|e|²)<br/>
+      direction never changes ⇒ rotation-equivariant by construction<br/>
+      the layer next to the shear layer also carries the bounded spin-2 radial bend<br/><br/>
+      <b>Permute</b>: cycles through all 6 orderings of the spin-0 slots;<br/>(z3, z4) never permuted>, fillcolor="#ffffff"];
+  }
+
+  subgraph cluster_shear {
+    label="SHEAR: lensing response  (stage 3: shear.py)"; fontsize=14; style="rounded,filled"; fillcolor="#e6f5e6"; color="#4f9a4f";
+    shear [label=<<b>ShearResponse</b>  (reads g = cond[0:2])<br/>
+      unshear:  z ↦ z + Q(z)·g + ½ gᵀR(z) g   (exact 2nd order in g, closed-form inverse by series inversion)<br/>
+      Q (5×2), R (5×2×2) built in closed form from 14 real coefficients<br/>
+      coefficients = _Coeffs MLP (width 128, depth 3, SiLU, rational bound) of whitened invariants (z0, z1, z2, |e|²)<br/>
+      projected on the spin-0 / spin-2 basis {Re(e*g), |g|², Re(e*²g²), …} ⇒ equivariant>, fillcolor="#ffffff"];
+  }
+
+  subgraph cluster_cent {
+    label="CENTROID: marginalisation over centroid error at the target's Σ_X  (stage 4: centroid.py train-sigmax)"; fontsize=14; style="rounded,filled"; fillcolor="#fdf0e0"; color="#c98a2e";
+    adapter [label=<<b>CentroidShearAdapter</b>  (reads g and Σ_X)<br/>
+      z ↦ z + Q_c(z; Σ_X)·g   (first order in g; identically the identity at g = 0)<br/>
+      18 coefficients (12 spin-0, 6 spin-2) from an MLP (8 → 18, width 32, depth 2) of rotation/parity invariants of e, g and the Σ_X ellipticity E<br/>
+      inverse: fixed 8-step Picard iteration>, fillcolor="#ffffff"];
+    sigx [label=<<b>SigmaXBlockLayer</b>  (g-blind; reads Σ_X = cond[2:5] → log scale, e1, e2)<br/>
+      closed-form block (no iterative solver; log-det = jacfwd + slogdet):<br/>
+      shape dipole D (net_dip) and quadrupole c (net_quad), |c| &lt; 1 bounded;  isotropic own-ellipticity term (net_eown)<br/>
+      size scale κ = exp g_s (net_size);  flux shift s0 (net_flux + net_flux_e);  Mc shift (net_mc)>, fillcolor="#ffffff"];
+  }
+
+  chart [label=<<b>RawMomentStandardize</b> (the chart; standardisation constants from bulk_base_x6r)<br/>
+     z = standardise[ log10 Mf,  Mr/Mf,  Mc/Mr − Φ(Mr/Mf)/(Mr/Mf),  spin2_bound(M1/Mr, M2/Mr) ]<br/>
+     Φ = exact Mc/Mf of an isotropic Gaussian under the KBlackmanHarris weight;  spin2_bound = atanh in |e| ⇒ |e| &lt; 1 guaranteed<br/>
+     spin-2 standardisation symmetrised (one std for z3, z4) ⇒ the whole stack stays isotropic>, fillcolor="#f3e6f7"];
+
+  data [label="Observed-frame latent moments  M = (Mf, Mr, M1, M2, Mc)\np(M | g, Σ_X) = N(f⁻¹(M); 0, I) · |det ∂f/∂M|", fillcolor="#eeeeee"];
+
+  cond [shape=note, style=filled, fillcolor="#fffbe0", label="condition vector\n[g1, g2, C00, C01, C11]\ng = shear\nΣ_X = target's centroid\ncovariance (cov_odd)"];
+
+  base -> bulkrep [label="  sample"];
+  bulkrep -> shear;
+  shear -> adapter;
+  adapter -> sigx;
+  sigx -> chart;
+  chart -> data [label="  chart⁻¹"];
+  data -> base [style=dashed, color="#888888", constraint=false, label="  log p: data → base (Σ log|det|)", fontcolor="#666666"];
+
+  cond -> shear [style=dotted, label=" g"];
+  cond -> adapter [style=dotted, label=" g, Σ_X"];
+  cond -> sigx [style=dotted, label=" Σ_X"];
+  {rank=same; shear; cond}
+
+  note [shape=plaintext, style="", fontsize=12, label=<<i>Generative order (solid arrows): base → bulk → shear(g) → centroid(Σ_X) → data, i.e. a galaxy is lensed, then measured about a guessed centroid.<br/>
+    Symmetries enforced by the architecture: rotation equivariance (spin-0 / spin-2 split, radial maps, invariant-built coefficients) and parity;<br/>
+    broken only through the condition (g, Σ_X anisotropy). bias.split_centroid peels SigmaXBlockLayer off so it runs once per draw outside the g-autodiff.</i>>];
+  data -> note [style=invis];
+}

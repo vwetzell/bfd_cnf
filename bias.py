@@ -426,6 +426,13 @@ CATALOGS = {
     # (+0.0008, -0.0039)) + noise +/-12%, seed 3, 1M per arm -- dev/desv.sh.
     "bulgedisc_g2n_1m_desv": {a: f"targets_bdg2_{b}_1m_desv" for a, b in
                               (("plus", "g1p02"), ("minus", "g1m02"), ("zero", "g0"))},
+    # 2026-10-14: the same 1M (seed 3, same galaxies and noise row for row) with mean PSF e1 +0.05
+    # (0.0508; sd unchanged) -- paired PSF-anisotropy leakage test, dev/desv_x6r_psfe.sh.
+    "bulgedisc_g2n_1m_desv_psfe1p05": {a: f"targets_bdg2_{b}_1m_desv_psfe1p05" for a, b in
+                                       (("plus", "g1p02"), ("minus", "g1m02"), ("zero", "g0"))},
+    # 2026-10-15: the same with mean PSF e1 +0.15 (0.1508), dev/desv_psfe15.sh.
+    "bulgedisc_g2n_1m_desv_psfe1p15": {a: f"targets_bdg2_{b}_1m_desv_psfe1p15" for a, b in
+                                       (("plus", "g1p02"), ("minus", "g1m02"), ("zero", "g0"))},
     # 8 more closed-loop populations (seed 12), for the real-catalog-sized
     # chunk scatter -- same script.
     # sn8r closed loops from the cv2 s0 flow (dev/closed_loop.py, REAL_POP=bulgedisc_g2n_176k_sn8r);
@@ -476,6 +483,8 @@ TRAIN_DATA = {
     **{f"bulgedisc_g2n_176k_sn8_cond{c}": "moments_bulgedisc_g2_bdg2n.fits" for c in "ABCDEW"},
     "bulgedisc_g2n_176k_des": "moments_bulgedisc_g2_bdg2d.fits",
     "bulgedisc_g2n_1m_desv": "moments_bulgedisc_g2_bdg2d.fits",
+    "bulgedisc_g2n_1m_desv_psfe1p05": "moments_bulgedisc_g2_bdg2d.fits",
+    "bulgedisc_g2n_1m_desv_psfe1p15": "moments_bulgedisc_g2_bdg2d.fits",
     "bulgedisc": "moments.fits", "bulgedisc_noisy": "moments.fits",
     "bulgedisc_deep": "moments.fits",
     "bulgedisc_deep_v2": "moments_bulgedisc_v2.fits",

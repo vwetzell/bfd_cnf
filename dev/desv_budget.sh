@@ -1,0 +1,35 @@
+#!/bin/bash
+# 2026-10-13: option-1 test -- fixed budget, cosine LR decay to zero, last EMA params (no --converge, no stop test).
+# Centroid stage only, upstream fixed (shear_l4).  A: seed 4 100k; B: seed 4 200k (doubling); C: seed 5 200k (seeds).
+# Then the CPU per-template fit on all three.  Usage: bash dev/desv_budget.sh > logs/desv/chain_budget.log 2>&1
+set -o pipefail
+cd "$(dirname "$0")/.."
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+D=../bfd_cnf_imsims/data; L=logs/desv; F=flows/desm; SM=1.5
+POP=bulgedisc_g2; M=$D/moments_${POP}_bdg2d.fits; C=$D/copies_${POP}_bdg2d_tn15c.fits; SX=$D/targets_bdg2_g0_1m_desv.fits
+SP=/tmp/claude-1000/-home-vwetzell-gitrepos-bfd-cnf/7a140eea-a3cd-4c43-a042-7378af54bad3/scratchpad
+die() { echo "$1 FAILED $(date)"; exit 1; }
+ollama_off() { for m in $(ollama ps 2>/dev/null | awk 'NR > 1 {print $1}'); do ollama stop $m >/dev/null 2>&1; done; }
+( while kill -0 $$ 2>/dev/null; do ollama_off; sleep 30; done ) &
+gate() { python -u dev/tail_gate.py --kind $1 $2 --data $M --sx-from $SX 2>&1 | grep "tail gate" | tee -a $L/tail_gate.log | grep -q PASS; }
+run() {   # tag seed steps
+    local r=$1 seed=$2 steps=$3
+    local cf=$F/centroid_tnc15c_$r.eqx cl=$L/centroid_tnc15c_$r.log
+    [ -f $cf ] && return 0
+    systemd-run --user --scope -q -p MemoryMax=48G -p MemorySwapMax=0 env \
+        XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 XLA_FLAGS=--xla_gpu_enable_command_buffer= python -u centroid.py train-sigmax \
+        --multi-scale --anisotropic --n-aniso 400 --aniso-max 0.10 --scale-margin $SM --copies $C --train-data $M \
+        --init $F/shear_l4.eqx --flow $cf --steps $steps --batch 8192 --seed $seed \
+        --g-resp-weight 1.0 --g-resp-grid --adapter > $cl 2>&1 || die "$r train"
+    local g=PASS; gate centroid $cf || g=FAIL
+    local er=$(awk '/ellipticity response/ {print $NF}' $cl | tail -1)
+    python -u dev/eresp_scan.py $C $M $cf 2>&1 | grep -v -e Warning -e log_den > $L/eresp_scan_c_$r.log
+    echo "$r (seed $seed, $steps steps): tail gate $g, e-resp $er; $(tail -1 $L/eresp_scan_c_$r.log); last full-loss $(grep -o 'full-loss (all 403 scales) [0-9.]*' $cl | tail -1 | awk '{print $NF}')  $(date)"
+}
+run b4a 4 100000
+run b4b 4 200000
+run b5b 5 200000
+echo "GPU done $(date)"
+JAX_PLATFORMS=cpu python -u $SP/cent_resp.py 100000 b4a b4b b5b l4 l5 2>&1 | grep -v "Warning\|np.log" > $L/cent_resp_budget.log
+grep -E "^[bl][0-9]|x1.000" $L/cent_resp_budget.log
+echo "ALL DONE $(date)"

@@ -1,0 +1,26 @@
+digraph infer {
+  graph [rankdir=TB, fontname="Helvetica", fontsize=22, labelloc=t, nodesep=0.45, ranksep=0.5, newrank=true,
+         label="Shear inference with x6r  (bias.py → pqr/desv_tnc15c_x6rA.npz, full90k window)\n\n"];
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=13, penwidth=1.2, fillcolor="#ffffff"];
+  edge [fontname="Helvetica", fontsize=11, penwidth=1.3];
+
+  tg [fillcolor="#f2f2f2", label=<<b>Targets</b>  targets_bdg2_{g1p02, g1m02}_1m_desv.fits  (seed 3; first 300,000 rows of each arm)<br/>the same galaxies and pixel noise lensed at g1 = +0.02 and −0.02;  pixel noise 2.289 (DES Y6 depth)<br/>per-galaxy conditions: PSF e mean (+0.0008, −0.0039), sd (0.008, 0.008); PSF σ 0.40 ± 0.020; noise sd 0.28<br/>each row: recentred moments M, covariance C_M, Σ_X (cov_odd), badcenter flag>];
+  flow [fillcolor="#f3e6f7", label=<<b>centroid_tnc15c_x6r.eqx</b><br/>p(m | g, Σ_X)>];
+
+  pre [label=<drop badcenter rows (either arm);  prefilter: integrate only targets inside the window widened by 30%<br/>(the out-of-window COUNT comes from the full catalog)>];
+  ker [label=<<b>Noise kernel</b>, deconvolved for template noise (--deconvolve-templates --template-noise-g):<br/>L(M | m) = N(M − m;  C_M − Σ_t(g)),   Σ_t(g) = C_t + g·c̄(G + Gᵀ)<br/>C_t = mean template covariance;  G = Cov(dD, dM)/C_ff from the templates (dev/noise_G.py → noiseG_bulgedisc_g2_bdg2d.npz)>];
+  draw [label=<<b>8192 draws per target</b> from the defensive mixture  q = 0.5·(noise kernel around M) + 0.5·flow(Σ_X)   (--alpha 0.5)<br/>physical support enforced (--support);  draws below the template cut get weight 0 (--template-cut 1200 1.5)>];
+  eval [label=<<b>Per draw</b>: SigmaXBlockLayer evaluated once (g-independent log-det, bias.split_centroid);<br/>log p_rest(· | g) through adapter + shear + bulk with its g-gradient and g-Hessian (autodiff);<br/>noisy-Jacobian weight 1/J(m)  (--window-jacobian full)>];
+  acc [label=<<b>Streamed accumulation</b> in chunks of 4096 draws:  A = Σ w p,  B = Σ w ∇_g p,  C = Σ w ∇²_g p<br/>delete-one jackknife over chunks ⇒ per target  Q_i = ∇_g log P(M_i),  R_i = ∇²_g log P(M_i)>];
+  win [label=<<b>Tapered window</b> on each target's measured M:<br/>Mr/Mf ∈ [2.2, 3.5] (Gaussian-CDF edges, τ = 0.05),  Mf ∈ [2200, 90000] (τ = 150)  ⇒  weight w_i>];
+
+  sel [fillcolor="#fdf0e0", label=<<b>Selection terms</b> (--window-terms flow):  2²⁴ prior draws from the flow at the population-mean (deconvolved) C_M and Σ_X<br/>P_s = probability a galaxy lands in the window;  Q_s, R_s = its g-derivatives by central differences, h = 0.005<br/>same tapered window, noisy |J| weight;  support required at all 9 stencil points<br/>x6r: P_s = 0.3665;  9.1e-5 of draws dropped;  top draw carries 0.69% of R_s11;  traceless R_s +2.8e-5>];
+
+  est [fillcolor="#e6f5e6", label=<<b>BFD estimator</b>, per arm:<br/>Q = Σ_i w_i Q_i − N_ns Q_s/(1 − P_s)<br/>R = −Σ_i w_i R_i + N_ns [Q_s Q_sᵀ/(1 − P_s)² + R_s/(1 − P_s)],   N_ns = N_pop − Σ_i w_i<br/>ĝ = R⁻¹ Q>];
+  res [shape=box, style="rounded,filled,bold", fillcolor="#e3eefb", label=<m1 = (ĝ₊ − ĝ₋)₁ / (2 × 0.02) − 1,    c = (ĝ₊ + ĝ₋)/2<br/>errors: bootstrap over targets;  selection MC from re-solves with selection seeds 1-3 (--load-pqr)<br/><b>x6r, 4 selection seeds:  m1 = +0.00009 ± 0.00057 (targets) ± 0.00007 (selection MC)</b>>];
+
+  tg -> pre -> ker -> draw -> eval -> acc -> win -> est -> res;
+  flow -> draw [style=dashed]; flow -> eval [style=dashed]; flow -> sel [style=dashed];
+  sel -> est;
+  {rank=same; eval; sel}
+}
