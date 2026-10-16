@@ -718,6 +718,75 @@ def log_conv_is(flow, m_i, draws, log_wt, g, ok=None):
             - jnp.log(draws.shape[0]))
 
 
+def taylor_layers(flow_g):
+    """`(adapter or None, shear, rest)` when the PEELED chain is
+    [CentroidShearAdapter?, ShearResponse, *g-unconditional layers], else None.
+    `BFD_TAYLOR=0` forces None (the full autodiff path, for paired checks)."""
+    if os.environ.get("BFD_TAYLOR", "1") == "0":
+        return None
+    bij = list(flow_g.bijection.bijection.bijections)
+    ad = bij.pop(0) if bij and isinstance(bij[0], CentroidShearAdapter) else None
+    if not bij or not isinstance(bij[0], shear.ShearResponse):
+        return None
+    if any(b.cond_shape is not None for b in bij[1:]):
+        return None
+    return ad, bij[0], bij[1:]
+
+
+def log_conv_is_taylor(tl, base, m_i, draws, log_wt, g, sigma_x, ok):
+    """`log_conv_is` on the peeled flow, EXACT in value, gradient and Hessian
+    at g = 0 -- all the Q/R kernels read -- with the adapter and shear layers
+    taken out of the g-autodiff (2026-10-16: 2.8x faster, 4x less memory on
+    bw32, `dev/hess_modes.py`; Q, R agree to float32 roundoff).
+
+    The adapter is exactly linear in g, x1 = x0 + W(x0) g, and the shear layer
+    exactly quadratic, y = x1 + Q(x1) g + g.R(x1).g / 2, so to second order
+        y = x0 + V g + g.Rh.g / 2,  V = W + Q,  Rh_iab = R_iab + C_iab + C_iba,
+        C_iab = dQ_ia/dx_j W_jb,
+        ld_shear = t1.g + g.T2.g / 2,  t1_a = tr A_a,
+        T2_ab = tr dR_ab - tr(A_a A_b) + D_ab + D_ba,  D_ab = d(tr A_a)/dx . W_b,
+    with A_a = dQ_a/dx, dR = dR/dx, and ld_adapter = slogdet(I + K.g) exactly,
+    K_a = dW_a/dx.  All of it is g-independent, so only the unconditional bulk
+    stays under the forward-over-reverse Hessian.  NOT log P at g != 0 beyond
+    second order -- never use it for the selection terms' finite differences.
+    `sigma_x` is passed apart from `g` so no g-tangent reaches the coefficients."""
+    ad, sh, rest = tl
+    x = jnp.where(ok[:, None], draws, 0.0)    # stand-in: see log_conv_is
+    E = jnp.eye(2, dtype=x.dtype)
+
+    def pre(x0):
+        if ad is None:
+            W, K = jnp.zeros((5, 2), x0.dtype), jnp.zeros((2, 5, 5), x0.dtype)
+        else:
+            w = lambda z, a: ad._w(z, jnp.concatenate([E[a], sigma_x]))
+            W = jnp.stack([w(x0, 0), w(x0, 1)], -1)
+            K = jnp.stack([jax.jacfwd(w)(x0, 0), jax.jacfwd(w)(x0, 1)])
+        (Q, R), (A, dR) = sh.response_tensors(x0), jax.jacfwd(sh.response_tensors)(x0)
+        divQ = lambda z: jnp.einsum("iai->a", jax.jacfwd(lambda u: sh.response_tensors(u)[0])(z))
+        D = jax.vmap(lambda v: jax.jvp(divQ, (x0,), (v,))[1], in_axes=1, out_axes=1)(W)
+        C = jnp.einsum("iaj,jb->iab", A, W)
+        T2 = jnp.einsum("iabi->ab", dR) - jnp.einsum("iaj,jbi->ab", A, A) + D + D.T
+        return W + Q, R + C + C.transpose(0, 2, 1), jnp.einsum("iai->a", A), T2, K
+
+    def bulk_lp(y):
+        tot = 0.0
+        for l in rest:
+            y, ld = l.transform_and_log_det(y, None)
+            tot = tot + ld
+        return tot + base.log_prob(y)
+
+    V, Rh, t1, T2, K = jax.vmap(pre)(x)
+    y = x + V @ g + 0.5 * jnp.einsum("siab,a,b->si", Rh, g, g)
+    lp = (jax.vmap(bulk_lp)(y) + t1 @ g + 0.5 * jnp.einsum("sab,a,b->s", T2, g, g)
+          + jnp.linalg.slogdet(jnp.eye(5) + jnp.einsum("saij,a->sij", K, g))[1])
+    # flowjax's own rule (`AbstractTransformed._log_prob`): NaN = outside the
+    # transform's support = -inf.  Without it a bulk log-det NaN far off the
+    # templates (z2 ~ 5) poisoned the whole target: 6% of targets lost.
+    lp = jnp.where(jnp.isnan(lp), -jnp.inf, lp)
+    return (jax.nn.logsumexp(jnp.where(ok, lp + log_wt, -jnp.inf))
+            - jnp.log(draws.shape[0]))
+
+
 def log_conv(flow, m_i, eps, g):
     """log INT dm P(m|g) L(M_i - m), by Monte Carlo over the noise kernel.
 
@@ -1192,6 +1261,25 @@ def mixture_draws(flow, m, cov, samples, alpha, seed, batch=None, sigma_x=None,
 
     cat = np.concatenate if to_host else jnp.concatenate
     return cat(draws_out), cat(wt_out)
+
+
+def g0_proposal(flow):
+    """`flow` with its `CentroidShearAdapter` and `ShearResponse` removed, for
+    `mixture_draws`, which samples and evaluates the proposal at g = 0 only.
+    Both layers are EXACTLY the identity there with log-det exactly 0 (every
+    term carries a factor of g), so draws and log weights are unchanged
+    (bit-for-bit, barring a NaN coefficient) -- but `sample` no longer runs the
+    shear layer's closed-form inverse plus the adapter's 8 Picard steps, and
+    `log_prob` no longer runs `slogdet(jacfwd(...))` of both (2026-10-16).
+    Keeps the `SupportedFlow` wrapper (support indicator, floor)."""
+    inner = flow.flow if isinstance(flow, bulk.SupportedFlow) else flow
+    bij = inner.bijection.bijection.bijections
+    keep = [b for b in bij if not isinstance(b, (CentroidShearAdapter, shear.ShearResponse))]
+    if len(keep) == len(bij):
+        return flow
+    inner = eqx.tree_at(lambda f: f.bijection, inner, Invert(Chain(keep)))
+    return (eqx.tree_at(lambda f: f.flow, flow, inner)
+            if isinstance(flow, bulk.SupportedFlow) else inner)
 
 
 def split_centroid(flow):
@@ -1956,9 +2044,20 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
         print("    WARNING: --floor-eps is IGNORED on the peeled path "
               "(the floor lives in raw-moment space)", flush=True)
 
+    # Adapter + shear out of the g-autodiff (`log_conv_is_taylor`); only with
+    # the peel, whose draws arrive standardised and g-independent.
+    tl = taylor_layers(flow_g) if layer is not None else None
+    prop0 = g0_proposal(flow if proposal is None else proposal)   # mixture_draws is at g = 0
+    print(f"    g-Hessian: {'adapter+shear Taylor peel' if tl else 'full autodiff'}", flush=True)
+
+    def _lci(m_i, draws_i, log_wt_i, g, sigma_x_i, ok_i):
+        if tl is not None:
+            return log_conv_is_taylor(tl, flow_g.base_dist, m_i, draws_i, log_wt_i,
+                                      g, sigma_x_i, ok_i)
+        return log_conv_is(flow_g, m_i, draws_i, log_wt_i, condition(g, sigma_x_i), ok_i)
+
     def one(m_i, draws_i, log_wt_i, sigma_x_i, ok_i):
-        f = lambda g: log_conv_is(flow_g, m_i, draws_i, log_wt_i,
-                                  condition(g, sigma_x_i), ok_i)
+        f = lambda g: _lci(m_i, draws_i, log_wt_i, g, sigma_x_i, ok_i)
         # One forward-over-reverse pass per g direction yields the value, the
         # gradient AND a column of the Hessian.  Calling f, jax.grad(f) and
         # jax.hessian(f) separately -- as this did -- evaluates the flow three
@@ -1967,10 +2066,10 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
         return _val_grad_hess(f)
 
     def one_t(m_i, draws_i, log_wt_i, sigma_x_i, ok_i, lin_i, quad_i):
-        f = lambda g: log_conv_is(
-            flow_g, m_i, draws_i,
+        f = lambda g: _lci(
+            m_i, draws_i,
             log_wt_i + lin_i @ g - jnp.einsum("skl,k,l->s", quad_i, g, g),
-            condition(g, sigma_x_i), ok_i)
+            g, sigma_x_i, ok_i)
         return _val_grad_hess(f)
 
     if dsig is not None:
@@ -2375,7 +2474,7 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
             # numpy round trip is pure loss and its `np.asarray` drained the
             # pipeline once per chunk.  Bit-identical values.
             d, lw = mixture_draws(
-                flow if proposal is None else proposal, m_b, cov_b, chunk, alpha,
+                prop0, m_b, cov_b, chunk, alpha,
                 seed + 7919 * c + 104729 * (i // batch),
                 batch=len(m_b), sigma_x=sx_b if proposal is None else psx_b,
                 to_host=False)
@@ -2405,7 +2504,7 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
                                               or gauge != "prior") else None)
             if support_cut is not None:
                 bad = ~bulk.selected(d_raw, support_cut)
-                n_unsup += int(bad.sum())
+                n_unsup = n_unsup + bad.sum()   # on device: int() here drained the pipeline per chunk
                 lw = jnp.where(bad, -jnp.inf, lw)
                 if ok_raw is not None:
                     ok_raw = ok_raw & ~bad
@@ -2516,8 +2615,8 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
         print(f"    {n_empty} targets had no draw with any weight; "
               f"they contribute nothing", flush=True)
     if support_cut is not None:
-        print(f"    --template-cut: zeroed {n_unsup} draws below the cut "
-              f"({n_unsup / max(len(m) * samples, 1):.1e} of all)", flush=True)
+        print(f"    --template-cut: zeroed {int(n_unsup)} draws below the cut "
+              f"({int(n_unsup) / max(len(m) * samples, 1):.1e} of all)", flush=True)
     if n_fallback:
         # One chunk holds nearly all of this target's weight, so the delete-one
         # jackknife would divide by a vanishing 1 - a_e and these targets keep
