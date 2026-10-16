@@ -26,12 +26,11 @@ S = [1 / 1.5, 1 / 1.4, 1 / 1.2, 1.0, 1.2, 1.4, 1.5]
 res = C.weighted_copy_mean_many(copies, galaxies, [sx0 * s ** 2 for s in S])
 del copies
 m_train = shear.load(td)[0]
-tmpl = bulk.build_flow(jr.key(2), m_train, shear=True, centroid=True, flux_sas=None, adapter=True)
 m0all = np.asarray(galaxies["moments"], np.float64)
 e = lambda m: (m[:, 2] + 1j * m[:, 3]) / m[:, 1]
 ok = True
 for path in flows:
-    flow = eqx.tree_deserialise_leaves(path, tmpl)
+    flow = bulk.load_flow(path, m_train, key=jr.key(2), shear=True, centroid=True, flux_sas=None, adapter=True)
     layer, chart = C._sigmax_layer(flow), C._chart(flow)
     print(f"\n{path}")
     worst = 0.0

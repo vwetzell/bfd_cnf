@@ -1559,6 +1559,7 @@ def main():
                         "response instead (see models/bijections.py). "
                         "Incompatible with --fit-K (net_K is unused on a "
                         "g_blind layer).")
+    bulk.add_net_args(p)
     a = p.parse_args()
     if a.fit_K and a.adapter:
         p.error("--fit-K is incompatible with --adapter: net_K is unused "
@@ -1581,14 +1582,15 @@ def main():
     # 16%, d2M1/dg2 44% -> 96%; 2026-10-05) -- bias.py syncs to TRAIN_DATA too.
     m_train = (shear.load(a.train_data)[0] if a.train_data
                else np.asarray(galaxies["moments"], dtype=np.float64))
+    net = bulk.merged_net_kw(a, a.init if a.mode in ("train", "train-sigmax") else a.flow)
     flow = bulk.build_flow(jr.key(a.seed), m_train, shear=True, centroid=True,
-                           flux_sas=a.flux_sas, adapter=a.adapter)
+                           flux_sas=a.flux_sas, adapter=a.adapter, **net)
 
     if a.mode in ("train", "train-sigmax"):
         if a.init:
             prior = eqx.tree_deserialise_leaves(
                 a.init, bulk.build_flow(jr.key(a.seed), m_train, shear=True,
-                                        flux_sas=a.flux_sas))
+                                        flux_sas=a.flux_sas, **bulk.net_kw(a.init)))
             pb = prior.bijection.bijection.bijections
             # prior is [raw2standard, shear, *bulk]; this chain inserts the
             # centroid layer (and, with --adapter, CentroidShearAdapter right
@@ -1774,7 +1776,8 @@ def main():
             flow = train(flow, m0[fit], (target - m0)[fit], sigma_x,
                         jr.key(a.seed + 1), steps=a.steps, batch=a.batch)
         eqx.tree_serialise_leaves(a.flow, flow)
-        print(f"wrote {a.flow}")
+        bulk.save_net_kw(a.flow, net)
+        print(f"wrote {a.flow}" + (f" (net sizes {net})" if net else ""))
     else:
         flow = eqx.tree_deserialise_leaves(a.flow, flow)
     if a.holdout:

@@ -763,6 +763,7 @@ def main():
     p.add_argument("--m-range", type=float, default=0.25)
     p.add_argument("--n", type=int, default=101)
     p.add_argument("--out", default="plots/shear_derivs.png")
+    bulk.add_net_args(p)
     a = p.parse_args()
 
     data = load(a.data)
@@ -778,8 +779,9 @@ def main():
     labels = load_labels(a.data)
     val_labels = None if labels is None else labels[n_train:]
 
+    net = bulk.merged_net_kw(a, a.init if a.mode == "train" else a.flow)
     flow = bulk.build_flow(jr.key(a.seed), train_set[0], shear=True,
-                           flux_sas=a.flux_sas)
+                           flux_sas=a.flux_sas, **net)
 
     if a.mode == "train":
         # Warm start the bulk from phase 1: it already knows p(m) at g=0, so the
@@ -787,7 +789,7 @@ def main():
         if a.init:
             bulk_only = eqx.tree_deserialise_leaves(
                 a.init, bulk.build_flow(jr.key(a.seed), train_set[0],
-                                        flux_sas=a.flux_sas))
+                                        flux_sas=a.flux_sas, **bulk.net_kw(a.init)))
             # `flow` is [raw2standard, shear, *bulk]; `bulk_only` is
             # [raw2standard, *bulk].  Graft every non-shear slot, in order.
             keep = [i for i, b in enumerate(flow.bijection.bijection.bijections)
@@ -829,7 +831,8 @@ def main():
                      jac_weight=a.jac_weight)
         print(f"val nll {val_nll(flow, val_set, jr.key(99)):.4f}")
         eqx.tree_serialise_leaves(a.flow, flow)
-        print(f"wrote {a.flow}")
+        bulk.save_net_kw(a.flow, net)
+        print(f"wrote {a.flow}" + (f" (net sizes {net})" if net else ""))
         check(flow, val_set, labels=val_labels)
         return
 

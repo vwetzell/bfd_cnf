@@ -31,6 +31,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import os
 
 import equinox as eqx
 import fitsio
@@ -298,7 +300,8 @@ def coeff_stats(t, mean=None, std=None):
 
 def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH,
                shear=False, centroid=False,
-               flux_sas=None, adapter=False):
+               flux_sas=None, adapter=False, shear_width=128, shear_depth=3,
+               sigmax_width=32, sigmax_depth=2, adapter_width=32):
     """Bulk flow standardised against `m_train`; conditioned on g and/or Sigma_X.
 
     The generative stack is ``base -> bulk -> shear(g) -> centroid(Sigma_X) ->
@@ -378,7 +381,7 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
     # [g1, g2, C00, C01, C11].  Shear reads the first two, centroid the last three.
     cond = 5 if (shear and centroid) else None
     shear_layer = (ShearResponse(
-        k_shear, cond_dim=cond or 2,
+        k_shear, nn_width=shear_width, nn_depth=shear_depth, cond_dim=cond or 2,
         # The chart's EFFECTIVE spin-2 std, not slot 3's own.
         # `RawMomentStandardize._effective` symmetrises the pair to
         # sqrt((s3^2 + s4^2)/2) -- that is what z3 and z4 are actually
@@ -412,13 +415,14 @@ def build_flow(key, m_train, layers=LAYERS, nn_width=NN_WIDTH, nn_depth=NN_DEPTH
     # right after it to carry that dependence instead -- `jr.fold_in(
     # k_centroid, 1)` so this never perturbs the key `SigmaXBlockLayer`
     # itself gets, keeping `adapter=False` builds bit-identical to before.
-    centroid_layer = ([SigmaXBlockLayer(k_centroid, full_cond_dim=cond or 3,
+    centroid_layer = ([SigmaXBlockLayer(k_centroid, nn_width=sigmax_width, nn_depth=sigmax_depth,
+                                        full_cond_dim=cond or 3,
                                         log_scale_mean=10.8, e_max=0.1,
                                         size_loc=float(t.mean(0)[1] / t.std(0)[1]),
                                         g_blind=adapter)]
                       if centroid else [])
     adapter_layer = ([CentroidShearAdapter(
-        jr.fold_in(k_centroid, 1), log_scale_mean=10.8, e_max=0.1,
+        jr.fold_in(k_centroid, 1), nn_width=adapter_width, log_scale_mean=10.8, e_max=0.1,
         e_scale=float(np.sqrt(0.5 * (t.std(0)[3] ** 2 + t.std(0)[4] ** 2))))]
                      if adapter else [])
     head = centroid_layer + adapter_layer + ([shear_layer] if shear else [])
@@ -619,6 +623,43 @@ def sync_chart_constants(flow, m_train=None):
     return flow
 
 
+# Network sizes (2026-10-15, net-size ladder): `build_flow` kwargs -> trainer flag.  A flow built at
+# non-default sizes carries them in a sidecar `<flow>.json`; `load_flow` and the trainers' --init /
+# --chart-from read it, so every consumer rebuilds the right skeleton (a wrong one fails loudly).
+NET_FLAGS = {"layers": "--bulk-layers", "nn_width": "--bulk-width", "nn_depth": "--bulk-depth",
+             "shear_width": "--shear-width", "shear_depth": "--shear-depth",
+             "sigmax_width": "--sigmax-width", "sigmax_depth": "--sigmax-depth",
+             "adapter_width": "--adapter-width"}
+
+
+def add_net_args(p):
+    for k, flag in NET_FLAGS.items():
+        p.add_argument(flag, dest=f"net_{k}", type=int, default=None,
+                       help="network size (default: the --init/--chart-from flow's, else build_flow's)")
+
+
+def net_kw(path):
+    """Non-default network sizes of the flow at `path` ({} without a sidecar)."""
+    side = f"{path}.json"
+    return json.load(open(side)) if path and os.path.exists(side) else {}
+
+
+def merged_net_kw(a, upstream=None):
+    """`upstream`'s sidecar sizes overridden by whichever size flags were given."""
+    kw = net_kw(upstream)
+    kw.update({k: getattr(a, f"net_{k}") for k in NET_FLAGS if getattr(a, f"net_{k}") is not None})
+    return kw
+
+
+def save_net_kw(path, kw):
+    """Write (or remove a stale) sidecar next to the checkpoint at `path`."""
+    side = f"{path}.json"
+    if kw:
+        json.dump(kw, open(side, "w"))
+    elif os.path.exists(side):
+        os.remove(side)
+
+
 def load_flow(path, m_train, key=None, **kw):
     """Build a flow matching `path`'s checkpoint and deserialise it.
 
@@ -640,6 +681,7 @@ def load_flow(path, m_train, key=None, **kw):
     just `eqx.tree_deserialise_leaves(path, build_flow(key, m_train, **kw))`.
     """
     key = jr.key(0) if key is None else key
+    kw = {**net_kw(path), **kw}
     flow = build_flow(key, m_train, **kw)
     if kw.get("adapter") or not (kw.get("shear") and kw.get("centroid")):
         # Caller already said which, or the adapter question doesn't even
@@ -1086,6 +1128,7 @@ def main():
                         "-- found when a first --jac-weight run without this "
                         "produced exactly that at one held-out point.")
     p.add_argument("--out", default="plots/bulk_corner.png")
+    add_net_args(p)
     a = p.parse_args()
 
     m = load_moments(a.data)
@@ -1093,9 +1136,11 @@ def main():
     cov_train, cov_val = _split(load_cov(a.data)) if a.template_cut else (None, None)
     key = jr.key(a.seed)
     k_build, k_train, k_sample = jr.split(key, 3)
-    flow = build_flow(k_build, m_train, flux_sas=a.flux_sas)
-    if a.chart_from:
-        src = eqx.tree_deserialise_leaves(a.chart_from, flow)
+    net = merged_net_kw(a, None if a.mode == "train" else a.flow)   # bulk sizes are never inherited
+    flow = build_flow(k_build, m_train, flux_sas=a.flux_sas, **net)
+    if a.chart_from:   # only the chart is copied, so the source may have other net sizes
+        src = eqx.tree_deserialise_leaves(a.chart_from, build_flow(
+            k_build, m_train, flux_sas=a.flux_sas, **net_kw(a.chart_from)))
         flow = eqx.tree_at(lambda f: chart_of(f), flow, replace=chart_of(src))
 
     if a.mode == "train":
@@ -1116,7 +1161,8 @@ def main():
                    f"{float(np.mean(sel_prob(jnp.asarray(m_val), jnp.asarray(cov_val), a.template_cut))):.4f}")
         print(f"val nll {-jnp.mean(flow.log_prob(jnp.asarray(mv))):.4f}" + msg)
         eqx.tree_serialise_leaves(a.flow, flow)
-        print(f"wrote {a.flow}")
+        save_net_kw(a.flow, net)
+        print(f"wrote {a.flow}" + (f" (net sizes {net})" if net else ""))
         return
 
     import matplotlib

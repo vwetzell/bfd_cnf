@@ -145,7 +145,7 @@ jax.config.update("jax_default_matmul_precision", "highest")
 # question it looks like it answers: it reports the fraction of time at least
 # one kernel was RESIDENT, not that the SMs were busy, so a launch-bound loop
 # of tiny kernels reads ~100% exactly like a saturated one.
-_TIME = ({"draw": 0.0, "lambda": 0.0, "dispatch": 0.0, "device": 0.0,
+_TIME = ({"draw": 0.0, "tn": 0.0, "lambda": 0.0, "dispatch": 0.0, "device": 0.0,
           "merge": 0.0, "finish": 0.0, "wall": 0.0}
          if os.environ.get("BFD_TIMING") else None)
 
@@ -2417,6 +2417,9 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
             else:
                 d = d_raw
             sx_j = None if sx_b is None else jnp.asarray(sx_b, dtype=jnp.float32)
+            if _TIME is not None and gauge != "auto":   # auto charges its own draw time below
+                jax.block_until_ready((d, lw))
+                _TIME["draw"] += time.perf_counter() - _t
             if gauge == "auto":
                 m_raw_j = jnp.asarray(m_b, dtype=jnp.float32)
                 # The masking and `r0` now live INSIDE the kernel (`_auto_glue`)
@@ -2455,8 +2458,16 @@ def pqr_streamed(flow, m, cov, samples, alpha, seed, sigma_x=None,
                 r0 = m_raw_j[:, None, :] - d_raw
                 f, df, d2f = batched(r0, d, d_raw, c_k, sx_j, ok_raw)
             elif dsig is not None:
-                f, df, d2f = batched(m_z, d, lw, sx_j, ok_raw,
-                                     *tn_terms(m_b, d_raw, cov_b))
+                if _TIME is not None:
+                    _t2 = time.perf_counter()
+                tn = tn_terms(m_b, d_raw, cov_b)
+                if _TIME is not None:
+                    jax.block_until_ready(tn)
+                    _TIME["tn"] += time.perf_counter() - _t2
+                    _t3 = time.perf_counter()
+                f, df, d2f = batched(m_z, d, lw, sx_j, ok_raw, *tn)
+                if _TIME is not None:
+                    _TIME["dispatch"] += time.perf_counter() - _t3
             else:
                 f, df, d2f = batched(m_z, d, lw, sx_j, ok_raw)
             if _TIME is not None:
